@@ -1,17 +1,34 @@
 import type { CsvFormat, ImportReport, NormalizedOrder } from "@invai/contracts";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, lt } from "drizzle-orm";
 import { systemContext, type TenantContext } from "../../api/context";
 import { afterCommit, type Tx, withSystem, withTenant } from "../../db/client";
-import { channelConnections, importRuns, jobs, orders } from "../../db/schema";
+import {
+  channelConnections,
+  importRuns,
+  jobs,
+  orders,
+  WEBHOOK_DELIVERY_RETENTION_MS,
+  webhookDeliveries,
+} from "../../db/schema";
 import { env } from "../../env";
-import { getChannelAdapter } from "../../integrations/channels";
+import {
+  channelMocked,
+  getChannelAdapter,
+  webhookAdapter,
+  webhookDeliveryId,
+} from "../../integrations/channels";
 import { parseOrdersCsv } from "../../integrations/channels/csv";
 import {
   exchangeShopifyCode,
   finishShopifyInstall,
   verifyOAuthQuery,
 } from "../../integrations/channels/shopify";
-import type { HeaderBag } from "../../integrations/channels/types";
+import type {
+  FetchedOrder,
+  HeaderBag,
+  VerifyWebhookOptions,
+  WebhookEvent,
+} from "../../integrations/channels/types";
 import { audit } from "../../lib/audit";
 import { decryptJson, encryptField, encryptJson, safeEqual } from "../../lib/crypto";
 import { badRequest, conflict, notFound, ORPCError } from "../../lib/errors";
@@ -303,31 +320,143 @@ export async function pollableConnections() {
 /* ------------------------------------ webhooks ------------------------------------ */
 
 /**
- * Verify a channel webhook synchronously (Shopify wants a 401 for a bad HMAC). Returns the
- * connections it belongs to, or null when the signature is invalid.
+ * Verify a channel webhook synchronously, on the raw body, before anything is written or
+ * enqueued (Shopify wants a 401 for a bad HMAC). The adapter comes from the channel's own mock
+ * flag. A mock provider signs with a public constant, so production never accepts it.
  */
 export async function verifyWebhook(
   channel: ConnectionRow["channel"],
   headers: HeaderBag,
   body: string,
-) {
-  const adapter = getChannelAdapter(channel, env.mocks.shopify ? "mock" : "live");
-  return adapter.verifyWebhook(headers, body);
+  opts?: VerifyWebhookOptions,
+): Promise<boolean> {
+  if (env.isProd && channelMocked(channel)) return false;
+  return webhookAdapter(channel).verifyWebhook(headers, body, opts);
 }
 
+/**
+ * Record a verified delivery. True when it is new; false when the channel already delivered it
+ * (a redelivery: acknowledge and do nothing). Written with the system role because no tenant is
+ * known yet; the app role cannot write this table.
+ */
+export async function recordWebhookDelivery(
+  channel: ConnectionRow["channel"],
+  deliveryId: string,
+): Promise<boolean> {
+  const inserted = await withSystem((tx) =>
+    tx
+      .insert(webhookDeliveries)
+      .values({ channel, deliveryId })
+      .onConflictDoNothing()
+      .returning({ id: webhookDeliveries.id }),
+  );
+  return inserted.length > 0;
+}
+
+/** Undo a record whose job could not be enqueued, so the channel's retry is processed. */
+export async function forgetWebhookDelivery(channel: ConnectionRow["channel"], deliveryId: string) {
+  await withSystem((tx) =>
+    tx
+      .delete(webhookDeliveries)
+      .where(
+        and(
+          eq(webhookDeliveries.channel, channel),
+          eq(webhookDeliveries.deliveryId, deliveryId),
+          eq(webhookDeliveries.status, "received"),
+        ),
+      ),
+  );
+}
+
+async function finishWebhookDelivery(
+  channel: ConnectionRow["channel"],
+  headers: HeaderBag,
+  outcome: {
+    status: "processed" | "ignored" | "failed";
+    companyId?: string | null;
+    detail?: string | null;
+  },
+) {
+  const deliveryId = webhookDeliveryId(channel, headers);
+  if (!deliveryId) return;
+  await withSystem((tx) =>
+    tx
+      .update(webhookDeliveries)
+      .set({
+        status: outcome.status,
+        processedAt: new Date(),
+        detail: outcome.detail?.slice(0, 500) ?? null,
+        ...(outcome.companyId ? { companyId: outcome.companyId } : {}),
+      })
+      .where(
+        and(eq(webhookDeliveries.channel, channel), eq(webhookDeliveries.deliveryId, deliveryId)),
+      ),
+  );
+}
+
+/** Delete deliveries older than the retention window (daily job). */
+export async function purgeWebhookDeliveries(now = new Date()) {
+  const cutoff = new Date(now.getTime() - WEBHOOK_DELIVERY_RETENTION_MS);
+  const deleted = await withSystem((tx) =>
+    tx
+      .delete(webhookDeliveries)
+      .where(lt(webhookDeliveries.receivedAt, cutoff))
+      .returning({ id: webhookDeliveries.id }),
+  );
+  return { deleted: deleted.length };
+}
+
+type WebhookResult =
+  | { handled: false; reason: string }
+  | { handled: true; kind: WebhookEvent["kind"]; orderIds: string[] };
+
+/**
+ * Process a verified delivery in the worker. Re-verifies (timestamps against `receivedAt`, so a
+ * queued retry still passes), routes by shop id to `connected` connections only, and for
+ * `order_ref` events (Etsy) fetches the order by id instead of trusting the payload.
+ */
 export async function processWebhook(
   channel: ConnectionRow["channel"],
   headers: HeaderBag,
   body: string,
-) {
-  const adapter = getChannelAdapter(channel, env.mocks.shopify ? "mock" : "live");
-  if (!(await adapter.verifyWebhook(headers, body))) {
-    log.warn("webhook signature invalid; dropped", { channel });
-    return { handled: false, reason: "invalid signature" };
+  receivedAt?: string,
+): Promise<WebhookResult> {
+  try {
+    const res = await handleWebhook(channel, headers, body, receivedAt);
+    await finishWebhookDelivery(channel, headers, {
+      status: res.result.handled ? "processed" : "ignored",
+      companyId: res.companyId,
+      detail: res.result.handled ? null : res.result.reason,
+    });
+    return res.result;
+  } catch (err) {
+    await finishWebhookDelivery(channel, headers, {
+      status: "failed",
+      detail: err instanceof Error ? err.message : String(err),
+    }).catch(() => {});
+    throw err;
   }
+}
+
+async function handleWebhook(
+  channel: ConnectionRow["channel"],
+  headers: HeaderBag,
+  body: string,
+  receivedAt?: string,
+): Promise<{ result: WebhookResult; companyId: string | null }> {
+  const skip = (reason: string) => ({
+    result: { handled: false as const, reason },
+    companyId: null,
+  });
+  const at = receivedAt ? new Date(receivedAt) : undefined;
+  if (!(await verifyWebhook(channel, headers, body, { receivedAt: at }))) {
+    log.warn("webhook signature invalid; dropped", { channel });
+    return skip("invalid signature");
+  }
+  const adapter = webhookAdapter(channel);
   const event = await adapter.parseWebhook(headers, body);
-  if (event.kind === "ignored") return { handled: false, reason: `topic ${event.topic} ignored` };
-  if (!event.shopDomain) return { handled: false, reason: "no shop domain" };
+  if (event.kind === "ignored") return skip(`topic ${event.topic} ignored`);
+  if (!event.shopDomain) return skip("no shop domain");
   const live = await withSystem((tx) =>
     tx
       .select()
@@ -336,36 +465,52 @@ export async function processWebhook(
         and(
           eq(channelConnections.channel, channel),
           eq(channelConnections.externalShopId, event.shopDomain as string),
-          // Only installs that finished Shopify OAuth (pending rows never carry the domain).
+          // Only installs that finished OAuth (pending rows never carry the shop id).
           eq(channelConnections.status, "connected"),
         ),
       ),
   );
-  if (live.length === 0) return { handled: false, reason: `no connection for ${event.shopDomain}` };
+  if (live.length === 0) return skip(`no connection for ${event.shopDomain}`);
   let orderIds: string[] = [];
   for (const conn of live) {
     const ctx = systemContext(conn.companyId);
+    // Webhook as a trigger: fetch the order by id outside any transaction.
+    let fetched: FetchedOrder | null = null;
+    if (event.kind === "order_ref") {
+      if (!adapter.fetchOrder) return skip(`${channel} cannot fetch orders by id`);
+      fetched = await adapter.fetchOrder(toChannelConn(conn), event.channelOrderId);
+    }
     await withTenant(conn.companyId, async (tx) => {
       await markConnection(tx, conn.id, { kind: "webhook" });
-      if (event.kind === "order_upsert") {
-        await checkPlan(tx, ctx, [event.order], conn.channel);
-        const res = await importNormalizedOrders(tx, ctx, conn, [event.order], {
+      const upsert =
+        event.kind === "order_upsert"
+          ? event.order
+          : fetched && !fetched.cancelled
+            ? fetched.order
+            : null;
+      if (upsert) {
+        await checkPlan(tx, ctx, [upsert], conn.channel);
+        const res = await importNormalizedOrders(tx, ctx, conn, [upsert], {
           source: "webhook",
         });
         orderIds = orderIds.concat(res.orderIds);
-        // Encrypted raw payload archive (purged with the buyer PII).
-        const rawKey = objectKey(conn.companyId, "raw", "json");
-        await putObject(rawKey, encryptField(body), "application/octet-stream");
-        if (res.orderIds.length)
-          await tx
-            .update(orders)
-            .set({ rawPayloadKey: rawKey })
-            .where(inArray(orders.id, res.orderIds));
+        if (event.kind === "order_upsert") {
+          // Encrypted raw payload archive (purged with the buyer PII).
+          const rawKey = objectKey(conn.companyId, "raw", "json");
+          await putObject(rawKey, encryptField(body), "application/octet-stream");
+          if (res.orderIds.length)
+            await tx
+              .update(orders)
+              .set({ rawPayloadKey: rawKey })
+              .where(inArray(orders.id, res.orderIds));
+        }
         if (res.imported)
           afterCommit(tx, async () => {
             await publish(conn.companyId, "today.changed", { reason: "webhook" });
           });
       } else if (event.kind === "order_cancelled") {
+        await cancelFromChannel(tx, ctx, conn.channel, event.channelOrderId);
+      } else if (event.kind === "order_ref" && fetched?.cancelled) {
         await cancelFromChannel(tx, ctx, conn.channel, event.channelOrderId);
       } else if (event.kind === "uninstalled") {
         await tx
@@ -391,15 +536,57 @@ export async function processWebhook(
       }
     });
   }
-  return { handled: true, kind: event.kind, orderIds };
+  return {
+    result: { handled: true, kind: event.kind, orderIds },
+    companyId: live[0]?.companyId ?? null,
+  };
 }
 
 /* ------------------------------------ Shopify OAuth ------------------------------------ */
 
+/** An install link works for 10 minutes and once only. */
+export const OAUTH_STATE_TTL_MS = 10 * 60_000;
+
+/**
+ * Burn the pending connection's OAuth state under a row lock, so two callbacks with the same
+ * state can't both finish (the second sees no state and is refused). Keeps the pending shop so
+ * the user can start again.
+ */
+async function consumeOAuthState(connectionId: string, state: string) {
+  const ok = await withSystem(async (tx) => {
+    const [row] = await tx
+      .select()
+      .from(channelConnections)
+      .where(and(eq(channelConnections.id, connectionId), eq(channelConnections.status, "pending")))
+      .for("update");
+    if (!row?.credentials) return false;
+    let creds: { oauthState?: string; pendingShop?: string };
+    try {
+      creds = decryptJson(row.credentials);
+    } catch {
+      return false;
+    }
+    if (typeof creds.oauthState !== "string" || !safeEqual(creds.oauthState, state)) return false;
+    await tx
+      .update(channelConnections)
+      .set({
+        credentials: encryptJson({
+          pendingShop: creds.pendingShop,
+          oauthStateUsedAt: new Date().toISOString(),
+        }),
+      })
+      .where(eq(channelConnections.id, connectionId));
+    return true;
+  });
+  if (!ok)
+    throw badRequest("This Shopify connection link was already used. Connect the store again.");
+}
+
 /**
  * `/webhooks/shopify/oauth/callback?code&shop&state&hmac&timestamp`. Finds the pending
- * connection by shop + state, exchanges the code for an offline token, subscribes webhooks
- * and marks the connection connected. Mock mode skips the HMAC and token exchange.
+ * connection by shop + state, checks the state is at most OAUTH_STATE_TTL_MS old and burns it,
+ * exchanges the code for an offline token, subscribes webhooks and marks the connection
+ * connected. Mock mode skips the HMAC and token exchange.
  */
 export async function completeShopifyOAuth(query: Record<string, string>) {
   const shop = query.shop ?? "";
@@ -430,6 +617,10 @@ export async function completeShopifyOAuth(query: Record<string, string>) {
     }
   });
   if (!conn) throw notFound("pending Shopify connection");
+  // `connect()` rewrites the pending row with each new state, so updatedAt is when it was issued.
+  if (Date.now() - conn.updatedAt.getTime() > OAUTH_STATE_TTL_MS)
+    throw badRequest("This Shopify connection link has expired. Connect the store again.");
+  await consumeOAuthState(conn.id, state);
   if (await shopifyConnectedElsewhere(shop, conn.companyId))
     throw conflict("This Shopify store is connected to another InvAI account");
 

@@ -57,7 +57,17 @@ export type WebhookEvent =
   | { kind: "order_upsert"; topic: string; shopDomain: string | null; order: NormalizedOrder }
   | { kind: "order_cancelled"; topic: string; shopDomain: string | null; channelOrderId: string }
   | { kind: "uninstalled"; topic: string; shopDomain: string | null }
+  /** The webhook only names an order (Etsy): fetch it by id and trust the fetch, not the payload. */
+  | { kind: "order_ref"; topic: string; shopDomain: string | null; channelOrderId: string }
   | { kind: "ignored"; topic: string; shopDomain: string | null };
+
+/** One order fetched by id: `order` null when the channel no longer has it. */
+export type FetchedOrder = { order: NormalizedOrder | null; cancelled: boolean };
+
+export type VerifyWebhookOptions = {
+  /** When the delivery reached us; signed timestamps are checked against it (default: now). */
+  receivedAt?: Date;
+};
 
 export type HeaderBag = Headers | Record<string, string | undefined>;
 
@@ -74,6 +84,8 @@ export interface ChannelAdapter {
   fetchOrders(conn: ChannelConn): Promise<FetchOrdersResult>;
   pushTracking(conn: ChannelConn, push: TrackingPush): Promise<TrackingPushResult>;
   setAvailability(conn: ChannelConn, updates: AvailabilityUpdate[]): Promise<{ updated: number }>;
-  verifyWebhook(headers: HeaderBag, body: string): Promise<boolean>;
+  verifyWebhook(headers: HeaderBag, body: string, opts?: VerifyWebhookOptions): Promise<boolean>;
   parseWebhook(headers: HeaderBag, body: string): Promise<WebhookEvent>;
+  /** Fetch one order by its channel id (webhook `order_ref` events). */
+  fetchOrder?(conn: ChannelConn, channelOrderId: string): Promise<FetchedOrder>;
 }

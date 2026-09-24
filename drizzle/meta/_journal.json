@@ -43,6 +43,20 @@
       "when": 1790237763616,
       "tag": "0005_connected_shop_unique",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1790281049873,
+      "tag": "0006_webhooks_deliveries",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1790281058651,
+      "tag": "0007_webhooks_deliveries_system_writes",
+      "breakpoints": true
     }
   ]
 }

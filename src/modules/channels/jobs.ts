@@ -2,7 +2,12 @@ import { z } from "zod";
 import { env } from "../../env";
 import { errorData, logger } from "../../lib/log";
 import { defineJob, queues } from "../../lib/queues";
-import { pollableConnections, processWebhook, syncConnection } from "./sync";
+import {
+  pollableConnections,
+  processWebhook,
+  purgeWebhookDeliveries,
+  syncConnection,
+} from "./sync";
 
 const log = logger("channels.jobs");
 
@@ -39,26 +44,52 @@ export const pollChannelsJob = defineJob({
   },
 });
 
+const webhookInput = z.object({
+  channel: z.string(),
+  body: z.string(),
+  headers: z.record(z.string(), z.string()),
+  receivedAt: z.string(),
+});
+
 /** Verified webhooks are processed here so the marketplace gets a fast 200. */
 export const shopifyWebhookJob = defineJob({
   queue: "sync",
   name: "channels.shopify.webhook",
-  input: z.object({
-    channel: z.string(),
-    body: z.string(),
-    headers: z.record(z.string(), z.string()),
-    receivedAt: z.string(),
-  }),
+  input: webhookInput,
   options: { attempts: 5 },
-  handler: async ({ body, headers }) => processWebhook("shopify", headers, body),
+  handler: async ({ body, headers, receivedAt }) =>
+    processWebhook("shopify", headers, body, receivedAt),
 });
 
-/** Idempotent: registers the 10-minute poll scheduler (safe from API and worker). */
+/** Etsy webhooks name a receipt; the handler fetches it by id (Etsy retries for about 30 h). */
+export const etsyWebhookJob = defineJob({
+  queue: "sync",
+  name: "channels.etsy.webhook",
+  input: webhookInput,
+  options: { attempts: 5 },
+  handler: async ({ body, headers, receivedAt }) =>
+    processWebhook("etsy", headers, body, receivedAt),
+});
+
+/** Daily: drop webhook delivery records past their retention (7 days). */
+export const purgeWebhookDeliveriesJob = defineJob({
+  queue: "sync",
+  name: "channels.webhookDeliveries.purge",
+  input: z.object({}).passthrough(),
+  handler: async () => purgeWebhookDeliveries(),
+});
+
+/** Idempotent: registers the 10-minute poll and the nightly delivery purge (API and worker). */
 export async function schedulePolling() {
   await queues.sync.upsertJobScheduler(
     "channels-poll",
     { every: POLL_EVERY_MS },
     { name: pollChannelsJob.name, data: {} },
+  );
+  await queues.sync.upsertJobScheduler(
+    "channels-webhook-deliveries-purge",
+    { pattern: "45 4 * * *", tz: "UTC" },
+    { name: purgeWebhookDeliveriesJob.name, data: {} },
   );
 }
 
