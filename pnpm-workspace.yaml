@@ -1,0 +1,16 @@
+allowBuilds:
+  esbuild: true
+  msgpackr-extract: true
+minimumReleaseAgeExclude:
+  - '@orpc/client@1.15.4'
+  - '@orpc/contract@1.15.4'
+  - '@orpc/interop@1.15.4'
+  - '@orpc/server@1.15.4'
+  - '@orpc/shared@1.15.4'
+  - '@orpc/standard-server-aws-lambda@1.15.4'
+  - '@orpc/standard-server-fastify@1.15.4'
+  - '@orpc/standard-server-fetch@1.15.4'
+  - '@orpc/standard-server-node@1.15.4'
+  - '@orpc/standard-server-peer@1.15.4'
+  - '@orpc/standard-server@1.15.4'
+  - hono@4.13.9

@@ -1,0 +1,48 @@
+{
+  "name": "invai-backend",
+  "version": "0.1.0",
+  "private": true,
+  "description": "InvAI API server and background workers (one codebase, two processes)",
+  "type": "module",
+  "scripts": {
+    "lint": "biome check .",
+    "format": "biome check --write .",
+    "typecheck": "tsc --noEmit",
+    "dev:api": "tsx watch src/api/server.ts",
+    "dev:worker": "tsx watch src/worker/index.ts",
+    "build": "tsup src/api/server.ts src/worker/index.ts --format esm --target node24 --clean --noExternal @invai/contracts",
+    "start:api": "node dist/server.js",
+    "start:worker": "node dist/index.js",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "drizzle-kit migrate",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@invai/contracts": "link:../invai-contracts",
+    "@hono/node-server": "^2.1.1",
+    "@orpc/server": "^1.15.4",
+    "@t3-oss/env-core": "^0.13.11",
+    "@anthropic-ai/sdk": "^0.128.0",
+    "better-auth": "^1.7.5",
+    "bullmq": "^6.3.8",
+    "drizzle-orm": "^0.45.3",
+    "hono": "^4.13.9",
+    "ioredis": "^6.0.0",
+    "pg": "^8.23.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2",
+    "@biomejs/biome": "^2.5.14",
+    "vitest": "^5.0.1",
+    "@types/node": "^26.6.2",
+    "@types/pg": "^8.23.1",
+    "drizzle-kit": "^0.31.11",
+    "tsup": "^8.5.1",
+    "tsx": "^4.23.15"
+  },
+  "packageManager": "pnpm@12.6.0",
+  "engines": {
+    "node": ">=24"
+  }
+}
