@@ -1,15 +1,55 @@
-import { contract } from "@invai/contracts";
-import { authed, stubRouter } from "../../api/orpc";
-
-/*
- * vendors routers. Every procedure starts as a NOT_IMPLEMENTED stub; replace entries as you
- * implement them (see src/modules/catalog/router.ts and src/modules/README.md).
- */
+import { authed } from "../../api/orpc";
+import { withTenant } from "../../db/client";
+import * as svc from "./service";
 
 export const vendorsRouter = authed.vendors.router({
-  ...stubRouter(authed.vendors, contract.vendors, ["vendors"]),
+  list: authed.vendors.list.handler(({ context: { tenant } }) =>
+    withTenant(tenant.companyId, (tx) => svc.listConnections(tx, tenant)),
+  ),
+  get: authed.vendors.get.handler(({ input, context: { tenant } }) =>
+    withTenant(tenant.companyId, (tx) => svc.getConnection(tx, tenant, input.id)),
+  ),
+  invite: authed.vendors.invite.handler(({ input, context: { tenant } }) =>
+    withTenant(tenant.companyId, (tx) => svc.inviteVendor(tx, tenant, input)),
+  ),
+  update: authed.vendors.update.handler(({ input, context: { tenant } }) =>
+    withTenant(tenant.companyId, (tx) => svc.updateConnection(tx, tenant, input)),
+  ),
+  setDefault: authed.vendors.setDefault.handler(({ input, context: { tenant } }) =>
+    withTenant(tenant.companyId, (tx) => svc.setDefaultConnection(tx, tenant, input.id)),
+  ),
+  remove: authed.vendors.remove.handler(({ input, context: { tenant } }) =>
+    withTenant(tenant.companyId, (tx) => svc.removeConnection(tx, tenant, input.id)),
+  ),
 });
 
+/** Vendor org side. The service opens `withVendor()` (and the shop's tenant for status writes). */
 export const vendorPortalRouter = authed.vendorPortal.router({
-  ...stubRouter(authed.vendorPortal, contract.vendorPortal, ["vendorPortal"]),
+  inbox: authed.vendorPortal.inbox.handler(({ input, context: { tenant } }) =>
+    svc.vendorInbox(tenant, input),
+  ),
+  get: authed.vendorPortal.get.handler(({ input, context: { tenant } }) =>
+    svc.vendorSheet(tenant, input.id),
+  ),
+  downloadUrls: authed.vendorPortal.downloadUrls.handler(({ input, context: { tenant } }) =>
+    svc.vendorDownloadUrls(tenant, input.id),
+  ),
+  acknowledge: authed.vendorPortal.acknowledge.handler(({ input, context: { tenant } }) =>
+    svc.vendorUpdate(tenant, input.id, { kind: "acknowledge" }),
+  ),
+  markPrinted: authed.vendorPortal.markPrinted.handler(({ input, context: { tenant } }) =>
+    svc.vendorUpdate(tenant, input.id, { kind: "printed" }),
+  ),
+  markShipped: authed.vendorPortal.markShipped.handler(({ input, context: { tenant } }) =>
+    svc.vendorUpdate(tenant, input.id, {
+      kind: "shipped",
+      carrier: input.carrier,
+      trackingCode: input.trackingCode,
+      note: input.note,
+    }),
+  ),
+  reject: authed.vendorPortal.reject.handler(({ input, context: { tenant } }) =>
+    svc.vendorUpdate(tenant, input.id, { kind: "reject", reason: input.reason }),
+  ),
+  shops: authed.vendorPortal.shops.handler(({ context: { tenant } }) => svc.vendorShops(tenant)),
 });
