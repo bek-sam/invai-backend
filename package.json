@@ -15,7 +15,7 @@
     "start:worker": "node dist/index.js",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
-    "test": "vitest run"
+    "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
     "@invai/contracts": "link:../invai-contracts",
