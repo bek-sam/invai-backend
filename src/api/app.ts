@@ -73,6 +73,8 @@ app.use(
   }),
 );
 
+// Public and unauthenticated: dependency status only. Which providers run on mocks is logged at
+// startup (server.ts) and never exposed here.
 app.get("/health", async (c) => {
   const checks = await Promise.all([
     db
@@ -95,7 +97,6 @@ app.get("/health", async (c) => {
       redis: redisOk,
       imaging: imagingOk,
       s3: s3Ok,
-      mocks: env.mocks,
       version: process.env.npm_package_version ?? "dev",
     },
     ok ? 200 : 503,

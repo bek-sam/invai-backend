@@ -11,7 +11,7 @@ The API server and the background workers. They share one codebase and run as tw
 
 ```
 src/
-  env.ts          Validated env vars (Zod); env.mocks.{ai,carrier,shopify,supplier,billing}
+  env.ts          Validated env vars (Zod); env.mocks.{ai,carrier,shopify,supplier,billing,mail}; production key guard
   auth.ts         Better Auth config (organizations plugin, disabledPaths, rate limits)
   api/            Hono app, oRPC handler, webhooks, SSE
   worker/         BullMQ workers and the outbox relay
@@ -45,4 +45,26 @@ pnpm dev:worker
 No real API keys are needed: every integration (Claude, EasyPost, Shopify, S&S) falls back to a
 mock provider automatically when its env var is unset (`env.mocks.*` in `src/env.ts`). See
 `invai-docs/build/runbook.md` for the env var reference and the mock-to-real switches, and
-`invai-docs/architecture.md` for the full design.
+`invai-docs/architecture.md` for the full design. Outgoing mail goes to Mailpit
+(`SMTP_URL`/`MAIL_FROM` default to it outside production; UI on http://localhost:8025).
+
+## Production build and required keys
+
+```
+pnpm build        # tsup (tsup.config.ts): dist/server.js (api) and dist/index.js (worker)
+pnpm start:api    # node dist/server.js
+pnpm start:worker # node dist/index.js
+```
+
+`@invai/contracts` is bundled; every other dependency loads from `node_modules`.
+
+With `NODE_ENV=production` the api and worker refuse to start, with one message listing every
+missing key, unless all of these are set: `EASYPOST_API_KEY`, `STRIPE_SECRET_KEY`,
+`STRIPE_WEBHOOK_SECRET`, `ANTHROPIC_API_KEY`, `SHOPIFY_API_KEY`, `SHOPIFY_API_SECRET`, `SMTP_URL`,
+`MAIL_FROM` (`PRODUCTION_KEYS` in `src/env.ts`). Without them a provider would silently run on its
+mock and fake success. A demo or staging stage can set `ALLOW_MOCKS=true` to boot anyway; it logs
+a warning on every start, and mail without `SMTP_URL` is logged, not sent. Development and tests
+need none of these keys.
+
+The public `/health` reports only dependency status (db, redis, imaging, s3). Which providers run
+on mocks is logged at startup, never exposed over HTTP.
