@@ -69,16 +69,20 @@ export type DefinedJob<I> = JobDefinition<I> & {
 
 const registry = new Map<string, DefinedJob<unknown>>();
 
+/** BullMQ forbids ":" in custom ids; idempotency keys may still be written naturally. */
+export const safeJobId = (id: string) => id.replace(/:/g, "_");
+
 export function defineJob<I>(def: JobDefinition<I>): DefinedJob<I> {
   if (registry.has(def.name)) throw new Error(`job ${def.name} is defined twice`);
   const job: DefinedJob<I> = {
     ...def,
     enqueue: (input, options) => {
       const data = def.input.parse(input);
+      const jobId = options?.jobId ?? def.jobId?.(data);
       return queues[def.queue].add(def.name, data, {
         ...def.options,
         ...options,
-        jobId: options?.jobId ?? def.jobId?.(data),
+        jobId: jobId ? safeJobId(jobId) : undefined,
       }) as Promise<Job<I>>;
     },
   };

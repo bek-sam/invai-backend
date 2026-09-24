@@ -29,7 +29,7 @@ webhooks.post("/:channel", async (c) => {
   await job.enqueue(
     { channel, body, headers, receivedAt: new Date().toISOString() },
     {
-      jobId: `webhook:${channel}:${deliveryId}`,
+      jobId: `webhook-${channel}-${deliveryId}`,
     },
   );
   return c.body(null, 202);
@@ -40,6 +40,6 @@ webhooks.get("/shopify/oauth", async (c) => {
   const job = getJob("channels.shopify.oauthCallback");
   if (!job) return c.text("Shopify OAuth is not configured", 501);
   const query = Object.fromEntries(new URL(c.req.url).searchParams);
-  await job.enqueue({ query }, { jobId: `shopify-oauth:${query.state ?? crypto.randomUUID()}` });
+  await job.enqueue({ query }, { jobId: `shopify-oauth-${query.state ?? crypto.randomUUID()}` });
   return c.redirect(`${c.req.header("origin") ?? ""}/channels?connected=shopify`);
 });

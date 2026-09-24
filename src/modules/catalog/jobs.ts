@@ -19,7 +19,7 @@ export const runDesignQaJob = defineJob({
   queue: "render",
   name: "catalog.runDesignQa",
   input: z.object({ companyId: z.uuid(), designId: z.uuid() }),
-  jobId: (i) => `design-qa:${i.designId}`,
+  jobId: (i) => `design-qa-${i.designId}`,
   handler: async ({ companyId, designId }) => {
     if (!(await imaging.isUp())) {
       log.warn("imaging down, leaving QA pending", { designId });
