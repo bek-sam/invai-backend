@@ -32,7 +32,7 @@ export function normalizeText(text: string): string {
 }
 
 const EXACT_WEIGHT: Record<string, number> = { slogan: 0.9, character: 0.85, word: 0.7 };
-const FUZZY_MIN = 0.75;
+const FUZZY_MIN = 0.65;
 
 /** Pure: risk contribution of one match, 0..1. */
 export function matchRisk(m: {
