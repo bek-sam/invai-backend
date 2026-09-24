@@ -165,7 +165,7 @@ function meter(used: number, limit: number | null): Meter {
   };
 }
 
-async function count(tx: Tx, q: Promise<{ n: number }[]>) {
+async function count(_tx: Tx, q: Promise<{ n: number }[]>) {
   const [row] = await q;
   return row?.n ?? 0;
 }
