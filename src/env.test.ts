@@ -31,7 +31,7 @@ async function boot(extra: Record<string, string>) {
         "--import",
         "tsx",
         "-e",
-        "import('./src/env.ts').then(({ env }) => console.log('BOOTED', JSON.stringify({ smtp: env.SMTP_URL ?? null, from: env.MAIL_FROM ?? null })))",
+        "import('./src/env.ts').then(({ env }) => console.log('BOOTED', JSON.stringify({ smtp: env.SMTP_URL ?? null, from: env.MAIL_FROM ?? null, mocks: env.mocks })))",
       ],
       { env: { ...BASE, ...extra }, cwd: process.cwd() },
     );
@@ -49,6 +49,37 @@ describe("production key guard", () => {
       "STRIPE_WEBHOOK_SECRET",
     ]);
     expect(missingProductionKeys(ALL_KEYS)).toEqual([]);
+  });
+
+  it("counts blank or whitespace-only values as missing", () => {
+    expect(
+      missingProductionKeys({ ...ALL_KEYS, STRIPE_SECRET_KEY: "  ", MAIL_FROM: "\t\n " }),
+    ).toEqual(["STRIPE_SECRET_KEY", "MAIL_FROM"]);
+  });
+
+  it("refuses to boot when keys are whitespace-only, and ALLOW_MOCKS then runs them as mocks", async () => {
+    const blank = Object.fromEntries(PRODUCTION_KEYS.map((k) => [k, "  "]));
+    const refused = await boot({ NODE_ENV: "production", ...blank });
+    expect(refused.ok).toBe(false);
+    expect(refused.out).toContain(
+      `Refusing to start in production: missing ${PRODUCTION_KEYS.join(", ")}.`,
+    );
+
+    const allowed = await boot({ NODE_ENV: "production", ALLOW_MOCKS: "true", ...blank });
+    expect(allowed.ok).toBe(true);
+    expect(allowed.out).toContain("running production on MOCK providers");
+    expect(allowed.out).toContain(
+      '"mocks":{"ai":true,"carrier":true,"shopify":true,"supplier":true,"billing":true,"mail":true}',
+    );
+  });
+
+  it("trims real values instead of treating padding as part of the key", async () => {
+    const padded = Object.fromEntries(Object.entries(ALL_KEYS).map(([k, v]) => [k, ` ${v} `]));
+    const res = await boot({ NODE_ENV: "production", ...padded, SMTP_URL: " smtp://mail:25 " });
+    expect(res.ok).toBe(true);
+    expect(res.out).toContain('"smtp":"smtp://mail:25"');
+    expect(res.out).toContain('"from":"real-mail_from"');
+    expect(res.out).toContain('"ai":false');
   });
 
   it("refuses to boot in production without keys, naming all of them in one message", async () => {
@@ -73,7 +104,7 @@ describe("production key guard", () => {
     expect(res.out).toContain("BOOTED");
     expect(res.out).toContain("running production on MOCK providers");
     // No Mailpit default in production: the mailer logs instead of sending.
-    expect(res.out).toContain('{"smtp":null,"from":null}');
+    expect(res.out).toContain('{"smtp":null,"from":null,');
   });
 
   it("boots in production with every key set, and without a warning", async () => {

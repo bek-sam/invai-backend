@@ -9,6 +9,17 @@ if (process.env.NODE_ENV !== "production" && !process.env.INVAI_SKIP_DOTENV) {
   }
 }
 
+/**
+ * Provider keys and mail config: trimmed, and blank or whitespace-only counts as unset, so a
+ * secret rendered as " " can't pass the production guard or turn a mock flag off.
+ */
+function secret<T extends z.ZodType<string>>(schema: T) {
+  return z.preprocess(
+    (v) => (typeof v === "string" ? v.trim() || undefined : v),
+    schema.optional(),
+  );
+}
+
 const raw = createEnv({
   server: {
     NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
@@ -50,18 +61,18 @@ const raw = createEnv({
     /** `<keyId>:<base64 32 bytes>[,<keyId>:<base64>]`; the first key encrypts, all keys decrypt. */
     FIELD_ENCRYPTION_KEY: z.string().min(40),
 
-    ANTHROPIC_API_KEY: z.string().optional(),
-    EASYPOST_API_KEY: z.string().optional(),
-    SHOPIFY_API_KEY: z.string().optional(),
-    SHOPIFY_API_SECRET: z.string().optional(),
-    SS_ACTIVEWEAR_ACCOUNT: z.string().optional(),
-    SS_ACTIVEWEAR_API_KEY: z.string().optional(),
-    STRIPE_SECRET_KEY: z.string().optional(),
-    STRIPE_WEBHOOK_SECRET: z.string().optional(),
+    ANTHROPIC_API_KEY: secret(z.string()),
+    EASYPOST_API_KEY: secret(z.string()),
+    SHOPIFY_API_KEY: secret(z.string()),
+    SHOPIFY_API_SECRET: secret(z.string()),
+    SS_ACTIVEWEAR_ACCOUNT: secret(z.string()),
+    SS_ACTIVEWEAR_API_KEY: secret(z.string()),
+    STRIPE_SECRET_KEY: secret(z.string()),
+    STRIPE_WEBHOOK_SECRET: secret(z.string()),
 
     /** Outgoing mail. Outside production both default to Mailpit (docker compose, UI on :8025). */
-    SMTP_URL: z.url().optional(),
-    MAIL_FROM: z.string().optional(),
+    SMTP_URL: secret(z.url()),
+    MAIL_FROM: secret(z.string()),
 
     /**
      * Production refuses to boot while any provider key is missing (it would run on a mock).
@@ -103,7 +114,7 @@ export const PRODUCTION_KEYS = [
 export function missingProductionKeys(
   values: Partial<Record<(typeof PRODUCTION_KEYS)[number], string | undefined>>,
 ): string[] {
-  return PRODUCTION_KEYS.filter((key) => !values[key]);
+  return PRODUCTION_KEYS.filter((key) => !values[key]?.trim());
 }
 
 const missingInProd = isProd ? missingProductionKeys(raw) : [];
