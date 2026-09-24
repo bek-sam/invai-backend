@@ -28,18 +28,21 @@ export const s3 = new S3Client({
       : undefined,
 });
 
-/** Presigning client: when the browser reaches MinIO on a different host than the API does. */
-const presigner = env.S3_PUBLIC_ENDPOINT
-  ? new S3Client({
-      region: env.S3_REGION,
-      endpoint: env.S3_PUBLIC_ENDPOINT,
-      forcePathStyle: env.S3_FORCE_PATH_STYLE,
-      credentials:
-        env.S3_ACCESS_KEY_ID && env.S3_SECRET_ACCESS_KEY
-          ? { accessKeyId: env.S3_ACCESS_KEY_ID, secretAccessKey: env.S3_SECRET_ACCESS_KEY }
-          : undefined,
-    })
-  : s3;
+/**
+ * Presigning client (on S3_PUBLIC_ENDPOINT when the browser reaches MinIO on a different host).
+ * Checksums only when required: otherwise the SDK signs a CRC32 of an empty body into every
+ * presigned PUT, which real S3 rejects for the actual upload.
+ */
+const presigner = new S3Client({
+  region: env.S3_REGION,
+  endpoint: env.S3_PUBLIC_ENDPOINT ?? env.S3_ENDPOINT,
+  forcePathStyle: env.S3_FORCE_PATH_STYLE,
+  requestChecksumCalculation: "WHEN_REQUIRED",
+  credentials:
+    env.S3_ACCESS_KEY_ID && env.S3_SECRET_ACCESS_KEY
+      ? { accessKeyId: env.S3_ACCESS_KEY_ID, secretAccessKey: env.S3_SECRET_ACCESS_KEY }
+      : undefined,
+});
 
 export const bucket = env.S3_BUCKET;
 
@@ -51,14 +54,48 @@ export function objectKey(companyId: string, kind: string, ext: string, id = cry
   return `${companyId}/${kind}/${yyyy}/${mm}/${id}.${ext.replace(/^\./, "")}`;
 }
 
-export async function presignPut(key: string, contentType: string, expiresIn = 900) {
+/** Object keys we generate or accept: no empty segments, no `.`/`..`, no leading slash. */
+const SAFE_KEY = /^[A-Za-z0-9_-]+(?:\/[A-Za-z0-9_-][A-Za-z0-9._-]*)*$/;
+export function isSafeKey(key: string): boolean {
+  return key.length <= 512 && SAFE_KEY.test(key) && !key.split("/").some((p) => p === "..");
+}
+
+/** Keys taken from API input must be well formed and inside the caller's company prefix. */
+export function isCompanyKey(companyId: string, key: string): boolean {
+  return isSafeKey(key) && key.startsWith(`${companyId}/`);
+}
+
+/**
+ * Presigned PUT that binds the content type and exact byte size into the signature, so the
+ * browser cannot upload a different type or a larger file than the one we validated.
+ */
+export async function presignPut(
+  key: string,
+  contentType: string,
+  expiresIn = 900,
+  sizeBytes?: number,
+) {
   return getSignedUrl(
     presigner,
-    new PutObjectCommand({ Bucket: bucket, Key: key, ContentType: contentType }),
+    new PutObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      ContentType: contentType,
+      ContentLength: sizeBytes,
+    }),
     {
       expiresIn,
+      signableHeaders: new Set(
+        sizeBytes === undefined ? ["content-type"] : ["content-type", "content-length"],
+      ),
     },
   );
+}
+
+/** `attachment` header value with an ASCII-safe fallback name and an RFC 5987 UTF-8 name. */
+export function contentDisposition(filename: string): string {
+  const ascii = filename.replace(/[^\x20-\x7e]|["\\]/g, "_").slice(0, 150) || "download";
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(filename.slice(0, 150))}`;
 }
 
 export async function presignGet(key: string, expiresIn = 3600, downloadName?: string) {
@@ -67,9 +104,7 @@ export async function presignGet(key: string, expiresIn = 3600, downloadName?: s
     new GetObjectCommand({
       Bucket: bucket,
       Key: key,
-      ResponseContentDisposition: downloadName
-        ? `attachment; filename="${downloadName}"`
-        : undefined,
+      ResponseContentDisposition: downloadName ? contentDisposition(downloadName) : undefined,
     }),
     { expiresIn },
   );

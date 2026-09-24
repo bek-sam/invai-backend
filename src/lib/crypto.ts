@@ -46,7 +46,7 @@ export function resetKeyRing() {
 export function encryptField(plain: string): string {
   const { primary } = loadRing();
   const iv = randomBytes(12);
-  const cipher = createCipheriv("aes-256-gcm", primary.key, iv);
+  const cipher = createCipheriv("aes-256-gcm", primary.key, iv, { authTagLength: 16 });
   const data = Buffer.concat([cipher.update(plain, "utf8"), cipher.final()]);
   const tag = cipher.getAuthTag();
   return `${primary.id}:${Buffer.concat([iv, tag, data]).toString("base64")}`;
@@ -59,10 +59,12 @@ export function decryptField(stored: string): string {
   const key = loadRing().all.get(keyId);
   if (!key) throw new Error(`Unknown encryption key id ${keyId}`);
   const buf = Buffer.from(stored.slice(idx + 1), "base64");
+  if (buf.length < 28) throw new Error("Malformed encrypted field");
   const iv = buf.subarray(0, 12);
   const tag = buf.subarray(12, 28);
   const data = buf.subarray(28);
-  const decipher = createDecipheriv("aes-256-gcm", key, iv);
+  // A fixed 16-byte tag: without it Node accepts truncated tags, which weakens authentication.
+  const decipher = createDecipheriv("aes-256-gcm", key, iv, { authTagLength: 16 });
   decipher.setAuthTag(tag);
   return Buffer.concat([decipher.update(data), decipher.final()]).toString("utf8");
 }

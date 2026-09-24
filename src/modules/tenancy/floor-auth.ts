@@ -5,7 +5,14 @@ import { members, staffPins, stations, stationTokens, users } from "../../db/sch
 import { env } from "../../env";
 import { audit } from "../../lib/audit";
 import { hmacHex, randomToken, sha256Hex, signPayload, verifyPayload } from "../../lib/crypto";
-import { badRequest, ORPCError, unauthorized } from "../../lib/errors";
+import { badRequest, ORPCError, rateLimited, unauthorized } from "../../lib/errors";
+import {
+  clearFailures,
+  isRevoked,
+  lockedFor,
+  recordFailure,
+  revokeUntil,
+} from "../../lib/ratelimit";
 
 /*
  * Floor login, two factors:
@@ -34,6 +41,8 @@ export type FloorSessionPayload = {
   tid: string;
   role: Role;
   exp: number;
+  /** Random nonce: every login is a distinct token, so logout revokes only that session. */
+  n?: string;
 };
 
 export type FloorSession = {
@@ -94,8 +103,12 @@ export async function issueStationToken(
   return { token, tokenId: row.id };
 }
 
-export async function revokeStationTokens(tx: Tx, input: { companyId: string; stationId: string }) {
-  await tx
+/** Revoke a station's live tokens. Returns the revoked token ids (to drop from the live cache). */
+export async function revokeStationTokens(
+  tx: Tx,
+  input: { companyId: string; stationId: string },
+): Promise<string[]> {
+  const revoked = await tx
     .update(stationTokens)
     .set({ revokedAt: new Date() })
     .where(
@@ -104,11 +117,14 @@ export async function revokeStationTokens(tx: Tx, input: { companyId: string; st
         eq(stationTokens.stationId, input.stationId),
         isNull(stationTokens.revokedAt),
       ),
-    );
+    )
+    .returning({ id: stationTokens.id });
   await tx
     .update(stations)
     .set({ tokenIssuedAt: null })
     .where(and(eq(stations.companyId, input.companyId), eq(stations.id, input.stationId)));
+  for (const r of revoked) forgetStationToken(r.id);
+  return revoked.map((r) => r.id);
 }
 
 /** Validate a station token. Null when unknown, revoked or malformed. */
@@ -190,6 +206,7 @@ export function createFloorSessionToken(session: Omit<FloorSession, "expiresAt">
     tid: session.stationTokenId,
     role: session.role,
     exp: Math.floor(expiresAt.getTime() / 1000),
+    n: randomToken(9),
   };
   return { token: `${FLOOR_PREFIX}.${signPayload(env.FLOOR_TOKEN_SECRET, payload)}`, expiresAt };
 }
@@ -211,6 +228,18 @@ export function verifyFloorSessionToken(token: string): FloorSession | null {
     role: payload.role,
     expiresAt: new Date(payload.exp * 1000),
   };
+}
+
+/** Logout: the signed token stays unusable for the rest of its lifetime. */
+export async function revokeFloorSession(token: string): Promise<void> {
+  const session = verifyFloorSessionToken(token);
+  if (!session) return;
+  const ttl = Math.ceil((session.expiresAt.getTime() - Date.now()) / 1000);
+  await revokeUntil(`fs:${sha256Hex(token)}`, ttl);
+}
+
+export function isFloorSessionRevoked(token: string): Promise<boolean> {
+  return isRevoked(`fs:${sha256Hex(token)}`);
 }
 
 const liveTokenCache = new Map<string, { until: number; ok: boolean }>();
@@ -244,6 +273,10 @@ export type PinLoginResult = {
   station: { id: string; name: string; kind: StationKind | null };
 };
 
+/** Failed PINs allowed per station token in PIN_WINDOW_SEC before the station is locked out. */
+export const PIN_MAX_FAILURES = 10;
+const PIN_WINDOW_SEC = 15 * 60;
+
 /** Station token + PIN → floor session. Throws INVALID_PIN / STATION_INACTIVE style errors. */
 export async function pinLogin(input: {
   stationToken: string;
@@ -255,6 +288,10 @@ export async function pinLogin(input: {
   if (!station.station.active) {
     throw new ORPCError("STATION_INACTIVE", { status: 403, message: "Station is inactive" });
   }
+
+  const limitKey = `pin:${station.tokenId}`;
+  const locked = await lockedFor(limitKey, PIN_MAX_FAILURES);
+  if (locked) throw rateLimited(locked);
 
   const pinHash = hashPin(station.companyId, input.pin);
   const found = await withTenant(station.companyId, async (tx) => {
@@ -285,7 +322,12 @@ export async function pinLogin(input: {
       .where(eq(stations.id, station.station.id));
     return { userId: pin.userId, name: member.name, role: member.role };
   });
-  if (!found) throw new ORPCError("INVALID_PIN", { status: 401, message: "PIN not recognized" });
+  if (!found) {
+    const failures = await recordFailure(limitKey, PIN_WINDOW_SEC);
+    if (failures >= PIN_MAX_FAILURES) throw rateLimited(PIN_WINDOW_SEC);
+    throw new ORPCError("INVALID_PIN", { status: 401, message: "PIN not recognized" });
+  }
+  await clearFailures(limitKey);
 
   const { token, expiresAt } = createFloorSessionToken({
     userId: found.userId,

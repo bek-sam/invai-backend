@@ -68,10 +68,22 @@ export function col(row: Record<string, string>, ...names: string[]): string {
   return "";
 }
 
+/**
+ * CSV formula injection guard (OWASP): a text cell starting with = + - @ or a tab/CR is run as a
+ * formula by Excel and Sheets, so it gets a leading apostrophe. Numbers stay numbers.
+ */
+export function neutralizeFormula(v: unknown): string {
+  if (v == null) return "";
+  const s = String(v);
+  if (typeof v === "number" || typeof v === "bigint") return s;
+  if (/^[=+\-@\t\r]/.test(s) && !/^[+-]?\d+(\.\d+)?$/.test(s)) return `'${s}`;
+  return s;
+}
+
 export function toCsv(rows: Record<string, unknown>[], headers?: string[]): string {
   const cols = headers ?? Array.from(new Set(rows.flatMap((r) => Object.keys(r))));
   const esc = (v: unknown) => {
-    const s = v == null ? "" : String(v);
+    const s = neutralizeFormula(v);
     return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
   };
   return [cols.join(","), ...rows.map((r) => cols.map((c) => esc(r[c])).join(","))].join("\r\n");

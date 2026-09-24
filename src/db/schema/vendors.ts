@@ -109,8 +109,12 @@ export const vendorAccess = pgTable(
   ],
 ).enableRLS();
 
-/** Rows of a table are vendor-visible when a live vendor_access row names their sheet. */
-export const vendorHasSheetAccess = (sheetIdColumn: string) =>
+/**
+ * Rows of a table are vendor-visible when a live vendor_access row names their sheet and was
+ * granted by the company that owns the row (a vendor_access row a vendor wrote for itself, or
+ * one pointing at another company's sheet id, exposes nothing).
+ */
+export const vendorHasSheetAccess = (table: string, sheetIdColumn: string) =>
   sql.raw(
-    `${sheetIdColumn} in (select gang_sheet_id from vendor_access where vendor_company_id = nullif(current_setting('app.vendor_org_id', true), '')::uuid and revoked_at is null)`,
+    `${table}.${sheetIdColumn} in (select va.gang_sheet_id from vendor_access va where va.company_id = ${table}.company_id and va.vendor_company_id = nullif(current_setting('app.vendor_org_id', true), '')::uuid and va.revoked_at is null)`,
   );

@@ -7,6 +7,7 @@ import { companies, members, stations, users } from "../db/schema";
 import type { Actor } from "../lib/audit";
 import { logger } from "../lib/log";
 import {
+  isFloorSessionRevoked,
   isStationTokenLive,
   resolveStationToken,
   verifyFloorSessionToken,
@@ -73,6 +74,11 @@ export function permissionsFor(role: Role | null): ReadonlySet<Permission> {
   return role ? new Set(ROLE_PERMISSIONS[role]) : NO_PERMISSIONS;
 }
 
+/** Vendor orgs only carry the `vendor` role and shops never do; anything else gets no permissions. */
+export function roleFits(orgType: CompanyType, role: Role): boolean {
+  return orgType === "vendor" ? role === "vendor" : role !== "vendor";
+}
+
 export function clientIp(headers: Headers): string | null {
   const fwd = headers.get("x-forwarded-for");
   return fwd?.split(",")[0]?.trim() ?? headers.get("x-real-ip") ?? null;
@@ -108,16 +114,26 @@ export async function buildContext(request: Request): Promise<Context> {
 async function floorContext(ctx: Context, token: string): Promise<Context | null> {
   const session = verifyFloorSessionToken(token);
   if (!session) return null;
+  if (await isFloorSessionRevoked(token)) return null;
   if (!(await isStationTokenLive(session.companyId, session.stationTokenId))) return null;
   const [company] = await db
     .select({ type: companies.type })
     .from(companies)
     .where(eq(companies.id, session.companyId))
     .limit(1);
+  // Role and status come from the live membership, so a role change or deactivation applies to
+  // floor sessions at once instead of when the signed token expires.
   const [user] = await db
-    .select({ id: users.id, name: users.name, email: users.email })
+    .select({ id: users.id, name: users.name, email: users.email, role: members.role })
     .from(users)
-    .where(eq(users.id, session.userId))
+    .innerJoin(members, eq(members.userId, users.id))
+    .where(
+      and(
+        eq(users.id, session.userId),
+        eq(members.organizationId, session.companyId),
+        eq(members.status, "active"),
+      ),
+    )
     .limit(1);
   if (!company || !user) return null;
   const station = await withTenant(session.companyId, async (tx) => {
@@ -132,11 +148,11 @@ async function floorContext(ctx: Context, token: string): Promise<Context | null
   return {
     ...ctx,
     sessionKind: "floor",
-    user,
+    user: { id: user.id, name: user.name, email: user.email },
     companyId: session.companyId,
     orgType: company.type,
-    role: session.role,
-    permissions: permissionsFor(session.role),
+    role: user.role,
+    permissions: roleFits(company.type, user.role) ? permissionsFor(user.role) : NO_PERMISSIONS,
     station: { ...station, tokenId: session.stationTokenId },
   };
 }
@@ -183,7 +199,8 @@ async function userContext(ctx: Context, headers: Headers): Promise<Context | nu
     companyId: active?.orgId ?? null,
     orgType: active?.type ?? null,
     role: active?.role ?? null,
-    permissions: permissionsFor(active?.role ?? null),
+    permissions:
+      active && roleFits(active.type, active.role) ? permissionsFor(active.role) : NO_PERMISSIONS,
     memberships: memberships.map(({ orgId, name, type, role }) => ({ orgId, name, type, role })),
     authSessionId: session.session.id,
   };

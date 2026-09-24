@@ -18,7 +18,7 @@ import { badRequest, conflict, notFound, upstream } from "../../lib/errors";
 import { logger } from "../../lib/log";
 import { emit } from "../../lib/outbox";
 import { keyset, type PageInput } from "../../lib/pagination";
-import { getObject, objectKey, presignGet } from "../../lib/s3";
+import { getObject, isCompanyKey, objectKey, presignGet } from "../../lib/s3";
 
 const log = logger("catalog");
 
@@ -174,6 +174,7 @@ export async function createDesign(
     })
     .returning();
   if (!row) throw new Error("design insert failed");
+  assertOwnFiles(ctx, input.placements);
   await tx.insert(designFiles).values(
     input.placements.map((p) => ({
       companyId: ctx.companyId,
@@ -194,6 +195,11 @@ export async function createDesign(
   });
   await emit(tx, ctx.companyId, "design.updated", { designId: row.id, qaRequested: true });
   return getDesign(tx, ctx, row.id);
+}
+
+/** Design files must be objects this company uploaded (keys are `{companyId}/...`). */
+function assertOwnFiles(ctx: TenantContext, placements: { fileKey: string }[]) {
+  for (const p of placements) if (!isCompanyKey(ctx.companyId, p.fileKey)) throw notFound("file");
 }
 
 export type DesignUpdateInput = Partial<DesignInput> & { id: string };
@@ -219,6 +225,7 @@ export async function updateDesign(
     .where(eq(designs.id, input.id));
   let qaRequested = false;
   if (input.placements) {
+    assertOwnFiles(ctx, input.placements);
     await tx.delete(designFiles).where(eq(designFiles.designId, input.id));
     await tx.insert(designFiles).values(
       input.placements.map((p) => ({
@@ -488,6 +495,7 @@ export async function bulkImportBlanks(
   let candidates: { row: number; data: unknown }[] = [];
   if (input.rows) candidates = input.rows.map((data, i) => ({ row: i + 1, data }));
   else if (input.fileKey) {
+    if (!isCompanyKey(ctx.companyId, input.fileKey)) throw notFound("file");
     const text = (await getObject(input.fileKey)).toString("utf8");
     const parsed = parseCsvObjects(text);
     candidates = parsed.rows.map((r, i) => ({

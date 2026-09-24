@@ -105,8 +105,8 @@ export const gangSheets = pgTable(
     index().on(t.companyId, t.status, t.createdAt),
     index().on(t.companyId, t.batchId),
     tenantPolicy("gang_sheets"),
-    vendorReadPolicy("gang_sheets", vendorHasSheetAccess("id")),
-    vendorUpdatePolicy("gang_sheets", vendorHasSheetAccess("id")),
+    vendorReadPolicy("gang_sheets", vendorHasSheetAccess("gang_sheets", "id")),
+    vendorUpdatePolicy("gang_sheets", vendorHasSheetAccess("gang_sheets", "id")),
   ],
 ).enableRLS();
 
@@ -150,7 +150,7 @@ export const transfers = pgTable(
     index().on(t.companyId, t.gangSheetId),
     index().on(t.companyId, t.orderItemId),
     tenantPolicy("transfers"),
-    vendorReadPolicy("transfers", vendorHasSheetAccess("gang_sheet_id")),
+    vendorReadPolicy("transfers", vendorHasSheetAccess("transfers", "gang_sheet_id")),
   ],
 ).enableRLS();
 

@@ -167,4 +167,21 @@ describe("catalog service", () => {
       call(router.designs.list, { limit: 5 }, { context: anonymousContext(new Headers(), null) }),
     ).rejects.toMatchObject({ code: "UNAUTHORIZED" });
   });
+
+  it("refuses file keys outside the company's prefix", async () => {
+    const other = (await createCompany()).id;
+    const foreign = designInput("X1");
+    foreign.placements = foreign.placements.map((p) => ({
+      ...p,
+      fileKey: `${other}/design/theirs.png`,
+    }));
+    await expect(
+      withTenant(companyId, (tx) => svc.createDesign(tx, ctx, foreign)),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    await expect(
+      withTenant(companyId, (tx) =>
+        svc.bulkImportBlanks(tx, ctx, { fileKey: `${other}/csv/2026/09/blanks.csv` }),
+      ),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+  });
 });

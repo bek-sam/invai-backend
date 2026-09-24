@@ -4,7 +4,7 @@ import { authed, pub } from "../../api/orpc";
 import { auth } from "../../auth";
 import { withTenant } from "../../db/client";
 import { badRequest, forbidden, unauthorized } from "../../lib/errors";
-import { forgetStationToken, pinLogin, resolveStationToken } from "./floor-auth";
+import { pinLogin, resolveStationToken, revokeFloorSession } from "./floor-auth";
 import * as svc from "./service";
 
 export const meRouter = authed.me.router({
@@ -90,11 +90,7 @@ export const stationsRouter = authed.stations.router({
     withTenant(tenant.companyId, (tx) => svc.issueToken(tx, tenant, input.id)),
   ),
   revokeToken: authed.stations.revokeToken.handler(({ input, context: { tenant } }) =>
-    withTenant(tenant.companyId, async (tx) => {
-      const result = await svc.revokeToken(tx, tenant, input.id);
-      forgetStationToken(input.id);
-      return result;
-    }),
+    withTenant(tenant.companyId, (tx) => svc.revokeToken(tx, tenant, input.id)),
   ),
 });
 
@@ -112,7 +108,12 @@ export const floorRouter = pub.floor.router({
       permissions: [...ROLE_PERMISSIONS[result.user.role]],
     };
   }),
-  logout: pub.floor.logout.handler(async () => ({ ok: true as const })),
+  logout: pub.floor.logout.handler(async ({ context }) => {
+    const authz = context.headers.get("authorization");
+    if (authz?.toLowerCase().startsWith("bearer fs1."))
+      await revokeFloorSession(authz.slice(7).trim());
+    return { ok: true as const };
+  }),
   staff: pub.floor.staff.handler(async ({ context }) => {
     const token = stationTokenFromHeaders(context.headers);
     const station = token ? await resolveStationToken(token) : null;

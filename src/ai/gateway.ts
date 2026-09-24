@@ -6,7 +6,7 @@ import { upstream } from "../lib/errors";
 import { logger } from "../lib/log";
 import { assertCredits, type CreditKind, chargeCredits } from "./credits";
 import { tokensToCostCents, tokensToCredits } from "./models";
-import { stripPiiDeep } from "./pii";
+import { stripPii, stripPiiDeep } from "./pii";
 import { type PromptDef, promptRef } from "./prompts";
 import { anthropicProvider } from "./providers/anthropic";
 import { mockProvider } from "./providers/mock";
@@ -143,6 +143,15 @@ export async function runStructured<V, O>(
   }
 }
 
+/** The user's free text (and earlier turns) may contain pasted buyer data; scrub it too. */
+export function scrubAssistantRun(run: AssistantRun): AssistantRun {
+  return {
+    ...run,
+    message: stripPii(run.message),
+    history: run.history.map((h) => ({ ...h, text: stripPii(h.text) })),
+  };
+}
+
 /**
  * The tool-using assistant, streamed. Yields text deltas and tool events; returns usage and the
  * credits charged. Throws CREDITS_EXHAUSTED before any model call when the balance is empty.
@@ -152,10 +161,11 @@ export async function* runAssistant(
   run: AssistantRun,
 ): AsyncGenerator<AssistantStreamEvent, { credits: number; model: string; aiJobId: string }> {
   const provider = aiProvider();
-  const aiJobId = await startJob(meta, { message: run.message.slice(0, 500) }, provider);
+  const clean = scrubAssistantRun(run);
+  const aiJobId = await startJob(meta, { message: clean.message.slice(0, 500) }, provider);
   let text = "";
   try {
-    const gen = provider.assistant({ ...run, message: run.message });
+    const gen = provider.assistant(clean);
     let step = await gen.next();
     while (!step.done) {
       if (step.value.type === "text") text += step.value.text;

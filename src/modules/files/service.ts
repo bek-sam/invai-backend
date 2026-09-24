@@ -1,10 +1,10 @@
-import type { PresignedUpload, SignedDownload } from "@invai/contracts";
+import type { Permission, PresignedUpload, SignedDownload } from "@invai/contracts";
 import { eq, or } from "drizzle-orm";
 import type { TenantContext } from "../../api/context";
 import { type Tx, withVendor } from "../../db/client";
 import { files, gangSheets } from "../../db/schema";
 import { notFound, ORPCError } from "../../lib/errors";
-import { headObject, objectKey, presignGet, presignPut } from "../../lib/s3";
+import { headObject, isSafeKey, objectKey, presignGet, presignPut } from "../../lib/s3";
 
 /*
  * Direct-to-S3 uploads and short-lived download links. Keys are `{companyId}/{kind}/...`, so
@@ -27,7 +27,11 @@ const LIMITS: Record<Kind, { maxBytes: number; types: RegExp }> = {
   },
   photo: { maxBytes: 25 * 1024 * 1024, types: /^image\/(png|jpeg|webp|heic)$/ },
   mockup: { maxBytes: 25 * 1024 * 1024, types: /^image\/(png|jpeg|webp)$/ },
-  other: { maxBytes: 25 * 1024 * 1024, types: /.*/ },
+  // No html/svg/js: the bucket serves objects inline, so those would be script on its origin.
+  other: {
+    maxBytes: 25 * 1024 * 1024,
+    types: /^(application\/(pdf|zip|octet-stream)|image\/(png|jpeg|webp)|text\/(csv|plain))$/,
+  },
 };
 
 const EXT: Record<string, string> = {
@@ -72,7 +76,9 @@ export async function presignUpload(
       message: "Content type not allowed for this kind",
     });
   }
-  const ext = EXT[input.contentType] ?? input.filename.split(".").pop()?.toLowerCase() ?? "bin";
+  // The extension is the only user-influenced part of a key; keep it to a short alphanumeric.
+  const guessed = input.filename.split(".").pop()?.toLowerCase() ?? "";
+  const ext = EXT[input.contentType] ?? (/^[a-z0-9]{1,8}$/.test(guessed) ? guessed : "bin");
   const key = objectKey(ctx.companyId, input.kind, ext);
   await tx.insert(files).values({
     companyId: ctx.companyId,
@@ -84,11 +90,12 @@ export async function presignUpload(
     uploadedBy: ctx.userId,
     status: "pending",
   });
-  const uploadUrl = await presignPut(key, input.contentType, UPLOAD_TTL);
+  const uploadUrl = await presignPut(key, input.contentType, UPLOAD_TTL, input.sizeBytes);
   return {
     fileKey: key,
     uploadUrl,
     method: "PUT",
+    // The browser sets content-length from the body; both are part of the signature.
     headers: { "content-type": input.contentType },
     expiresAt: new Date(Date.now() + UPLOAD_TTL * 1000).toISOString(),
   };
@@ -101,6 +108,7 @@ export async function downloadUrl(
   ctx: TenantContext,
   input: { fileKey: string; disposition: "inline" | "attachment" },
 ): Promise<SignedDownload> {
+  if (!isSafeKey(input.fileKey)) throw notFound("file");
   const owned = input.fileKey.startsWith(`${ctx.companyId}/`);
   if (
     !owned &&
@@ -108,6 +116,7 @@ export async function downloadUrl(
   ) {
     throw notFound("file");
   }
+  if (owned && !canReadKind(ctx, input.fileKey.split("/")[1] ?? "")) throw notFound("file");
   const head = await headObject(input.fileKey);
   if (!head.exists) throw notFound("file");
   const name = input.disposition === "attachment" ? input.fileKey.split("/").pop() : undefined;
@@ -118,6 +127,23 @@ export async function downloadUrl(
     contentType: head.contentType,
     sizeBytes: head.size,
   };
+}
+
+/*
+ * Kinds that carry buyer personal data need more than `files.read` (which pressers and
+ * designers have): raw channel payloads never leave through this endpoint, uploaded CSVs
+ * (order exports) only to people who import them, labels only to shipping roles.
+ */
+const KIND_PERMISSIONS: Record<string, Permission[] | null> = {
+  raw: null,
+  csv: ["channels.import", "catalog.manage", "finance.manage"],
+  label: ["shipping.read"],
+};
+
+function canReadKind(ctx: TenantContext, kind: string): boolean {
+  if (!(kind in KIND_PERMISSIONS)) return true;
+  const needed = KIND_PERMISSIONS[kind];
+  return !!needed?.some((p) => ctx.permissions.has(p));
 }
 
 /** A vendor may read a key only when it belongs to a sheet the vendor RLS policy exposes. */

@@ -4,8 +4,10 @@ import { RPCHandler } from "@orpc/server/fetch";
 import type { StandardHandleResult } from "@orpc/server/standard";
 import { experimental_ZodSmartCoercionPlugin } from "@orpc/zod/zod4";
 import { sql } from "drizzle-orm";
-import { Hono } from "hono";
+import { type Context, Hono, type Next } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import { cors } from "hono/cors";
+import { secureHeaders } from "hono/secure-headers";
 import { auth } from "../auth";
 import { db } from "../db/client";
 import { env } from "../env";
@@ -41,6 +43,25 @@ const rest = new OpenAPIHandler(router, {
 });
 
 export const app = new Hono();
+
+// API responses are JSON/SSE only, so the strictest CSP applies; HSTS only matters behind TLS.
+app.use(
+  "*",
+  secureHeaders({
+    contentSecurityPolicy: { defaultSrc: ["'none'"], frameAncestors: ["'none'"] },
+    strictTransportSecurity: env.isProd ? "max-age=31536000; includeSubDomains" : false,
+    crossOriginResourcePolicy: "same-site",
+    xFrameOptions: "DENY",
+    referrerPolicy: "no-referrer",
+  }),
+);
+
+// Uploads go straight to S3, so request bodies stay small (webhooks included).
+const MAX_BODY = 5 * 1024 * 1024;
+app.use(
+  "*",
+  bodyLimit({ maxSize: MAX_BODY, onError: (c) => c.json({ error: "payload too large" }, 413) }),
+);
 
 app.use(
   "*",
@@ -97,6 +118,13 @@ app.use("/api/v1/*", async (c, next) => {
   await next();
 });
 
+// The mock Shopify provider signs with a constant secret; never accept those webhooks in production.
+const noMockWebhooksInProd = async (c: Context, next: Next) => {
+  if (env.isProd && env.mocks.shopify) return c.json({ error: "not found" }, 404);
+  await next();
+};
+app.use("/webhooks/shopify", noMockWebhooksInProd);
+app.use("/webhooks/shopify/*", noMockWebhooksInProd);
 app.route("/webhooks", webhooks);
 app.route(REALTIME_SSE_PATH, events);
 

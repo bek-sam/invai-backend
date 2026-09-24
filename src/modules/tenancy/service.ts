@@ -2,7 +2,7 @@ import type { AuditEntry, Location, Me, Org, StationDevice, User } from "@invai/
 import { AUDIT_ACTIONS, ROLE_PERMISSIONS } from "@invai/contracts";
 import { and, asc, count, desc, eq, gte, inArray, lte, type SQL, sql } from "drizzle-orm";
 import type { Context, TenantContext } from "../../api/context";
-import { db, type Tx, withSystem } from "../../db/client";
+import { db, type Tx } from "../../db/client";
 import type { Address, Role, StationKind } from "../../db/schema";
 import {
   auditLog,
@@ -170,23 +170,60 @@ async function getMember(tx: Tx, companyId: string, userId: string): Promise<Use
   return toUser(row);
 }
 
+/** A role must fit the org type: vendor orgs only have `vendor`, shops never do. */
+function assertRoleFitsOrg(ctx: TenantContext, role: Role) {
+  if (ctx.orgType === "vendor" && role !== "vendor")
+    throw badRequest("Vendor orgs only have the vendor role");
+  if (ctx.orgType === "shop" && role === "vendor")
+    throw badRequest("Shops cannot have vendor members");
+}
+
+/** Only an owner may grant the owner role or change/deactivate an owner. */
+function assertCanManage(ctx: TenantContext, targetRole: Role | null, newRole?: Role) {
+  const touchesOwner = targetRole === "owner" || newRole === "owner";
+  if (touchesOwner && ctx.role !== "owner")
+    throw forbidden("team.manage", "Only an owner can grant or change the owner role");
+}
+
+async function activeOwnerCount(companyId: string) {
+  const [row] = await db
+    .select({ n: count() })
+    .from(members)
+    .where(
+      and(
+        eq(members.organizationId, companyId),
+        eq(members.role, "owner"),
+        eq(members.status, "active"),
+      ),
+    );
+  return row?.n ?? 0;
+}
+
+async function memberRole(companyId: string, userId: string): Promise<Role | null> {
+  const [row] = await db
+    .select({ role: members.role })
+    .from(members)
+    .where(and(eq(members.organizationId, companyId), eq(members.userId, userId)))
+    .limit(1);
+  return row?.role ?? null;
+}
+
 export async function inviteUser(
   tx: Tx,
   ctx: TenantContext,
   input: { email: string; name: string; role: Role },
 ): Promise<User> {
-  if (ctx.orgType === "vendor" && input.role !== "vendor")
-    throw badRequest("Vendor orgs only have the vendor role");
-  if (ctx.orgType === "shop" && input.role === "vendor")
-    throw badRequest("Shops cannot have vendor members");
+  assertRoleFitsOrg(ctx, input.role);
+  assertCanManage(ctx, null, input.role);
   const email = input.email.toLowerCase();
-  const user = await withSystem(async (stx) => {
-    const [existing] = await stx.select().from(users).where(eq(users.email, email)).limit(1);
+  // users carries no RLS (Better Auth table), so the app role can look it up directly.
+  const user = await (async () => {
+    const [existing] = await db.select().from(users).where(eq(users.email, email)).limit(1);
     if (existing) return existing;
-    const [created] = await stx.insert(users).values({ email, name: input.name }).returning();
+    const [created] = await db.insert(users).values({ email, name: input.name }).returning();
     if (!created) throw new Error("user insert failed");
     return created;
-  });
+  })();
   const [dup] = await db
     .select({ id: members.id })
     .from(members)
@@ -217,6 +254,12 @@ export async function changeRole(
   input: { userId: string; role: Role },
 ): Promise<User> {
   if (input.userId === ctx.userId) throw badRequest("You cannot change your own role");
+  assertRoleFitsOrg(ctx, input.role);
+  const current = await memberRole(ctx.companyId, input.userId);
+  if (!current) throw notFound("user", input.userId);
+  assertCanManage(ctx, current, input.role);
+  if (current === "owner" && input.role !== "owner" && (await activeOwnerCount(ctx.companyId)) <= 1)
+    throw conflict("A company needs at least one owner");
   const [row] = await db
     .update(members)
     .set({ role: input.role })
@@ -230,6 +273,7 @@ export async function changeRole(
     entityType: "user",
     entityId: input.userId,
     summary: `Role changed to ${input.role}`,
+    data: { from: current, to: input.role },
   });
   return getMember(tx, ctx.companyId, input.userId);
 }
@@ -241,6 +285,15 @@ export async function setMemberStatus(
   status: "active" | "deactivated",
 ) {
   if (userId === ctx.userId) throw badRequest("You cannot deactivate yourself");
+  const current = await memberRole(ctx.companyId, userId);
+  if (!current) throw notFound("user", userId);
+  assertCanManage(ctx, current);
+  if (
+    status === "deactivated" &&
+    current === "owner" &&
+    (await activeOwnerCount(ctx.companyId)) <= 1
+  )
+    throw conflict("A company needs at least one owner");
   const [row] = await db
     .update(members)
     .set({ status })
@@ -266,7 +319,8 @@ export async function setUserPin(
   ctx: TenantContext,
   input: { userId: string; pin: string },
 ) {
-  await getMember(tx, ctx.companyId, input.userId);
+  const target = await getMember(tx, ctx.companyId, input.userId);
+  assertCanManage(ctx, target.role);
   await setPin(tx, {
     companyId: ctx.companyId,
     userId: input.userId,

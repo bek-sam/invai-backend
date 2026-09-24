@@ -38,6 +38,35 @@ export const authRoles = {
   vendor: ac.newRole(adminAc.statements),
 };
 
+/**
+ * Better Auth organization endpoints the apps never call. Team, role and org changes go through
+ * the InvAI procedures (team.*, me.updateOrg), which enforce owner rules and write audit rows;
+ * leaving these open would let an admin promote or remove owners, or edit `plan`, around them.
+ * The web app only uses organization/create, list and set-active (plus invitation accept).
+ */
+export const DISABLED_AUTH_PATHS = [
+  "/organization/update",
+  "/organization/delete",
+  "/organization/invite-member",
+  "/organization/cancel-invitation",
+  "/organization/update-member-role",
+  "/organization/remove-member",
+  "/organization/leave",
+  "/organization/create-role",
+  "/organization/update-role",
+  "/organization/delete-role",
+  "/organization/create-team",
+  "/organization/update-team",
+  "/organization/remove-team",
+  "/organization/add-team-member",
+  "/organization/remove-team-member",
+  "/organization/set-active-team",
+  // Member and invitation listings (emails) belong behind team.read.
+  "/organization/list-members",
+  "/organization/get-full-organization",
+  "/organization/list-invitations",
+];
+
 export const auth = betterAuth({
   database: drizzleAdapter(db, {
     provider: "pg",
@@ -46,7 +75,19 @@ export const auth = betterAuth({
   secret: env.BETTER_AUTH_SECRET,
   baseURL: env.BETTER_AUTH_URL,
   trustedOrigins: [env.WEB_ORIGIN, env.FLOOR_ORIGIN],
-  emailAndPassword: { enabled: true, minPasswordLength: 8 },
+  emailAndPassword: { enabled: true, minPasswordLength: 8, maxPasswordLength: 128 },
+  disabledPaths: DISABLED_AUTH_PATHS,
+  // Per-IP limits on the auth endpoints (Better Auth only enables them in production by default).
+  rateLimit: {
+    enabled: !env.isTest,
+    window: 60,
+    max: 100,
+    customRules: {
+      "/sign-in/email": { window: 60, max: 10 },
+      "/sign-up/email": { window: 60, max: 5 },
+      "/organization/create": { window: 60, max: 5 },
+    },
+  },
   user: { modelName: "users" },
   session: {
     modelName: "sessions",
@@ -55,7 +96,11 @@ export const auth = betterAuth({
   },
   account: { modelName: "accounts" },
   verification: { modelName: "verifications" },
-  advanced: { database: { generateId: "uuid" } },
+  advanced: {
+    database: { generateId: "uuid" },
+    useSecureCookies: env.isProd,
+    defaultCookieAttributes: { httpOnly: true, sameSite: "lax", secure: env.isProd },
+  },
   databaseHooks: {
     session: {
       create: {
@@ -90,8 +135,9 @@ export const auth = betterAuth({
         organization: {
           modelName: "companies",
           additionalFields: {
-            type: { type: "string", required: false, defaultValue: "shop", input: true },
-            plan: { type: "string", required: false, defaultValue: "trial", input: true },
+            // Never client input: vendor orgs are created by vendors.invite, plans by billing.
+            type: { type: "string", required: false, defaultValue: "shop", input: false },
+            plan: { type: "string", required: false, defaultValue: "trial", input: false },
             timezone: {
               type: "string",
               required: false,
