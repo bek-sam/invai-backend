@@ -14,3 +14,7 @@ minimumReleaseAgeExclude:
   - '@orpc/standard-server-peer@1.15.4'
   - '@orpc/standard-server@1.15.4'
   - hono@4.13.9
+  - '@orpc/json-schema@1.15.4'
+  - '@orpc/openapi-client@1.15.4'
+  - '@orpc/openapi@1.15.4'
+  - '@orpc/zod@1.15.4'

@@ -1,24 +1,64 @@
 import { Worker } from "bullmq";
-import { QUEUE_NAMES, redis } from "../lib/queues";
+import "../modules/jobs";
+import { closeDb } from "../db/client";
+import { errorData, logger } from "../lib/log";
+import {
+  closeQueues,
+  getJob,
+  listJobs,
+  QUEUE_CONCURRENCY,
+  QUEUE_NAMES,
+  redis,
+} from "../lib/queues";
+import { startOutboxRelay } from "./outbox-relay";
 
-const CONCURRENCY: Record<(typeof QUEUE_NAMES)[number], number> = {
-  sync: 10,
-  render: 2,
-  ship: 5,
-  ai: 4,
-  reports: 1,
-};
+const log = logger("worker");
 
-for (const name of QUEUE_NAMES) {
+/*
+ * One BullMQ Worker per queue. Jobs are dispatched by name to the definition registered with
+ * `defineJob()` (src/lib/queues.ts). `src/modules/jobs.ts` imports every module's jobs.ts so the
+ * registry is complete before the workers start. The outbox relay runs in this process too.
+ */
+
+const workers = QUEUE_NAMES.map((queue) => {
   const worker = new Worker(
-    name,
+    queue,
     async (job) => {
-      // TODO: dispatch job.name to the owning module
-      console.log(`[${name}] ${job.name} ${job.id}`);
+      const def = getJob(job.name);
+      if (!def) throw new Error(`no handler registered for job ${job.name} on queue ${queue}`);
+      const input = def.input.parse(job.data);
+      return def.handler(input, job);
     },
-    { connection: redis, concurrency: CONCURRENCY[name] },
+    { connection: redis, concurrency: QUEUE_CONCURRENCY[queue] },
   );
-  worker.on("failed", (job, err) => console.error(`[${name}] ${job?.id} failed`, err));
+  worker.on("failed", (job, err) =>
+    log.error("job failed", {
+      queue,
+      job: job?.name,
+      id: job?.id,
+      attempts: job?.attemptsMade,
+      ...errorData(err),
+    }),
+  );
+  worker.on("completed", (job) => log.debug("job done", { queue, job: job.name, id: job.id }));
+  return worker;
+});
+
+const stopRelay = startOutboxRelay();
+
+log.info("worker started", {
+  queues: QUEUE_NAMES.length,
+  jobs: listJobs().map((j) => j.name),
+});
+
+async function shutdown(signal: string) {
+  log.info("shutting down", { signal });
+  stopRelay();
+  await Promise.all(workers.map((w) => w.close()));
+  await closeQueues();
+  await closeDb();
+  process.exit(0);
 }
 
-console.log("invai worker started");
+process.on("SIGTERM", () => void shutdown("SIGTERM"));
+process.on("SIGINT", () => void shutdown("SIGINT"));

@@ -1,0 +1,490 @@
+import {
+  CHANNEL_RULES,
+  type ChannelConnection,
+  type ConnectInput as ConnectInputSchema,
+  type ConnectionSettings as ConnectionSettingsSchema,
+  type ImportReport,
+} from "@invai/contracts";
+import { and, desc, eq, gt, inArray, sql } from "drizzle-orm";
+import type { z } from "zod";
+import type { TenantContext } from "../../api/context";
+import { type Tx, withSystem } from "../../db/client";
+import {
+  channelConnections,
+  DEFAULT_CONNECTION_SETTINGS,
+  importRuns,
+  orderItems,
+  orders,
+  shipments,
+} from "../../db/schema";
+import { env } from "../../env";
+import { getChannelAdapter } from "../../integrations/channels";
+import { shopifyAuthorizeUrl } from "../../integrations/channels/shopify";
+import type { ChannelConn, ChannelCredentials } from "../../integrations/channels/types";
+import { audit } from "../../lib/audit";
+import { decryptJson, encryptJson, randomToken } from "../../lib/crypto";
+import { badRequest, notFound, ORPCError } from "../../lib/errors";
+import { emit } from "../../lib/outbox";
+import { keyset, type PageInput } from "../../lib/pagination";
+
+/*
+ * Channel connections: list/connect/update/disconnect, health, tracking push for shipping.
+ * Import (CSV + API sync) lives in ./sync.ts and modules/orders/import.ts; SKU rules in ./sku.ts.
+ */
+
+export type ConnectionRow = typeof channelConnections.$inferSelect;
+type ConnectInput = z.infer<typeof ConnectInputSchema>;
+type ConnectionSettings = z.infer<typeof ConnectionSettingsSchema>;
+
+const STALE_ALERT_MINUTES = 30;
+
+export function settingsOf(row: Pick<ConnectionRow, "settings">): ConnectionSettings {
+  return { ...DEFAULT_CONNECTION_SETTINGS, ...(row.settings ?? {}) };
+}
+
+/** The adapter-facing view of a connection (credentials decrypted). */
+export function toChannelConn(row: ConnectionRow): ChannelConn {
+  let credentials: ChannelCredentials | null = null;
+  if (row.credentials) {
+    try {
+      credentials = decryptJson<ChannelCredentials>(row.credentials);
+    } catch {
+      credentials = null;
+    }
+  }
+  return {
+    id: row.id,
+    companyId: row.companyId,
+    channel: row.channel,
+    name: row.name,
+    mode: row.mode,
+    provider: row.provider,
+    externalShopId: row.externalShopId,
+    cursor: row.cursor,
+    credentials,
+  };
+}
+
+type HealthStats = { ordersLast24h: number; errorsLast24h: number };
+
+function toConnection(row: ConnectionRow, stats: HealthStats): ChannelConnection {
+  const adapter = getChannelAdapter(row.channel, row.provider);
+  const lastSync = [row.lastPollAt, row.lastWebhookAt]
+    .filter((d): d is Date => !!d)
+    .sort((a, b) => b.getTime() - a.getTime())[0];
+  const staleMinutes =
+    row.mode === "api" && row.status === "connected"
+      ? lastSync
+        ? Math.max(0, Math.floor((Date.now() - lastSync.getTime()) / 60_000))
+        : null
+      : null;
+  const errored = row.status === "error";
+  const stale = staleMinutes !== null && staleMinutes > STALE_ALERT_MINUTES;
+  return {
+    id: row.id,
+    channel: row.channel,
+    name: row.name,
+    status: row.status,
+    mode: row.mode,
+    externalShopId: row.externalShopId,
+    provider: row.provider,
+    settings: settingsOf(row),
+    health: {
+      ok: !errored && !stale && row.status !== "disconnected",
+      lastWebhookAt: row.lastWebhookAt?.toISOString() ?? null,
+      lastPollAt: row.lastPollAt?.toISOString() ?? null,
+      lastImportAt: row.lastImportAt?.toISOString() ?? null,
+      ordersLast24h: stats.ordersLast24h,
+      errorsLast24h: stats.errorsLast24h,
+      lastError: row.lastError,
+      pendingApproval: adapter.pendingApproval,
+      staleMinutes,
+    },
+    connectedAt: row.connectedAt?.toISOString() ?? null,
+    createdAt: row.createdAt.toISOString(),
+  };
+}
+
+async function healthStats(tx: Tx, rows: ConnectionRow[]): Promise<Map<string, HealthStats>> {
+  const out = new Map<string, HealthStats>();
+  if (rows.length === 0) return out;
+  const ids = rows.map((r) => r.id);
+  const since = new Date(Date.now() - 86400_000);
+  const orderCounts = await tx
+    .select({ id: orders.connectionId, n: sql<number>`count(*)`.mapWith(Number) })
+    .from(orders)
+    .where(and(inArray(orders.connectionId, ids), gt(orders.createdAt, since)))
+    .groupBy(orders.connectionId);
+  const errorCounts = await tx
+    .select({
+      id: importRuns.connectionId,
+      n: sql<number>`coalesce(sum(${importRuns.rowsFailed} + case when ${importRuns.status} = 'failed' then 1 else 0 end), 0)`.mapWith(
+        Number,
+      ),
+    })
+    .from(importRuns)
+    .where(and(inArray(importRuns.connectionId, ids), gt(importRuns.startedAt, since)))
+    .groupBy(importRuns.connectionId);
+  for (const r of rows) {
+    const recentError = r.lastErrorAt && r.lastErrorAt > since ? 1 : 0;
+    out.set(r.id, {
+      ordersLast24h: orderCounts.find((c) => c.id === r.id)?.n ?? 0,
+      errorsLast24h: (errorCounts.find((c) => c.id === r.id)?.n ?? 0) + recentError,
+    });
+  }
+  return out;
+}
+
+async function hydrate(tx: Tx, rows: ConnectionRow[]): Promise<ChannelConnection[]> {
+  const stats = await healthStats(tx, rows);
+  return rows.map((r) =>
+    toConnection(r, stats.get(r.id) ?? { ordersLast24h: 0, errorsLast24h: 0 }),
+  );
+}
+
+export async function getConnectionRow(tx: Tx, id: string): Promise<ConnectionRow> {
+  const [row] = await tx
+    .select()
+    .from(channelConnections)
+    .where(eq(channelConnections.id, id))
+    .limit(1);
+  if (!row) throw notFound("channel_connection", id);
+  return row;
+}
+
+/** Every connection of the company (disconnected ones last). */
+export async function listConnections(tx: Tx, _ctx: TenantContext): Promise<ChannelConnection[]> {
+  const rows = await tx
+    .select()
+    .from(channelConnections)
+    .orderBy(
+      sql`case when ${channelConnections.status} = 'disconnected' then 1 else 0 end`,
+      channelConnections.createdAt,
+    );
+  return hydrate(tx, rows);
+}
+
+export async function getConnection(tx: Tx, _ctx: TenantContext, id: string) {
+  const [out] = await hydrate(tx, [await getConnectionRow(tx, id)]);
+  return out as ChannelConnection;
+}
+
+/** The shop domain a pending Shopify install is for (only in its encrypted credentials). */
+export function pendingShopOf(row: Pick<ConnectionRow, "credentials">): string | null {
+  if (!row.credentials) return null;
+  try {
+    const c = decryptJson<ChannelCredentials>(row.credentials);
+    return typeof c.pendingShop === "string" ? c.pendingShop : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Cross-tenant check (system scope): is this shop already connected to another company? */
+export async function shopifyConnectedElsewhere(shop: string, companyId: string): Promise<boolean> {
+  const rows = await withSystem((stx) =>
+    stx
+      .select({ companyId: channelConnections.companyId })
+      .from(channelConnections)
+      .where(
+        and(
+          eq(channelConnections.channel, "shopify"),
+          eq(channelConnections.externalShopId, shop),
+          eq(channelConnections.status, "connected"),
+        ),
+      ),
+  );
+  return rows.some((r) => r.companyId !== companyId);
+}
+
+export async function connect(tx: Tx, ctx: TenantContext, input: ConnectInput) {
+  if (input.channel === "shopify") {
+    const shop = input.shopDomain;
+    // The shop domain is unproven until Shopify's OAuth callback: a pending row keeps it only in
+    // its encrypted credentials, and `external_shop_id` (which routes webhooks) is set on success.
+    if (await shopifyConnectedElsewhere(shop, ctx.companyId))
+      throw new ORPCError("ALREADY_CONNECTED", {
+        status: 409,
+        message: "This shop is connected to another InvAI account",
+      });
+    const rows = await tx
+      .select()
+      .from(channelConnections)
+      .where(eq(channelConnections.channel, "shopify"));
+    const existing =
+      rows.find((r) => r.externalShopId === shop) ??
+      rows.find((r) => r.status === "pending" && pendingShopOf(r) === shop);
+    if (existing && existing.status !== "disconnected" && existing.status !== "pending") {
+      throw new ORPCError("ALREADY_CONNECTED", {
+        status: 409,
+        message: "This shop is already connected",
+      });
+    }
+    const provider = env.mocks.shopify ? "mock" : "live";
+    const state = randomToken(24);
+    const values = {
+      name: shop.replace(/\.myshopify\.com$/, ""),
+      status: "pending" as const,
+      mode: "api" as const,
+      provider: provider as "mock" | "live",
+      externalShopId: null,
+      credentials: encryptJson({
+        oauthState: state,
+        pendingShop: shop,
+      } satisfies ChannelCredentials),
+      lastError: null,
+    };
+    const row = existing
+      ? (
+          await tx
+            .update(channelConnections)
+            .set(values)
+            .where(eq(channelConnections.id, existing.id))
+            .returning()
+        )[0]
+      : (
+          await tx
+            .insert(channelConnections)
+            .values({ companyId: ctx.companyId, channel: "shopify", ...values })
+            .returning()
+        )[0];
+    if (!row) throw new Error("connection insert failed");
+    const redirectUri = `${env.BETTER_AUTH_URL}/webhooks/shopify/oauth/callback`;
+    // The mock store has no Shopify admin to send the browser to: the callback completes directly.
+    const authorizeUrl =
+      provider === "mock"
+        ? `${redirectUri}?shop=${encodeURIComponent(shop)}&state=${state}&code=mock`
+        : shopifyAuthorizeUrl(shop, state, redirectUri);
+    await audit(tx, {
+      companyId: ctx.companyId,
+      actor: ctx.actor,
+      action: "settings.changed",
+      entityType: "channel_connection",
+      entityId: row.id,
+      summary: `Shopify install started for ${shop}`,
+    });
+    return { kind: "oauth" as const, connectionId: row.id, authorizeUrl };
+  }
+
+  const mode = input.mode;
+  const [row] = await tx
+    .insert(channelConnections)
+    .values({
+      companyId: ctx.companyId,
+      channel: input.channel,
+      name: input.name,
+      status: mode === "csv" ? "csv_only" : "error",
+      mode,
+      provider: "mock",
+      externalShopId: null,
+      lastError:
+        mode === "api"
+          ? `${CHANNEL_RULES[input.channel].label} API access is pending marketplace approval; use CSV import`
+          : null,
+      lastErrorAt: mode === "api" ? new Date() : null,
+      connectedAt: new Date(),
+    })
+    .returning();
+  if (!row) throw new Error("connection insert failed");
+  await audit(tx, {
+    companyId: ctx.companyId,
+    actor: ctx.actor,
+    action: "settings.changed",
+    entityType: "channel_connection",
+    entityId: row.id,
+    summary: `${CHANNEL_RULES[input.channel].label} connection "${input.name}" created`,
+  });
+  await emit(tx, ctx.companyId, "connection.connected", { connectionId: row.id });
+  return { kind: "created" as const, connection: await getConnection(tx, ctx, row.id) };
+}
+
+export async function updateConnection(
+  tx: Tx,
+  ctx: TenantContext,
+  input: { id: string; name?: string; settings?: Partial<ConnectionSettings> },
+) {
+  const row = await getConnectionRow(tx, input.id);
+  const settings = { ...settingsOf(row), ...(input.settings ?? {}) };
+  await tx
+    .update(channelConnections)
+    .set({ name: input.name ?? row.name, settings })
+    .where(eq(channelConnections.id, input.id));
+  await audit(tx, {
+    companyId: ctx.companyId,
+    actor: ctx.actor,
+    action: "settings.changed",
+    entityType: "channel_connection",
+    entityId: row.id,
+    summary: `Channel ${row.name} settings updated`,
+    data: { settings: input.settings ?? {}, name: input.name ?? null },
+  });
+  return getConnection(tx, ctx, input.id);
+}
+
+export async function disconnect(tx: Tx, ctx: TenantContext, id: string) {
+  const row = await getConnectionRow(tx, id);
+  await tx
+    .update(channelConnections)
+    .set({ status: "disconnected", credentials: null, cursor: row.cursor })
+    .where(eq(channelConnections.id, id));
+  await audit(tx, {
+    companyId: ctx.companyId,
+    actor: ctx.actor,
+    action: "settings.changed",
+    entityType: "channel_connection",
+    entityId: id,
+    summary: `Channel ${row.name} disconnected`,
+  });
+  return getConnection(tx, ctx, id);
+}
+
+export async function health(tx: Tx, ctx: TenantContext) {
+  const items = await listConnections(tx, ctx);
+  return {
+    items: items
+      .filter((c) => c.status !== "disconnected")
+      .map((c) => ({ connectionId: c.id, channel: c.channel, name: c.name, health: c.health })),
+  };
+}
+
+/** Record a sync/webhook/import outcome on the connection (health, alerts). */
+export async function markConnection(
+  tx: Tx,
+  id: string,
+  outcome:
+    | { kind: "poll"; cursor?: string | null }
+    | { kind: "webhook" }
+    | { kind: "import" }
+    | { kind: "error"; error: string },
+) {
+  const now = new Date();
+  const set: Partial<typeof channelConnections.$inferInsert> =
+    outcome.kind === "error"
+      ? { lastError: outcome.error.slice(0, 500), lastErrorAt: now }
+      : outcome.kind === "poll"
+        ? {
+            lastPollAt: now,
+            lastError: null,
+            ...(outcome.cursor !== undefined ? { cursor: outcome.cursor } : {}),
+          }
+        : outcome.kind === "webhook"
+          ? { lastWebhookAt: now }
+          : { lastImportAt: now };
+  await tx.update(channelConnections).set(set).where(eq(channelConnections.id, id));
+}
+
+/* ---------------------------------- imports list ---------------------------------- */
+
+type ImportRunRow = typeof importRuns.$inferSelect;
+
+export function toImportReport(r: ImportRunRow): ImportReport {
+  return {
+    importId: r.id,
+    connectionId: r.connectionId,
+    format: r.format,
+    fileKey: r.fileKey,
+    status: r.status === "failed" ? "failed" : "completed",
+    rowsTotal: r.rowsTotal,
+    ordersImported: r.ordersImported,
+    ordersUpdated: r.ordersUpdated,
+    ordersSkipped: r.ordersSkipped,
+    rowsFailed: r.rowsFailed,
+    itemsNeedingMapping: r.itemsNeedingMapping,
+    errors: r.errors,
+    orderIds: r.orderIds,
+    startedAt: r.startedAt.toISOString(),
+    finishedAt: r.finishedAt?.toISOString() ?? null,
+  };
+}
+
+export async function listImports(tx: Tx, _ctx: TenantContext, input: PageInput & { id: string }) {
+  const page = keyset(importRuns.createdAt, importRuns.id, input);
+  const rows = await tx
+    .select()
+    .from(importRuns)
+    .where(and(eq(importRuns.connectionId, input.id), page.where))
+    .orderBy(...page.orderBy)
+    .limit(page.limit + 1);
+  return page.result(rows, toImportReport);
+}
+
+/* ---------------------------------- tracking push ---------------------------------- */
+
+export type PushTrackingResult = {
+  status: "pushed" | "manual" | "not_required";
+  connectionId: string;
+  externalId: string | null;
+  message: string | null;
+};
+
+/**
+ * Push a labeled shipment's tracking to the order's channel. Called by the shipping module from
+ * its push job. Returns `not_required` when the connection has tracking push off (or is
+ * disconnected) and `manual` for channels without API access (the shop uploads it by hand).
+ * Throws UPSTREAM_FAILED when the channel rejects it, so the caller can retry and record it.
+ */
+export async function pushTrackingForShipment(
+  tx: Tx,
+  ctx: TenantContext,
+  shipmentId: string,
+): Promise<PushTrackingResult> {
+  const [shipment] = await tx.select().from(shipments).where(eq(shipments.id, shipmentId)).limit(1);
+  if (!shipment) throw notFound("shipment", shipmentId);
+  if (!shipment.trackingCode || !shipment.carrier)
+    throw badRequest("Shipment has no tracking code yet");
+  const [order] = await tx.select().from(orders).where(eq(orders.id, shipment.orderId)).limit(1);
+  if (!order) throw notFound("order", shipment.orderId);
+  const conn = await getConnectionRow(tx, order.connectionId);
+  if (conn.status === "disconnected" || !settingsOf(conn).pushTracking) {
+    return {
+      status: "not_required",
+      connectionId: conn.id,
+      externalId: null,
+      message: "Tracking push is off for this channel",
+    };
+  }
+
+  const items = await tx
+    .select({ channelLineId: orderItems.channelLineId })
+    .from(orderItems)
+    .where(
+      shipment.orderItemIds.length
+        ? inArray(orderItems.id, shipment.orderItemIds)
+        : and(eq(orderItems.orderId, order.id), sql`${orderItems.state} <> 'cancelled'`),
+    );
+  const byLine = new Map<string, number>();
+  for (const i of items) byLine.set(i.channelLineId, (byLine.get(i.channelLineId) ?? 0) + 1);
+
+  const adapter = getChannelAdapter(conn.channel, conn.provider);
+  const result = await adapter.pushTracking(toChannelConn(conn), {
+    channelOrderId: order.channelOrderId,
+    carrier: shipment.carrier,
+    trackingCode: shipment.trackingCode,
+    trackingUrl: shipment.trackingUrl,
+    items: [...byLine].map(([channelLineId, quantity]) => ({ channelLineId, quantity })),
+  });
+  await audit(tx, {
+    companyId: ctx.companyId,
+    actor: ctx.actor,
+    action: "tracking.pushed",
+    entityType: "order",
+    entityId: order.id,
+    summary:
+      result.status === "pushed"
+        ? `Tracking ${shipment.trackingCode} pushed to ${CHANNEL_RULES[conn.channel].label}`
+        : (result.message ?? "Tracking needs a manual upload"),
+    data: { shipmentId, status: result.status, externalId: result.externalId },
+  });
+  return {
+    status: result.status,
+    connectionId: conn.id,
+    externalId: result.externalId,
+    message: result.message,
+  };
+}
+
+/** Latest import runs across connections (for Today / onboarding). */
+export async function recentImports(tx: Tx, limit = 10) {
+  const rows = await tx.select().from(importRuns).orderBy(desc(importRuns.startedAt)).limit(limit);
+  return rows.map(toImportReport);
+}
