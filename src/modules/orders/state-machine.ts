@@ -26,6 +26,8 @@ import { publish } from "../../lib/realtime";
 
 export { canTransition, ITEM_TRANSITIONS };
 
+const DEFAULT_RISK_WINDOW_MS = 24 * 3600_000;
+
 export type OrderItemRow = typeof orderItems.$inferSelect;
 
 export type TransitionOptions = {
@@ -99,16 +101,25 @@ export async function transitionItem(
   await emitSpecific(tx, updated, from, opts);
 
   const status = await recomputeOrderStatus(tx, item.companyId, item.orderId);
+  const [order] = await tx
+    .select({ shipBy: orders.shipBy })
+    .from(orders)
+    .where(eq(orders.id, item.orderId))
+    .limit(1);
+  const atRisk =
+    !!order &&
+    !["shipped", "delivered", "cancelled"].includes(status) &&
+    order.shipBy.getTime() <= Date.now() + DEFAULT_RISK_WINDOW_MS;
 
   afterCommit(tx, async () => {
-    await publish(item.companyId, {
-      type: "item.state_changed",
-      data: { orderItemId: itemId, orderId: item.orderId, from, to, station },
+    await publish(item.companyId, "item.state_changed", {
+      orderItemId: itemId,
+      orderId: item.orderId,
+      from,
+      to,
+      station,
     });
-    await publish(item.companyId, {
-      type: "order.updated",
-      data: { orderId: item.orderId, status, atRisk: false },
-    });
+    await publish(item.companyId, "order.updated", { orderId: item.orderId, status, atRisk });
   });
 
   return updated;

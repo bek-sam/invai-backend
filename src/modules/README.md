@@ -128,7 +128,7 @@ export function carrierAdapter(): CarrierAdapter {
 | Tenant transaction | `withTenant`, `withVendor`, `withSystem`, `afterCommit` (`src/db/client.ts`) |
 | Audit row | `audit(tx, { companyId, actor, action, entityType, entityId, summary, data })` |
 | Outbox event | `emit(tx, companyId, name, payload)` (typed by contracts `Events`) |
-| Realtime | `publish(companyId, { type, data })` (contracts `RealtimeEvents` names) |
+| Realtime | `publish(companyId, name, payload)` (contracts `RealtimeEvents`; wire = `RealtimeEnvelope`) |
 | Jobs | `defineJob`, `onEvent`, `getJob`, `runJobInline` (`src/lib/queues.ts`) |
 | S3 | `objectKey`, `presignPut/Get`, `putObject`, `getObject`, `headObject` |
 | Encryption | `encryptedText()` column type, `encryptJson/decryptJson`, `randomToken`, `sha256Hex` |

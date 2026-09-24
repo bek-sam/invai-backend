@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import { logger } from "../lib/log";
-import { type RealtimeMessage, replay, subscribe } from "../lib/realtime";
+import { type RealtimeEnvelope, type RealtimeMessage, replay, subscribe } from "../lib/realtime";
 import { buildContext } from "./context";
 
 const log = logger("sse");
@@ -28,12 +28,10 @@ events.get("/", async (c) => {
   const lastEventId = c.req.header("last-event-id") ?? url.searchParams.get("lastEventId");
 
   return streamSSE(c, async (stream) => {
-    const send = (m: RealtimeMessage) =>
-      stream.writeSSE({
-        event: m.type,
-        id: m.id,
-        data: JSON.stringify({ id: m.id, name: m.type, at: m.at, payload: m.data }),
-      });
+    const send = (m: RealtimeMessage) => {
+      const envelope: RealtimeEnvelope = { id: m.id, name: m.name, at: m.at, payload: m.payload };
+      return stream.writeSSE({ event: m.name, id: m.id, data: JSON.stringify(envelope) });
+    };
 
     const queue: RealtimeMessage[] = [];
     let replaying = true;
