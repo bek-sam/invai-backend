@@ -11,11 +11,15 @@ import * as schema from "../schema";
 /*
  * T-1-5 acceptance criteria: proves `ensureReferenceData` runs from a completely empty
  * database (no `pnpm db:seed` step), by migrating a throwaway database of its own - never the
- * shared dev DB or the shared `invai_test*` database other test files use - and dropping it
+ * shared dev DB or the `invai_test*` database other test files in this run use - and dropping it
  * afterwards.
+ *
+ * The scratch DB name is derived from this run's own test database (env.MIGRATION_DATABASE_URL,
+ * which is `TEST_MIGRATION_DATABASE_URL` under NODE_ENV=test - one per card/agent, per
+ * `invai-docs/waves/1/wave.md`), not hard-coded: two agents running `pnpm test` at the same time
+ * each get their own scratch DB, so one run's `afterAll` (`DROP DATABASE ... WITH (FORCE)`) can
+ * never drop the other's database out from under it.
  */
-
-const SCRATCH_DB = "invai_ref_check";
 
 function withDatabaseName(url: string, name: string): string {
   const u = new URL(url);
@@ -23,6 +27,7 @@ function withDatabaseName(url: string, name: string): string {
   return u.toString();
 }
 
+const SCRATCH_DB = `${new URL(env.MIGRATION_DATABASE_URL).pathname.slice(1)}_ref`;
 const scratchUrl = withDatabaseName(env.MIGRATION_DATABASE_URL, SCRATCH_DB);
 
 describe("ensureReferenceData, via runMigrations on an empty database", () => {
