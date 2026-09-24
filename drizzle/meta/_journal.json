@@ -64,6 +64,20 @@
       "when": 1790281611503,
       "tag": "0008_inventory_po_idempotency",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1790284342666,
+      "tag": "0009_billing_stripe",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1790284346804,
+      "tag": "0010_billing_webhook_events_system_writes",
+      "breakpoints": true
     }
   ]
 }

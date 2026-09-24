@@ -1,6 +1,15 @@
-import { integer, pgTable, text, timestamp, uniqueIndex } from "drizzle-orm/pg-core";
+import {
+  boolean,
+  index,
+  integer,
+  pgTable,
+  text,
+  timestamp,
+  uniqueIndex,
+  uuid,
+} from "drizzle-orm/pg-core";
 import { enumText, id, publicReadPolicy, tenantPolicy, timestamps } from "./_shared";
-import { companyId, PLAN_KEYS } from "./tenancy";
+import { companies, companyId, PLAN_KEYS } from "./tenancy";
 
 /** Global plan catalog (contracts `Plan`). `key` is stored on companies.plan. */
 export const plans = pgTable(
@@ -21,9 +30,19 @@ export const plans = pgTable(
   () => [publicReadPolicy("plans")],
 ).enableRLS();
 
-export const SUBSCRIPTION_STATUSES = ["trialing", "active", "past_due", "cancelled"] as const;
+/** `trial_expired`: past `trialEndsAt` with no paid subscription; blocks imports and label buys. */
+export const SUBSCRIPTION_STATUSES = [
+  "trialing",
+  "active",
+  "past_due",
+  "cancelled",
+  "trial_expired",
+] as const;
 
-/** Stripe is stubbed in v1; the row still records the plan and period so limits apply. */
+/**
+ * One row per company. With live Stripe the plan and status change only through the
+ * `/webhooks/stripe` handler; with mock Stripe `changePlan` writes them directly.
+ */
 export const subscriptions = pgTable(
   "subscriptions",
   {
@@ -41,6 +60,12 @@ export const subscriptions = pgTable(
     trialEndsAt: timestamp({ withTimezone: true }),
     currentPeriodStart: timestamp({ withTimezone: true }).notNull().defaultNow(),
     currentPeriodEnd: timestamp({ withTimezone: true }),
+    cancelAtPeriodEnd: boolean().notNull().default(false),
+    /**
+     * `created` of the last Stripe event applied to this row. An event older than this is
+     * ignored, so out-of-order deliveries can't roll the plan or status back.
+     */
+    stripeEventAt: timestamp({ withTimezone: true }),
     ...timestamps,
   },
   (t) => [uniqueIndex().on(t.companyId), tenantPolicy("subscriptions")],
@@ -61,4 +86,43 @@ export const usage = pgTable(
     updatedAt: timestamp({ withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [uniqueIndex().on(t.companyId, t.period), tenantPolicy("usage")],
+).enableRLS();
+
+export const BILLING_WEBHOOK_EVENT_STATUSES = ["received", "processed", "ignored"] as const;
+
+/**
+ * Kept longer than Stripe's automatic retries (3 days) and its manual resend window, so a
+ * replayed event (and the credit pack it paid for) is never applied twice. Events older than
+ * this are refused by the handler for the same reason.
+ */
+export const BILLING_WEBHOOK_EVENT_RETENTION_MS = 30 * 24 * 3600_000;
+
+/**
+ * One row per verified Stripe webhook event, unique on the Stripe event id (decision 0009's
+ * shape: tenant policy for reads, system-only writes, purged nightly). The row is inserted in
+ * the same transaction that applies the event, so an event is applied exactly once or not at
+ * all. `company_id` is null when the event names no InvAI company.
+ */
+export const billingWebhookEvents = pgTable(
+  "billing_webhook_events",
+  {
+    id: id(),
+    companyId: uuid().references(() => companies.id, { onDelete: "cascade" }),
+    /** Stripe `evt_...`. */
+    stripeEventId: text().notNull(),
+    type: text().notNull(),
+    /** Stripe's `created` for the event. */
+    stripeCreatedAt: timestamp({ withTimezone: true }).notNull(),
+    status: text(enumText(BILLING_WEBHOOK_EVENT_STATUSES)).notNull().default("received"),
+    receivedAt: timestamp({ withTimezone: true }).notNull().defaultNow(),
+    processedAt: timestamp({ withTimezone: true }),
+    /** Why it was ignored (no PII: reasons only). */
+    detail: text(),
+  },
+  (t) => [
+    uniqueIndex().on(t.stripeEventId),
+    index().on(t.receivedAt),
+    index().on(t.companyId, t.receivedAt),
+    tenantPolicy("billing_webhook_events"),
+  ],
 ).enableRLS();
