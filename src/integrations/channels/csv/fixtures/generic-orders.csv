@@ -1,0 +1,4 @@
+order_id,order_no,placed_at,ship_by,buyer_name,buyer_email,address1,address2,city,state,zip,country,phone,sku,title,variant,quantity,unit_price,shipping,tax,discount,total,note,personalization,rush
+POP-1001,POP-1001,2026-09-22 10:00,2026-09-25,Grace Hall,grace@example.com,10 Market St,,Prescott,AZ,86301,US,,DB031-CC1717-IVY-M,Teacher Of Tiny Cacti Tee,Ivory / M,1,32.00,5.00,2.75,0,39.75,Pop-up booth order,,no
+POP-1002,POP-1002,2026-09-22 11:30,,Henry Ford,,22 Elm St,,Prescott,AZ,86301,US,,DB026-G64000-SGR-L,Family Reunion Saguaro Tee,Sport Grey / L,4,24.00,0,8.26,0,104.26,,"family name: Ford, year: 2026",yes
+POP-1003,POP-1003,2026-09-23 09:00,,Ivy Chen,ivy@example.com,3 Pine St,,Prescott,AZ,86301,US,,,No SKU Tee,,1,20.00,0,0,0,20.00,,,no
