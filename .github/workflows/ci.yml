@@ -102,16 +102,18 @@ jobs:
           ALTER DEFAULT PRIVILEGES FOR ROLE invai IN SCHEMA public
             GRANT USAGE, SELECT ON SEQUENCES TO invai_app;
           SQL
-      # MinIO needs a `server` command, which job services can't pass, so it runs as a step.
+      # MinIO's official binary (container registries rate-limit shared runners).
       - name: Start MinIO (S3 for presign, upload and retention tests)
         run: |
-          docker run -d --name minio -p 9000:9000 \
-            -e MINIO_ROOT_USER=invai -e MINIO_ROOT_PASSWORD=invai-secret \
-            quay.io/minio/minio server /data
+          curl -sSfL -o /tmp/minio https://dl.min.io/server/minio/release/linux-amd64/minio
+          chmod +x /tmp/minio
+          mkdir -p /tmp/minio-data
+          MINIO_ROOT_USER=invai MINIO_ROOT_PASSWORD=invai-secret \
+            nohup /tmp/minio server /tmp/minio-data --address :9000 > /tmp/minio.log 2>&1 &
           for i in $(seq 1 30); do
             curl -sf http://localhost:9000/minio/health/live && exit 0
             sleep 1
           done
-          echo "MinIO did not start" && docker logs minio && exit 1
+          echo "MinIO did not start" && cat /tmp/minio.log && exit 1
       - run: pnpm run --if-present db:migrate
       - run: pnpm run --if-present test
