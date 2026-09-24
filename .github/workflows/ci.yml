@@ -9,6 +9,44 @@ jobs:
     defaults:
       run:
         working-directory: invai-backend
+    # Matches invai-infra/local/docker-compose.yml: Postgres with pgvector, Valkey. The
+    # invai_app role + extensions are created by the step below (mirrors
+    # invai-infra/local/init.sql, which this job doesn't have checked out).
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: invai
+          POSTGRES_PASSWORD: invai
+          POSTGRES_DB: invai
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U invai -d invai"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      valkey:
+        image: valkey/valkey:8
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # Owner role: migrations, seed, outbox relay, cross-tenant jobs. RLS-enforced app role
+      # below (invai_app has no BYPASSRLS, matching local dev and prod).
+      MIGRATION_DATABASE_URL: postgres://invai:invai@localhost:5432/invai
+      DATABASE_URL: postgres://invai_app:invai@localhost:5432/invai
+      REDIS_URL: redis://localhost:6379
+      S3_BUCKET: invai-ci
+      S3_ENDPOINT: http://localhost:9000
+      IMAGING_URL: http://localhost:8000
+      BETTER_AUTH_SECRET: ci-only-secret-32-chars-minimum-xxxx
+      BETTER_AUTH_URL: http://localhost:3000
+      WEB_ORIGIN: http://localhost:5173
+      # <keyId>:<base64 32 bytes> — a fixed CI-only dummy key, never a real secret.
+      FIELD_ENCRYPTION_KEY: ci:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
     steps:
       - uses: actions/checkout@v4
         with:
@@ -33,4 +71,22 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm lint
       - run: pnpm typecheck
+      - name: Create invai_app role and extensions (mirrors invai-infra/local/init.sql)
+        env:
+          PGPASSWORD: invai
+        run: |
+          psql -h localhost -U invai -d invai -v ON_ERROR_STOP=1 <<'SQL'
+          CREATE ROLE invai_app LOGIN PASSWORD 'invai';
+          GRANT ALL ON DATABASE invai TO invai_app;
+          GRANT USAGE ON SCHEMA public TO invai_app;
+          CREATE EXTENSION IF NOT EXISTS pg_trgm;
+          CREATE EXTENSION IF NOT EXISTS vector;
+          CREATE EXTENSION IF NOT EXISTS pgcrypto;
+          CREATE EXTENSION IF NOT EXISTS citext;
+          ALTER DEFAULT PRIVILEGES FOR ROLE invai IN SCHEMA public
+            GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO invai_app;
+          ALTER DEFAULT PRIVILEGES FOR ROLE invai IN SCHEMA public
+            GRANT USAGE, SELECT ON SEQUENCES TO invai_app;
+          SQL
+      - run: pnpm run --if-present db:migrate
       - run: pnpm run --if-present test
