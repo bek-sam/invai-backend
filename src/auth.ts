@@ -15,6 +15,7 @@ import {
   verifications,
 } from "./db/schema";
 import { env } from "./env";
+import { onOrganizationCreated } from "./modules/today/org-hooks";
 
 /*
  * Better Auth: email + password, companies are organizations (`companies` table with a `type`
@@ -79,6 +80,12 @@ export const auth = betterAuth({
       roles: authRoles,
       creatorRole: "owner",
       allowUserToCreateOrganization: true,
+      organizationHooks: {
+        // Default "Main" location, trial subscription, company.created (src/modules/today).
+        afterCreateOrganization: async ({ organization: org }) => {
+          await onOrganizationCreated({ id: org.id, type: org.type as string | undefined });
+        },
+      },
       schema: {
         organization: {
           modelName: "companies",

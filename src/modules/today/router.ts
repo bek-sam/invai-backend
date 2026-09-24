@@ -1,15 +1,21 @@
-import { contract } from "@invai/contracts";
-import { authed, stubRouter } from "../../api/orpc";
-
-/*
- * today routers. Every procedure starts as a NOT_IMPLEMENTED stub; replace entries as you
- * implement them (see src/modules/catalog/router.ts and src/modules/README.md).
- */
+import { authed } from "../../api/orpc";
+import { withTenant } from "../../db/client";
+import * as svc from "./service";
 
 export const todayRouter = authed.today.router({
-  ...stubRouter(authed.today, contract.today, ["today"]),
+  summary: authed.today.summary.handler(({ input, context: { tenant } }) =>
+    withTenant(tenant.companyId, (tx) => svc.summary(tx, tenant, input)),
+  ),
 });
 
 export const alertsRouter = authed.alerts.router({
-  ...stubRouter(authed.alerts, contract.alerts, ["alerts"]),
+  list: authed.alerts.list.handler(({ input, context: { tenant } }) =>
+    withTenant(tenant.companyId, (tx) => svc.listAlerts(tx, tenant, input)),
+  ),
+  markRead: authed.alerts.markRead.handler(({ input, context: { tenant } }) =>
+    withTenant(tenant.companyId, (tx) => svc.markRead(tx, tenant, input.ids)),
+  ),
+  markAllRead: authed.alerts.markAllRead.handler(({ context: { tenant } }) =>
+    withTenant(tenant.companyId, (tx) => svc.markAllRead(tx, tenant)),
+  ),
 });
