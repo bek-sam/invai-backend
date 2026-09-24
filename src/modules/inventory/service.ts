@@ -1023,9 +1023,10 @@ export async function updatePo(
   const set: Partial<typeof purchaseOrders.$inferInsert> = {};
   if (input.supplier) set.supplier = input.supplier;
   if (input.locationId) set.locationId = await locationOrDefault(tx, ctx, input.locationId);
-  if (input.expectedAt !== undefined)
-    set.expectedAt = input.expectedAt ? new Date(input.expectedAt) : null;
-  if (input.notes !== undefined) set.notes = input.notes;
+  // The contract's partial input still applies defaults (freight 0, notes/expectedAt null), so
+  // those values mean "unchanged" on update.
+  if (input.expectedAt) set.expectedAt = new Date(input.expectedAt);
+  if (input.notes) set.notes = input.notes;
   let subtotal = po.subtotalCents;
   if (input.lines) {
     await tx.delete(purchaseOrderLines).where(eq(purchaseOrderLines.purchaseOrderId, po.id));
@@ -1036,7 +1037,7 @@ export async function updatePo(
     ctx.companyId,
     set.supplier ?? po.supplier,
     subtotal,
-    input.freight ?? po.freightCents,
+    input.freight || po.freightCents,
   );
   await tx
     .update(purchaseOrders)
