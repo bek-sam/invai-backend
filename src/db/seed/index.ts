@@ -1076,6 +1076,14 @@ async function main() {
   }
 
   /* ---- gang sheets + transfers ---- */
+  const sheetComposes: {
+    sheetId: string;
+    widthIn: number;
+    lengthIn: number;
+    pngKey: string;
+    previewKey: string;
+    placements: Parameters<typeof imaging.compose>[0]["placements"];
+  }[] = [];
   const sheetsCreated = await withSystem(async (tx) => {
     const [vendor] = await tx
       .select()
@@ -1098,22 +1106,25 @@ async function main() {
           ? "sent"
           : "printed"
         : "received";
-      // Two columns, rows as tall as their tallest design plus label and spacing.
+      // Greedy rows across the 22 in film, each as tall as its tallest design plus label and spacing.
+      const { marginIn, spacingIn, widthIn: filmIn } = DEFAULT_SHEET_SPEC;
       const layout: { xIn: number; yIn: number }[] = [];
-      let y = DEFAULT_SHEET_SPEC.marginIn;
+      let x = marginIn;
+      let y = marginIn;
+      let rowH = 0;
       let printArea = 0;
-      for (let k = 0; k < chunk.length; k += 2) {
-        const pair = chunk.slice(k, k + 2);
-        let x = DEFAULT_SHEET_SPEC.marginIn;
-        for (const c of pair) {
-          layout.push({ xIn: x, yIn: Math.round(y * 100) / 100 });
-          x += c.widthIn + DEFAULT_SHEET_SPEC.spacingIn;
-          printArea += c.widthIn * c.heightIn;
+      for (const c of chunk) {
+        if (x > marginIn && x + c.widthIn > filmIn - marginIn) {
+          y += rowH + 0.35 + spacingIn;
+          x = marginIn;
+          rowH = 0;
         }
-        y += Math.max(...pair.map((c) => c.heightIn)) + 0.35 + DEFAULT_SHEET_SPEC.spacingIn;
+        layout.push({ xIn: Math.round(x * 100) / 100, yIn: Math.round(y * 100) / 100 });
+        x += c.widthIn + spacingIn;
+        rowH = Math.max(rowH, c.heightIn);
+        printArea += c.widthIn * c.heightIn;
       }
-      const lengthIn =
-        Math.round((y - DEFAULT_SHEET_SPEC.spacingIn + DEFAULT_SHEET_SPEC.marginIn) * 100) / 100;
+      const lengthIn = Math.round((y + rowH + 0.35 + marginIn) * 100) / 100;
       const builtAt = new Date(first.placedAt.getTime() + 8 * HOUR);
       const [batch] = await tx
         .insert(gangSheetBatches)
@@ -1146,8 +1157,9 @@ async function main() {
           transferCount: chunk.length,
           reprintCount: chunk.filter((c) => c.isReprint).length,
           costCents: Math.round(lengthIn * DEFAULT_SHEET_SPEC.pricePerInch),
-          pngKey: `${shopId}/sheet/seed/${day}-${sheetNo}.png`,
-          previewKey: `${shopId}/preview/seed/${day}-${sheetNo}.png`,
+          // Open sheets get real files (composed below); historical ones keep no file.
+          pngKey: status === "received" ? null : `${shopId}/sheet/seed/${day}-${sheetNo}.png`,
+          previewKey: status === "received" ? null : `${shopId}/preview/seed/${day}-${sheetNo}.png`,
           sentAt: new Date(builtAt.getTime() + HOUR),
           acknowledgedAt: status === "sent" ? null : new Date(builtAt.getTime() + 3 * HOUR),
           printedAt: status === "sent" ? null : new Date(builtAt.getTime() + 20 * HOUR),
@@ -1161,6 +1173,31 @@ async function main() {
         })
         .returning();
       if (!sheet) throw new Error("sheet");
+      if (sheet.pngKey && sheet.previewKey)
+        sheetComposes.push({
+          sheetId: sheet.id,
+          widthIn: 22,
+          lengthIn,
+          pngKey: sheet.pngKey,
+          previewKey: sheet.previewKey,
+          placements: chunk.map((c, k) => ({
+            transfer_id: "",
+            file_key: c.fileKey,
+            x_in: layout[k]?.xIn ?? marginIn,
+            y_in: layout[k]?.yIn ?? 0,
+            width_in: c.widthIn,
+            height_in: c.heightIn,
+            rotated: false,
+            label: {
+              order_no: c.orderNo,
+              item_no: `${k + 1}`,
+              size: c.size,
+              color: c.color,
+              design: c.designName,
+              reprint: c.isReprint,
+            },
+          })),
+        });
       await tx.insert(vendorAccess).values({
         companyId: shopId,
         vendorCompanyId: vendorOrg.id,
@@ -1204,6 +1241,9 @@ async function main() {
           })
           .returning({ id: transfers.id });
         if (!transfer) throw new Error("transfer");
+        const compose = sheetComposes.find((c) => c.sheetId === sheet.id);
+        const placement = compose?.placements[k];
+        if (placement) placement.transfer_id = transfer.id;
         await tx
           .update(orderItems)
           .set({ transferId: transfer.id, gangSheetId: sheet.id })
@@ -1233,6 +1273,33 @@ async function main() {
     }
     return sheetNo;
   }, shopId);
+  // Real PNG + preview for the sheets a vendor can still open (the historical ones have none).
+  let composed = 0;
+  for (const c of sheetComposes) {
+    if (!imagingUp) break;
+    try {
+      await imaging.compose({
+        width_in: c.widthIn,
+        length_in: c.lengthIn,
+        placements: c.placements,
+        out_key: c.pngKey,
+        preview_key: c.previewKey,
+        preview_width_px: 1200,
+      });
+      composed++;
+    } catch (err) {
+      log.warn("sheet compose failed", { sheet: c.sheetId, error: String(err) });
+      await withSystem(
+        (tx) =>
+          tx
+            .update(gangSheets)
+            .set({ pngKey: null, previewKey: null })
+            .where(eq(gangSheets.id, c.sheetId)),
+        shopId,
+      );
+    }
+  }
+  log.info("sheet files", { composed, of: sheetComposes.length });
   log.info("sheets", { count: sheetsCreated, transfers: productionItems.length });
 
   /* ---- shipments ---- */
