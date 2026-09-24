@@ -71,8 +71,23 @@ export function computeShipBy(input: {
   processingDays: number | null;
   timeZone?: string;
 }): Date {
-  if (input.channelShipBy && !Number.isNaN(input.channelShipBy.getTime()))
-    return input.channelShipBy;
+  const c = input.channelShipBy;
+  if (c && !Number.isNaN(c.getTime())) {
+    // A date-only ship-by (CSV exports) arrives as 12:00:00.000Z: due by the end of that day.
+    const dateOnly =
+      c.getUTCHours() === 12 &&
+      c.getUTCMinutes() === 0 &&
+      c.getUTCSeconds() === 0 &&
+      c.getUTCMilliseconds() === 0;
+    return dateOnly
+      ? zonedInstant(
+          c.getUTCFullYear(),
+          c.getUTCMonth() + 1,
+          c.getUTCDate(),
+          input.timeZone ?? "America/Phoenix",
+        )
+      : c;
+  }
   const days = input.processingDays ?? CHANNEL_RULES[input.channel].shipBy.defaultDays;
   return addBusinessDays(input.placedAt, days, input.timeZone);
 }

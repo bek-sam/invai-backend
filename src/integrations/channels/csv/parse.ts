@@ -119,8 +119,12 @@ const MONTHS: Record<string, number> = {
 
 /**
  * Tolerant date parser: ISO 8601, `MM/DD/YY(YY)[ hh:mm[:ss][ AM|PM]]`, `YYYY-MM-DD hh:mm:ss`,
- * `Sep 22, 2026`, `22-Sep-2026`. Times without an offset are read as UTC.
+ * `Sep 22, 2026`, `22-Sep-2026`. Times without an offset are read as UTC. A date without a time
+ * becomes 12:00 UTC (the same calendar day in every US timezone); the importer treats a
+ * channel ship-by at exactly 12:00:00.000Z as "by the end of that day" in the shop's timezone.
  */
+export const DATE_ONLY_HOUR = "12";
+
 export function parseDate(v: string): Date | null {
   const s = v.trim();
   if (!s) return null;
@@ -131,7 +135,7 @@ export function parseDate(v: string): Date | null {
   const n = (m: RegExpExecArray, i: number) => Number(m[i] ?? Number.NaN);
   const month = (m: RegExpExecArray, i: number) => MONTHS[(m[i] ?? "").toLowerCase()];
   let m = /^(\d{4})-(\d{1,2})-(\d{1,2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?/.exec(s);
-  if (m) return utc(n(m, 1), n(m, 2), n(m, 3), m[4], m[5], m[6]);
+  if (m) return utc(n(m, 1), n(m, 2), n(m, 3), m[4] ?? DATE_ONLY_HOUR, m[5], m[6]);
   m =
     /^(\d{1,2})\/(\d{1,2})\/(\d{4}|\d{2})(?:[ ,T]+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM|am|pm)?)?/.exec(
       s,
@@ -139,16 +143,17 @@ export function parseDate(v: string): Date | null {
   if (m) {
     let y = n(m, 3);
     if (y < 100) y += 2000;
-    let h = m[4] ? Number(m[4]) : 0;
+    if (!m[4]) return utc(y, n(m, 1), n(m, 2), DATE_ONLY_HOUR);
+    let h = Number(m[4]);
     if (m[7]) h = (h % 12) + (/pm/i.test(m[7]) ? 12 : 0);
     return utc(y, n(m, 1), n(m, 2), String(h), m[5], m[6]);
   }
   m = /^([A-Za-z]{3})[a-z]*\.? (\d{1,2}),? (\d{4})/.exec(s);
   const mo1 = m ? month(m, 1) : undefined;
-  if (m && mo1) return utc(n(m, 3), mo1, n(m, 2));
+  if (m && mo1) return utc(n(m, 3), mo1, n(m, 2), DATE_ONLY_HOUR);
   m = /^(\d{1,2})[- ]([A-Za-z]{3})[a-z]*[- ](\d{4})/.exec(s);
   const mo2 = m ? month(m, 2) : undefined;
-  if (m && mo2) return utc(n(m, 3), mo2, n(m, 1));
+  if (m && mo2) return utc(n(m, 3), mo2, n(m, 1), DATE_ONLY_HOUR);
   const d = new Date(s);
   return Number.isNaN(d.getTime()) ? null : d;
 }

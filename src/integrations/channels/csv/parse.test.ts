@@ -20,12 +20,12 @@ describe("csv value parsing", () => {
   });
 
   it("reads dates in the usual export shapes", () => {
-    expect(parseDate("09/22/26")?.toISOString()).toBe("2026-09-22T00:00:00.000Z");
+    expect(parseDate("09/22/26")?.toISOString()).toBe("2026-09-22T12:00:00.000Z");
     expect(parseDate("09/22/2026 04:02:10 PM")?.toISOString()).toBe("2026-09-22T16:02:10.000Z");
     expect(parseDate("2026-09-22T15:04:11+00:00")?.toISOString()).toBe("2026-09-22T15:04:11.000Z");
     expect(parseDate("2026-09-22 09:12:44 -0700")?.toISOString()).toBe("2026-09-22T16:12:44.000Z");
-    expect(parseDate("2026-09-22")?.toISOString()).toBe("2026-09-22T00:00:00.000Z");
-    expect(parseDate("Sep 22, 2026")?.toISOString()).toBe("2026-09-22T00:00:00.000Z");
+    expect(parseDate("2026-09-22")?.toISOString()).toBe("2026-09-22T12:00:00.000Z");
+    expect(parseDate("Sep 22, 2026")?.toISOString()).toBe("2026-09-22T12:00:00.000Z");
     expect(parseDate("not-a-date")).toBeNull();
   });
 });
@@ -108,7 +108,7 @@ describe("marketplace CSV formats", () => {
     expect(out.orders).toHaveLength(2);
     valid(out.orders);
     const po = out.orders.find((o) => o.channelOrderId === "4792210001234");
-    expect(po).toMatchObject({ orderNo: "200012345678901", shipBy: "2026-09-23T00:00:00.000Z" });
+    expect(po).toMatchObject({ orderNo: "200012345678901", shipBy: "2026-09-23T12:00:00.000Z" });
     expect(po?.items).toHaveLength(2);
     expect(po?.items[1]).toMatchObject({ quantity: 2, unitPrice: 2399 });
     expect(po?.totals.tax).toBe(594);
@@ -148,7 +148,7 @@ describe("marketplace CSV formats", () => {
       { question: "year", answer: "2026", fileUrl: null },
     ]);
     expect(out.orders.find((o) => o.channelOrderId === "POP-1001")?.shipBy).toBe(
-      "2026-09-25T00:00:00.000Z",
+      "2026-09-25T12:00:00.000Z",
     );
   });
 

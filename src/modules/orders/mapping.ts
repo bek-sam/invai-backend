@@ -173,7 +173,7 @@ async function unmappedItems(
     .innerJoin(orders, eq(orders.id, orderItems.orderId))
     .where(
       and(
-        inArray(orderItems.state, ["needs_mapping", "imported"]),
+        eq(orderItems.state, "needs_mapping"),
         filter.channelSku ? eq(orderItems.channelSku, filter.channelSku) : undefined,
         filter.channel ? eq(orders.channel, filter.channel) : undefined,
       ),
