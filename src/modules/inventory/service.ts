@@ -9,26 +9,35 @@ import type {
   ReorderSuggestion,
   StockLevel,
 } from "@invai/contracts";
-import { ORPCError } from "@orpc/server";
 import { and, asc, eq, gte, inArray, lte, sql } from "drizzle-orm";
 import type { z } from "zod";
 import type { TenantContext } from "../../api/context";
-import type { Tx } from "../../db/client";
+import { type Tx, withTenant } from "../../db/client";
 import {
   blankVariants,
   inventoryMovements,
   inventorySettings,
   locations,
   purchaseOrderLines,
+  purchaseOrderReceipts,
   purchaseOrders,
   stockLevels,
   suppliers,
   users,
 } from "../../db/schema";
 import { SUPPLIERS } from "../../db/schema/catalog";
-import { getSupplierAdapter, type SupplierCredentials } from "../../integrations/suppliers";
+import {
+  getSupplierAdapter,
+  type SupplierAdapter,
+  type SupplierCredentials,
+  SupplierError,
+  SupplierNotConnectedError,
+  type SupplierOrderInput,
+  type SupplierOrderResult,
+  supplierProvider,
+} from "../../integrations/suppliers";
 import { audit } from "../../lib/audit";
-import { badRequest, invalidTransition, notFound } from "../../lib/errors";
+import { badRequest, conflict, invalidTransition, notFound, ORPCError } from "../../lib/errors";
 import { logger } from "../../lib/log";
 import { emit } from "../../lib/outbox";
 import { keyset, type PageInput } from "../../lib/pagination";
@@ -637,12 +646,31 @@ function credsOf(row: typeof suppliers.$inferSelect | undefined): SupplierCreden
     : null;
 }
 
-export async function supplierAdapterFor(tx: Tx, companyId: string, supplier: string) {
+/**
+ * The company's own supplier account: live with its credentials, the mock outside production,
+ * null for a supplier with no API in production. Throws a clear CONFLICT when production has no
+ * credentials for an API supplier (InvAI's own account is never used for a tenant).
+ */
+export async function supplierAdapterFor(
+  tx: Tx,
+  companyId: string,
+  supplier: string,
+): Promise<SupplierAdapter | null> {
   const [row] = await tx
     .select()
     .from(suppliers)
     .where(and(eq(suppliers.companyId, companyId), eq(suppliers.supplier, supplier as Supplier)));
-  return getSupplierAdapter(supplier, credsOf(row));
+  try {
+    return getSupplierAdapter(supplier, credsOf(row), { account: companyId });
+  } catch (err) {
+    if (err instanceof SupplierNotConnectedError) {
+      const name = SUPPLIER_NAMES[supplier as Supplier] ?? supplier;
+      throw conflict(
+        `Connect your ${name} account (account number and API key) in Inventory settings before ordering from ${name}.`,
+      );
+    }
+    throw err;
+  }
 }
 
 export async function listSuppliers(tx: Tx, ctx: Ctx) {
@@ -655,12 +683,11 @@ export async function listSuppliers(tx: Tx, ctx: Ctx) {
   return {
     items: SUPPLIERS.map((supplier) => {
       const r = rows.find((x) => x.supplier === supplier);
-      const adapter = supplier === "other" ? null : getSupplierAdapter(supplier, credsOf(r));
       return {
         supplier,
         name: r?.name ?? SUPPLIER_NAMES[supplier],
         connected: !!r,
-        provider: adapter ? adapter.provider : ("none" as const),
+        provider: supplier === "other" ? ("none" as const) : supplierProvider(supplier, credsOf(r)),
         freeFreightThreshold: r?.freeFreightThresholdCents ?? DEFAULT_FREE_FREIGHT[supplier],
         accountNumber: r?.accountNumber ?? null,
         hasApiKey: !!r?.apiKey,
@@ -689,9 +716,13 @@ export async function supplierStock(
     if (b.supplier === "other" || !b.supplierSku) continue;
     bySupplier.set(b.supplier, [...(bySupplier.get(b.supplier) ?? []), b]);
   }
+  const rows = await supplierRows(tx, ctx.companyId);
   for (const [supplier, list] of bySupplier) {
     try {
-      const adapter = await supplierAdapterFor(tx, ctx.companyId, supplier);
+      const creds = credsOf(rows.find((r) => r.supplier === supplier));
+      if (supplierProvider(supplier, creds) === "none") continue;
+      const adapter = getSupplierAdapter(supplier, creds, { account: ctx.companyId });
+      if (!adapter) continue;
       const stock = await adapter.stock(list.map((b) => b.supplierSku));
       const bySku = new Map(stock.map((s) => [s.sku, s.quantity]));
       for (const b of list) out.set(b.id, bySku.get(b.supplierSku) ?? null);
@@ -817,7 +848,8 @@ async function toPurchaseOrders(tx: Tx, rows: PoRow[]): Promise<PurchaseOrder[]>
     id: r.id,
     poNo: r.poNo,
     supplier: r.supplier,
-    status: r.status,
+    // `submitting` is internal until contracts PO_STATES has it; nothing is confirmed yet.
+    status: r.status === "submitting" ? "draft" : r.status,
     locationId: r.locationId,
     lines: lines
       .filter((l) => l.purchaseOrderId === r.id)
@@ -871,12 +903,15 @@ export async function listPos(
   input: PageInput & { status?: PoRow["status"][]; supplier?: Supplier },
 ) {
   const page = keyset(purchaseOrders.createdAt, purchaseOrders.id, input);
+  const status = input.status?.includes("draft")
+    ? [...input.status, "submitting" as const]
+    : input.status;
   const rows = await tx
     .select()
     .from(purchaseOrders)
     .where(
       and(
-        input.status?.length ? inArray(purchaseOrders.status, input.status) : undefined,
+        status?.length ? inArray(purchaseOrders.status, status) : undefined,
         input.supplier ? eq(purchaseOrders.supplier, input.supplier) : undefined,
         page.where,
       ),
@@ -1061,48 +1096,28 @@ async function shipToFor(tx: Tx, locationId: string) {
   };
 }
 
-export async function submitPo(tx: Tx, ctx: Ctx, id: string): Promise<PurchaseOrder> {
-  const po = await loadPo(tx, ctx, id);
-  if (po.status !== "draft")
-    throw invalidTransition("purchase_order", po.id, po.status, "submitted");
-  const lines: PoLineRow[] = await tx
-    .select()
-    .from(purchaseOrderLines)
-    .where(eq(purchaseOrderLines.purchaseOrderId, po.id));
-  if (!lines.length) throw badRequest("A purchase order needs at least one line");
-  const blanks = await tx
-    .select()
-    .from(blankVariants)
-    .where(
-      inArray(
-        blankVariants.id,
-        lines.map((l) => l.blankVariantId),
-      ),
-    );
-  const skuBy = new Map(blanks.map((b) => [b.id, b.supplierSku || b.sku]));
-  const adapter = await supplierAdapterFor(tx, ctx.companyId, po.supplier);
-  let result: { supplierOrderId: string; expectedAt: string | null };
-  try {
-    result = await adapter.placeOrder({
-      poNo: po.poNo,
-      lines: lines.map((l) => ({ sku: skuBy.get(l.blankVariantId) ?? "", quantity: l.qty })),
-      shipTo: await shipToFor(tx, po.locationId),
-    });
-  } catch (err) {
-    throw new ORPCError("SUPPLIER_REJECTED", {
-      status: 502,
-      message: "Supplier rejected the order",
-      data: { detail: (err as Error).message },
-    });
-  }
-  const now = new Date();
+/** A `submitting` PO whose call started this recently may still be in flight: don't resume it. */
+export const SUBMIT_IN_FLIGHT_MS = 2 * 60_000;
+
+type SubmitPlan =
+  | { kind: "done" }
+  | { kind: "call"; resume: boolean; adapter: SupplierAdapter; order: SupplierOrderInput };
+
+async function markSubmitted(
+  tx: Tx,
+  ctx: Ctx,
+  po: PoRow,
+  result: SupplierOrderResult | null,
+  provider: string,
+) {
   await tx
     .update(purchaseOrders)
     .set({
       status: "submitted",
-      submittedAt: now,
-      supplierOrderId: result.supplierOrderId,
-      expectedAt: po.expectedAt ?? (result.expectedAt ? new Date(result.expectedAt) : null),
+      submittedAt: new Date(),
+      submitAttemptedAt: null,
+      supplierOrderId: result?.supplierOrderId ?? null,
+      expectedAt: po.expectedAt ?? (result?.expectedAt ? new Date(result.expectedAt) : null),
     })
     .where(eq(purchaseOrders.id, po.id));
   await emit(tx, ctx.companyId, "po.submitted", { purchaseOrderId: po.id, supplier: po.supplier });
@@ -1112,19 +1127,196 @@ export async function submitPo(tx: Tx, ctx: Ctx, id: string): Promise<PurchaseOr
     action: "purchase_order.submit",
     entityType: "purchase_order",
     entityId: po.id,
-    summary: `${po.poNo} submitted to ${po.supplier} (${adapter.provider}) as ${result.supplierOrderId}`,
+    summary: result
+      ? `${po.poNo} submitted to ${po.supplier} (${provider}) as ${result.supplierOrderId}`
+      : `${po.poNo} marked submitted; ${po.supplier} has no ordering API, so place it with the supplier`,
   });
-  return getPo(tx, ctx, po.id);
 }
 
+/**
+ * Sends a PO to the supplier exactly once (R8): tx 1 records the intent (`submitting`) and
+ * commits, the supplier call runs outside any transaction with the PO number as its
+ * idempotency key, and tx 2 records the supplier order id. A retry of a `submitting` PO reads
+ * the supplier back by PO number before ordering again. Repeating a submitted PO returns it.
+ */
+export async function submitPo(ctx: Ctx, id: string): Promise<PurchaseOrder> {
+  const plan = await withTenant(ctx.companyId, async (tx): Promise<SubmitPlan> => {
+    const po = await loadPo(tx, ctx, id);
+    if (
+      po.status === "submitted" ||
+      po.status === "partially_received" ||
+      po.status === "received"
+    ) {
+      return { kind: "done" };
+    }
+    if (po.status === "submitting") {
+      const since = po.submitAttemptedAt ? Date.now() - po.submitAttemptedAt.getTime() : null;
+      if (since !== null && since < SUBMIT_IN_FLIGHT_MS) {
+        throw conflict(
+          "This purchase order is being sent to the supplier right now. Check again in a minute.",
+        );
+      }
+    } else if (po.status !== "draft") {
+      throw invalidTransition("purchase_order", po.id, po.status, "submitted");
+    }
+    const lines: PoLineRow[] = await tx
+      .select()
+      .from(purchaseOrderLines)
+      .where(eq(purchaseOrderLines.purchaseOrderId, po.id));
+    if (!lines.length) throw badRequest("A purchase order needs at least one line");
+    const adapter = await supplierAdapterFor(tx, ctx.companyId, po.supplier);
+    if (!adapter) {
+      await markSubmitted(tx, ctx, po, null, "manual");
+      return { kind: "done" };
+    }
+    const blanks = await tx
+      .select()
+      .from(blankVariants)
+      .where(
+        inArray(
+          blankVariants.id,
+          lines.map((l) => l.blankVariantId),
+        ),
+      );
+    const skuBy = new Map(blanks.map((b) => [b.id, b.supplierSku || b.sku]));
+    const order: SupplierOrderInput = {
+      poNo: po.poNo,
+      lines: lines.map((l) => ({ sku: skuBy.get(l.blankVariantId) ?? "", quantity: l.qty })),
+      shipTo: await shipToFor(tx, po.locationId),
+    };
+    await tx
+      .update(purchaseOrders)
+      .set({ status: "submitting", submitAttemptedAt: new Date() })
+      .where(eq(purchaseOrders.id, po.id));
+    return { kind: "call", resume: po.status === "submitting", adapter, order };
+  });
+  if (plan.kind === "done") return withTenant(ctx.companyId, (tx) => getPo(tx, ctx, id));
+
+  // No transaction and no row lock while the supplier is called.
+  let result: SupplierOrderResult;
+  try {
+    const existing = plan.resume ? await plan.adapter.findOrder(plan.order.poNo) : null;
+    result =
+      existing && !existing.cancelled
+        ? { supplierOrderId: existing.supplierOrderId, expectedAt: existing.expectedAt }
+        : await plan.adapter.placeOrder(plan.order);
+  } catch (err) {
+    const unknown = !(err instanceof SupplierError) || err.outcome === "unknown";
+    // Not placed: back to draft. Unknown: stay `submitting` with no call in flight, so the
+    // next submit reads back before ordering.
+    await withTenant(ctx.companyId, (tx) =>
+      tx
+        .update(purchaseOrders)
+        .set(unknown ? { submitAttemptedAt: null } : { status: "draft", submitAttemptedAt: null })
+        .where(and(eq(purchaseOrders.id, id), eq(purchaseOrders.status, "submitting"))),
+    );
+    const detail = (err as Error).message;
+    log.warn("supplier order failed", { purchaseOrderId: id, unknown, detail });
+    if (unknown) {
+      throw new ORPCError("UPSTREAM_FAILED", {
+        status: 502,
+        message:
+          "We couldn't confirm the order with the supplier. Submit again to check; it won't be ordered twice.",
+        data: { service: "supplier", detail },
+      });
+    }
+    throw new ORPCError("SUPPLIER_REJECTED", {
+      status: 502,
+      message: "Supplier rejected the order",
+      data: { detail },
+    });
+  }
+
+  try {
+    return await withTenant(ctx.companyId, async (tx) => {
+      const po = await loadPo(tx, ctx, id);
+      if (po.status === "submitting")
+        await markSubmitted(tx, ctx, po, result, plan.adapter.provider);
+      return getPo(tx, ctx, id);
+    });
+  } catch (err) {
+    // The supplier has the order but we couldn't record it: clear the in-flight mark so the
+    // next submit reads it back instead of waiting out SUBMIT_IN_FLIGHT_MS.
+    log.error("supplier accepted the PO but saving it failed", {
+      purchaseOrderId: id,
+      supplierOrderId: result.supplierOrderId,
+      error: (err as Error).message,
+    });
+    await withTenant(ctx.companyId, (tx) =>
+      tx
+        .update(purchaseOrders)
+        .set({ submitAttemptedAt: null })
+        .where(and(eq(purchaseOrders.id, id), eq(purchaseOrders.status, "submitting"))),
+    ).catch(() => {});
+    throw err;
+  }
+}
+
+const sameReceipt = (
+  a: { lineId: string; qty: number }[],
+  b: { lineId: string; qty: number }[],
+) => {
+  const key = (l: { lineId: string; qty: number }[]) =>
+    l
+      .map((x) => `${x.lineId}:${x.qty}`)
+      .sort()
+      .join(",");
+  return key(a) === key(b);
+};
+
+/**
+ * Receives lines into stock. With `idempotencyKey` a retried receipt counts once: the same key
+ * and lines return the PO as it is, the same key with different lines is a CONFLICT. Without a
+ * key, each call is a new delivery.
+ */
 export async function receivePo(tx: Tx, ctx: Ctx, input: ReceiveInput): Promise<PurchaseOrder> {
   const po = await loadPo(tx, ctx, input.purchaseOrderId);
+  const lineInput = input.lines.map((l) => ({ lineId: l.lineId, qty: l.qty }));
+  if (input.idempotencyKey) {
+    const [prior] = await tx
+      .select()
+      .from(purchaseOrderReceipts)
+      .where(
+        and(
+          eq(purchaseOrderReceipts.companyId, ctx.companyId),
+          eq(purchaseOrderReceipts.idempotencyKey, input.idempotencyKey),
+        ),
+      );
+    if (prior) {
+      if (
+        prior.purchaseOrderId !== po.id ||
+        (input.locationId && input.locationId !== prior.locationId) ||
+        !sameReceipt(prior.lines, lineInput)
+      ) {
+        throw conflict("This receipt was already recorded with different quantities");
+      }
+      return getPo(tx, ctx, po.id);
+    }
+  }
   if (po.status !== "submitted" && po.status !== "partially_received") {
     throw invalidTransition("purchase_order", po.id, po.status, "received");
   }
   const locationId = input.locationId
     ? await locationOrDefault(tx, ctx, input.locationId)
     : po.locationId;
+  let receiptId: string | null = null;
+  if (input.idempotencyKey) {
+    const [receipt] = await tx
+      .insert(purchaseOrderReceipts)
+      .values({
+        companyId: ctx.companyId,
+        purchaseOrderId: po.id,
+        idempotencyKey: input.idempotencyKey,
+        locationId,
+        lines: lineInput,
+        createdBy: ctx.userId,
+      })
+      .onConflictDoNothing()
+      .returning({ id: purchaseOrderReceipts.id });
+    // Lost a race with the same key on another PO (this PO's lock serializes same-PO retries).
+    if (!receipt) throw conflict("This receipt was already recorded with different quantities");
+    receiptId = receipt.id;
+  }
   const lines = await tx
     .select()
     .from(purchaseOrderLines)
@@ -1132,7 +1324,7 @@ export async function receivePo(tx: Tx, ctx: Ctx, input: ReceiveInput): Promise<
   const lineBy = new Map(lines.map((l) => [l.id, l]));
   const movementIds: string[] = [];
   const touched: string[] = [];
-  for (const r of input.lines) {
+  for (const [i, r] of input.lines.entries()) {
     const line = lineBy.get(r.lineId);
     if (!line) throw notFound("purchase order line", r.lineId);
     const remaining = line.qty - line.receivedQty;
@@ -1148,6 +1340,7 @@ export async function receivePo(tx: Tx, ctx: Ctx, input: ReceiveInput): Promise<
       refType: "purchase_order",
       refId: po.id,
       note: input.note,
+      idempotencyKey: receiptId ? `receive:${receiptId}:${i}` : null,
     });
     if (row) movementIds.push(row.id);
     touched.push(line.blankVariantId);
@@ -1181,11 +1374,7 @@ export async function receivePo(tx: Tx, ctx: Ctx, input: ReceiveInput): Promise<
   return getPo(tx, ctx, po.id);
 }
 
-export async function cancelPo(tx: Tx, ctx: Ctx, id: string): Promise<PurchaseOrder> {
-  const po = await loadPo(tx, ctx, id);
-  if (po.status !== "draft" && po.status !== "submitted") {
-    throw invalidTransition("purchase_order", po.id, po.status, "cancelled");
-  }
+async function markCancelled(tx: Tx, ctx: Ctx, po: PoRow, summary: string) {
   await tx.update(purchaseOrders).set({ status: "cancelled" }).where(eq(purchaseOrders.id, po.id));
   await audit(tx, {
     companyId: ctx.companyId,
@@ -1193,7 +1382,64 @@ export async function cancelPo(tx: Tx, ctx: Ctx, id: string): Promise<PurchaseOr
     action: "purchase_order.cancel",
     entityType: "purchase_order",
     entityId: po.id,
-    summary: `${po.poNo} cancelled`,
+    summary,
   });
-  return getPo(tx, ctx, po.id);
+}
+
+/**
+ * Cancels a PO. A draft (or a PO never sent through an API) cancels here. A PO the supplier
+ * has is cancelled at the supplier first (outside any transaction); when the supplier can't or
+ * won't, it is refused until the supplier shows the order cancelled.
+ */
+export async function cancelPo(ctx: Ctx, id: string): Promise<PurchaseOrder> {
+  const plan = await withTenant(ctx.companyId, async (tx) => {
+    const po = await loadPo(tx, ctx, id);
+    if (po.status === "cancelled") return null;
+    if (po.status === "submitting") {
+      throw conflict(
+        "This purchase order is being sent to the supplier. Wait until it shows as submitted, then cancel it.",
+      );
+    }
+    if (po.status !== "draft" && po.status !== "submitted") {
+      throw invalidTransition("purchase_order", po.id, po.status, "cancelled");
+    }
+    if (po.status === "draft" || !po.supplierOrderId) {
+      await markCancelled(tx, ctx, po, `${po.poNo} cancelled`);
+      return null;
+    }
+    const adapter = await supplierAdapterFor(tx, ctx.companyId, po.supplier);
+    return { po, adapter, supplierOrderId: po.supplierOrderId };
+  });
+  if (!plan) return withTenant(ctx.companyId, (tx) => getPo(tx, ctx, id));
+
+  const name = SUPPLIER_NAMES[plan.po.supplier];
+  let how: string | null = null;
+  let detail: string | null = null;
+  if (plan.adapter?.cancelOrder) {
+    try {
+      await plan.adapter.cancelOrder(plan.supplierOrderId);
+      how = `cancelled at ${name}`;
+    } catch (err) {
+      detail = (err as Error).message;
+    }
+  }
+  if (!how && plan.adapter) {
+    // Already cancelled at the supplier (by hand, or an earlier attempt that we didn't record)?
+    const found = await plan.adapter.findOrder(plan.po.poNo).catch(() => null);
+    if (found?.cancelled) how = `already cancelled at ${name}`;
+  }
+  if (!how) {
+    log.warn("supplier cancel refused", { purchaseOrderId: id, detail });
+    throw conflict(
+      `${name} still has order ${plan.supplierOrderId} for ${plan.po.poNo}. Cancel it with ${name} first, then cancel it here.`,
+    );
+  }
+
+  return withTenant(ctx.companyId, async (tx) => {
+    const po = await loadPo(tx, ctx, id);
+    if (po.status === "submitted") {
+      await markCancelled(tx, ctx, po, `${po.poNo} cancelled (${how}, ${plan.supplierOrderId})`);
+    }
+    return getPo(tx, ctx, id);
+  });
 }

@@ -74,7 +74,7 @@ describe("inventory service", () => {
     expect(po.subtotal).toBe(3 * 40 * 250);
     expect(po.freight).toBe(0);
 
-    const submitted = await withTenant(companyId, (tx) => svc.submitPo(tx, ctx, po.id));
+    const submitted = await svc.submitPo(ctx, po.id);
     expect(submitted.status).toBe("submitted");
     expect(submitted.supplierOrderId).toMatch(/^MOCK-SSA-/);
 

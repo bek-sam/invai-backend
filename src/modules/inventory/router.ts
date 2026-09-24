@@ -34,14 +34,15 @@ export const inventoryRouter = t.router({
     update: t.purchaseOrders.update.handler(({ input, context: { tenant } }) =>
       withTenant(tenant.companyId, (tx) => svc.updatePo(tx, tenant, input)),
     ),
+    // submit and cancel open their own short transactions: the supplier call runs outside them.
     submit: t.purchaseOrders.submit.handler(({ input, context: { tenant } }) =>
-      withTenant(tenant.companyId, (tx) => svc.submitPo(tx, tenant, input.id)),
+      svc.submitPo(tenant, input.id),
     ),
     receive: t.purchaseOrders.receive.handler(({ input, context: { tenant } }) =>
       withTenant(tenant.companyId, (tx) => svc.receivePo(tx, tenant, input)),
     ),
     cancel: t.purchaseOrders.cancel.handler(({ input, context: { tenant } }) =>
-      withTenant(tenant.companyId, (tx) => svc.cancelPo(tx, tenant, input.id)),
+      svc.cancelPo(tenant, input.id),
     ),
   },
   suppliers: {

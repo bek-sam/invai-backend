@@ -9,7 +9,7 @@ import {
   uuid,
 } from "drizzle-orm/pg-core";
 import { encryptedText } from "../../lib/crypto";
-import { enumText, id, tenantPolicy, timestamps } from "./_shared";
+import { enumText, id, jsonArray, tenantPolicy, timestamps } from "./_shared";
 import { blankVariants, SUPPLIERS } from "./catalog";
 import { companyId, locations } from "./tenancy";
 
@@ -140,8 +140,13 @@ export const inventorySettings = pgTable(
   (t) => [uniqueIndex().on(t.companyId), tenantPolicy("inventory_settings")],
 ).enableRLS();
 
+/**
+ * `submitting`: the supplier order was (or is being) sent and its outcome isn't recorded yet.
+ * It is internal: the API shows it as `draft` until the contract's PO_STATES has it.
+ */
 export const PO_STATUSES = [
   "draft",
+  "submitting",
   "submitted",
   "partially_received",
   "received",
@@ -164,6 +169,11 @@ export const purchaseOrders = pgTable(
     totalCents: integer().notNull().default(0),
     supplierOrderId: text(),
     expectedAt: timestamp({ withTimezone: true }),
+    /**
+     * When the supplier call in flight started (status `submitting`). Null while submitting
+     * means the last call ended with an unknown outcome, so a retry reads back first.
+     */
+    submitAttemptedAt: timestamp({ withTimezone: true }),
     submittedAt: timestamp({ withTimezone: true }),
     receivedAt: timestamp({ withTimezone: true }),
     notes: text(),
@@ -194,4 +204,31 @@ export const purchaseOrderLines = pgTable(
     ...timestamps,
   },
   (t) => [index().on(t.companyId, t.purchaseOrderId), tenantPolicy("purchase_order_lines")],
+).enableRLS();
+
+/**
+ * One row per receipt submitted with a client idempotency key, so a retried receipt counts once.
+ * `lines` is the request as received; the same key with different lines is a conflict.
+ */
+export const purchaseOrderReceipts = pgTable(
+  "purchase_order_receipts",
+  {
+    id: id(),
+    companyId: companyId(),
+    purchaseOrderId: uuid()
+      .notNull()
+      .references(() => purchaseOrders.id, { onDelete: "cascade" }),
+    idempotencyKey: text().notNull(),
+    locationId: uuid()
+      .notNull()
+      .references(() => locations.id, { onDelete: "restrict" }),
+    lines: jsonArray<{ lineId: string; qty: number }>(),
+    createdBy: uuid(),
+    createdAt: timestamp({ withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex().on(t.companyId, t.idempotencyKey),
+    index().on(t.companyId, t.purchaseOrderId),
+    tenantPolicy("purchase_order_receipts"),
+  ],
 ).enableRLS();
