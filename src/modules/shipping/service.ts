@@ -13,7 +13,7 @@ import { PDFDocument } from "pdf-lib";
 import type { z } from "zod";
 import type { TenantContext } from "../../api/context";
 import { afterCommit, type Tx, withTenant } from "../../db/client";
-import type { Address, ShipmentState } from "../../db/schema";
+import type { Address, RateQuote, ShipmentState } from "../../db/schema";
 import {
   bins,
   blankVariants,
@@ -26,10 +26,12 @@ import {
   shippingSettings,
 } from "../../db/schema";
 import {
+  type BuyRequest,
   CarrierError,
   type CarrierRate,
   carrierAdapter,
   type Parcel,
+  type PurchasedLabel,
 } from "../../integrations/carriers";
 import { type Actor, audit } from "../../lib/audit";
 import { badRequest, conflict, notFound, ORPCError, upstream } from "../../lib/errors";
@@ -72,6 +74,15 @@ export const MOCK_TRANSIT_HOURS = Number(process.env.MOCK_CARRIER_TRANSIT_HOURS 
 export const MOCK_DELIVERY_HOURS = Number(process.env.MOCK_CARRIER_DELIVERY_HOURS ?? 72);
 
 const LIVE_LABEL: ShipmentState[] = ["labeled", "in_transit", "delivered", "exception", "returned"];
+/** A carrier call is in flight or its outcome is unknown: no new rate, buy or push for it. */
+const BUSY: ShipmentState[] = ["buying", "voiding"];
+
+/** The API shows the internal intent states as the state they started from. */
+function apiStatus(status: ShipmentState): Shipment["status"] {
+  if (status === "buying") return "rated";
+  if (status === "voiding") return "labeled";
+  return status;
+}
 
 /* --------------------------------- settings -------------------------------- */
 
@@ -265,7 +276,7 @@ function toShipment(
     orderId: row.orderId,
     orderNo: order.orderNo,
     channel: order.channel,
-    status: row.status,
+    status: apiStatus(row.status),
     orderItemIds: row.orderItemIds,
     carrier: row.carrier,
     service: row.service,
@@ -287,7 +298,7 @@ function toShipment(
       : null,
     shipBy: order.shipBy.toISOString(),
     trackingPush: {
-      status: row.trackingPushStatus,
+      status: row.trackingPushStatus === "pushing" ? "pending" : row.trackingPushStatus,
       pushedAt: row.trackingPushedAt?.toISOString() ?? null,
       attempts: row.trackingPushAttempts,
       error: row.trackingPushError,
@@ -328,7 +339,12 @@ export type ShipmentListInput = PageInput & {
 export async function listShipments(tx: Tx, _ctx: TenantContext, input: ShipmentListInput) {
   const page = keyset(shipments.createdAt, shipments.id, input);
   const f: (SQL | undefined)[] = [page.where];
-  if (input.status?.length) f.push(inArray(shipments.status, input.status));
+  if (input.status?.length) {
+    const wanted: ShipmentState[] = [...input.status];
+    if (wanted.includes("rated")) wanted.push("buying");
+    if (wanted.includes("labeled")) wanted.push("voiding");
+    f.push(inArray(shipments.status, wanted));
+  }
   if (input.channel) f.push(eq(orders.channel, input.channel));
   if (input.orderId) f.push(eq(shipments.orderId, input.orderId));
   if (input.search) {
@@ -398,7 +414,7 @@ async function shippableOrderIds(tx: Tx, channel?: string) {
     .where(
       and(
         channel ? eq(orders.channel, channel as Shipment["channel"]) : undefined,
-        sql`not exists (select 1 from shipments s where s.order_id = ${orderItems.orderId} and s.status in ('labeled','in_transit','delivered','exception','returned'))`,
+        sql`not exists (select 1 from shipments s where s.order_id = ${orderItems.orderId} and s.status in ('labeled','in_transit','delivered','exception','returned','buying','voiding'))`,
       ),
     )
     .groupBy(orderItems.orderId, orders.shipBy)
@@ -514,100 +530,138 @@ function carrierFailure(err: unknown): never {
 const rateExpired = () =>
   new ORPCError("RATE_EXPIRED", { status: 409, message: "Rates expired; fetch them again" });
 
-/** Rate-shop an order: creates or reuses its open shipment and stores the quotes on it. */
-export async function rateOrder(
-  tx: Tx,
-  ctx: TenantContext,
-  input: RatesInput,
-): Promise<RatesResult> {
-  const [order] = await tx.select().from(orders).where(eq(orders.id, input.orderId)).for("update");
-  if (!order) throw notFound("order", input.orderId);
-  const pack = (await orderPacks(tx, [order.id])).get(order.id);
-  if (!pack?.allPacked) throw orderNotPacked();
-  const settings = await settingsRow(tx, ctx);
-  if (!settings.fromAddress) throw badRequest("Set a ship-from address in shipping settings first");
-  const to = await shipTo(tx, order.id);
-  if (!addressValid(to))
-    throw addressInvalid(
-      to ? "street, city and a 5-digit ZIP are required" : "no ship-to address on the order",
-    );
+/**
+ * Rate-shop an order: creates or reuses its open shipment and stores the quotes on it. The
+ * carrier is called with no transaction open and no row locked: tx 1 checks the order and picks
+ * the shipment, tx 2 stores the quotes if the shipment is still open.
+ */
+export async function rateOrder(ctx: TenantContext, input: RatesInput): Promise<RatesResult> {
+  const plan = await withTenant(ctx.companyId, async (tx) => {
+    const [order] = await tx
+      .select()
+      .from(orders)
+      .where(eq(orders.id, input.orderId))
+      .for("update");
+    if (!order) throw notFound("order", input.orderId);
+    const [taken] = await tx
+      .select({ status: shipments.status })
+      .from(shipments)
+      .where(
+        and(eq(shipments.orderId, order.id), inArray(shipments.status, [...BUSY, ...LIVE_LABEL])),
+      )
+      .limit(1);
+    if (taken && BUSY.includes(taken.status))
+      throw conflict(
+        "A label for this order is being bought or voided right now. Try again in a minute.",
+      );
+    if (taken) throw conflict("This order already has a label. Void it first to buy a new one.");
+    const pack = (await orderPacks(tx, [order.id])).get(order.id);
+    if (!pack?.allPacked) throw orderNotPacked();
+    const settings = await settingsRow(tx, ctx);
+    if (!settings.fromAddress)
+      throw badRequest("Set a ship-from address in shipping settings first");
+    const to = await shipTo(tx, order.id);
+    if (!addressValid(to))
+      throw addressInvalid(
+        to ? "street, city and a 5-digit ZIP are required" : "no ship-to address on the order",
+      );
 
-  const presets = await presetRows(tx);
-  const preset = input.packagePresetId
-    ? presets.find((p) => p.id === input.packagePresetId)
-    : choosePreset(presets, pack.itemIds.length);
-  if (input.packagePresetId && !preset) throw notFound("package preset", input.packagePresetId);
-  const parcel: Parcel = {
-    lengthIn: input.parcel?.lengthIn ?? preset?.lengthIn ?? 10,
-    widthIn: input.parcel?.widthIn ?? preset?.widthIn ?? 13,
-    heightIn: input.parcel?.heightIn ?? preset?.heightIn ?? 1,
-    weightOz:
-      input.parcel?.weightOz ??
-      parcelWeight(pack.blanks, settings.weightPerStyle, preset?.tareOz ?? 0),
-  };
+    const presets = await presetRows(tx);
+    const preset = input.packagePresetId
+      ? presets.find((p) => p.id === input.packagePresetId)
+      : choosePreset(presets, pack.itemIds.length);
+    if (input.packagePresetId && !preset) throw notFound("package preset", input.packagePresetId);
+    const parcel: Parcel = {
+      lengthIn: input.parcel?.lengthIn ?? preset?.lengthIn ?? 10,
+      widthIn: input.parcel?.widthIn ?? preset?.widthIn ?? 13,
+      heightIn: input.parcel?.heightIn ?? preset?.heightIn ?? 1,
+      weightOz:
+        input.parcel?.weightOz ??
+        parcelWeight(pack.blanks, settings.weightPerStyle, preset?.tareOz ?? 0),
+    };
 
-  let [shipment] = await tx
-    .select()
-    .from(shipments)
-    .where(and(eq(shipments.orderId, order.id), inArray(shipments.status, ["pending", "rated"])))
-    .orderBy(desc(shipments.createdAt))
-    .limit(1);
-  if (!shipment) {
-    [shipment] = await tx
-      .insert(shipments)
-      .values({
-        companyId: ctx.companyId,
-        orderId: order.id,
-        orderItemIds: pack.itemIds,
-        status: "pending",
-      })
-      .returning();
-  }
-  if (!shipment) throw new Error("shipment insert failed");
-
-  const adapter = carrierAdapter();
-  let quote: Awaited<ReturnType<typeof adapter.rate>>;
-  try {
-    quote = await adapter.rate({
-      companyId: ctx.companyId,
+    let [shipment] = await tx
+      .select()
+      .from(shipments)
+      .where(and(eq(shipments.orderId, order.id), inArray(shipments.status, ["pending", "rated"])))
+      .orderBy(desc(shipments.createdAt))
+      .limit(1);
+    if (!shipment) {
+      [shipment] = await tx
+        .insert(shipments)
+        .values({
+          companyId: ctx.companyId,
+          orderId: order.id,
+          orderItemIds: pack.itemIds,
+          status: "pending",
+        })
+        .returning();
+    }
+    if (!shipment) throw new Error("shipment insert failed");
+    return {
       shipmentId: shipment.id,
+      itemIds: pack.itemIds,
+      presetId: preset?.id ?? null,
+      parcel,
       from: settings.fromAddress,
       to: to as Address,
-      parcel,
+      allowedCarriers: settings.allowedCarriers,
+    };
+  });
+
+  // No transaction and no row lock while the carrier is called.
+  let quote: Awaited<ReturnType<ReturnType<typeof carrierAdapter>["rate"]>>;
+  try {
+    quote = await carrierAdapter().rate({
+      companyId: ctx.companyId,
+      shipmentId: plan.shipmentId,
+      from: plan.from,
+      to: plan.to,
+      parcel: plan.parcel,
     });
   } catch (err) {
     carrierFailure(err);
   }
-  const allowed = new Set(settings.allowedCarriers);
+  const allowed = new Set(plan.allowedCarriers);
   const rates = quote.rates.filter((r) => allowed.has(r.carrier));
   if (!rates.length) throw upstream("carrier", "no rates for the allowed carriers");
   const ratedAt = new Date();
-  await tx
-    .update(shipments)
-    .set({
-      status: "rated",
-      orderItemIds: pack.itemIds,
-      packagePresetId: preset?.id ?? null,
-      lengthIn: parcel.lengthIn,
-      widthIn: parcel.widthIn,
-      heightIn: parcel.heightIn,
-      weightOz: parcel.weightOz,
-      rateQuotes: rates.map((r) => ({
-        rateId: r.rateId,
-        carrier: r.carrier,
-        service: r.service,
-        serviceLabel: r.serviceLabel,
-        rate: r.rateCents,
-        deliveryDays: r.deliveryDays,
-        estimatedDeliveryAt: r.estimatedDeliveryAt,
-      })),
-      ratedAt,
-      carrierShipmentId: quote.carrierShipmentId,
-    })
-    .where(eq(shipments.id, shipment.id));
+  await withTenant(ctx.companyId, async (tx) => {
+    const [s] = await tx
+      .select({ status: shipments.status })
+      .from(shipments)
+      .where(eq(shipments.id, plan.shipmentId))
+      .for("update");
+    // A buy started meanwhile: its carrier shipment and quotes must stay as they are.
+    if (!s || (s.status !== "pending" && s.status !== "rated"))
+      throw conflict("The shipment changed while rates were fetched. Fetch rates again.");
+    await tx
+      .update(shipments)
+      .set({
+        status: "rated",
+        orderItemIds: plan.itemIds,
+        packagePresetId: plan.presetId,
+        lengthIn: plan.parcel.lengthIn,
+        widthIn: plan.parcel.widthIn,
+        heightIn: plan.parcel.heightIn,
+        weightOz: plan.parcel.weightOz,
+        rateQuotes: rates.map((r) => ({
+          rateId: r.rateId,
+          carrier: r.carrier,
+          service: r.service,
+          serviceLabel: r.serviceLabel,
+          rate: r.rateCents,
+          deliveryDays: r.deliveryDays,
+          estimatedDeliveryAt: r.estimatedDeliveryAt,
+        })),
+        ratedAt,
+        carrierShipmentId: quote.carrierShipmentId,
+      })
+      .where(eq(shipments.id, plan.shipmentId));
+  });
   return {
-    shipmentId: shipment.id,
-    parcel,
+    shipmentId: plan.shipmentId,
+    parcel: plan.parcel,
     rates: markRates(rates),
     ratedAt: ratedAt.toISOString(),
   };
@@ -618,87 +672,207 @@ export async function rateOrder(
 /** Channels with no API to push tracking to. */
 const NO_PUSH_CHANNELS = new Set(["csv"]);
 
+/** A `buying` shipment whose carrier call started this recently may still be in flight. */
+export const BUY_IN_FLIGHT_MS = 2 * 60_000;
+
+type BuyPlan =
+  | { kind: "done" }
+  | { kind: "call"; resume: boolean; expired: boolean; quote: RateQuote; req: BuyRequest };
+
+/** Ends a buy that bought nothing (`not_done`, back to `rated`) or whose outcome is unknown. */
+async function settleBuy(ctx: TenantContext, shipmentId: string, outcome: "not_done" | "unknown") {
+  await withTenant(ctx.companyId, (tx) =>
+    tx
+      .update(shipments)
+      .set(
+        outcome === "unknown"
+          ? { buyAttemptedAt: null }
+          : { status: "rated", buyAttemptedAt: null },
+      )
+      .where(and(eq(shipments.id, shipmentId), eq(shipments.status, "buying"))),
+  );
+}
+
 /**
- * Buy the chosen rate. Idempotent per shipment: a second call (double click, retry) returns the
- * labeled shipment. Tracking push is queued via `shipment.labeled`; when no push is needed the
- * items ship right away.
+ * Buy the chosen rate, never twice (research 10 R8). Tx 1 records the intent on the shipment
+ * (`buying`, the rate, the attempt time) and commits. The carrier buys with no transaction open,
+ * on the carrier shipment created at rating (our shipment id is its reference). Tx 2 records the
+ * label. A retry of a `buying` shipment reads the carrier back before buying again, and a
+ * repeat on a bought shipment returns it. Tracking push is queued via `shipment.labeled`.
  */
 export async function buyLabel(
-  tx: Tx,
   ctx: TenantContext,
   input: { shipmentId: string; rateId: string },
 ): Promise<Shipment> {
-  const [s] = await tx
-    .select()
-    .from(shipments)
-    .where(eq(shipments.id, input.shipmentId))
-    .for("update");
-  if (!s) throw notFound("shipment", input.shipmentId);
-  if (LIVE_LABEL.includes(s.status)) return getShipment(tx, ctx, s.id);
-  if (s.status === "voided") throw conflict("Shipment was voided; rate the order again");
-  const quote = s.rateQuotes.find((q) => q.rateId === input.rateId);
-  if (
-    !quote ||
-    !s.ratedAt ||
-    !s.carrierShipmentId ||
-    Date.now() - s.ratedAt.getTime() > RATE_TTL_MS
-  )
-    throw rateExpired();
-  const [order] = await tx.select().from(orders).where(eq(orders.id, s.orderId)).limit(1);
-  if (!order) throw notFound("order", s.orderId);
-  const pack = (await orderPacks(tx, [order.id])).get(order.id);
-  if (!pack?.allPacked) throw orderNotPacked();
-  const settings = await settingsRow(tx, ctx);
-  const to = await shipTo(tx, order.id);
-  if (!settings.fromAddress || !to || !addressValid(to))
-    throw addressInvalid("ship-to address incomplete");
+  const plan = await withTenant(ctx.companyId, async (tx): Promise<BuyPlan> => {
+    const [s] = await tx
+      .select()
+      .from(shipments)
+      .where(eq(shipments.id, input.shipmentId))
+      .for("update");
+    if (!s) throw notFound("shipment", input.shipmentId);
+    if (LIVE_LABEL.includes(s.status)) return { kind: "done" };
+    if (s.status === "voided" || s.status === "voiding")
+      throw conflict("Shipment was voided; rate the order again");
+    const resume = s.status === "buying";
+    if (resume) {
+      if (s.selectedRateId !== input.rateId)
+        throw conflict(
+          "A label for a different rate is already being bought for this order. Buy that rate again to finish it.",
+        );
+      const since = s.buyAttemptedAt ? Date.now() - s.buyAttemptedAt.getTime() : null;
+      if (since !== null && since < BUY_IN_FLIGHT_MS)
+        throw conflict("This label is being bought right now. Check again in a minute.");
+    }
+    const quote = s.rateQuotes.find((q) => q.rateId === input.rateId);
+    if (!quote || !s.ratedAt || !s.carrierShipmentId) throw rateExpired();
+    const expired = Date.now() - s.ratedAt.getTime() > RATE_TTL_MS;
+    if (expired && !resume) throw rateExpired();
+    const [order] = await tx.select().from(orders).where(eq(orders.id, s.orderId)).limit(1);
+    if (!order) throw notFound("order", s.orderId);
+    if (!resume) {
+      const pack = (await orderPacks(tx, [order.id])).get(order.id);
+      if (!pack?.allPacked) throw orderNotPacked();
+    }
+    const settings = await settingsRow(tx, ctx);
+    const to = await shipTo(tx, order.id);
+    if (!settings.fromAddress || !to || !addressValid(to))
+      throw addressInvalid("ship-to address incomplete");
+    await tx
+      .update(shipments)
+      .set({ status: "buying", selectedRateId: quote.rateId, buyAttemptedAt: new Date() })
+      .where(eq(shipments.id, s.id));
+    return {
+      kind: "call",
+      resume,
+      expired,
+      quote,
+      req: {
+        companyId: ctx.companyId,
+        shipmentId: s.id,
+        carrierShipmentId: s.carrierShipmentId,
+        from: settings.fromAddress,
+        to,
+        parcel: {
+          lengthIn: s.lengthIn,
+          widthIn: s.widthIn,
+          heightIn: s.heightIn,
+          weightOz: s.weightOz,
+        },
+        rate: {
+          rateId: quote.rateId,
+          carrier: quote.carrier,
+          service: quote.service,
+          serviceLabel: quote.serviceLabel,
+          rateCents: quote.rate,
+          deliveryDays: quote.deliveryDays,
+          estimatedDeliveryAt: quote.estimatedDeliveryAt,
+        },
+      },
+    };
+  });
+  if (plan.kind === "done")
+    return withTenant(ctx.companyId, (tx) => getShipment(tx, ctx, input.shipmentId));
 
-  let label: Awaited<ReturnType<ReturnType<typeof carrierAdapter>["buy"]>>;
+  // No transaction and no row lock while the carrier is called.
+  const adapter = carrierAdapter();
+  let label: PurchasedLabel;
   try {
-    label = await carrierAdapter().buy({
-      companyId: ctx.companyId,
-      shipmentId: s.id,
-      carrierShipmentId: s.carrierShipmentId,
-      from: settings.fromAddress,
-      to,
-      parcel: {
-        lengthIn: s.lengthIn,
-        widthIn: s.widthIn,
-        heightIn: s.heightIn,
-        weightOz: s.weightOz,
-      },
-      rate: {
-        rateId: quote.rateId,
-        carrier: quote.carrier,
-        service: quote.service,
-        serviceLabel: quote.serviceLabel,
-        rateCents: quote.rate,
-        deliveryDays: quote.deliveryDays,
-        estimatedDeliveryAt: quote.estimatedDeliveryAt,
-      },
-    });
+    const found = plan.resume
+      ? (
+          await adapter.lookup({
+            companyId: ctx.companyId,
+            shipmentId: input.shipmentId,
+            carrierShipmentId: plan.req.carrierShipmentId,
+          })
+        ).label
+      : null;
+    if (!found && plan.expired) {
+      await settleBuy(ctx, input.shipmentId, "not_done");
+      throw rateExpired();
+    }
+    label = found ?? (await adapter.buy(plan.req));
   } catch (err) {
+    if (err instanceof ORPCError) throw err;
+    const unknown = !(err instanceof CarrierError) || err.outcome === "unknown";
+    // Not bought: back to rated. Unknown: stay `buying` with no call in flight, so the next
+    // buy reads the carrier back before buying.
+    await settleBuy(ctx, input.shipmentId, unknown ? "unknown" : "not_done");
+    const detail = err instanceof Error ? err.message : String(err);
+    log.warn("label buy failed", { shipmentId: input.shipmentId, unknown, detail });
+    if (unknown)
+      throw new ORPCError("UPSTREAM_FAILED", {
+        status: 502,
+        message:
+          "We couldn't confirm the label with the carrier. Buy again to check; you won't be charged twice.",
+        data: { service: "carrier", detail },
+      });
     carrierFailure(err);
   }
 
+  try {
+    return await withTenant(ctx.companyId, async (tx) => {
+      const [s] = await tx
+        .select()
+        .from(shipments)
+        .where(eq(shipments.id, input.shipmentId))
+        .for("update");
+      if (s?.status === "buying") await recordLabel(tx, ctx, s, plan.quote, label);
+      return getShipment(tx, ctx, input.shipmentId);
+    });
+  } catch (err) {
+    // The carrier sold the label but we couldn't record it: clear the in-flight mark so the next
+    // buy reads it back instead of waiting out BUY_IN_FLIGHT_MS.
+    log.error("carrier sold the label but saving it failed", {
+      shipmentId: input.shipmentId,
+      carrierLabelId: label.carrierLabelId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    await withTenant(ctx.companyId, (tx) =>
+      tx
+        .update(shipments)
+        .set({ buyAttemptedAt: null })
+        .where(and(eq(shipments.id, input.shipmentId), eq(shipments.status, "buying"))),
+    ).catch(() => {});
+    throw err;
+  }
+}
+
+/** Tx 2 of a buy: the label row, the labeled shipment, its items, audit and events. */
+async function recordLabel(
+  tx: Tx,
+  ctx: TenantContext,
+  s: ShipmentRow,
+  quote: RateQuote,
+  label: PurchasedLabel,
+) {
+  const [order] = await tx.select().from(orders).where(eq(orders.id, s.orderId)).limit(1);
+  if (!order) throw notFound("order", s.orderId);
+  const pack = (await orderPacks(tx, [order.id])).get(order.id);
+  const itemIds = pack?.itemIds ?? s.orderItemIds;
+  const settings = await settingsRow(tx, ctx);
   const needsPush = settings.trackingPushEnabled && !NO_PUSH_CHANNELS.has(order.channel);
   const now = new Date();
-  await tx.insert(labels).values({
-    companyId: ctx.companyId,
-    shipmentId: s.id,
-    carrier: quote.carrier,
-    service: quote.service,
-    trackingCode: label.trackingCode,
-    labelKey: label.labelKey,
-    format: "pdf",
-    postageCents: label.postageCents,
-    labelFeeCents: LABEL_FEE_CENTS,
-    carrierLabelId: label.carrierLabelId,
-  });
+  await tx
+    .insert(labels)
+    .values({
+      companyId: ctx.companyId,
+      shipmentId: s.id,
+      carrier: quote.carrier,
+      service: quote.service,
+      trackingCode: label.trackingCode,
+      labelKey: label.labelKey,
+      format: "pdf",
+      postageCents: label.postageCents,
+      labelFeeCents: LABEL_FEE_CENTS,
+      carrierLabelId: label.carrierLabelId,
+    })
+    .onConflictDoNothing();
   await tx
     .update(shipments)
     .set({
       status: "labeled",
+      buyAttemptedAt: null,
       carrier: quote.carrier,
       service: quote.service,
       trackingCode: label.trackingCode,
@@ -710,7 +884,7 @@ export async function buyLabel(
       labelFeeCents: LABEL_FEE_CENTS,
       selectedRateId: quote.rateId,
       carrierLabelId: label.carrierLabelId,
-      orderItemIds: pack.itemIds,
+      orderItemIds: itemIds,
       trackingPushStatus: needsPush ? "pending" : "not_required",
       trackingPushAttempts: 0,
       trackingPushError: null,
@@ -718,7 +892,8 @@ export async function buyLabel(
       voidedAt: null,
     })
     .where(eq(shipments.id, s.id));
-  await tx.update(orderItems).set({ shipmentId: s.id }).where(inArray(orderItems.id, pack.itemIds));
+  if (itemIds.length)
+    await tx.update(orderItems).set({ shipmentId: s.id }).where(inArray(orderItems.id, itemIds));
   await audit(tx, {
     companyId: ctx.companyId,
     actor: ctx.actor,
@@ -729,7 +904,7 @@ export async function buyLabel(
   });
   await emit(tx, ctx.companyId, "shipment.status_changed", {
     shipmentId: s.id,
-    from: s.status,
+    from: "rated",
     to: "labeled",
   });
   await emit(tx, ctx.companyId, "shipment.labeled", {
@@ -738,15 +913,13 @@ export async function buyLabel(
     trackingCode: label.trackingCode,
     carrier: quote.carrier,
   });
-  if (!needsPush)
-    await shipItems(tx, ctx.actor, pack.itemIds, "label bought (no tracking push needed)");
+  if (!needsPush) await shipItems(tx, ctx.actor, itemIds, "label bought (no tracking push needed)");
   afterCommit(tx, () =>
     publish(ctx.companyId, {
       type: "shipment.updated",
       data: { shipmentId: s.id, orderId: order.id, status: "labeled" },
     }).then(() => undefined),
   );
-  return getShipment(tx, ctx, s.id);
 }
 
 async function shipItems(tx: Tx, actor: Actor, itemIds: string[], reason: string) {
@@ -807,26 +980,34 @@ export async function batchBuy(
   let totalPostage = 0;
   for (const [i, orderId] of input.orderIds.entries()) {
     try {
-      const shipment = await withTenant(ctx.companyId, async (tx) => {
-        const [live] = await tx
+      const live = await withTenant(ctx.companyId, async (tx) => {
+        const [row] = await tx
           .select({ id: shipments.id })
           .from(shipments)
           .where(and(eq(shipments.orderId, orderId), inArray(shipments.status, LIVE_LABEL)))
           .limit(1);
-        if (live) return { skipped: true as const, id: live.id };
         const [order] = await tx
           .select({ shipBy: orders.shipBy })
           .from(orders)
           .where(eq(orders.id, orderId));
         if (!order) throw notFound("order", orderId);
-        const quote = await rateOrder(tx, ctx, { orderId, packagePresetId: input.packagePresetId });
-        const rate = pickRate(quote.rates, strategy, order.shipBy);
-        if (!rate) throw upstream("carrier", "no rate");
-        return {
-          skipped: false as const,
-          shipment: await buyLabel(tx, ctx, { shipmentId: quote.shipmentId, rateId: rate.rateId }),
-        };
+        return { id: row?.id ?? null, shipBy: order.shipBy };
       });
+      // Rate and buy each run their own short transactions around the carrier calls.
+      const shipment = live.id
+        ? { skipped: true as const, id: live.id }
+        : await (async () => {
+            const quote = await rateOrder(ctx, {
+              orderId,
+              packagePresetId: input.packagePresetId,
+            });
+            const rate = pickRate(quote.rates, strategy, live.shipBy);
+            if (!rate) throw upstream("carrier", "no rate");
+            return {
+              skipped: false as const,
+              shipment: await buyLabel(ctx, { shipmentId: quote.shipmentId, rateId: rate.rateId }),
+            };
+          })();
       if (shipment.skipped) {
         results.push({
           orderId,
@@ -946,6 +1127,7 @@ export async function voidShipment(
     let res: Awaited<ReturnType<ReturnType<typeof carrierAdapter>["void"]>>;
     try {
       res = await carrierAdapter().void({
+        companyId: ctx.companyId,
         carrierShipmentId: s.carrierShipmentId,
         trackingCode: s.trackingCode,
       });
@@ -1091,7 +1273,7 @@ function toPushStatus(r: PushRow): TrackingPushStatus {
     orderNo: r.orderNo,
     channel: r.channel,
     trackingCode: r.s.trackingCode ?? "",
-    status: r.s.trackingPushStatus,
+    status: r.s.trackingPushStatus === "pushing" ? "pending" : r.s.trackingPushStatus,
     attempts: r.s.trackingPushAttempts,
     lastAttemptAt: r.s.trackingPushAttempts > 0 ? r.s.updatedAt.toISOString() : null,
     error: r.s.trackingPushError,

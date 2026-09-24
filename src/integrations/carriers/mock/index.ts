@@ -1,19 +1,43 @@
 import { createHash } from "node:crypto";
-import { objectKey } from "../../../lib/s3";
+import { getObject, headObject, putObject } from "../../../lib/s3";
 import { imaging } from "../../imaging/client";
 import {
   type CarrierAdapter,
   CarrierError,
+  type CarrierLookup,
   type CarrierRate,
+  labelObjectKey,
   type Parcel,
+  type PurchasedLabel,
   type RateRequest,
 } from "../types";
 
 /*
  * Sandbox carrier used when no EASYPOST_API_KEY is set. Rates are deterministic from weight and a
  * zone derived from the ZIP prefixes, tracking codes are derived from the shipment id, and the
- * 4x6 label PDF comes from imaging `POST /labels/mock`.
+ * 4x6 label PDF comes from imaging `POST /labels/mock`. The "carrier's records" live in the
+ * bucket next to the PDF (a small JSON per carrier shipment), so a read-back after a crash sees
+ * what an earlier process bought, like EasyPost `GET /shipments/{id}` would.
  */
+
+type MockRecord = { label: PurchasedLabel; refundStatus: string | null };
+
+const recordKey = (companyId: string, carrierShipmentId: string) =>
+  labelObjectKey(companyId, carrierShipmentId).replace(/\.pdf$/, ".json");
+
+async function readRecord(companyId: string, carrierShipmentId: string) {
+  const key = recordKey(companyId, carrierShipmentId);
+  if (!(await headObject(key)).exists) return null;
+  return JSON.parse((await getObject(key)).toString("utf8")) as MockRecord;
+}
+
+async function writeRecord(companyId: string, carrierShipmentId: string, record: MockRecord) {
+  await putObject(
+    recordKey(companyId, carrierShipmentId),
+    Buffer.from(JSON.stringify(record)),
+    "application/json",
+  );
+}
 
 type Service = {
   carrier: "usps" | "ups";
@@ -98,7 +122,8 @@ export function mockRates(
 function validate(to: RateRequest["to"], parcel: Parcel) {
   if (!to.street1?.trim() || !/^\d{5}(-\d{4})?$/.test(to.zip.trim()))
     throw new CarrierError("mock", "address_invalid", "Street and a 5-digit ZIP are required");
-  if (parcel.weightOz > 70 * 16) throw new CarrierError("mock", "upstream", "Parcel over 70 lb");
+  if (parcel.weightOz > 70 * 16)
+    throw new CarrierError("mock", "upstream", "Parcel over 70 lb", "not_done");
 }
 
 export const mockCarrier: CarrierAdapter = {
@@ -114,9 +139,13 @@ export const mockCarrier: CarrierAdapter = {
 
   async buy(req) {
     validate(req.to, req.parcel);
+    const existing = await readRecord(req.companyId, req.carrierShipmentId);
+    // Like EasyPost, a carrier shipment is bought once; buying it again is refused.
+    if (existing)
+      throw new CarrierError("mock", "upstream", "Shipment already has postage", "not_done");
     const carrier = req.rate.carrier === "ups" ? "ups" : "usps";
     const trackingCode = mockTrackingCode(carrier, `${req.shipmentId}:${req.rate.service}`);
-    const labelKey = objectKey(req.companyId, "label", "pdf");
+    const labelKey = labelObjectKey(req.companyId, req.carrierShipmentId);
     const place = (a: RateRequest["from"]) => ({
       name: a.name,
       city: a.city,
@@ -133,16 +162,26 @@ export const mockCarrier: CarrierAdapter = {
       weight_oz: req.parcel.weightOz,
       out_key: labelKey,
     });
-    return {
+    const label: PurchasedLabel = {
       trackingCode,
       trackingUrl: mockTrackingUrl(carrier, trackingCode),
       labelKey,
       carrierLabelId: `pl_mock_${trackingCode.slice(-10)}`,
       postageCents: req.rate.rateCents,
     };
+    await writeRecord(req.companyId, req.carrierShipmentId, { label, refundStatus: null });
+    return label;
   },
 
-  async void() {
-    return { ok: true };
+  async lookup({ companyId, carrierShipmentId }): Promise<CarrierLookup> {
+    const record = await readRecord(companyId, carrierShipmentId);
+    return record ?? { label: null, refundStatus: null };
+  },
+
+  async void({ companyId, carrierShipmentId }) {
+    const record = await readRecord(companyId, carrierShipmentId);
+    if (record && !record.refundStatus)
+      await writeRecord(companyId, carrierShipmentId, { ...record, refundStatus: "refunded" });
+    return { ok: true, pending: false };
   },
 };

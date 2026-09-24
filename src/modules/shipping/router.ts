@@ -43,12 +43,11 @@ export const shippingRouter = authed.shipping.router({
   queue: authed.shipping.queue.handler(({ input, context: { tenant } }) =>
     withTenant(tenant.companyId, (tx) => svc.shipQueue(tx, tenant, input)),
   ),
+  // Rate and buy open their own short transactions around the carrier call (R8).
   rates: authed.shipping.rates.handler(({ input, context: { tenant } }) =>
-    withTenant(tenant.companyId, (tx) => svc.rateOrder(tx, tenant, input)),
+    svc.rateOrder(tenant, input),
   ),
-  buy: authed.shipping.buy.handler(({ input, context: { tenant } }) =>
-    withTenant(tenant.companyId, (tx) => svc.buyLabel(tx, tenant, input)),
-  ),
+  buy: authed.shipping.buy.handler(({ input, context: { tenant } }) => svc.buyLabel(tenant, input)),
   batchBuy: authed.shipping.batchBuy.handler(({ input, context: { tenant } }) =>
     svc.batchBuy(tenant, input),
   ),

@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import {
   boolean,
   doublePrecision,
@@ -18,6 +19,11 @@ import { type Address, companyId } from "./tenancy";
 export const CARRIERS = ["usps", "ups", "mock"] as const;
 export type Carrier = (typeof CARRIERS)[number];
 
+/**
+ * `buying` and `voiding` are internal intent states (crash-safe carrier calls, research 10 R8):
+ * the carrier call was (or is being) made and its outcome isn't recorded yet. The API shows them
+ * as `rated` and `labeled` until contracts SHIPMENT_STATES has them.
+ */
 export const SHIPMENT_STATES = [
   "pending",
   "rated",
@@ -27,10 +33,19 @@ export const SHIPMENT_STATES = [
   "exception",
   "returned",
   "voided",
+  "buying",
+  "voiding",
 ] as const;
 export type ShipmentState = (typeof SHIPMENT_STATES)[number];
 
-export const TRACKING_PUSH_STATUSES = ["not_required", "pending", "pushed", "failed"] as const;
+/** `pushing` is internal (shown as `pending`): the channel call was (or is being) made. */
+export const TRACKING_PUSH_STATUSES = [
+  "not_required",
+  "pending",
+  "pushed",
+  "failed",
+  "pushing",
+] as const;
 export const LABEL_FORMATS = ["pdf", "zpl"] as const;
 export const BATCH_STRATEGIES = ["cheapest", "fastest", "cheapest_on_time"] as const;
 
@@ -111,7 +126,16 @@ export const shipments = pgTable(
     /** EasyPost shipment id (or mock id). */
     carrierShipmentId: text(),
     carrierLabelId: text(),
+    /**
+     * When the carrier buy in flight started (status `buying`). Null while buying means the last
+     * call ended with an unknown outcome, so a retry reads the carrier back before buying.
+     */
+    buyAttemptedAt: timestamp({ withTimezone: true }),
+    /** Same for the refund in flight (status `voiding`). */
+    voidAttemptedAt: timestamp({ withTimezone: true }),
     trackingPushStatus: text(enumText(TRACKING_PUSH_STATUSES)).notNull().default("pending"),
+    /** Same for the channel push in flight (tracking push status `pushing`). */
+    pushAttemptedAt: timestamp({ withTimezone: true }),
     trackingPushedAt: timestamp({ withTimezone: true }),
     trackingPushAttempts: integer().notNull().default(0),
     trackingPushError: text(),
@@ -155,6 +179,10 @@ export const labels = pgTable(
   (t) => [
     index().on(t.companyId, t.shipmentId),
     index().on(t.companyId, t.trackingCode),
+    // One live label per shipment: a retried or raced buy can't record a second one.
+    uniqueIndex("labels_one_purchased_per_shipment")
+      .on(t.companyId, t.shipmentId)
+      .where(sql`status = 'purchased'`),
     tenantPolicy("labels"),
   ],
 ).enableRLS();
