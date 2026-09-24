@@ -42,8 +42,9 @@ export const teamRouter = authed.team.router({
   list: authed.team.list.handler(({ input, context: { tenant } }) =>
     withTenant(tenant.companyId, (tx) => svc.listTeam(tx, tenant, input)),
   ),
+  // Not wrapped in withTenant: it runs its own short transactions around the email send.
   invite: authed.team.invite.handler(({ input, context: { tenant } }) =>
-    withTenant(tenant.companyId, (tx) => svc.inviteUser(tx, tenant, input)),
+    svc.inviteTeammate(tenant, input),
   ),
   changeRole: authed.team.changeRole.handler(({ input, context: { tenant } }) =>
     withTenant(tenant.companyId, (tx) => svc.changeRole(tx, tenant, input)),

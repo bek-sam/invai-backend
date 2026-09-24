@@ -1,4 +1,4 @@
-import { and, eq, gt } from "drizzle-orm";
+import { and, eq, gt, ne } from "drizzle-orm";
 import { z } from "zod";
 import { db, type Tx, withSystem } from "../../db/client";
 import type { Role } from "../../db/schema";
@@ -115,17 +115,38 @@ export function inviteEmail(input: InviteEmailInput) {
   return { subject: copy.subject, text, html };
 }
 
+/** How long an invite waits on the mail server before it is reported as not sent. */
+export const INVITE_EMAIL_TIMEOUT_MS = 15_000;
+
 /**
- * Send an invite email. Throws UPSTREAM_FAILED when the mail server refuses it, so the caller's
- * transaction rolls back and the web never says "sent" for an email that didn't go out.
+ * Send one invite-related email. Callers commit the invitation first and call this with no
+ * transaction open (a slow mail server must never hold a pooled connection or a row lock), then
+ * remove the invitation if it throws. Throws UPSTREAM_FAILED on a refusal or after the timeout,
+ * so the web never says "sent" for an email that didn't go out.
  */
-export async function sendInviteEmail(to: string, input: InviteEmailInput) {
+export async function deliverInviteMail(
+  mail: { to: string; subject: string; text: string; html?: string },
+  timeoutMs = INVITE_EMAIL_TIMEOUT_MS,
+) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    await sendMail({ to, ...inviteEmail(input) });
+    await Promise.race([
+      sendMail(mail),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`timed out after ${timeoutMs} ms`)), timeoutMs);
+      }),
+    ]);
   } catch (err) {
     log.warn("invite email failed", { error: String(err) });
     throw upstream("Invite email");
+  } finally {
+    clearTimeout(timer);
   }
+}
+
+/** Send the invite email (English or Spanish). See deliverInviteMail for the rules. */
+export function sendInviteEmail(to: string, input: InviteEmailInput, timeoutMs?: number) {
+  return deliverInviteMail({ to, ...inviteEmail(input) }, timeoutMs);
 }
 
 /** Company name plus the inviter's name and language, for the email. */
@@ -149,8 +170,13 @@ export async function inviteSenders(companyId: string, inviterId: string | null)
   };
 }
 
-/** Cancel pending invitations for this email in this company (a re-invite replaces them). */
-export async function cancelPendingInvitations(tx: Tx, companyId: string, email: string) {
+/** Cancel pending invitations for this email in this company, except `keepId` (a re-invite replaces them). */
+export async function cancelPendingInvitations(
+  tx: Tx,
+  companyId: string,
+  email: string,
+  keepId?: string,
+) {
   await tx
     .update(invitations)
     .set({ status: "canceled" })
@@ -159,6 +185,7 @@ export async function cancelPendingInvitations(tx: Tx, companyId: string, email:
         eq(invitations.organizationId, companyId),
         eq(invitations.email, email),
         eq(invitations.status, "pending"),
+        keepId ? ne(invitations.id, keepId) : undefined,
       ),
     );
 }

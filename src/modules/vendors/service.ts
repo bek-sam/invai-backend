@@ -22,7 +22,7 @@ import {
   vendorConnections,
 } from "../../db/schema";
 import { env } from "../../env";
-import { sendMail, vendorAdapter } from "../../integrations/vendors";
+import { vendorAdapter } from "../../integrations/vendors";
 import { type Actor, audit } from "../../lib/audit";
 import { randomToken } from "../../lib/crypto";
 import { badRequest, conflict, notFound, ORPCError, upstream } from "../../lib/errors";
@@ -39,6 +39,7 @@ import {
   transitionSheet,
 } from "../production/service";
 import {
+  deliverInviteMail,
   inviteExpiry,
   inviteLink,
   inviteSenders,
@@ -140,15 +141,25 @@ const slugify = (s: string) =>
  * Invite a DTF vendor by email. An email that already belongs to a vendor org links to it, but
  * the connection stays `invited` until that org accepts in its portal. Otherwise a vendor org is
  * created with a Better Auth organization invitation for that email. Until then sheets go by email.
+ *
+ * No transaction is open while the email goes out (idempotent-side-effect):
+ *   1. the vendor org and its invitation are committed (short system transaction);
+ *   2. the email is sent;
+ *   3. on success the shop's connection, audit row and `vendor.invited` event are committed; on
+ *      failure the new vendor org (and its invitation) is deleted and the call fails with
+ *      UPSTREAM_FAILED, so the shop never sees "invited" for a vendor who got nothing.
  */
-export async function inviteVendor(tx: Tx, ctx: TenantContext, input: VendorInviteInput) {
+export async function inviteVendor(ctx: TenantContext, input: VendorInviteInput) {
   const email = input.email.trim().toLowerCase();
-  const [dupEmail] = await tx
-    .select({ id: vendorConnections.id })
-    .from(vendorConnections)
-    .where(sql`lower(${vendorConnections.email}) = ${email}`)
-    .limit(1);
-  if (dupEmail) throw conflict("That vendor is already connected");
+  const assertNotConnected = async (tx: Tx) => {
+    const [dup] = await tx
+      .select({ id: vendorConnections.id })
+      .from(vendorConnections)
+      .where(sql`lower(${vendorConnections.email}) = ${email}`)
+      .limit(1);
+    if (dup) throw conflict("That vendor is already connected");
+  };
+  await withTenant(ctx.companyId, assertNotConnected);
 
   const existingOrg = await withSystem(async (stx) => {
     const [row] = await stx
@@ -199,63 +210,74 @@ export async function inviteVendor(tx: Tx, ctx: TenantContext, input: VendorInvi
     vendorCompanyId = created.orgId;
     invitation = created.invitation;
   }
-  const senders = await inviteSenders(ctx.companyId, ctx.userId);
-  const mail = {
-    ...senders,
-    kind: "vendor" as const,
-    role: "vendor" as const,
-    expiresAt: invitation?.expiresAt ?? inviteExpiry(VENDOR_INVITE_DAYS),
+  const removeNewOrg = async () => {
+    const orgId = vendorCompanyId;
+    if (invitation && orgId)
+      await withSystem((stx) => stx.delete(companies).where(eq(companies.id, orgId)));
   };
-  // The email goes out before the connection is saved: if it fails, the invite fails (and the
-  // vendor org made above is removed), so the shop never sees "invited" for a vendor who got nothing.
+
+  const senders = await inviteSenders(ctx.companyId, ctx.userId);
   try {
     if (invitation) {
-      await sendInviteEmail(email, { ...mail, link: inviteLink(invitation.id) });
+      await sendInviteEmail(email, {
+        ...senders,
+        kind: "vendor",
+        role: "vendor",
+        link: inviteLink(invitation.id),
+        expiresAt: invitation.expiresAt ?? inviteExpiry(VENDOR_INVITE_DAYS),
+      });
     } else {
       // Already has a vendor account: accepting is opening the shop list in their portal.
       const link = `${env.WEB_ORIGIN}/vendor/shops`;
-      await sendMail({
+      await deliverInviteMail({
         to: email,
         subject: `${senders.companyName} invited you to InvAI`,
         text: `${senders.companyName} wants to send you DTF gang sheets through InvAI.\n\nOpen your vendor portal to accept: ${link}\n\nUntil then, sheets arrive by email with download links.`,
       });
     }
   } catch (err) {
-    log.warn("vendor invite email failed", { error: String(err) });
-    const orgId = vendorCompanyId;
-    if (invitation && orgId)
-      await withSystem((stx) => stx.delete(companies).where(eq(companies.id, orgId)));
-    throw upstream("Invite email");
+    await removeNewOrg();
+    throw err;
   }
+
   // Always `invited`: even a known vendor org must accept (opening the shop list in its portal
   // activates the connection, see activatePending). Until then sheets go by email.
-  const [row] = await tx
-    .insert(vendorConnections)
-    .values({
-      companyId: ctx.companyId,
-      vendorCompanyId,
-      name: input.name,
-      email,
-      status: "invited",
-      delivery: "email",
-      spec: { ...DEFAULT_SHEET_SPEC, ...input.spec } as SheetSpec,
-      isDefault: input.isDefault,
-      turnaroundDays: input.turnaroundDays,
-      acceptedAt: null,
-    })
-    .returning();
-  if (!row) throw new Error("vendor connection insert failed");
-  if (input.isDefault) await clearDefault(tx, row.id);
-  await audit(tx, {
-    companyId: ctx.companyId,
-    actor: ctx.actor,
-    action: "vendor.invited",
-    entityType: "vendor_connection",
-    entityId: row.id,
-    summary: `Vendor ${input.name} <${email}> invited`,
-  });
-  await emit(tx, ctx.companyId, "vendor.invited", { vendorConnectionId: row.id, email });
-  return toVendorConnection(row, 0);
+  try {
+    return await withTenant(ctx.companyId, async (tx) => {
+      await assertNotConnected(tx);
+      const [row] = await tx
+        .insert(vendorConnections)
+        .values({
+          companyId: ctx.companyId,
+          vendorCompanyId,
+          name: input.name,
+          email,
+          status: "invited",
+          delivery: "email",
+          spec: { ...DEFAULT_SHEET_SPEC, ...input.spec } as SheetSpec,
+          isDefault: input.isDefault,
+          turnaroundDays: input.turnaroundDays,
+          acceptedAt: null,
+        })
+        .returning();
+      if (!row) throw new Error("vendor connection insert failed");
+      if (input.isDefault) await clearDefault(tx, row.id);
+      await audit(tx, {
+        companyId: ctx.companyId,
+        actor: ctx.actor,
+        action: "vendor.invited",
+        entityType: "vendor_connection",
+        entityId: row.id,
+        summary: `Vendor ${input.name} <${email}> invited`,
+      });
+      await emit(tx, ctx.companyId, "vendor.invited", { vendorConnectionId: row.id, email });
+      return toVendorConnection(row, 0);
+    });
+  } catch (err) {
+    // Someone connected the same vendor while the email was going out: don't leave an orphan org.
+    await removeNewOrg();
+    throw err;
+  }
 }
 
 export async function updateConnection(

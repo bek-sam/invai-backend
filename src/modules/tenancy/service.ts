@@ -2,7 +2,7 @@ import type { AuditEntry, Location, Me, Org, StationDevice, User } from "@invai/
 import { AUDIT_ACTIONS, ROLE_PERMISSIONS } from "@invai/contracts";
 import { and, asc, count, desc, eq, gte, inArray, lte, type SQL, sql } from "drizzle-orm";
 import type { Context, TenantContext } from "../../api/context";
-import { db, type Tx } from "../../db/client";
+import { db, type Tx, withTenant } from "../../db/client";
 import type { Address, Role, StationKind } from "../../db/schema";
 import {
   auditLog,
@@ -253,35 +253,86 @@ async function pendingInvitation(tx: Tx, companyId: string, id: string) {
 }
 
 /**
- * Invite someone by email: a Better Auth invitation (no user row until they sign up) and an
- * email with /accept-invite/<id>. Accepting makes them an active member with this role. A second
- * invite to the same email replaces the pending one. If the email can't be sent the request fails
- * and nothing is saved.
+ * team.invite: invite someone by email. A Better Auth invitation (no user row until they sign
+ * up) and an email with /accept-invite/<id>; accepting makes them an active member with this role.
+ *
+ * The email is sent with no transaction open, so a slow mail server never holds a pooled
+ * connection or a row lock (idempotent-side-effect):
+ *   1. `inviteUser` checks the team rules and commits a pending invitation (short transaction);
+ *   2. the email is sent;
+ *   3. on success a second short transaction replaces older invitations for this email and writes
+ *      the audit row; on failure it deletes the new invitation and the call fails with
+ *      UPSTREAM_FAILED, so "Invitation sent" always means sent.
+ */
+export async function inviteTeammate(
+  ctx: TenantContext,
+  input: { email: string; name: string; role: Role },
+): Promise<User> {
+  const invitation = await withTenant(ctx.companyId, (tx) => inviteUser(tx, ctx, input));
+  const senders = await inviteSenders(ctx.companyId, ctx.userId);
+  try {
+    await sendInviteEmail(invitation.email, {
+      ...senders,
+      kind: "staff",
+      role: input.role,
+      link: inviteLink(invitation.id),
+      expiresAt: invitation.expiresAt ?? inviteExpiry(STAFF_INVITE_DAYS),
+    });
+  } catch (err) {
+    await withTenant(ctx.companyId, (tx) =>
+      tx.delete(invitations).where(eq(invitations.id, invitation.id)),
+    );
+    throw err;
+  }
+  await withTenant(ctx.companyId, async (tx) => {
+    await cancelPendingInvitations(tx, ctx.companyId, invitation.email, invitation.id);
+    // Before invitations were real, an invite made a member row that could never sign in.
+    await tx
+      .delete(members)
+      .where(
+        and(
+          eq(members.organizationId, ctx.companyId),
+          eq(members.status, "invited"),
+          inArray(
+            members.userId,
+            tx.select({ id: users.id }).from(users).where(eq(users.email, invitation.email)),
+          ),
+        ),
+      );
+    await audit(tx, {
+      companyId: ctx.companyId,
+      actor: ctx.actor,
+      action: "team.invite",
+      entityType: "invitation",
+      entityId: invitation.id,
+      summary: `${input.name} invited as ${input.role}`,
+    });
+  });
+  return invitedUser(invitation, input.name);
+}
+
+/**
+ * Step 1 of `inviteTeammate`: check the team rules and write a pending invitation. Sends no
+ * email; the router calls `inviteTeammate`, which sends it after this transaction commits.
  */
 export async function inviteUser(
   tx: Tx,
   ctx: TenantContext,
   input: { email: string; name: string; role: Role },
-): Promise<User> {
+): Promise<typeof invitations.$inferSelect> {
+  if (!ctx.userId) throw forbidden("team.manage", "Sign in as a person to invite teammates");
   assertRoleFitsOrg(ctx, input.role);
   assertCanManage(ctx, null, input.role);
-  if (!ctx.userId) throw forbidden("team.manage", "Sign in as a person to invite teammates");
   const email = input.email.trim().toLowerCase();
   // users carries no RLS (Better Auth table), so the app role can look it up directly.
   const [existing] = await tx
-    .select({ userId: users.id, status: members.status })
+    .select({ status: members.status })
     .from(users)
     .innerJoin(members, eq(members.userId, users.id))
     .where(and(eq(users.email, email), eq(members.organizationId, ctx.companyId)))
     .limit(1);
   if (existing && existing.status !== "invited")
     throw conflict("That person is already on the team");
-  // Before invitations were real, an invite made a member row that could never sign in.
-  if (existing)
-    await tx
-      .delete(members)
-      .where(and(eq(members.userId, existing.userId), eq(members.organizationId, ctx.companyId)));
-  await cancelPendingInvitations(tx, ctx.companyId, email);
   const [invitation] = await tx
     .insert(invitations)
     .values({
@@ -294,23 +345,7 @@ export async function inviteUser(
     })
     .returning();
   if (!invitation) throw new Error("invitation insert failed");
-  await audit(tx, {
-    companyId: ctx.companyId,
-    actor: ctx.actor,
-    action: "team.invite",
-    entityType: "invitation",
-    entityId: invitation.id,
-    summary: `${input.name} invited as ${input.role}`,
-  });
-  const senders = await inviteSenders(ctx.companyId, ctx.userId);
-  await sendInviteEmail(email, {
-    ...senders,
-    kind: "staff",
-    role: input.role,
-    link: inviteLink(invitation.id),
-    expiresAt: invitation.expiresAt ?? inviteExpiry(STAFF_INVITE_DAYS),
-  });
-  return invitedUser(invitation, input.name);
+  return invitation;
 }
 
 export async function changeRole(

@@ -8,10 +8,30 @@ import { env } from "../../env";
 import { createCompany, createUser, tenantContext } from "../../test/fixtures";
 
 type Sent = { to: string; subject: string; text: string; html?: string };
-const mail = vi.hoisted(() => ({ sent: [] as Sent[], fail: false }));
+type AtSend = { busy: number; committed: boolean };
+const mail = vi.hoisted(() => ({
+  sent: [] as Sent[],
+  fail: false,
+  delayMs: 0,
+  atSend: [] as AtSend[],
+}));
 vi.mock("../../integrations/vendors/mailer", async (orig) => ({
   ...(await orig<typeof import("../../integrations/vendors/mailer")>()),
   sendMail: vi.fn(async (m: Sent) => {
+    // What the database looks like while the email goes out: connections checked out of either
+    // pool (an open transaction holds one), and whether the linked invitation is already
+    // committed (visible from a fresh connection).
+    const { appPool, systemPool, db: freshDb } = await import("../../db/client");
+    const { invitations: inv } = await import("../../db/schema");
+    const { eq: eqOp } = await import("drizzle-orm");
+    const busy =
+      appPool.totalCount - appPool.idleCount + systemPool.totalCount - systemPool.idleCount;
+    const id = m.text.match(/\/accept-invite\/([0-9a-f-]{36})/)?.[1];
+    const committed = id
+      ? (await freshDb.select({ id: inv.id }).from(inv).where(eqOp(inv.id, id))).length === 1
+      : false;
+    mail.atSend.push({ busy, committed });
+    if (mail.delayMs) await new Promise((r) => setTimeout(r, mail.delayMs));
     if (mail.fail) throw new Error("smtp down");
     mail.sent.push(m);
     return { messageId: `<${mail.sent.length}@test>` };
@@ -19,7 +39,7 @@ vi.mock("../../integrations/vendors/mailer", async (orig) => ({
 }));
 
 const svc = await import("./service");
-const { inviteEmail, invitePreview } = await import("./invites");
+const { inviteEmail, invitePreview, sendInviteEmail } = await import("./invites");
 
 const json = (body: unknown, cookie?: string) => ({
   method: "POST",
@@ -60,7 +80,7 @@ describe("team invites", () => {
   const uniqEmail = (p: string) =>
     `${p}-${Date.now()}-${Math.random().toString(36).slice(2)}@test.local`;
   const invite = (email: string, role: "office" | "presser" = "office") =>
-    withTenant(companyId, (tx) => svc.inviteUser(tx, owner, { email, name: "Rosa", role }));
+    svc.inviteTeammate(owner, { email, name: "Rosa", role });
 
   beforeAll(async () => {
     companyId = (await createCompany({ name: "Desert Test" })).id;
@@ -90,6 +110,53 @@ describe("team invites", () => {
       svc.listTeam(tx, owner, { limit: 50, includeDeactivated: false }),
     );
     expect(team.items.find((u) => u.id === user.id)?.status).toBe("invited");
+  });
+
+  it("sends the email after the invitation is committed, with no transaction open", async () => {
+    mail.atSend.length = 0;
+    const inv = await invite(uniqEmail("notx"));
+    expect(mail.atSend).toEqual([{ busy: 0, committed: true }]);
+    expect(mail.sent.at(-1)?.text).toContain(inv.id);
+  });
+
+  it("removes the committed invitation when the email fails, and keeps an older link working", async () => {
+    const email = uniqEmail("retry");
+    const first = await invite(email);
+    mail.fail = true;
+    mail.atSend.length = 0;
+    try {
+      await expect(invite(email, "presser")).rejects.toMatchObject({ code: "UPSTREAM_FAILED" });
+    } finally {
+      mail.fail = false;
+    }
+    // The failed invitation existed (committed) when the send was tried, and is gone now.
+    expect(mail.atSend).toEqual([{ busy: 0, committed: true }]);
+    const rows = await db.select().from(invitations).where(eq(invitations.email, email));
+    expect(rows.map((r) => [r.id, r.status])).toEqual([[first.id, "pending"]]);
+    expect(await invitePreview(first.id)).toMatchObject({ status: "pending" });
+  });
+
+  it("a mail server that hangs counts as not sent", async () => {
+    mail.delayMs = 500;
+    try {
+      await expect(
+        sendInviteEmail(
+          "slow@test.local",
+          {
+            locale: "en",
+            kind: "staff",
+            companyName: "Desert Test",
+            inviterName: null,
+            role: "office",
+            link: "http://web/accept-invite/x",
+            expiresAt: new Date(),
+          },
+          50,
+        ),
+      ).rejects.toMatchObject({ code: "UPSTREAM_FAILED" });
+    } finally {
+      mail.delayMs = 0;
+    }
   });
 
   it("a failed email fails the invite and saves nothing", async () => {

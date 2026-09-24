@@ -9,8 +9,9 @@ export const vendorsRouter = authed.vendors.router({
   get: authed.vendors.get.handler(({ input, context: { tenant } }) =>
     withTenant(tenant.companyId, (tx) => svc.getConnection(tx, tenant, input.id)),
   ),
+  // Not wrapped in withTenant: it runs its own short transactions around the email send.
   invite: authed.vendors.invite.handler(({ input, context: { tenant } }) =>
-    withTenant(tenant.companyId, (tx) => svc.inviteVendor(tx, tenant, input)),
+    svc.inviteVendor(tenant, input),
   ),
   update: authed.vendors.update.handler(({ input, context: { tenant } }) =>
     withTenant(tenant.companyId, (tx) => svc.updateConnection(tx, tenant, input)),

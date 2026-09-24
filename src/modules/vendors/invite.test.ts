@@ -7,10 +7,15 @@ import { env } from "../../env";
 import { createCompany, createUser, tenantContext } from "../../test/fixtures";
 
 type Sent = { to: string; subject: string; text: string; html?: string };
-const mail = vi.hoisted(() => ({ sent: [] as Sent[], fail: false }));
+const mail = vi.hoisted(() => ({ sent: [] as Sent[], fail: false, busyAtSend: [] as number[] }));
 vi.mock("../../integrations/vendors/mailer", async (orig) => ({
   ...(await orig<typeof import("../../integrations/vendors/mailer")>()),
   sendMail: vi.fn(async (m: Sent) => {
+    // Connections checked out of either pool while the email goes out (an open transaction).
+    const { appPool, systemPool } = await import("../../db/client");
+    mail.busyAtSend.push(
+      appPool.totalCount - appPool.idleCount + systemPool.totalCount - systemPool.idleCount,
+    );
     if (mail.fail) throw new Error("smtp down");
     mail.sent.push(m);
     return { messageId: `<${mail.sent.length}@test>` };
@@ -39,15 +44,13 @@ describe("vendor invitations need the vendor's acceptance", () => {
     const vendorUser = await createUser(vendorOrg, "vendor", { email });
     const vendor = tenantContext(vendorOrg, vendorUser.id, "vendor", "vendor");
 
-    const conn = await withTenant(shopId, (tx) =>
-      inviteVendor(tx, shop, {
-        name: "Known DTF",
-        email,
-        spec: {},
-        isDefault: false,
-        turnaroundDays: 2,
-      }),
-    );
+    const conn = await inviteVendor(shop, {
+      name: "Known DTF",
+      email,
+      spec: {},
+      isDefault: false,
+      turnaroundDays: 2,
+    });
     expect(conn.status).toBe("invited");
     const status = async () =>
       (
@@ -74,16 +77,15 @@ describe("vendor invitations need the vendor's acceptance", () => {
     const shopId = (await createCompany({ name: "Bloom Shop" })).id;
     const shop = tenantContext(shopId, (await createUser(shopId, "owner")).id, "owner");
     const email = `newvendor-${Date.now()}@test.local`;
-    const conn = await withTenant(shopId, (tx) =>
-      inviteVendor(tx, shop, {
-        name: "Fresh DTF",
-        email,
-        spec: {},
-        isDefault: false,
-        turnaroundDays: 2,
-      }),
-    );
+    const conn = await inviteVendor(shop, {
+      name: "Fresh DTF",
+      email,
+      spec: {},
+      isDefault: false,
+      turnaroundDays: 2,
+    });
     expect(conn.status).toBe("invited");
+    expect(mail.busyAtSend.at(-1)).toBe(0); // no transaction open while the email went out
     const m = mail.sent.at(-1);
     expect(m?.to).toBe(email);
     expect(m?.text).not.toContain("/vendor/accept");
@@ -139,20 +141,22 @@ describe("vendor invitations need the vendor's acceptance", () => {
     mail.fail = true;
     try {
       await expect(
-        withTenant(shopId, (tx) =>
-          inviteVendor(tx, shop, {
-            name: "Ghost DTF",
-            email,
-            spec: {},
-            isDefault: false,
-            turnaroundDays: 2,
-          }),
-        ),
+        inviteVendor(shop, {
+          name: "Ghost DTF",
+          email,
+          spec: {},
+          isDefault: false,
+          turnaroundDays: 2,
+        }),
       ).rejects.toMatchObject({ code: "UPSTREAM_FAILED" });
     } finally {
       mail.fail = false;
     }
     expect(await db.select().from(invitations).where(eq(invitations.email, email))).toHaveLength(0);
+    expect(await db.select().from(companies).where(eq(companies.name, "Ghost DTF"))).toHaveLength(
+      0,
+    );
+    expect(mail.busyAtSend.at(-1)).toBe(0);
     const conns = await withSystem((tx) =>
       tx
         .select()
