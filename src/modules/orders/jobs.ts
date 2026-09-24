@@ -1,19 +1,20 @@
 import { and, eq, inArray, isNotNull, isNull, lt, or } from "drizzle-orm";
 import { z } from "zod";
-import { withSystem } from "../../db/client";
-import { buyerPii, orders } from "../../db/schema";
+import { withSystem, withTenant } from "../../db/client";
+import { buyerPii, companies, orders } from "../../db/schema";
 import { env } from "../../env";
 import { errorData, logger } from "../../lib/log";
 import { defineJob, queues } from "../../lib/queues";
-import { deleteObject } from "../../lib/s3";
+import { deleteObject, listKeysOlderThan } from "../../lib/s3";
+import { forgetFiles } from "../files/service";
 
 const log = logger("orders.jobs");
 
 export const PII_RETENTION_DAYS = 30;
 
 /**
- * Buyer PII purge (cross-tenant): deletes `buyer_pii` rows 30 days after delivery (or past an
- * explicit `purgeAfter`) and the raw channel payload archive of those orders. The order keeps
+ * Buyer PII purge (cross-tenant): deletes `buyer_pii` rows 30 days after delivery (or after
+ * shipping/cancelling when no delivery event arrives, or past an explicit `purgeAfter`) and the raw channel payload archive of those orders. The order keeps
  * everything that is not personal (items, totals, states, profit).
  */
 export async function purgeBuyerPii(now = new Date()) {
@@ -28,8 +29,13 @@ export async function purgeBuyerPii(now = new Date()) {
           and(isNotNull(buyerPii.purgeAfter), lt(buyerPii.purgeAfter, now)),
           and(
             isNull(buyerPii.purgeAfter),
-            isNotNull(orders.deliveredAt),
-            lt(orders.deliveredAt, cutoff),
+            or(
+              lt(orders.deliveredAt, cutoff),
+              // No delivery event ever arrives for CSV channels or lost tracking: 30 days after
+              // shipping (or cancelling) is the fallback, so no order keeps PII forever.
+              and(isNull(orders.deliveredAt), lt(orders.shippedAt, cutoff)),
+              lt(orders.cancelledAt, cutoff),
+            ),
           ),
         ),
       ),
@@ -65,12 +71,43 @@ export async function purgeBuyerPii(now = new Date()) {
   return { purged: due.length, payloads };
 }
 
+/** Object kinds that carry buyer data: raw channel payloads, uploaded order CSVs, label PDFs. */
+export const PII_OBJECT_KINDS = ["raw", "csv", "label"] as const;
+
+/**
+ * Retention sweep for S3 (cross-tenant): objects of the PII kinds older than 30 days are
+ * deleted under every company prefix (`{companyId}/{kind}/...`), and their `files` rows go too.
+ * This also catches merged batch-label PDFs and CSVs that no table points at.
+ */
+export async function purgePiiObjects(now = new Date(), only?: string[]) {
+  const cutoff = new Date(now.getTime() - PII_RETENTION_DAYS * 86400_000);
+  const companyIds = only
+    ? only.map((id) => ({ id }))
+    : await withSystem((tx) => tx.select({ id: companies.id }).from(companies));
+  let deleted = 0;
+  for (const { id } of companyIds) {
+    const keys: string[] = [];
+    for (const kind of PII_OBJECT_KINDS)
+      keys.push(...(await listKeysOlderThan(`${id}/${kind}/`, cutoff)));
+    for (const key of keys) {
+      try {
+        await deleteObject(key);
+        deleted++;
+      } catch (err) {
+        log.warn("PII object delete failed", { key, ...errorData(err) });
+      }
+    }
+    if (keys.length) await withTenant(id, (tx) => forgetFiles(tx, keys));
+  }
+  return { objects: deleted };
+}
+
 export const purgeBuyerPiiJob = defineJob({
   queue: "reports",
   name: "orders.purgeBuyerPii",
   input: z.object({}).passthrough(),
   handler: async () => {
-    const res = await purgeBuyerPii();
+    const res = { ...(await purgeBuyerPii()), ...(await purgePiiObjects()) };
     log.info("buyer PII purge", res);
     return res;
   },

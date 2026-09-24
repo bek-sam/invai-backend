@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import {
   boolean,
   index,
@@ -72,6 +73,10 @@ export const channelConnections = pgTable(
   (t) => [
     index().on(t.companyId, t.channel),
     uniqueIndex().on(t.companyId, t.channel, t.externalShopId),
+    // A marketplace store is connected to at most one company (webhooks route by it).
+    uniqueIndex("channel_connections_connected_shop_uq")
+      .on(t.channel, t.externalShopId)
+      .where(sql`status = 'connected' and external_shop_id is not null`),
     tenantPolicy("channel_connections"),
   ],
 ).enableRLS();

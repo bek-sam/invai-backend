@@ -1,5 +1,5 @@
 import type { Permission, PresignedUpload, SignedDownload } from "@invai/contracts";
-import { eq, or } from "drizzle-orm";
+import { eq, inArray, or } from "drizzle-orm";
 import type { TenantContext } from "../../api/context";
 import { type Tx, withVendor } from "../../db/client";
 import { files, gangSheets } from "../../db/schema";
@@ -163,4 +163,9 @@ async function vendorCanRead(vendorCompanyId: string, key: string): Promise<bool
 /** Mark an uploaded key as ready (called by services once they consume it). */
 export async function markFileReady(tx: Tx, key: string) {
   await tx.update(files).set({ status: "ready" }).where(eq(files.key, key));
+}
+
+/** Drop `files` rows whose objects were deleted (retention sweep). */
+export async function forgetFiles(tx: Tx, keys: string[]) {
+  if (keys.length) await tx.delete(files).where(inArray(files.key, keys));
 }

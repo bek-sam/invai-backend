@@ -63,12 +63,69 @@ export function compileTemplate(template: string): RegExp {
   return new RegExp(`${re}$`, "i");
 }
 
+/*
+ * Regex rules are user input run in shared processes, so they are bounded against
+ * catastrophic backtracking (ReDoS): short patterns, no backreferences or lookarounds, no
+ * quantified group that itself contains a quantifier or an alternation (`(a+)+`, `(a|a)*`), and
+ * SKUs longer than MAX_SKU_MATCH_LEN are never run through a pattern.
+ */
+export const MAX_PATTERN_LEN = 200;
+export const MAX_SKU_MATCH_LEN = 128;
+
+/** Why a regex source is unsafe to run on user data, or null when it is fine. */
+export function unsafeRegexReason(source: string): string | null {
+  if (source.length > MAX_PATTERN_LEN) return `longer than ${MAX_PATTERN_LEN} characters`;
+  if (/\\[1-9]|\\k</.test(source)) return "backreferences are not allowed";
+  if (/\(\?<?[=!]/.test(source)) return "lookarounds are not allowed";
+  // Per open group: does it contain a quantifier or `|`? A quantifier right after its `)` nests.
+  const stack: { risky: boolean }[] = [];
+  let inClass = false;
+  for (let i = 0; i < source.length; i++) {
+    const ch = source[i];
+    if (ch === "\\") {
+      i++;
+      continue;
+    }
+    if (inClass) {
+      if (ch === "]") inClass = false;
+      continue;
+    }
+    if (ch === "[") inClass = true;
+    else if (ch === "(") stack.push({ risky: false });
+    else if (ch === ")") {
+      const group = stack.pop();
+      const next = source[i + 1];
+      const quantified = next === "+" || next === "*" || next === "{";
+      if (group?.risky && quantified) return "nested quantifiers are not allowed";
+      if (group?.risky && stack.length)
+        (stack[stack.length - 1] as { risky: boolean }).risky = true;
+    } else if (ch === "+" || ch === "*" || ch === "{" || ch === "|") {
+      const top = stack[stack.length - 1];
+      if (top) top.risky = true;
+    }
+  }
+  return null;
+}
+
+/** Run a rule pattern against a SKU, refusing SKUs long enough to make backtracking costly. */
+export function execSku(re: RegExp | null | undefined, sku: string): RegExpExecArray | null {
+  const s = sku.trim();
+  if (!re || s.length > MAX_SKU_MATCH_LEN) return null;
+  return re.exec(s);
+}
+
 export function compilePattern(
   patternType: RuleRow["patternType"],
   pattern: string,
 ): RegExp | null {
   if (patternType === "exact") return null;
-  if (patternType === "template") return compileTemplate(pattern);
+  if (patternType === "template") {
+    if (pattern.length > MAX_PATTERN_LEN)
+      throw badRequest(`Template is longer than ${MAX_PATTERN_LEN} characters`);
+    return compileTemplate(pattern);
+  }
+  const unsafe = unsafeRegexReason(pattern);
+  if (unsafe) throw badRequest(`Regex not allowed: ${unsafe}`);
   try {
     const re = new RegExp(pattern, "i");
     return re;
@@ -86,7 +143,7 @@ export function captureFields(
   if (patternType === "exact")
     return sku.trim().toLowerCase() === pattern.trim().toLowerCase() ? {} : null;
   const re = compilePattern(patternType, pattern);
-  const m = re?.exec(sku.trim());
+  const m = execSku(re, sku);
   if (!m) return null;
   const out: Partial<Record<SkuField, string>> = {};
   for (const [k, v] of Object.entries(m.groups ?? {})) {
@@ -232,8 +289,7 @@ export function buildMatcher(rules: RuleRow[], index: CatalogIndex): Matcher {
         if (r.patternType === "exact") {
           fields = sku.trim().toLowerCase() === r.pattern.trim().toLowerCase() ? {} : null;
         } else {
-          const re = compiled.get(r.id);
-          const m = re?.exec(sku.trim());
+          const m = execSku(compiled.get(r.id), sku);
           fields = m
             ? (Object.fromEntries(
                 Object.entries(m.groups ?? {}).filter(([k]) => FIELD_SET.has(k)),
@@ -778,7 +834,7 @@ export async function suggest(
     if (template && blankVariantId) {
       const re = compileTemplate(template);
       const would = unmappedSkus.filter((u) => {
-        const m = re.exec(u.sku);
+        const m = execSku(re, u.sku);
         return m && resolveFields(index, m.groups ?? {}).ok;
       }).length;
       rule = {

@@ -130,9 +130,9 @@ const slugify = (s: string) =>
     .slice(0, 40) || "vendor";
 
 /**
- * Invite a DTF vendor by email. An email that already belongs to a vendor org links to it and
- * the connection is active (portal delivery). Otherwise a vendor org is created with a Better
- * Auth organization invitation for that email; until the vendor signs in, sheets go by email.
+ * Invite a DTF vendor by email. An email that already belongs to a vendor org links to it, but
+ * the connection stays `invited` until that org accepts in its portal. Otherwise a vendor org is
+ * created with a Better Auth organization invitation for that email. Until then sheets go by email.
  */
 export async function inviteVendor(tx: Tx, ctx: TenantContext, input: VendorInviteInput) {
   const email = input.email.trim().toLowerCase();
@@ -185,7 +185,8 @@ export async function inviteVendor(tx: Tx, ctx: TenantContext, input: VendorInvi
       return org.id;
     });
   }
-  const active = !!existingOrg;
+  // Always `invited`: even a known vendor org must accept (opening the shop list in its portal
+  // activates the connection, see activatePending). Until then sheets go by email.
   const [row] = await tx
     .insert(vendorConnections)
     .values({
@@ -193,13 +194,13 @@ export async function inviteVendor(tx: Tx, ctx: TenantContext, input: VendorInvi
       vendorCompanyId,
       name: input.name,
       email,
-      status: active ? "active" : "invited",
-      delivery: active ? "portal" : "email",
+      status: "invited",
+      delivery: "email",
       spec: { ...DEFAULT_SHEET_SPEC, ...input.spec } as SheetSpec,
       isDefault: input.isDefault,
       turnaroundDays: input.turnaroundDays,
-      inviteToken: active ? null : token,
-      acceptedAt: active ? new Date() : null,
+      inviteToken: token,
+      acceptedAt: null,
     })
     .returning();
   if (!row) throw new Error("vendor connection insert failed");
@@ -210,24 +211,27 @@ export async function inviteVendor(tx: Tx, ctx: TenantContext, input: VendorInvi
     action: "vendor.invited",
     entityType: "vendor_connection",
     entityId: row.id,
-    summary: `Vendor ${input.name} <${email}> ${active ? "linked" : "invited"}`,
+    summary: `Vendor ${input.name} <${email}> invited`,
   });
   await emit(tx, ctx.companyId, "vendor.invited", { vendorConnectionId: row.id, email });
-  if (!active) {
-    const [shop] = await tx
-      .select({ name: companies.name })
-      .from(companies)
-      .where(eq(companies.id, ctx.companyId));
-    const link = `${env.WEB_ORIGIN}/vendor/accept?token=${encodeURIComponent(token)}&email=${encodeURIComponent(email)}`;
-    try {
-      await sendMail({
-        to: email,
-        subject: `${shop?.name ?? "A shop"} invited you to InvAI`,
-        text: `${shop?.name ?? "A shop"} wants to send you DTF gang sheets through InvAI.\n\nCreate your free vendor account: ${link}\n\nUntil then, sheets arrive by email with download links.`,
-      });
-    } catch (err) {
-      log.warn("invite email failed", { email, error: String(err) });
-    }
+  const [shop] = await tx
+    .select({ name: companies.name })
+    .from(companies)
+    .where(eq(companies.id, ctx.companyId));
+  const link = existingOrg
+    ? `${env.WEB_ORIGIN}/vendor/shops`
+    : `${env.WEB_ORIGIN}/vendor/accept?token=${encodeURIComponent(token)}&email=${encodeURIComponent(email)}`;
+  const shopName = shop?.name ?? "A shop";
+  try {
+    await sendMail({
+      to: email,
+      subject: `${shopName} invited you to InvAI`,
+      text: existingOrg
+        ? `${shopName} wants to send you DTF gang sheets through InvAI.\n\nOpen your vendor portal to accept: ${link}\n\nUntil then, sheets arrive by email with download links.`
+        : `${shopName} wants to send you DTF gang sheets through InvAI.\n\nCreate your free vendor account: ${link}\n\nUntil then, sheets arrive by email with download links.`,
+    });
+  } catch (err) {
+    log.warn("invite email failed", { email, error: String(err) });
   }
   return toVendorConnection(row, 0);
 }
@@ -306,8 +310,11 @@ export async function removeConnection(tx: Tx, ctx: TenantContext, id: string) {
 
 /* --------------------------------- delivery -------------------------------- */
 
-/** 7 days: the SigV4 maximum, long enough for a vendor to pick an emailed sheet up. */
-const EMAIL_LINK_TTL = 7 * 24 * 3600;
+/**
+ * 24 hours: emailed links are bearer URLs to the shop's artwork, and with IAM-role credentials a
+ * presigned URL cannot outlive the session anyway. Portal vendors re-sign on every download.
+ */
+const EMAIL_LINK_TTL = 24 * 3600;
 
 /**
  * Send a ready sheet to a vendor: portal = `vendor_access` grant + notification, email = SMTP with
@@ -392,7 +399,10 @@ export async function sendSheetToVendor(
 
 /* ------------------------------- vendor portal ------------------------------ */
 
-/** First portal use by the vendor org activates connections that were waiting on the invite. */
+/**
+ * Acceptance: a vendor user opening the shop list (vendorPortal.shops, where invited shops are
+ * listed) accepts every connection waiting on that vendor org.
+ */
 async function activatePending(vendorCompanyId: string) {
   await withSystem(async (stx) => {
     const rows = await stx
@@ -444,7 +454,6 @@ export type InboxInput = PageInput & {
 };
 
 export async function vendorInbox(ctx: TenantContext, input: InboxInput) {
-  await activatePending(ctx.companyId);
   return withVendor(ctx.companyId, async (tx) => {
     const page = keyset(gangSheets.createdAt, gangSheets.id, input);
     const base: (SQL | undefined)[] = [

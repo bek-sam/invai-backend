@@ -4,6 +4,7 @@ import {
   GetObjectCommand,
   HeadBucketCommand,
   HeadObjectCommand,
+  ListObjectsV2Command,
   PutObjectCommand,
   S3Client,
 } from "@aws-sdk/client-s3";
@@ -164,4 +165,19 @@ export async function s3Healthy(): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/** Keys under `prefix` last modified before `before` (paginated listing). */
+export async function listKeysOlderThan(prefix: string, before: Date): Promise<string[]> {
+  const out: string[] = [];
+  let token: string | undefined;
+  do {
+    const res = await s3.send(
+      new ListObjectsV2Command({ Bucket: bucket, Prefix: prefix, ContinuationToken: token }),
+    );
+    for (const o of res.Contents ?? [])
+      if (o.Key && o.LastModified && o.LastModified < before) out.push(o.Key);
+    token = res.IsTruncated ? res.NextContinuationToken : undefined;
+  } while (token);
+  return out;
 }

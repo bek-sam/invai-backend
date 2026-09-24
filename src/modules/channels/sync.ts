@@ -13,7 +13,7 @@ import {
 } from "../../integrations/channels/shopify";
 import type { HeaderBag } from "../../integrations/channels/types";
 import { audit } from "../../lib/audit";
-import { decryptJson, encryptField, encryptJson } from "../../lib/crypto";
+import { decryptJson, encryptField, encryptJson, safeEqual } from "../../lib/crypto";
 import { badRequest, conflict, notFound, ORPCError } from "../../lib/errors";
 import { errorData, logger } from "../../lib/log";
 import { emit } from "../../lib/outbox";
@@ -26,6 +26,7 @@ import {
   type ConnectionRow,
   getConnectionRow,
   markConnection,
+  shopifyConnectedElsewhere,
   toChannelConn,
   toImportReport,
 } from "./service";
@@ -327,7 +328,7 @@ export async function processWebhook(
   const event = await adapter.parseWebhook(headers, body);
   if (event.kind === "ignored") return { handled: false, reason: `topic ${event.topic} ignored` };
   if (!event.shopDomain) return { handled: false, reason: "no shop domain" };
-  const conns = await withSystem((tx) =>
+  const live = await withSystem((tx) =>
     tx
       .select()
       .from(channelConnections)
@@ -335,10 +336,11 @@ export async function processWebhook(
         and(
           eq(channelConnections.channel, channel),
           eq(channelConnections.externalShopId, event.shopDomain as string),
+          // Only installs that finished Shopify OAuth (pending rows never carry the domain).
+          eq(channelConnections.status, "connected"),
         ),
       ),
   );
-  const live = conns.filter((c) => c.status !== "disconnected");
   if (live.length === 0) return { handled: false, reason: `no connection for ${event.shopDomain}` };
   let orderIds: string[] = [];
   for (const conn of live) {
@@ -410,23 +412,26 @@ export async function completeShopifyOAuth(query: Record<string, string>) {
       .select()
       .from(channelConnections)
       .where(
-        and(
-          eq(channelConnections.channel, "shopify"),
-          eq(channelConnections.externalShopId, shop),
-          eq(channelConnections.status, "pending"),
-        ),
+        and(eq(channelConnections.channel, "shopify"), eq(channelConnections.status, "pending")),
       ),
   );
   const conn = pending.find((c) => {
     try {
+      const creds =
+        c.credentials && decryptJson<{ oauthState?: string; pendingShop?: string }>(c.credentials);
       return (
-        c.credentials && decryptJson<{ oauthState?: string }>(c.credentials).oauthState === state
+        !!creds &&
+        typeof creds.oauthState === "string" &&
+        safeEqual(creds.oauthState, state) &&
+        creds.pendingShop === shop
       );
     } catch {
       return false;
     }
   });
   if (!conn) throw notFound("pending Shopify connection");
+  if (await shopifyConnectedElsewhere(shop, conn.companyId))
+    throw conflict("This Shopify store is connected to another InvAI account");
 
   let credentials: Record<string, unknown> = { accessToken: "mock-token", scopes: [] };
   let name = conn.name;
@@ -439,12 +444,16 @@ export async function completeShopifyOAuth(query: Record<string, string>) {
     );
     name = done.shopName;
   }
+  const isUniqueViolation = (err: unknown) =>
+    (err as { cause?: { code?: string } }).cause?.code === "23505" ||
+    (err as { code?: string }).code === "23505";
   await withTenant(conn.companyId, async (tx) => {
     await tx
       .update(channelConnections)
       .set({
         status: "connected",
         name,
+        externalShopId: shop,
         credentials: encryptJson(credentials),
         connectedAt: new Date(),
         lastError: null,
@@ -459,6 +468,11 @@ export async function completeShopifyOAuth(query: Record<string, string>) {
       summary: `Shopify store ${shop} connected`,
     });
     await emit(tx, conn.companyId, "connection.connected", { connectionId: conn.id });
+  }).catch((err) => {
+    // channel_connections_connected_shop_uq: another company finished connecting this store.
+    if (isUniqueViolation(err))
+      throw conflict("This Shopify store is connected to another InvAI account");
+    throw err;
   });
   return { connectionId: conn.id, companyId: conn.companyId };
 }

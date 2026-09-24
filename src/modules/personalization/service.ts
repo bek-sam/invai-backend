@@ -25,7 +25,7 @@ import { logger } from "../../lib/log";
 import { emit } from "../../lib/outbox";
 import { keyset, type PageInput } from "../../lib/pagination";
 import { publish } from "../../lib/realtime";
-import { objectKey, presignGet } from "../../lib/s3";
+import { isCompanyKey, objectKey, presignGet } from "../../lib/s3";
 import { ARTWORK_ITEM_FLAGS, ARTWORK_TO_ITEM_FLAG, withFlags } from "../orders/flags";
 import { transitionItem } from "../orders/state-machine";
 
@@ -113,8 +113,14 @@ export async function getTemplate(tx: Tx, _ctx: TenantContext, id: string) {
   return toTemplate(row, (await designCounts(tx, [id])).get(id) ?? 0);
 }
 
+/** Background art must be an object this company uploaded; imaging reads it by key. */
+function assertOwnBackground(ctx: TenantContext, key: string | null | undefined) {
+  if (key && !isCompanyKey(ctx.companyId, key)) throw notFound("file");
+}
+
 export async function createTemplate(tx: Tx, ctx: TenantContext, input: TemplateInput) {
   validateSlots(input);
+  assertOwnBackground(ctx, input.backgroundKey);
   const [row] = await tx
     .insert(personalizationTemplates)
     .values({ companyId: ctx.companyId, ...input })
@@ -136,6 +142,7 @@ export async function updateTemplate(
   ctx: TenantContext,
   input: Partial<TemplateInput> & { id: string },
 ) {
+  assertOwnBackground(ctx, input.backgroundKey);
   const row = await templateRow(tx, input.id);
   const next = {
     name: input.name ?? row.name,

@@ -8,7 +8,7 @@ import {
 import { and, desc, eq, gt, inArray, sql } from "drizzle-orm";
 import type { z } from "zod";
 import type { TenantContext } from "../../api/context";
-import type { Tx } from "../../db/client";
+import { type Tx, withSystem } from "../../db/client";
 import {
   channelConnections,
   DEFAULT_CONNECTION_SETTINGS,
@@ -169,16 +169,51 @@ export async function getConnection(tx: Tx, _ctx: TenantContext, id: string) {
   return out as ChannelConnection;
 }
 
+/** The shop domain a pending Shopify install is for (only in its encrypted credentials). */
+export function pendingShopOf(row: Pick<ConnectionRow, "credentials">): string | null {
+  if (!row.credentials) return null;
+  try {
+    const c = decryptJson<ChannelCredentials>(row.credentials);
+    return typeof c.pendingShop === "string" ? c.pendingShop : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Cross-tenant check (system scope): is this shop already connected to another company? */
+export async function shopifyConnectedElsewhere(shop: string, companyId: string): Promise<boolean> {
+  const rows = await withSystem((stx) =>
+    stx
+      .select({ companyId: channelConnections.companyId })
+      .from(channelConnections)
+      .where(
+        and(
+          eq(channelConnections.channel, "shopify"),
+          eq(channelConnections.externalShopId, shop),
+          eq(channelConnections.status, "connected"),
+        ),
+      ),
+  );
+  return rows.some((r) => r.companyId !== companyId);
+}
+
 export async function connect(tx: Tx, ctx: TenantContext, input: ConnectInput) {
   if (input.channel === "shopify") {
     const shop = input.shopDomain;
-    const [existing] = await tx
+    // The shop domain is unproven until Shopify's OAuth callback: a pending row keeps it only in
+    // its encrypted credentials, and `external_shop_id` (which routes webhooks) is set on success.
+    if (await shopifyConnectedElsewhere(shop, ctx.companyId))
+      throw new ORPCError("ALREADY_CONNECTED", {
+        status: 409,
+        message: "This shop is connected to another InvAI account",
+      });
+    const rows = await tx
       .select()
       .from(channelConnections)
-      .where(
-        and(eq(channelConnections.channel, "shopify"), eq(channelConnections.externalShopId, shop)),
-      )
-      .limit(1);
+      .where(eq(channelConnections.channel, "shopify"));
+    const existing =
+      rows.find((r) => r.externalShopId === shop) ??
+      rows.find((r) => r.status === "pending" && pendingShopOf(r) === shop);
     if (existing && existing.status !== "disconnected" && existing.status !== "pending") {
       throw new ORPCError("ALREADY_CONNECTED", {
         status: 409,
@@ -192,7 +227,11 @@ export async function connect(tx: Tx, ctx: TenantContext, input: ConnectInput) {
       status: "pending" as const,
       mode: "api" as const,
       provider: provider as "mock" | "live",
-      credentials: encryptJson({ oauthState: state } satisfies ChannelCredentials),
+      externalShopId: null,
+      credentials: encryptJson({
+        oauthState: state,
+        pendingShop: shop,
+      } satisfies ChannelCredentials),
       lastError: null,
     };
     const row = existing
@@ -206,12 +245,7 @@ export async function connect(tx: Tx, ctx: TenantContext, input: ConnectInput) {
       : (
           await tx
             .insert(channelConnections)
-            .values({
-              companyId: ctx.companyId,
-              channel: "shopify",
-              externalShopId: shop,
-              ...values,
-            })
+            .values({ companyId: ctx.companyId, channel: "shopify", ...values })
             .returning()
         )[0];
     if (!row) throw new Error("connection insert failed");

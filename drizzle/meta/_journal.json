@@ -29,6 +29,13 @@
       "when": 1790235248428,
       "tag": "0003_vendor_policy_owner_match",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1790237763616,
+      "tag": "0005_connected_shop_unique",
+      "breakpoints": true
     }
   ]
 }
