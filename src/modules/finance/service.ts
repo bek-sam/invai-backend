@@ -12,7 +12,7 @@ import {
 import { and, asc, eq, gte, inArray, isNotNull, lt, lte, ne, type SQL, sql } from "drizzle-orm";
 import type { z } from "zod";
 import type { TenantContext } from "../../api/context";
-import type { Tx } from "../../db/client";
+import { afterCommit, type Tx } from "../../db/client";
 import {
   adSpend,
   blankVariants,
@@ -21,6 +21,7 @@ import {
   designFiles,
   designs,
   gangSheets,
+  jobs,
   orderItems,
   orders,
   profitLines,
@@ -32,6 +33,7 @@ import { col, parseCsvObjects } from "../../lib/csv";
 import { badRequest, notFound } from "../../lib/errors";
 import { emit } from "../../lib/outbox";
 import { keyset, type PageInput } from "../../lib/pagination";
+import { publish } from "../../lib/realtime";
 import { getObject } from "../../lib/s3";
 import {
   allocate,
@@ -1012,4 +1014,73 @@ export async function orderProfit(
       ["channelFees", "blankCost", "transferCost", "labelCost", "adsCost"].includes(e),
     ),
   };
+}
+
+/* ------------------------------ recompute jobs ------------------------------- */
+
+export const RECOMPUTE_DEFAULT_DAYS = 90;
+
+/** Create the user-visible `jobs` row for a recompute; the caller enqueues after commit. */
+export async function createRecomputeJob(
+  tx: Tx,
+  ctx: Ctx,
+  period?: Period,
+): Promise<{ jobId: string; from: string; to: string }> {
+  const to = period?.to ?? new Date(Date.now() + 86400_000).toISOString();
+  const from =
+    period?.from ?? new Date(Date.now() - RECOMPUTE_DEFAULT_DAYS * 86400_000).toISOString();
+  if (new Date(from) >= new Date(to)) throw badRequest("period.from must be before period.to");
+  const [row] = await tx
+    .insert(jobs)
+    .values({
+      companyId: ctx.companyId,
+      kind: "profit_recompute",
+      status: "queued",
+      input: { from, to },
+      createdBy: ctx.userId ?? null,
+      message: "Queued",
+    })
+    .returning({ id: jobs.id });
+  if (!row) throw new Error("job insert failed");
+  return { jobId: row.id, from, to };
+}
+
+export async function setJobState(
+  tx: Tx,
+  companyId: string,
+  jobId: string,
+  patch: {
+    status: "queued" | "running" | "done" | "failed";
+    progress?: number;
+    message?: string | null;
+    error?: string | null;
+    resultIds?: string[];
+  },
+) {
+  const done = patch.status === "done" || patch.status === "failed";
+  const [row] = await tx
+    .update(jobs)
+    .set({
+      status: patch.status,
+      progress: patch.progress ?? (done ? 1 : undefined),
+      message: patch.message,
+      error: patch.error,
+      resultIds: patch.resultIds,
+      finishedAt: done ? new Date() : undefined,
+      updatedAt: new Date(),
+    })
+    .where(and(eq(jobs.companyId, companyId), eq(jobs.id, jobId)))
+    .returning();
+  if (row) {
+    afterCommit(tx, () =>
+      publish(companyId, "job.progress", {
+        jobId: row.id,
+        kind: row.kind,
+        status: row.status,
+        progress: row.progress,
+        message: row.message,
+        resultIds: row.resultIds,
+      }).then(() => undefined),
+    );
+  }
 }

@@ -60,7 +60,19 @@ export function finalize(b: Omit<Buckets, "net" | "marginPct">): Buckets {
     b.laborCost -
     b.adsCost -
     b.refunds;
-  return { ...b, net, marginPct: b.revenue > 0 ? net / b.revenue : null };
+  return {
+    revenue: b.revenue,
+    channelFees: b.channelFees,
+    blankCost: b.blankCost,
+    transferCost: b.transferCost,
+    labelCost: b.labelCost,
+    packagingCost: b.packagingCost,
+    laborCost: b.laborCost,
+    adsCost: b.adsCost,
+    refunds: b.refunds,
+    net,
+    marginPct: b.revenue > 0 ? net / b.revenue : null,
+  };
 }
 
 /** Sum bucket rows and recompute net/margin. */

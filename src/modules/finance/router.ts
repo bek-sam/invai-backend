@@ -1,11 +1,52 @@
-import { contract } from "@invai/contracts";
-import { authed, stubRouter } from "../../api/orpc";
-
-/*
- * finance routers. Every procedure starts as a NOT_IMPLEMENTED stub; replace entries as you
- * implement them (see src/modules/catalog/router.ts and src/modules/README.md).
- */
+import { authed } from "../../api/orpc";
+import { afterCommit, withTenant } from "../../db/client";
+import { recomputeJob } from "./jobs";
+import * as svc from "./service";
 
 export const financeRouter = authed.finance.router({
-  ...stubRouter(authed.finance, contract.finance, ["finance"]),
+  costSettings: {
+    get: authed.finance.costSettings.get.handler(({ context: { tenant } }) =>
+      withTenant(tenant.companyId, (tx) => svc.getCostSettings(tx, tenant)),
+    ),
+    update: authed.finance.costSettings.update.handler(({ input, context: { tenant } }) =>
+      withTenant(tenant.companyId, (tx) => svc.updateCostSettings(tx, tenant, input)),
+    ),
+  },
+  adSpend: {
+    list: authed.finance.adSpend.list.handler(({ input, context: { tenant } }) =>
+      withTenant(tenant.companyId, (tx) => svc.listAdSpend(tx, tenant, input)),
+    ),
+    create: authed.finance.adSpend.create.handler(({ input, context: { tenant } }) =>
+      withTenant(tenant.companyId, (tx) => svc.createAdSpend(tx, tenant, input)),
+    ),
+    update: authed.finance.adSpend.update.handler(({ input, context: { tenant } }) =>
+      withTenant(tenant.companyId, (tx) => svc.updateAdSpend(tx, tenant, input)),
+    ),
+    delete: authed.finance.adSpend.delete.handler(({ input, context: { tenant } }) =>
+      withTenant(tenant.companyId, (tx) => svc.deleteAdSpend(tx, tenant, input.id)),
+    ),
+    importCsv: authed.finance.adSpend.importCsv.handler(({ input, context: { tenant } }) =>
+      withTenant(tenant.companyId, (tx) => svc.importAdSpendCsv(tx, tenant, input.fileKey)),
+    ),
+  },
+  profit: authed.finance.profit.handler(({ input, context: { tenant } }) =>
+    withTenant(tenant.companyId, (tx) => svc.getProfit(tx, tenant, input)),
+  ),
+  orderProfit: authed.finance.orderProfit.handler(({ input, context: { tenant } }) =>
+    withTenant(tenant.companyId, (tx) => svc.orderProfit(tx, tenant, input.orderId)),
+  ),
+  recompute: authed.finance.recompute.handler(({ input, context: { tenant } }) =>
+    withTenant(tenant.companyId, async (tx) => {
+      const job = await svc.createRecomputeJob(tx, tenant, input.period);
+      afterCommit(tx, async () => {
+        await recomputeJob.enqueue({
+          companyId: tenant.companyId,
+          from: job.from,
+          to: job.to,
+          jobRowId: job.jobId,
+        });
+      });
+      return { jobId: job.jobId };
+    }),
+  ),
 });
