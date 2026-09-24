@@ -83,7 +83,7 @@ export const auth = betterAuth({
     window: 60,
     max: 100,
     customRules: {
-      "/sign-in/email": { window: 60, max: 10 },
+      "/sign-in/email": { window: 60, max: 20 }, // per IP; a shop office shares one IP
       "/sign-up/email": { window: 60, max: 5 },
       "/organization/create": { window: 60, max: 5 },
     },
