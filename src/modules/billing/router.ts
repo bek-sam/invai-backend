@@ -1,11 +1,15 @@
-import { contract } from "@invai/contracts";
-import { authed, stubRouter } from "../../api/orpc";
-
-/*
- * billing routers. Every procedure starts as a NOT_IMPLEMENTED stub; replace entries as you
- * implement them (see src/modules/catalog/router.ts and src/modules/README.md).
- */
+import { authed } from "../../api/orpc";
+import { withTenant } from "../../db/client";
+import * as svc from "./service";
 
 export const billingRouter = authed.billing.router({
-  ...stubRouter(authed.billing, contract.billing, ["billing"]),
+  get: authed.billing.get.handler(({ context: { tenant } }) =>
+    withTenant(tenant.companyId, (tx) => svc.getStatus(tx, tenant)),
+  ),
+  plans: authed.billing.plans.handler(({ context: { tenant } }) =>
+    withTenant(tenant.companyId, (tx) => svc.listPlans(tx)),
+  ),
+  changePlan: authed.billing.changePlan.handler(({ input, context: { tenant } }) =>
+    withTenant(tenant.companyId, (tx) => svc.changePlan(tx, tenant, input.plan)),
+  ),
 });
