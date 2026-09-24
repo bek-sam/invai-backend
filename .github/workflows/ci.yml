@@ -41,6 +41,10 @@ jobs:
       REDIS_URL: redis://localhost:6379
       S3_BUCKET: invai-ci
       S3_ENDPOINT: http://localhost:9000
+      S3_REGION: us-east-1
+      S3_ACCESS_KEY_ID: invai
+      S3_SECRET_ACCESS_KEY: invai-secret
+      S3_FORCE_PATH_STYLE: "true"
       IMAGING_URL: http://localhost:8000
       BETTER_AUTH_SECRET: ci-only-secret-32-chars-minimum-xxxx
       BETTER_AUTH_URL: http://localhost:3000
@@ -98,5 +102,16 @@ jobs:
           ALTER DEFAULT PRIVILEGES FOR ROLE invai IN SCHEMA public
             GRANT USAGE, SELECT ON SEQUENCES TO invai_app;
           SQL
+      # MinIO needs a `server` command, which job services can't pass, so it runs as a step.
+      - name: Start MinIO (S3 for presign, upload and retention tests)
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=invai -e MINIO_ROOT_PASSWORD=invai-secret \
+            quay.io/minio/minio server /data
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:9000/minio/health/live && exit 0
+            sleep 1
+          done
+          echo "MinIO did not start" && docker logs minio && exit 1
       - run: pnpm run --if-present db:migrate
       - run: pnpm run --if-present test
