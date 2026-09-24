@@ -1107,7 +1107,7 @@ async function markSubmitted(
   tx: Tx,
   ctx: Ctx,
   po: PoRow,
-  result: SupplierOrderResult | null,
+  result: SupplierOrderResult,
   provider: string,
 ) {
   await tx
@@ -1116,8 +1116,8 @@ async function markSubmitted(
       status: "submitted",
       submittedAt: new Date(),
       submitAttemptedAt: null,
-      supplierOrderId: result?.supplierOrderId ?? null,
-      expectedAt: po.expectedAt ?? (result?.expectedAt ? new Date(result.expectedAt) : null),
+      supplierOrderId: result.supplierOrderId,
+      expectedAt: po.expectedAt ?? (result.expectedAt ? new Date(result.expectedAt) : null),
     })
     .where(eq(purchaseOrders.id, po.id));
   await emit(tx, ctx.companyId, "po.submitted", { purchaseOrderId: po.id, supplier: po.supplier });
@@ -1127,9 +1127,7 @@ async function markSubmitted(
     action: "purchase_order.submit",
     entityType: "purchase_order",
     entityId: po.id,
-    summary: result
-      ? `${po.poNo} submitted to ${po.supplier} (${provider}) as ${result.supplierOrderId}`
-      : `${po.poNo} marked submitted; ${po.supplier} has no ordering API, so place it with the supplier`,
+    summary: `${po.poNo} submitted to ${po.supplier} (${provider}) as ${result.supplierOrderId}`,
   });
 }
 
@@ -1165,9 +1163,12 @@ export async function submitPo(ctx: Ctx, id: string): Promise<PurchaseOrder> {
       .where(eq(purchaseOrderLines.purchaseOrderId, po.id));
     if (!lines.length) throw badRequest("A purchase order needs at least one line");
     const adapter = await supplierAdapterFor(tx, ctx.companyId, po.supplier);
+    // Production, supplier with no ordering API (SanMar until B-36, "other"): refuse rather
+    // than report `submitted` for an order nobody placed. Marking a PO placed by hand is B-86.
     if (!adapter) {
-      await markSubmitted(tx, ctx, po, null, "manual");
-      return { kind: "done" };
+      throw conflict(
+        "This supplier has no connection yet. Place the order with the supplier directly.",
+      );
     }
     const blanks = await tx
       .select()

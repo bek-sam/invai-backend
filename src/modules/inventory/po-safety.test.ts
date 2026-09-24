@@ -117,10 +117,10 @@ describe("purchase order supplier safety", () => {
     vi.mocked(outbox.emit).mockClear();
   });
 
-  async function draftPo() {
+  async function draftPo(supplier: "ssactivewear" | "sanmar" | "other" = "ssactivewear") {
     return withTenant(companyId, (tx) =>
       svc.createPo(tx, ctx, {
-        supplier: "ssactivewear",
+        supplier,
         lines: blankIds.map((id) => ({ blankVariantId: id, qty: 10 })),
         freight: 0,
         expectedAt: null,
@@ -177,6 +177,45 @@ describe("purchase order supplier safety", () => {
         message: expect.stringMatching(/Connect your S&S Activewear account/),
       });
       expect((await row(po.id)).status).toBe("draft");
+    });
+
+    it("refuses in production for a supplier with no ordering API, and fakes nothing", async () => {
+      vi.mocked(suppliersModule.getSupplierAdapter).mockImplementation((s, c, o) =>
+        (realGetAdapter as typeof suppliersModule.getSupplierAdapter)(s, c, {
+          ...o,
+          production: true,
+        }),
+      );
+      for (const supplier of ["sanmar", "other"] as const) {
+        const po = await draftPo(supplier);
+        await expect(svc.submitPo(ctx, po.id)).rejects.toMatchObject({
+          code: "CONFLICT",
+          message:
+            "This supplier has no connection yet. Place the order with the supplier directly.",
+        });
+        expect(await row(po.id)).toMatchObject({
+          status: "draft",
+          supplierOrderId: null,
+          submittedAt: null,
+          submitAttemptedAt: null,
+        });
+      }
+      expect(vi.mocked(outbox.emit)).not.toHaveBeenCalledWith(
+        expect.anything(),
+        companyId,
+        "po.submitted",
+        expect.anything(),
+      );
+    });
+
+    it("outside production a supplier with no API still uses the mock", async () => {
+      vi.mocked(suppliersModule.getSupplierAdapter).mockImplementation(realGetAdapter as never);
+      const po = await draftPo("sanmar");
+      const submitted = await svc.submitPo(ctx, po.id);
+      expect(submitted).toMatchObject({
+        status: "submitted",
+        supplierOrderId: expect.stringMatching(/^MOCK-SAN-/),
+      });
     });
   });
 

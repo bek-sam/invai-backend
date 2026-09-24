@@ -35,7 +35,7 @@ export function supplierProvider(
  * The adapter for a company's supplier account. Only the company's own credentials make it
  * live: a tenant never orders on InvAI's account. Without them, development and tests get the
  * mock; production throws `SupplierNotConnectedError` for an API supplier and returns null for a
- * supplier with no API (the owner orders by hand; nothing is faked).
+ * supplier with no API (callers refuse to order; nothing is faked).
  */
 export function getSupplierAdapter(
   supplier: string,
