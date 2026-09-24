@@ -55,7 +55,7 @@ export function mockZone(fromZip: string, toZip: string): number {
   const a = Number.parseInt(fromZip.replace(/\D/g, "").slice(0, 3), 10);
   const b = Number.parseInt(toZip.replace(/\D/g, "").slice(0, 3), 10);
   if (Number.isNaN(a) || Number.isNaN(b)) return 5;
-  return Math.min(8, 1 + Math.floor(Math.abs(a - b) / 110));
+  return Math.min(8, 1 + Math.floor(Math.abs(a - b) / 100));
 }
 
 function digits(seed: string, n: number): string {
