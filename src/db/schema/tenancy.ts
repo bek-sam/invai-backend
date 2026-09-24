@@ -23,8 +23,8 @@ import {
 } from "./_shared";
 
 /*
- * Better Auth tables (users, sessions, accounts, verifications, companies, members, invitations)
- * are NOT tenant tables: authentication runs before the tenant is known, so they carry no RLS.
+ * Better Auth tables (users, sessions, accounts, verifications, two_factors, companies, members,
+ * invitations) are NOT tenant tables: authentication runs before the tenant is known, so they carry no RLS.
  * Only src/auth.ts and modules/tenancy touch them. Every other table in this file is a tenant
  * table with `company_id` and a policy.
  */
@@ -37,6 +37,8 @@ export const users = pgTable("users", {
   image: text(),
   locale: text().notNull().default("en"),
   lastSeenAt: timestamp({ withTimezone: true }),
+  /** Better Auth twoFactor plugin: true once the user confirmed an authenticator code. */
+  twoFactorEnabled: boolean().notNull().default(false),
   ...timestamps,
 });
 
@@ -116,6 +118,28 @@ export const verifications = pgTable(
     ...timestamps,
   },
   (t) => [index().on(t.identifier)],
+);
+
+/**
+ * Better Auth twoFactor plugin (`twoFactor` model): the TOTP secret and backup codes, both
+ * encrypted by Better Auth with BETTER_AUTH_SECRET. One row per user; `verified` stays false until
+ * the first authenticator code is confirmed.
+ */
+export const twoFactors = pgTable(
+  "two_factors",
+  {
+    id: id(),
+    userId: uuid()
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    secret: text().notNull(),
+    backupCodes: text().notNull(),
+    verified: boolean().notNull().default(true),
+    failedVerificationCount: integer().notNull().default(0),
+    lockedUntil: timestamp({ withTimezone: true }),
+    createdAt: createdAt(),
+  },
+  (t) => [uniqueIndex().on(t.userId)],
 );
 
 export const ROLES = [

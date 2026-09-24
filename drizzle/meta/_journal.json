@@ -78,6 +78,13 @@
       "when": 1790284346804,
       "tag": "0010_billing_webhook_events_system_writes",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1790284420253,
+      "tag": "0011_auth_security",
+      "breakpoints": true
     }
   ]
 }
