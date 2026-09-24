@@ -10,7 +10,7 @@ import { defaultLocationId as tenancyDefaultLocationId } from "../tenancy/servic
  * The stock ledger. Every stock change is one append-only `inventory_movements` row plus a
  * delta on the `stock_levels` cache in the same transaction. Sign conventions:
  *   receive/return/adjust/count/scrap/consume  -> qty changes onHand (signed)
- *   reserve (+n) / release (-n)                -> qty changes reserved only
+ *   reserve (+n) / release (+n)                -> reserved += n / reserved -= n (onHand untouched)
  * available = onHand - reserved.
  */
 
@@ -19,7 +19,8 @@ export function movementDelta(
   kind: MovementKind,
   qty: number,
 ): { onHand: number; reserved: number } {
-  if (kind === "reserve" || kind === "release") return { onHand: 0, reserved: qty };
+  if (kind === "reserve") return { onHand: 0, reserved: qty };
+  if (kind === "release") return { onHand: 0, reserved: -qty };
   return { onHand: qty, reserved: 0 };
 }
 
@@ -210,7 +211,7 @@ async function itemLedger(tx: Tx, companyId: string, itemIds: string[]) {
       e.locationId = r.locationId;
     } else if (r.kind === "release") {
       e.releases += r.n;
-      e.reserved += r.qty;
+      e.reserved -= r.qty;
     } else if (r.kind === "consume") e.consumes += r.n;
     else if (r.kind === "scrap") e.scraps += r.n;
     out.set(r.refId, e);
@@ -269,7 +270,7 @@ export async function releaseForItems(tx: Tx, ctx: Ctx, itemIds: string[]): Prom
       blankVariantId: item.blankVariantId,
       locationId: l.locationId ?? fallback,
       kind: "release",
-      qty: -l.reserved,
+      qty: l.reserved,
       refType: "order_item",
       refId: item.id,
       idempotencyKey: `release:order_item:${item.id}:${l.releases}`,
@@ -299,7 +300,7 @@ export async function consumeForItem(
       blankVariantId: item.blankVariantId,
       locationId,
       kind: "release",
-      qty: -l.reserved,
+      qty: l.reserved,
       refType: "order_item",
       refId: item.id,
       idempotencyKey: `release:order_item:${item.id}:${l.releases}`,
