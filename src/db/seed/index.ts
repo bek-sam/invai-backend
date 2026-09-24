@@ -5,7 +5,9 @@ import { systemContext } from "../../api/context";
 import { auth } from "../../auth";
 import { imaging } from "../../integrations/imaging/client";
 import { logger } from "../../lib/log";
+import { PLAN_CATALOG } from "../../modules/billing/service";
 import { bulkImportBlanks, createDesign, createProduct } from "../../modules/catalog/service";
+import { shelfFor } from "../../modules/inventory/shelves";
 import { transitionItem } from "../../modules/orders/state-machine";
 import { issueStationToken, setPin } from "../../modules/tenancy/floor-auth";
 import { closeDb, systemDb, withSystem } from "../client";
@@ -95,61 +97,7 @@ async function signUp(email: string, name: string): Promise<string> {
 }
 
 async function seedGlobals() {
-  await systemDb
-    .insert(plans)
-    .values([
-      {
-        key: "trial",
-        name: "Trial",
-        priceMonthlyCents: 0,
-        ordersPerMonth: 200,
-        aiCreditsPerMonth: 50,
-        labelFeeCents: 0,
-        maxUsers: 3,
-        maxConnections: 2,
-      },
-      {
-        key: "starter",
-        name: "Starter",
-        priceMonthlyCents: 4900,
-        ordersPerMonth: 1000,
-        aiCreditsPerMonth: 200,
-        labelFeeCents: 5,
-        maxUsers: 5,
-        maxConnections: 3,
-      },
-      {
-        key: "growth",
-        name: "Growth",
-        priceMonthlyCents: 14900,
-        ordersPerMonth: 5000,
-        aiCreditsPerMonth: 1000,
-        labelFeeCents: 4,
-        maxUsers: 15,
-        maxConnections: 6,
-      },
-      {
-        key: "pro",
-        name: "Pro",
-        priceMonthlyCents: 34900,
-        ordersPerMonth: 20000,
-        aiCreditsPerMonth: 4000,
-        labelFeeCents: 3,
-        maxUsers: 40,
-        maxConnections: 12,
-      },
-      {
-        key: "scale",
-        name: "Scale",
-        priceMonthlyCents: 79900,
-        ordersPerMonth: null,
-        aiCreditsPerMonth: 15000,
-        labelFeeCents: 2,
-        maxUsers: null,
-        maxConnections: null,
-      },
-    ])
-    .onConflictDoNothing();
+  await systemDb.insert(plans).values(PLAN_CATALOG).onConflictDoNothing();
   await systemDb
     .insert(trademarkMarks)
     .values(
@@ -1367,6 +1315,19 @@ async function main() {
         now()
       from inventory_movements where company_id = ${shopId}
       group by company_id, blank_variant_id, location_id`);
+    // Shelf labels for the pick queue: one bay per style, one shelf per color, one bin per size.
+    const colorsByStyle = new Map<string, string[]>();
+    for (const b of blanks) {
+      const list = colorsByStyle.get(b.styleCode) ?? [];
+      if (!list.includes(b.colorCode)) list.push(b.colorCode);
+      colorsByStyle.set(b.styleCode, list);
+    }
+    for (const b of blanks) {
+      await tx
+        .update(stockLevels)
+        .set({ shelf: shelfFor(b, undefined, colorsByStyle.get(b.styleCode)) })
+        .where(and(eq(stockLevels.companyId, shopId), eq(stockLevels.blankVariantId, b.id)));
+    }
     const low = await tx
       .select({
         variantId: stockLevels.blankVariantId,
