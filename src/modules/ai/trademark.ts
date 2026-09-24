@@ -22,7 +22,7 @@ export type TmMatch = TrademarkCheck["matches"][number] & {
   risk: number;
 };
 
-/** Same normalization as the seed (src/db/seed/trademarks.ts). */
+/** Same normalization as the reference data (src/db/reference/trademarks.ts). */
 export function normalizeText(text: string): string {
   return text
     .toLowerCase()

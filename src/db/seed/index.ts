@@ -43,7 +43,6 @@ import {
   stockLevels,
   subscriptions,
   suppliers,
-  trademarkMarks,
   transfers,
   usage,
   users,
@@ -62,7 +61,6 @@ import {
   STREETS,
   TEMPLATES,
 } from "./data";
-import { normalizeMark, TRADEMARK_MARKS } from "./trademarks";
 
 /*
  * Demo seed: "Desert Bloom Tees" (v1-plan 5.4). Runs as the owner role. Idempotent-ish: it
@@ -98,23 +96,10 @@ async function signUp(email: string, name: string): Promise<string> {
 }
 
 async function seedGlobals() {
+  // Trademark marks are no longer seeded here: `ensureReferenceData` (src/db/reference)
+  // upserts them at the end of every `pnpm db:migrate`, which always runs before this script.
   await systemDb.insert(plans).values(PLAN_CATALOG).onConflictDoNothing();
-  await systemDb
-    .insert(trademarkMarks)
-    .values(
-      TRADEMARK_MARKS.map((m) => ({
-        mark: m.mark,
-        normalized: normalizeMark(m.mark),
-        owner: m.owner,
-        kind: m.kind,
-        status: "live" as const,
-        classes: [25],
-        serialNo: null,
-        source: "seed",
-      })),
-    )
-    .onConflictDoNothing();
-  log.info("globals", { plans: 5, trademarks: TRADEMARK_MARKS.length });
+  log.info("globals", { plans: 5 });
 }
 
 async function main() {

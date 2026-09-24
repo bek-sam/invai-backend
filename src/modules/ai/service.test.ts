@@ -3,28 +3,16 @@ import { eq } from "drizzle-orm";
 import { beforeAll, describe, expect, it } from "vitest";
 import { assertCredits } from "../../ai/credits";
 import { withSystem, withTenant } from "../../db/client";
-import { designs, listingDrafts, trademarkMarks, usage } from "../../db/schema";
-import { normalizeMark, TRADEMARK_MARKS } from "../../db/seed/trademarks";
+import { designs, listingDrafts, usage } from "../../db/schema";
 import { createCompany, createUser, tenantContext } from "../../test/fixtures";
 import { periodOf } from "../billing/service";
 import * as svc from "./service";
 import { combineRisk, matchRisk } from "./trademark";
 
-async function seedMarks() {
-  await withSystem((tx) =>
-    tx
-      .insert(trademarkMarks)
-      .values(
-        TRADEMARK_MARKS.map((m) => ({
-          mark: m.mark,
-          normalized: normalizeMark(m.mark),
-          owner: m.owner,
-          kind: m.kind,
-        })),
-      )
-      .onConflictDoNothing(),
-  );
-}
+// Trademark marks (and the plan catalog) are no longer seeded per test file: the global test
+// setup runs `runMigrations`, which calls `ensureReferenceData` (src/db/reference), so
+// `trademark_marks` is already populated before this file's tests run. See
+// src/db/reference/index.test.ts for the migration-time guarantee itself.
 
 describe("trademark scoring", () => {
   it("combines match risks", () => {
@@ -70,7 +58,6 @@ describe("ai module", () => {
   let designId: string;
 
   beforeAll(async () => {
-    await seedMarks();
     companyId = (await createCompany()).id;
     const owner = await createUser(companyId, "owner");
     ctx = tenantContext(companyId, owner.id, "owner");

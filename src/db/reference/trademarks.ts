@@ -2,6 +2,10 @@
  * Sample class-25 trademark index for the risk check (global table, not tenant data).
  * A stand-in for the USPTO bulk build: well-known apparel/brand marks, slogans, characters and
  * a list of generic words that should never raise risk. Invented plausibly, not legal data.
+ *
+ * This is InvAI's versioned reference dataset (T-1-5, `REFERENCE_DATA_VERSION` in `./index.ts`),
+ * not seed data: it is upserted by `ensureReferenceData` at the end of every migration run, so it
+ * exists before any tenant does. B-46 (wave 8) replaces it with a real USPTO bulk loader.
  */
 
 type Mark = {
