@@ -1,9 +1,11 @@
-import { betterAuth } from "better-auth";
+import { type BetterAuthPlugin, betterAuth } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
+import { createAuthEndpoint } from "better-auth/api";
 import { organization } from "better-auth/plugins";
 import { createAccessControl } from "better-auth/plugins/access";
 import { adminAc, defaultStatements, ownerAc } from "better-auth/plugins/organization/access";
 import { eq } from "drizzle-orm";
+import { z } from "zod";
 import { db } from "./db/client";
 import {
   accounts,
@@ -15,6 +17,7 @@ import {
   verifications,
 } from "./db/schema";
 import { env } from "./env";
+import { invitePreview } from "./modules/tenancy/invites";
 import { onOrganizationCreated } from "./modules/today/org-hooks";
 
 /*
@@ -42,7 +45,8 @@ export const authRoles = {
  * Better Auth organization endpoints the apps never call. Team, role and org changes go through
  * the InvAI procedures (team.*, me.updateOrg), which enforce owner rules and write audit rows;
  * leaving these open would let an admin promote or remove owners, or edit `plan`, around them.
- * The web app only uses organization/create, list and set-active (plus invitation accept).
+ * The web app only uses organization/create, list and set-active, plus accept-invitation for the
+ * invitations team.invite and vendors.invite create (src/modules/tenancy/invites.ts).
  */
 export const DISABLED_AUTH_PATHS = [
   "/organization/update",
@@ -67,6 +71,22 @@ export const DISABLED_AUTH_PATHS = [
   "/organization/list-invitations",
 ];
 
+/**
+ * GET /api/auth/invite-preview?id=<invitationId>: what the accept-invite page shows before anyone
+ * signs in (company, role, the invited email, whether that email already has an account). The id
+ * is only in the invite email; anything but a pending invitation returns just its status.
+ */
+const invitePreviewPlugin = {
+  id: "invai-invite-preview",
+  endpoints: {
+    invitePreview: createAuthEndpoint(
+      "/invite-preview",
+      { method: "GET", query: z.object({ id: z.string().max(64) }) },
+      async (ctx) => ctx.json(await invitePreview(ctx.query.id)),
+    ),
+  },
+} satisfies BetterAuthPlugin;
+
 export const auth = betterAuth({
   database: drizzleAdapter(db, {
     provider: "pg",
@@ -86,6 +106,8 @@ export const auth = betterAuth({
       "/sign-in/email": { window: 60, max: 20 }, // per IP; a shop office shares one IP
       "/sign-up/email": { window: 60, max: 5 },
       "/organization/create": { window: 60, max: 5 },
+      "/invite-preview": { window: 60, max: 30 },
+      "/organization/accept-invitation": { window: 60, max: 10 },
     },
   },
   user: { modelName: "users" },
@@ -125,6 +147,9 @@ export const auth = betterAuth({
       roles: authRoles,
       creatorRole: "owner",
       allowUserToCreateOrganization: true,
+      // Emails aren't verified at sign-up. The invitation id (a random UUID) only travels in the
+      // invite email, so opening that link is the proof; accept still requires the invited email.
+      requireEmailVerificationOnInvitation: false,
       organizationHooks: {
         // Default "Main" location, trial subscription, company.created (src/modules/today).
         afterCreateOrganization: async ({ organization: org }) => {
@@ -156,6 +181,7 @@ export const auth = betterAuth({
         invitation: { modelName: "invitations" },
       },
     }),
+    invitePreviewPlugin,
   ],
 });
 

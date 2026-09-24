@@ -1,9 +1,34 @@
-import { eq } from "drizzle-orm";
-import { describe, expect, it } from "vitest";
-import { withSystem, withTenant } from "../../db/client";
-import { vendorConnections } from "../../db/schema";
+import { and, eq } from "drizzle-orm";
+import { describe, expect, it, vi } from "vitest";
+import { app } from "../../api/app";
+import { db, withSystem, withTenant } from "../../db/client";
+import { companies, invitations, members, users, vendorConnections } from "../../db/schema";
+import { env } from "../../env";
 import { createCompany, createUser, tenantContext } from "../../test/fixtures";
-import { inviteVendor, updateConnection, vendorInbox, vendorShops } from "./service";
+
+type Sent = { to: string; subject: string; text: string; html?: string };
+const mail = vi.hoisted(() => ({ sent: [] as Sent[], fail: false }));
+vi.mock("../../integrations/vendors/mailer", async (orig) => ({
+  ...(await orig<typeof import("../../integrations/vendors/mailer")>()),
+  sendMail: vi.fn(async (m: Sent) => {
+    if (mail.fail) throw new Error("smtp down");
+    mail.sent.push(m);
+    return { messageId: `<${mail.sent.length}@test>` };
+  }),
+}));
+
+const { inviteVendor, updateConnection, vendorInbox, vendorShops } = await import("./service");
+
+const post = (path: string, body: unknown, cookie?: string) =>
+  app.request(path, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      origin: env.WEB_ORIGIN,
+      ...(cookie ? { cookie } : {}),
+    },
+    body: JSON.stringify(body),
+  });
 
 describe("vendor invitations need the vendor's acceptance", () => {
   it("a known vendor org stays invited until it opens its shop list", async () => {
@@ -43,5 +68,97 @@ describe("vendor invitations need the vendor's acceptance", () => {
     const shops = await vendorShops(vendor);
     expect(shops.items.map((s) => s.orgId)).toContain(shopId);
     expect(await status()).toEqual({ status: "active", delivery: "portal" });
+  });
+
+  it("a new vendor gets an /accept-invite link, signs up, and sees the shop in the portal", async () => {
+    const shopId = (await createCompany({ name: "Bloom Shop" })).id;
+    const shop = tenantContext(shopId, (await createUser(shopId, "owner")).id, "owner");
+    const email = `newvendor-${Date.now()}@test.local`;
+    const conn = await withTenant(shopId, (tx) =>
+      inviteVendor(tx, shop, {
+        name: "Fresh DTF",
+        email,
+        spec: {},
+        isDefault: false,
+        turnaroundDays: 2,
+      }),
+    );
+    expect(conn.status).toBe("invited");
+    const m = mail.sent.at(-1);
+    expect(m?.to).toBe(email);
+    expect(m?.text).not.toContain("/vendor/accept");
+    const id = m?.text.match(/\/accept-invite\/([0-9a-f-]{36})/)?.[1];
+    expect(id).toBeTruthy();
+    const [inv] = await db
+      .select()
+      .from(invitations)
+      .where(eq(invitations.id, id as string));
+    expect(inv).toMatchObject({ email, role: "vendor", status: "pending" });
+    const preview = await app.request(`/api/auth/invite-preview?id=${id}`);
+    expect(await preview.json()).toMatchObject({
+      status: "pending",
+      organizationType: "vendor",
+      invitedBy: "Bloom Shop",
+    });
+
+    const signUp = await post("/api/auth/sign-up/email", {
+      email,
+      password: "correct horse 1",
+      name: "Fresh Vendor",
+    });
+    expect(signUp.status).toBe(200);
+    const cookie = signUp.headers
+      .getSetCookie()
+      .map((c) => c.split(";")[0])
+      .join("; ");
+    expect(
+      (await post("/api/auth/organization/accept-invitation", { invitationId: id }, cookie)).status,
+    ).toBe(200);
+    const [member] = await db
+      .select({ orgId: members.organizationId, role: members.role, status: members.status })
+      .from(members)
+      .innerJoin(users, eq(users.id, members.userId))
+      .where(eq(users.email, email));
+    expect(member).toMatchObject({ role: "vendor", status: "active" });
+    const [org] = await db
+      .select()
+      .from(companies)
+      .where(eq(companies.id, member?.orgId as string));
+    expect(org?.type).toBe("vendor");
+
+    const [vendorUser] = await db.select().from(users).where(eq(users.email, email));
+    const vendor = tenantContext(org?.id as string, vendorUser?.id as string, "vendor", "vendor");
+    const shops = await vendorShops(vendor);
+    expect(shops.items.map((s) => s.orgId)).toContain(shopId);
+  });
+
+  it("a failed invite email fails the vendor invite and leaves nothing behind", async () => {
+    const shopId = (await createCompany()).id;
+    const shop = tenantContext(shopId, (await createUser(shopId, "owner")).id, "owner");
+    const email = `nomail-vendor-${Date.now()}@test.local`;
+    mail.fail = true;
+    try {
+      await expect(
+        withTenant(shopId, (tx) =>
+          inviteVendor(tx, shop, {
+            name: "Ghost DTF",
+            email,
+            spec: {},
+            isDefault: false,
+            turnaroundDays: 2,
+          }),
+        ),
+      ).rejects.toMatchObject({ code: "UPSTREAM_FAILED" });
+    } finally {
+      mail.fail = false;
+    }
+    expect(await db.select().from(invitations).where(eq(invitations.email, email))).toHaveLength(0);
+    const conns = await withSystem((tx) =>
+      tx
+        .select()
+        .from(vendorConnections)
+        .where(and(eq(vendorConnections.companyId, shopId), eq(vendorConnections.email, email))),
+    );
+    expect(conns).toHaveLength(0);
   });
 });

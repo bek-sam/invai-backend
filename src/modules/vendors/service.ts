@@ -38,6 +38,13 @@ import {
   toGangSheet,
   transitionSheet,
 } from "../production/service";
+import {
+  inviteExpiry,
+  inviteLink,
+  inviteSenders,
+  sendInviteEmail,
+  VENDOR_INVITE_DAYS,
+} from "../tenancy/invites";
 
 const log = logger("vendors");
 
@@ -157,9 +164,12 @@ export async function inviteVendor(tx: Tx, ctx: TenantContext, input: VendorInvi
   });
 
   let vendorCompanyId = existingOrg;
-  const token = randomToken(24);
+  let invitation: { id: string; expiresAt: Date | null } | null = null;
   if (!vendorCompanyId) {
-    vendorCompanyId = await withSystem(async (stx) => {
+    const inviterId = ctx.userId;
+    if (!inviterId) throw badRequest("Sign in as a person to invite a vendor");
+    // The vendor org and its Better Auth invitation. The vendor accepts at /accept-invite/<id>.
+    const created = await withSystem(async (stx) => {
       const [org] = await stx
         .insert(companies)
         .values({
@@ -172,18 +182,50 @@ export async function inviteVendor(tx: Tx, ctx: TenantContext, input: VendorInvi
         })
         .returning({ id: companies.id });
       if (!org) throw new Error("vendor org insert failed");
-      if (ctx.userId) {
-        await stx.insert(invitations).values({
+      const [inv] = await stx
+        .insert(invitations)
+        .values({
           organizationId: org.id,
           email,
           role: "vendor",
           status: "pending",
-          inviterId: ctx.userId,
-          expiresAt: new Date(Date.now() + 14 * 86400_000),
-        });
-      }
-      return org.id;
+          inviterId,
+          expiresAt: inviteExpiry(VENDOR_INVITE_DAYS),
+        })
+        .returning({ id: invitations.id, expiresAt: invitations.expiresAt });
+      if (!inv) throw new Error("vendor invitation insert failed");
+      return { orgId: org.id, invitation: inv };
     });
+    vendorCompanyId = created.orgId;
+    invitation = created.invitation;
+  }
+  const senders = await inviteSenders(ctx.companyId, ctx.userId);
+  const mail = {
+    ...senders,
+    kind: "vendor" as const,
+    role: "vendor" as const,
+    expiresAt: invitation?.expiresAt ?? inviteExpiry(VENDOR_INVITE_DAYS),
+  };
+  // The email goes out before the connection is saved: if it fails, the invite fails (and the
+  // vendor org made above is removed), so the shop never sees "invited" for a vendor who got nothing.
+  try {
+    if (invitation) {
+      await sendInviteEmail(email, { ...mail, link: inviteLink(invitation.id) });
+    } else {
+      // Already has a vendor account: accepting is opening the shop list in their portal.
+      const link = `${env.WEB_ORIGIN}/vendor/shops`;
+      await sendMail({
+        to: email,
+        subject: `${senders.companyName} invited you to InvAI`,
+        text: `${senders.companyName} wants to send you DTF gang sheets through InvAI.\n\nOpen your vendor portal to accept: ${link}\n\nUntil then, sheets arrive by email with download links.`,
+      });
+    }
+  } catch (err) {
+    log.warn("vendor invite email failed", { error: String(err) });
+    const orgId = vendorCompanyId;
+    if (invitation && orgId)
+      await withSystem((stx) => stx.delete(companies).where(eq(companies.id, orgId)));
+    throw upstream("Invite email");
   }
   // Always `invited`: even a known vendor org must accept (opening the shop list in its portal
   // activates the connection, see activatePending). Until then sheets go by email.
@@ -199,7 +241,6 @@ export async function inviteVendor(tx: Tx, ctx: TenantContext, input: VendorInvi
       spec: { ...DEFAULT_SHEET_SPEC, ...input.spec } as SheetSpec,
       isDefault: input.isDefault,
       turnaroundDays: input.turnaroundDays,
-      inviteToken: token,
       acceptedAt: null,
     })
     .returning();
@@ -214,25 +255,6 @@ export async function inviteVendor(tx: Tx, ctx: TenantContext, input: VendorInvi
     summary: `Vendor ${input.name} <${email}> invited`,
   });
   await emit(tx, ctx.companyId, "vendor.invited", { vendorConnectionId: row.id, email });
-  const [shop] = await tx
-    .select({ name: companies.name })
-    .from(companies)
-    .where(eq(companies.id, ctx.companyId));
-  const link = existingOrg
-    ? `${env.WEB_ORIGIN}/vendor/shops`
-    : `${env.WEB_ORIGIN}/vendor/accept?token=${encodeURIComponent(token)}&email=${encodeURIComponent(email)}`;
-  const shopName = shop?.name ?? "A shop";
-  try {
-    await sendMail({
-      to: email,
-      subject: `${shopName} invited you to InvAI`,
-      text: existingOrg
-        ? `${shopName} wants to send you DTF gang sheets through InvAI.\n\nOpen your vendor portal to accept: ${link}\n\nUntil then, sheets arrive by email with download links.`
-        : `${shopName} wants to send you DTF gang sheets through InvAI.\n\nCreate your free vendor account: ${link}\n\nUntil then, sheets arrive by email with download links.`,
-    });
-  } catch (err) {
-    log.warn("invite email failed", { email, error: String(err) });
-  }
   return toVendorConnection(row, 0);
 }
 

@@ -9,6 +9,7 @@ import {
   blankVariants,
   channelConnections,
   companies,
+  invitations,
   locations,
   members,
   skuRules,
@@ -19,9 +20,17 @@ import {
 } from "../../db/schema";
 import { audit } from "../../lib/audit";
 import { badRequest, conflict, forbidden, notFound } from "../../lib/errors";
-import { emit } from "../../lib/outbox";
 import { keyset, type PageInput } from "../../lib/pagination";
 import { issueStationToken, revokeStationTokens, setPin } from "./floor-auth";
+import {
+  cancelPendingInvitations,
+  inviteExpiry,
+  inviteLink,
+  inviteSenders,
+  pendingInvitations,
+  STAFF_INVITE_DAYS,
+  sendInviteEmail,
+} from "./invites";
 
 /*
  * Tenancy: who am I, the team, locations, stations, audit. Better Auth tables (users, members,
@@ -91,7 +100,7 @@ async function onboarding(tx: Tx, companyId: string): Promise<Me["onboarding"]> 
     blanksImported: await n(await tx.select({ n: count() }).from(blankVariants)),
     skusMapped: await n(await tx.select({ n: count() }).from(skuRules)),
     vendorAdded: await n(await tx.select({ n: count() }).from(vendorConnections)),
-    staffInvited: (memberCount?.n ?? 0) > 1,
+    staffInvited: (memberCount?.n ?? 0) > 1 || (await pendingInvitations(tx, companyId)).length > 0,
   };
 }
 
@@ -158,10 +167,16 @@ export async function listTeam(
     and(page.where, input.includeDeactivated ? undefined : sql`${members.status} <> 'deactivated'`),
   );
   const limited = rows.slice(0, page.limit + 1);
-  return page.result(
+  const result = page.result(
     limited.map((r) => ({ ...r, id: r.member.id, createdAt: r.member.createdAt })),
     toUser,
   );
+  // Pending invitations lead the first page; the cursor only walks members.
+  if (input.cursor) return result;
+  const invited = (await pendingInvitations(tx, ctx.companyId))
+    .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
+    .map((row) => invitedUser(row));
+  return { ...result, items: [...invited, ...result.items] };
 }
 
 async function getMember(tx: Tx, companyId: string, userId: string): Promise<User> {
@@ -208,6 +223,41 @@ async function memberRole(companyId: string, userId: string): Promise<Role | nul
   return row?.role ?? null;
 }
 
+/** An invitation shown as a team row until it is accepted (status `invited`, id = invitation id). */
+function invitedUser(row: typeof invitations.$inferSelect, name?: string): User {
+  return {
+    id: row.id,
+    email: row.email,
+    name: name ?? row.email,
+    role: row.role as Role,
+    status: "invited",
+    hasPin: false,
+    lastSeenAt: null,
+    createdAt: row.createdAt.toISOString(),
+  };
+}
+
+async function pendingInvitation(tx: Tx, companyId: string, id: string) {
+  const [row] = await tx
+    .select()
+    .from(invitations)
+    .where(
+      and(
+        eq(invitations.id, id),
+        eq(invitations.organizationId, companyId),
+        eq(invitations.status, "pending"),
+      ),
+    )
+    .limit(1);
+  return row ?? null;
+}
+
+/**
+ * Invite someone by email: a Better Auth invitation (no user row until they sign up) and an
+ * email with /accept-invite/<id>. Accepting makes them an active member with this role. A second
+ * invite to the same email replaces the pending one. If the email can't be sent the request fails
+ * and nothing is saved.
+ */
 export async function inviteUser(
   tx: Tx,
   ctx: TenantContext,
@@ -215,37 +265,52 @@ export async function inviteUser(
 ): Promise<User> {
   assertRoleFitsOrg(ctx, input.role);
   assertCanManage(ctx, null, input.role);
-  const email = input.email.toLowerCase();
+  if (!ctx.userId) throw forbidden("team.manage", "Sign in as a person to invite teammates");
+  const email = input.email.trim().toLowerCase();
   // users carries no RLS (Better Auth table), so the app role can look it up directly.
-  const user = await (async () => {
-    const [existing] = await db.select().from(users).where(eq(users.email, email)).limit(1);
-    if (existing) return existing;
-    const [created] = await db.insert(users).values({ email, name: input.name }).returning();
-    if (!created) throw new Error("user insert failed");
-    return created;
-  })();
-  const [dup] = await db
-    .select({ id: members.id })
-    .from(members)
-    .where(and(eq(members.organizationId, ctx.companyId), eq(members.userId, user.id)))
+  const [existing] = await tx
+    .select({ userId: users.id, status: members.status })
+    .from(users)
+    .innerJoin(members, eq(members.userId, users.id))
+    .where(and(eq(users.email, email), eq(members.organizationId, ctx.companyId)))
     .limit(1);
-  if (dup) throw conflict("That person is already on the team");
-  await db.insert(members).values({
-    organizationId: ctx.companyId,
-    userId: user.id,
-    role: input.role,
-    status: "invited",
-  });
+  if (existing && existing.status !== "invited")
+    throw conflict("That person is already on the team");
+  // Before invitations were real, an invite made a member row that could never sign in.
+  if (existing)
+    await tx
+      .delete(members)
+      .where(and(eq(members.userId, existing.userId), eq(members.organizationId, ctx.companyId)));
+  await cancelPendingInvitations(tx, ctx.companyId, email);
+  const [invitation] = await tx
+    .insert(invitations)
+    .values({
+      organizationId: ctx.companyId,
+      email,
+      role: input.role,
+      status: "pending",
+      inviterId: ctx.userId,
+      expiresAt: inviteExpiry(STAFF_INVITE_DAYS),
+    })
+    .returning();
+  if (!invitation) throw new Error("invitation insert failed");
   await audit(tx, {
     companyId: ctx.companyId,
     actor: ctx.actor,
     action: "team.invite",
-    entityType: "user",
-    entityId: user.id,
+    entityType: "invitation",
+    entityId: invitation.id,
     summary: `${input.name} invited as ${input.role}`,
   });
-  await emit(tx, ctx.companyId, "user.invited", { orgId: ctx.companyId, userId: user.id });
-  return getMember(tx, ctx.companyId, user.id);
+  const senders = await inviteSenders(ctx.companyId, ctx.userId);
+  await sendInviteEmail(email, {
+    ...senders,
+    kind: "staff",
+    role: input.role,
+    link: inviteLink(invitation.id),
+    expiresAt: invitation.expiresAt ?? inviteExpiry(STAFF_INVITE_DAYS),
+  });
+  return invitedUser(invitation, input.name);
 }
 
 export async function changeRole(
@@ -256,7 +321,19 @@ export async function changeRole(
   if (input.userId === ctx.userId) throw badRequest("You cannot change your own role");
   assertRoleFitsOrg(ctx, input.role);
   const current = await memberRole(ctx.companyId, input.userId);
-  if (!current) throw notFound("user", input.userId);
+  if (!current) {
+    // A pending invitation in the team list: change the role they will join with.
+    const invitation = await pendingInvitation(tx, ctx.companyId, input.userId);
+    if (!invitation) throw notFound("user", input.userId);
+    assertCanManage(ctx, invitation.role as Role, input.role);
+    const [row] = await tx
+      .update(invitations)
+      .set({ role: input.role })
+      .where(eq(invitations.id, invitation.id))
+      .returning();
+    if (!row) throw notFound("user", input.userId);
+    return invitedUser(row);
+  }
   assertCanManage(ctx, current, input.role);
   if (current === "owner" && input.role !== "owner" && (await activeOwnerCount(ctx.companyId)) <= 1)
     throw conflict("A company needs at least one owner");
@@ -286,7 +363,26 @@ export async function setMemberStatus(
 ) {
   if (userId === ctx.userId) throw badRequest("You cannot deactivate yourself");
   const current = await memberRole(ctx.companyId, userId);
-  if (!current) throw notFound("user", userId);
+  if (!current) {
+    // Deactivating a pending invitation cancels it, so its link stops working.
+    const invitation =
+      status === "deactivated" ? await pendingInvitation(tx, ctx.companyId, userId) : null;
+    if (!invitation) throw notFound("user", userId);
+    assertCanManage(ctx, invitation.role as Role);
+    await tx
+      .update(invitations)
+      .set({ status: "canceled" })
+      .where(eq(invitations.id, invitation.id));
+    await audit(tx, {
+      companyId: ctx.companyId,
+      actor: ctx.actor,
+      action: "team.deactivated",
+      entityType: "invitation",
+      entityId: invitation.id,
+      summary: "Invitation canceled",
+    });
+    return { ...invitedUser(invitation), status: "deactivated" as const };
+  }
   assertCanManage(ctx, current);
   if (
     status === "deactivated" &&
@@ -319,6 +415,11 @@ export async function setUserPin(
   ctx: TenantContext,
   input: { userId: string; pin: string },
 ) {
+  if (
+    !(await memberRole(ctx.companyId, input.userId)) &&
+    (await pendingInvitation(tx, ctx.companyId, input.userId))
+  )
+    throw badRequest("Set a PIN after they accept the invite");
   const target = await getMember(tx, ctx.companyId, input.userId);
   assertCanManage(ctx, target.role);
   await setPin(tx, {
