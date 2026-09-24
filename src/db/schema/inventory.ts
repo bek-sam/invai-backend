@@ -94,6 +94,11 @@ export const stockLevels = pgTable(
     onHand: integer().notNull().default(0),
     reserved: integer().notNull().default(0),
     available: integer().notNull().default(0),
+    /** Per-location override; falls back to blank_variants.reorder_point, then velocity. */
+    reorderPoint: integer(),
+    reorderQty: integer(),
+    /** Shelf / bin label where this blank sits, e.g. "A-03-2" (shown on the pick queue). */
+    shelf: text(),
     updatedAt: timestamp({ withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [

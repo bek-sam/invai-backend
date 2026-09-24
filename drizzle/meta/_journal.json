@@ -15,6 +15,13 @@
       "when": 1790228783028,
       "tag": "0001_grants_extensions",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1790233357829,
+      "tag": "0002_inventory_shelf_reorder",
+      "breakpoints": true
     }
   ]
 }
