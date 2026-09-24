@@ -14,6 +14,7 @@ import {
   vendorConnections,
 } from "../../db/schema";
 import { DEFAULT_SHEET_SPEC } from "../../db/schema/vendors";
+import { runJobInline } from "../../lib/queues";
 import {
   createCompany,
   createConnection,
@@ -22,6 +23,8 @@ import {
   createUser,
   tenantContext,
 } from "../../test/fixtures";
+import { cancelOrder } from "../orders/service";
+import { scrapCancelledJob } from "./jobs";
 
 type NestReq = { items: { id: string; width_in: number; height_in: number }[] };
 
@@ -352,5 +355,40 @@ describe("production: batch building, scans and reprints", () => {
       svc.stationQueue(tx, presserCtx, { station: "qc", limit: 50 }),
     );
     expect(queue.items.find((i) => i.orderItemId === id)).toBeUndefined();
+  });
+  it("cancelling an order after its transfer is nested scraps the transfer", async () => {
+    const conn = await createConnection(companyId);
+    const { order, items } = await createOrder(companyId, conn.id, { units: 1, state: "ready" });
+    const id = items[0]?.id as string;
+    const [design] = await withSystem((tx) =>
+      tx.select().from(designs).where(eq(designs.companyId, companyId)),
+    );
+    await withSystem(
+      (tx) =>
+        tx
+          .update(orderItems)
+          .set({ designId: design?.id, blankVariantId: blackM, placement: "front" })
+          .where(eq(orderItems.id, id)),
+      companyId,
+    );
+    const ref = await withTenant(companyId, (tx) => svc.buildBatch(tx, ctx, opts));
+    await svc.runBuildSheets(companyId, ref.batchId, ref.jobId);
+    const t = await transferOf(id);
+    expect(t).toBeTruthy();
+
+    const cancelled = await withTenant(companyId, (tx) =>
+      cancelOrder(tx, ctx, { id: order.id, reason: "buyer_request", note: null }),
+    );
+    expect(cancelled.items[0]?.state).toBe("cancelled");
+    // The worker reacts to order.cancelled the way the outbox relay would.
+    await runJobInline(scrapCancelledJob, { companyId, orderId: order.id, transferIds: [t] });
+    const [transfer] = await withSystem((tx) =>
+      tx.select().from(transfers).where(eq(transfers.id, t)),
+    );
+    expect(transfer).toMatchObject({ scrapped: true, status: "scrap" });
+    const [row] = await withSystem((tx) =>
+      tx.select().from(orderItems).where(eq(orderItems.id, id)),
+    );
+    expect(row?.transferId).toBeNull();
   });
 });

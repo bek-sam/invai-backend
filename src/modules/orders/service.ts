@@ -976,8 +976,8 @@ export async function setItemArtwork(
       artworkKey: input.fileKey,
       artworkPreviewKey: input.fileKey,
       artworkStatus: "approved",
-      printWidthIn: input.widthIn !== undefined ? Math.round(input.widthIn) : item.printWidthIn,
-      printHeightIn: input.heightIn !== undefined ? Math.round(input.heightIn) : item.printHeightIn,
+      printWidthIn: input.widthIn !== undefined ? input.widthIn : item.printWidthIn,
+      printHeightIn: input.heightIn !== undefined ? input.heightIn : item.printHeightIn,
       flags: withFlags(item.flags, unique, [...ARTWORK_ITEM_FLAGS, "artwork_low_dpi"]),
     })
     .where(eq(orderItems.id, input.id));

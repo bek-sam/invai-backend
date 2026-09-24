@@ -92,12 +92,42 @@ export const BLANK_STYLES: BlankStyleSeed[] = [
   },
 ];
 
+/** Print sizes (inches) as a real shop sells them; the mix keeps 22 in gang sheets dense. */
+export type PrintSize = {
+  kind: "adult" | "youth" | "left_chest" | "sleeve" | "back";
+  placement: "front" | "back" | "left_chest" | "sleeve_left";
+  widthIn: number;
+  heightIn: number;
+};
+export const PRINT_SIZES: Record<PrintSize["kind"], PrintSize> = {
+  adult: { kind: "adult", placement: "front", widthIn: 10.5, heightIn: 12 },
+  youth: { kind: "youth", placement: "front", widthIn: 8.5, heightIn: 9.5 },
+  left_chest: { kind: "left_chest", placement: "left_chest", widthIn: 3.75, heightIn: 3.75 },
+  sleeve: { kind: "sleeve", placement: "sleeve_left", widthIn: 3, heightIn: 10 },
+  back: { kind: "back", placement: "back", widthIn: 12, heightIn: 14 },
+};
+/** Personalized templates render at this size. */
+export const TEMPLATE_SIZE = PRINT_SIZES.adult;
+const SIZE_MIX: PrintSize["kind"][] = [
+  "adult",
+  "adult",
+  "adult",
+  "youth",
+  "adult",
+  "left_chest",
+  "adult",
+  "back",
+  "adult",
+  "sleeve",
+];
+
 export type DesignSeed = {
   code: string;
   name: string;
   tags: string[];
   color: string;
   template?: number;
+  size: PrintSize;
 };
 
 const D = (
@@ -112,6 +142,10 @@ const D = (
   tags,
   color,
   template,
+  size:
+    template === undefined
+      ? PRINT_SIZES[SIZE_MIX[(Number.parseInt(code.slice(2), 10) - 1) % SIZE_MIX.length] ?? "adult"]
+      : TEMPLATE_SIZE,
 });
 
 export const DESIGNS: DesignSeed[] = [
@@ -189,8 +223,8 @@ export const TEMPLATES: {
 }[] = [
   {
     name: "Bride Tribe (name + date)",
-    widthIn: 11,
-    heightIn: 12,
+    widthIn: TEMPLATE_SIZE.widthIn,
+    heightIn: TEMPLATE_SIZE.heightIn,
     slots: [
       textSlot("name", 8.2, 48, { sourceQuestion: "name", uppercase: true, maxChars: 16 }),
       textSlot("date", 10.0, 24, { sourceQuestion: "date", required: false, placeholder: "2026" }),
@@ -198,8 +232,8 @@ export const TEMPLATES: {
   },
   {
     name: "Family Reunion (family name + year)",
-    widthIn: 11,
-    heightIn: 12,
+    widthIn: TEMPLATE_SIZE.widthIn,
+    heightIn: TEMPLATE_SIZE.heightIn,
     slots: [
       textSlot("family", 1.0, 44, { sourceQuestion: "family name", uppercase: true, maxChars: 18 }),
       textSlot("year", 10.2, 28, { sourceQuestion: "year", maxChars: 4 }),
@@ -207,8 +241,8 @@ export const TEMPLATES: {
   },
   {
     name: "Senior (school + class of)",
-    widthIn: 11,
-    heightIn: 12,
+    widthIn: TEMPLATE_SIZE.widthIn,
+    heightIn: TEMPLATE_SIZE.heightIn,
     slots: [
       textSlot("school", 1.2, 40, { sourceQuestion: "school", uppercase: true, maxChars: 22 }),
       textSlot("year", 9.8, 34, { sourceQuestion: "class of", maxChars: 4 }),

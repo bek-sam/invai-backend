@@ -95,8 +95,8 @@ export async function mapItems(
         blankVariantId: blank.id,
         productId: product?.id ?? null,
         placement: file?.placement ?? target.placement ?? "front",
-        printWidthIn: file ? Math.round(file.widthIn) : item.printWidthIn,
-        printHeightIn: file ? Math.round(file.heightIn) : item.printHeightIn,
+        printWidthIn: file ? file.widthIn : item.printWidthIn,
+        printHeightIn: file ? file.heightIn : item.printHeightIn,
         flags: withFlags(item.flags, [], ["needs_mapping"]),
         ...(design.templateId
           ? {}

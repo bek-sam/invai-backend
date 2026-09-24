@@ -1,5 +1,6 @@
 import {
   boolean,
+  doublePrecision,
   index,
   integer,
   pgTable,
@@ -171,8 +172,8 @@ export const orderItems = pgTable(
     productId: uuid(),
     blankVariantId: uuid(),
     placement: text(),
-    printWidthIn: integer(),
-    printHeightIn: integer(),
+    printWidthIn: doublePrecision(),
+    printHeightIn: doublePrecision(),
     artworkStatus: text(enumText(ITEM_ARTWORK_STATUSES)).notNull().default("none"),
     /** Rendered artwork S3 key (personalized items) or null to use the design file. */
     artworkKey: text(),

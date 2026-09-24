@@ -68,7 +68,7 @@ describe("scan matcher", () => {
         },
       }),
     );
-    expect(style.mismatch).toBe("wrong_design");
+    expect(style.mismatch).toBe("wrong_style");
     expect(color.message).toContain("needs Gildan 64000 Black M");
   });
 

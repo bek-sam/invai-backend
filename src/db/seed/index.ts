@@ -9,6 +9,7 @@ import { PLAN_CATALOG } from "../../modules/billing/service";
 import { bulkImportBlanks, createDesign, createProduct } from "../../modules/catalog/service";
 import { shelfFor } from "../../modules/inventory/shelves";
 import { transitionItem } from "../../modules/orders/state-machine";
+import { renderValues } from "../../modules/personalization/service";
 import { issueStationToken, setPin } from "../../modules/tenancy/floor-auth";
 import { closeDb, systemDb, withSystem } from "../client";
 import type { Role } from "../schema";
@@ -426,8 +427,8 @@ async function main() {
         await imaging.sampleArt({
           text: d.name,
           out_key: fileKey,
-          width_in: 11,
-          height_in: 12,
+          width_in: d.size.widthIn,
+          height_in: d.size.heightIn,
           color_hex: d.color,
         });
         rendered = true;
@@ -440,7 +441,14 @@ async function main() {
         code: d.code,
         name: d.name,
         tags: d.tags,
-        placements: [{ placement: "front", fileKey, widthIn: 11, heightIn: 12 }],
+        placements: [
+          {
+            placement: d.size.placement,
+            fileKey,
+            widthIn: d.size.widthIn,
+            heightIn: d.size.heightIn,
+          },
+        ],
         personalizationTemplateId:
           d.template === undefined ? null : (templateIds[d.template] ?? null),
       });
@@ -449,8 +457,8 @@ async function main() {
           .update(designFiles)
           .set({
             qaStatus: "passed",
-            widthPx: 3300,
-            heightPx: 3600,
+            widthPx: Math.round(d.size.widthIn * 300),
+            heightPx: Math.round(d.size.heightIn * 300),
             effectiveDpi: 300,
             qaCheckedAt: new Date(),
           })
@@ -675,6 +683,11 @@ async function main() {
     DESIGNS.filter((d) => d.template !== undefined).map((d) => d.code),
   );
   const designByCode = new Map(DESIGNS.map((d) => [d.code, d]));
+  const artworkRenders: {
+    key: string;
+    template: (typeof TEMPLATES)[number];
+    values: Record<string, string>;
+  }[] = [];
   const productionItems: {
     id: string;
     orderNo: string;
@@ -686,6 +699,8 @@ async function main() {
     isReprint: boolean;
     blankVariantId: string;
     fileKey: string;
+    widthIn: number;
+    heightIn: number;
   }[] = [];
   const shippedOrders: {
     id: string;
@@ -858,9 +873,9 @@ async function main() {
                 designId: line.needsMapping ? null : designIds.get(line.design.code),
                 productId: null,
                 blankVariantId: line.needsMapping ? null : line.blank.id,
-                placement: "front",
-                printWidthIn: 11,
-                printHeightIn: 12,
+                placement: line.design.size.placement,
+                printWidthIn: line.design.size.widthIn,
+                printHeightIn: line.design.size.heightIn,
                 artworkStatus: personalized
                   ? plan.finalState === "needs_artwork"
                     ? "flagged"
@@ -887,6 +902,20 @@ async function main() {
               .returning();
             if (!item) throw new Error("item insert failed");
             itemIds.push(item.id);
+            if (item.artworkKey && answers) {
+              const template = TEMPLATES[designByCode.get(line.design.code)?.template ?? 0];
+              if (template)
+                artworkRenders.push({
+                  key: item.artworkKey,
+                  template,
+                  values: Object.fromEntries(
+                    slotQuestions.map((sl) => [
+                      sl.name,
+                      (answers as Record<string, string>)[sl.sourceQuestion ?? sl.name] ?? "",
+                    ]),
+                  ),
+                });
+            }
 
             // Walk the item through the state machine to its planned state.
             let target: OrderItemState = plan.finalState;
@@ -971,6 +1000,8 @@ async function main() {
                 isReprint: qcFailed,
                 blankVariantId: line.blank.id,
                 fileKey: `${shopId}/design/seed/${line.design.code.toLowerCase()}.png`,
+                widthIn: line.design.size.widthIn,
+                heightIn: line.design.size.heightIn,
               });
             }
           }
@@ -1030,6 +1061,20 @@ async function main() {
     log.info("orders", { done: Math.min(batchStart + 20, plans_.length), of: plans_.length });
   }
 
+  /* ---- personalized artwork (rendered for real so proofs and sheets have a file) ---- */
+  if (imagingUp) {
+    let rendered = 0;
+    for (const r of artworkRenders) {
+      const out = await renderValues(
+        { ...r.template, backgroundKey: null, dpi: 300 },
+        r.values,
+        r.key,
+      );
+      if (out.status !== "failed") rendered++;
+    }
+    log.info("personalized artwork", { rendered, total: artworkRenders.length });
+  }
+
   /* ---- gang sheets + transfers ---- */
   const sheetsCreated = await withSystem(async (tx) => {
     const [vendor] = await tx
@@ -1053,8 +1098,22 @@ async function main() {
           ? "sent"
           : "printed"
         : "received";
-      const rows = Math.ceil(chunk.length / 2);
-      const lengthIn = Math.round(rows * 12.35 * 100) / 100;
+      // Two columns, rows as tall as their tallest design plus label and spacing.
+      const layout: { xIn: number; yIn: number }[] = [];
+      let y = DEFAULT_SHEET_SPEC.marginIn;
+      let printArea = 0;
+      for (let k = 0; k < chunk.length; k += 2) {
+        const pair = chunk.slice(k, k + 2);
+        let x = DEFAULT_SHEET_SPEC.marginIn;
+        for (const c of pair) {
+          layout.push({ xIn: x, yIn: Math.round(y * 100) / 100 });
+          x += c.widthIn + DEFAULT_SHEET_SPEC.spacingIn;
+          printArea += c.widthIn * c.heightIn;
+        }
+        y += Math.max(...pair.map((c) => c.heightIn)) + 0.35 + DEFAULT_SHEET_SPEC.spacingIn;
+      }
+      const lengthIn =
+        Math.round((y - DEFAULT_SHEET_SPEC.spacingIn + DEFAULT_SHEET_SPEC.marginIn) * 100) / 100;
       const builtAt = new Date(first.placedAt.getTime() + 8 * HOUR);
       const [batch] = await tx
         .insert(gangSheetBatches)
@@ -1082,7 +1141,7 @@ async function main() {
           vendorConnectionId: vendor.id,
           widthIn: 22,
           lengthIn,
-          utilization: Math.round(((chunk.length * 11 * 12) / (22 * lengthIn)) * 100) / 100,
+          utilization: Math.round((printArea / (22 * lengthIn)) * 100) / 100,
           status,
           transferCount: chunk.length,
           reprintCount: chunk.filter((c) => c.isReprint).length,
@@ -1117,10 +1176,10 @@ async function main() {
             companyId: shopId,
             gangSheetId: sheet.id,
             orderItemId: item.id,
-            xIn: k % 2 === 0 ? 0.25 : 11.25,
-            yIn: Math.round(Math.floor(k / 2) * 12.35 * 100) / 100,
-            widthIn: 11,
-            heightIn: 12,
+            xIn: layout[k]?.xIn ?? DEFAULT_SHEET_SPEC.marginIn,
+            yIn: layout[k]?.yIn ?? 0,
+            widthIn: item.widthIn,
+            heightIn: item.heightIn,
             rotated: false,
             label: {
               order_no: item.orderNo,
@@ -1244,29 +1303,6 @@ async function main() {
     const receiverId = userIds.get("receiver@desertbloom.test") as string;
     const receivedAt = new Date(now - 12 * DAY);
     const lowStock = new Set(blanks.filter((_, i) => i % 13 === 0).map((b) => b.id));
-    for (const b of blanks) {
-      const base =
-        b.styleCode === "G64000"
-          ? random.int(14, 48)
-          : b.styleCode === "CC1717"
-            ? random.int(8, 24)
-            : random.int(10, 30);
-      const qty = lowStock.has(b.id) ? random.int(2, 6) : base;
-      await tx.insert(inventoryMovements).values({
-        companyId: shopId,
-        blankVariantId: b.id,
-        locationId,
-        kind: "receive",
-        qty,
-        unitCostCents: b.costCents,
-        refType: "purchase_order",
-        refId: null,
-        note: "Opening stock",
-        userId: receiverId,
-        idempotencyKey: `seed:receive:${b.id}`,
-        createdAt: receivedAt,
-      });
-    }
     const consumed = await tx
       .select({
         id: orderItems.id,
@@ -1289,6 +1325,37 @@ async function main() {
           ]),
         ),
       );
+    // Opening stock covers everything already pressed or reserved, so no blank goes negative;
+    // "low" blanks end up just under their reorder point.
+    const committed = new Map<string, number>();
+    for (const it of consumed)
+      if (it.blankVariantId)
+        committed.set(it.blankVariantId, (committed.get(it.blankVariantId) ?? 0) + 1);
+    for (const b of blanks) {
+      const base =
+        b.styleCode === "G64000"
+          ? random.int(14, 48)
+          : b.styleCode === "CC1717"
+            ? random.int(8, 24)
+            : random.int(10, 30);
+      const used = committed.get(b.id) ?? 0;
+      const qty =
+        used + (lowStock.has(b.id) ? random.int(2, 6) : Math.max(base, random.int(6, 12)));
+      await tx.insert(inventoryMovements).values({
+        companyId: shopId,
+        blankVariantId: b.id,
+        locationId,
+        kind: "receive",
+        qty,
+        unitCostCents: b.costCents,
+        refType: "purchase_order",
+        refId: null,
+        note: "Opening stock",
+        userId: receiverId,
+        idempotencyKey: `seed:receive:${b.id}`,
+        createdAt: receivedAt,
+      });
+    }
     for (const it of consumed) {
       if (!it.blankVariantId) continue;
       const isConsume = ["pressed", "packed", "shipped", "delivered"].includes(it.state);

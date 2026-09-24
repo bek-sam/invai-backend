@@ -97,8 +97,7 @@ export function compareBlank(expected: BlankRef, scanned: BlankRef): MismatchRea
   const sameStyle =
     expected.styleCode.toLowerCase() === scanned.styleCode.toLowerCase() &&
     expected.brand.toLowerCase() === scanned.brand.toLowerCase();
-  // A different garment is the wrong product for this design; reported as wrong_design.
-  if (!sameStyle) return "wrong_design";
+  if (!sameStyle) return "wrong_style";
   if (expected.colorCode.toLowerCase() !== scanned.colorCode.toLowerCase()) return "wrong_color";
   if (expected.sizeCode.toLowerCase() !== scanned.sizeCode.toLowerCase()) return "wrong_size";
   return null;
@@ -121,7 +120,9 @@ function checkBlank(input: MatchInput, requirePick: boolean): MatchOutcome | nul
           ? "Wrong color"
           : reason === "wrong_size"
             ? "Wrong size"
-            : "Wrong blank";
+            : reason === "wrong_style"
+              ? "Wrong style"
+              : "Wrong blank";
       return fail(
         reason,
         `${label}: needs ${blankText(expected)}, scanned ${blankText(second.blank)}`,

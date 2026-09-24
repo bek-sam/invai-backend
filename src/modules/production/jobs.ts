@@ -1,8 +1,9 @@
 import { z } from "zod";
+import { withTenant } from "../../db/client";
 import { logger } from "../../lib/log";
 import { defineJob, onEvent } from "../../lib/queues";
 import { updateJobRow } from "./job-rows";
-import { runBuildSheets, runRegenerateSheet } from "./service";
+import { runBuildSheets, runRegenerateSheet, scrapTransfers } from "./service";
 
 const log = logger("production.jobs");
 
@@ -51,3 +52,21 @@ onEvent("sheet.regenerate_requested", regenerateSheetJob, (e) => ({
   sheetId: String(e.payload.sheetId),
   jobId: String(e.payload.jobId),
 }));
+
+/** A cancelled item whose transfer was already nested: scrap the transfer, free the sheet slot. */
+export const scrapCancelledJob = defineJob({
+  queue: "sync",
+  name: "production.scrapCancelled",
+  input: z.object({ companyId: z.uuid(), orderId: z.uuid(), transferIds: z.array(z.uuid()) }),
+  jobId: (i) => `scrap-cancelled-${i.orderId}-${i.transferIds.length}`,
+  handler: async ({ companyId, transferIds }) => {
+    await withTenant(companyId, (tx) => scrapTransfers(tx, transferIds));
+  },
+});
+
+onEvent("order.cancelled", scrapCancelledJob, (e) => {
+  const transferIds = (e.payload.scrappedTransferIds as string[] | undefined) ?? [];
+  return transferIds.length
+    ? { companyId: e.companyId, orderId: String(e.payload.orderId), transferIds }
+    : null;
+});
