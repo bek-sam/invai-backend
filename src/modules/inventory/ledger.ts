@@ -1,9 +1,10 @@
 import { and, eq, inArray, sql } from "drizzle-orm";
 import type { TenantContext } from "../../api/context";
-import type { Tx } from "../../db/client";
+import { afterCommit, type Tx } from "../../db/client";
 import type { MovementKind } from "../../db/schema";
 import { blankVariants, inventoryMovements, orderItems, stockLevels } from "../../db/schema";
 import { emit } from "../../lib/outbox";
+import { publish } from "../../lib/realtime";
 import { defaultLocationId as tenancyDefaultLocationId } from "../tenancy/service";
 
 /*
@@ -28,6 +29,32 @@ export function movementDelta(
 export function crossedBelow(before: number, after: number, point: number | null): boolean {
   if (point == null) return false;
   return before >= point && after < point;
+}
+
+/*
+ * Realtime `stock.changed`: one event per blank and location a transaction moved, carrying the
+ * last available count, sent after the commit (a 40-line PO receipt is 40 events, not more).
+ */
+const stockChanges = new WeakMap<
+  Tx,
+  Map<string, { blankVariantId: string; locationId: string; available: number }>
+>();
+
+function stockChanged(
+  tx: Tx,
+  companyId: string,
+  change: { blankVariantId: string; locationId: string; available: number },
+) {
+  let pending = stockChanges.get(tx);
+  if (!pending) {
+    const batch = new Map<string, typeof change>();
+    stockChanges.set(tx, batch);
+    pending = batch;
+    afterCommit(tx, async () => {
+      for (const c of batch.values()) await publish(companyId, "stock.changed", c);
+    });
+  }
+  pending.set(`${change.blankVariantId}|${change.locationId}`, change);
 }
 
 /** The company's default location (tenancy owns locations). */
@@ -111,6 +138,13 @@ export async function recordMovement(
       },
     })
     .returning({ available: stockLevels.available, reorderPoint: stockLevels.reorderPoint });
+
+  if (after)
+    stockChanged(tx, ctx.companyId, {
+      blankVariantId: m.blankVariantId,
+      locationId: m.locationId,
+      available: after.available,
+    });
 
   await emit(tx, ctx.companyId, "stock.movement", {
     movementId: row.id,

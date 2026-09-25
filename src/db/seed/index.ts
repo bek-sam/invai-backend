@@ -7,6 +7,7 @@ import { imaging } from "../../integrations/imaging/client";
 import { logger } from "../../lib/log";
 import { PLAN_CATALOG } from "../../modules/billing/service";
 import { bulkImportBlanks, createDesign, createProduct } from "../../modules/catalog/service";
+import { recordListingsForCompany } from "../../modules/channels/sku";
 import { shelfFor } from "../../modules/inventory/shelves";
 import { transitionItem } from "../../modules/orders/state-machine";
 import { renderValues } from "../../modules/personalization/service";
@@ -1482,6 +1483,10 @@ async function main() {
       lowStock: low.length,
     });
   }, shopId);
+
+  /* ---- channel listings (from the seeded orders; push stays off until the shop opts in) ---- */
+  const listingReport = await withSystem((tx) => recordListingsForCompany(tx, shopId), shopId);
+  log.info("listings", { listings: listingReport.listings, variants: listingReport.variants });
 
   /* ---- ad spend, usage, at-risk alerts ---- */
   await withSystem(async (tx) => {

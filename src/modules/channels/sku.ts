@@ -6,11 +6,20 @@ import {
   type SkuRuleTarget as SkuRuleTargetSchema,
   type SkuSuggestion,
 } from "@invai/contracts";
-import { and, desc, eq, ilike, inArray, or, type SQL, sql } from "drizzle-orm";
+import { and, asc, desc, eq, ilike, inArray, isNotNull, or, type SQL, sql } from "drizzle-orm";
 import type { z } from "zod";
 import type { TenantContext } from "../../api/context";
 import type { Tx } from "../../db/client";
-import { blankVariants, designs, orderItems, orders, products, skuRules } from "../../db/schema";
+import {
+  blankVariants,
+  designs,
+  listings,
+  listingVariants,
+  orderItems,
+  orders,
+  products,
+  skuRules,
+} from "../../db/schema";
 import { audit } from "../../lib/audit";
 import { badRequest, conflict, notFound } from "../../lib/errors";
 import { emit } from "../../lib/outbox";
@@ -364,6 +373,10 @@ export function toSkuRule(r: RuleRow): SkuRule {
   };
 }
 
+/** The listing SKUs a rule can touch: exact rules name one; patterns may match any. */
+const ruleScope = (r: Pick<RuleRow, "patternType" | "pattern">) =>
+  r.patternType === "exact" ? { skus: [r.pattern] } : {};
+
 function validateRule(input: Pick<SkuRuleInput, "patternType" | "pattern" | "target">) {
   compilePattern(input.patternType, input.pattern);
   if (input.patternType === "exact" && input.target.kind !== "direct")
@@ -469,6 +482,7 @@ export async function createRule(
   });
   if (source === "learned")
     await emit(tx, ctx.companyId, "sku_rule.learned", { ruleId: row.id, channelSku: row.pattern });
+  await refreshListingMappings(tx, ctx.companyId, ruleScope(row));
   return toSkuRule(row);
 }
 
@@ -503,6 +517,7 @@ export async function updateRule(
     entityId: input.id,
     summary: `SKU rule "${next.pattern}" updated`,
   });
+  await refreshListingMappings(tx, ctx.companyId, ruleScope(next));
   return toSkuRule(updated as RuleRow);
 }
 
@@ -868,4 +883,339 @@ export async function suggest(
   }
   // AI suggestions go through the AI gateway (ai module); the heuristic covers v1.
   return { items, creditsUsed: 0 };
+}
+
+/* ------------------------------------ listings ------------------------------------ */
+
+/*
+ * Channel listings as orders reveal them. Every imported or mapped unit names its listing
+ * (`channelListingId`) and SKU; one `listings` row per (connection, listing id) and one
+ * `listing_variants` row per SKU on it, carrying the design and blank the SKU maps to. The
+ * availability push (inventory) reads these rows. Channels don't send a variant id with an order
+ * line, so the SKU is the variant's identity on the listing.
+ */
+
+type ListingSource = {
+  connectionId: string;
+  channel: Channel;
+  channelListingId: string | null;
+  channelSku: string;
+  title: string;
+  variantTitle: string | null;
+  designId: string | null;
+  productId: string | null;
+  blankVariantId: string | null;
+  unitPriceCents: number;
+};
+
+export type RecordedListings = {
+  listings: number;
+  variants: number;
+  /** Blanks whose listing variants are new or now map to them: their availability should push. */
+  blankVariantIds: string[];
+};
+
+const listingSourceFields = {
+  connectionId: orders.connectionId,
+  channel: orders.channel,
+  channelListingId: orderItems.channelListingId,
+  channelSku: orderItems.channelSku,
+  title: orderItems.title,
+  variantTitle: orderItems.variantTitle,
+  designId: orderItems.designId,
+  productId: orderItems.productId,
+  blankVariantId: orderItems.blankVariantId,
+  unitPriceCents: orderItems.unitPriceCents,
+};
+
+/** Upsert the listings and listing variants of these order items (import and mapping). */
+export async function recordListingsForItems(
+  tx: Tx,
+  companyId: string,
+  orderItemIds: string[],
+): Promise<RecordedListings> {
+  if (!orderItemIds.length) return { listings: 0, variants: 0, blankVariantIds: [] };
+  const rows = await tx
+    .select(listingSourceFields)
+    .from(orderItems)
+    .innerJoin(orders, eq(orders.id, orderItems.orderId))
+    .where(and(eq(orderItems.companyId, companyId), inArray(orderItems.id, orderItemIds)))
+    .orderBy(asc(orderItems.createdAt));
+  return upsertListings(tx, companyId, rows);
+}
+
+/**
+ * Backfill from every order the company has (the seed, or a shop that imported before listings
+ * were recorded). Per listing SKU the latest mapped unit wins.
+ */
+export async function recordListingsForCompany(
+  tx: Tx,
+  companyId: string,
+): Promise<RecordedListings> {
+  const rows = await tx
+    .selectDistinctOn(
+      [orders.connectionId, orderItems.channelListingId, orderItems.channelSku],
+      listingSourceFields,
+    )
+    .from(orderItems)
+    .innerJoin(orders, eq(orders.id, orderItems.orderId))
+    .where(
+      and(
+        eq(orderItems.companyId, companyId),
+        isNotNull(orderItems.channelListingId),
+        sql`trim(${orderItems.channelSku}) <> ''`,
+      ),
+    )
+    .orderBy(
+      orders.connectionId,
+      orderItems.channelListingId,
+      orderItems.channelSku,
+      sql`${orderItems.blankVariantId} is null`,
+      desc(orderItems.createdAt),
+    );
+  // Oldest first, so the latest unit of each listing names it.
+  return upsertListings(tx, companyId, rows.reverse());
+}
+
+async function upsertListings(
+  tx: Tx,
+  companyId: string,
+  sources: ListingSource[],
+): Promise<RecordedListings> {
+  const usable = sources
+    .map((s) => ({ ...s, channelSku: s.channelSku.trim() }))
+    .filter((s) => s.channelListingId && s.channelSku !== "");
+  if (!usable.length) return { listings: 0, variants: 0, blankVariantIds: [] };
+
+  // One row per key: a single INSERT ... ON CONFLICT can't touch the same row twice.
+  const listingKey = (s: { connectionId: string; channelListingId: string | null }) =>
+    `${s.connectionId}|${s.channelListingId}`;
+  const byListing = new Map<string, ListingSource>();
+  for (const s of usable) {
+    const prev = byListing.get(listingKey(s));
+    byListing.set(listingKey(s), {
+      ...s,
+      designId: s.designId ?? prev?.designId ?? null,
+      productId: s.productId ?? prev?.productId ?? null,
+    });
+  }
+  const listingRows = await tx
+    .insert(listings)
+    .values(
+      [...byListing.values()].map((s) => ({
+        companyId,
+        connectionId: s.connectionId,
+        channel: s.channel,
+        channelListingId: s.channelListingId as string,
+        title: s.title,
+        designId: s.designId,
+        productId: s.productId,
+      })),
+    )
+    .onConflictDoUpdate({
+      target: [listings.companyId, listings.connectionId, listings.channelListingId],
+      set: {
+        title: sql`excluded.title`,
+        designId: sql`coalesce(excluded.design_id, ${listings.designId})`,
+        productId: sql`coalesce(excluded.product_id, ${listings.productId})`,
+        updatedAt: new Date(),
+      },
+    })
+    .returning({
+      id: listings.id,
+      connectionId: listings.connectionId,
+      channelListingId: listings.channelListingId,
+    });
+  const listingIdOf = new Map(listingRows.map((l) => [listingKey(l), l.id]));
+
+  const variantKey = (listingId: string, sku: string) => `${listingId}|${sku}`;
+  const byVariant = new Map<string, ListingSource & { listingId: string }>();
+  for (const s of usable) {
+    const listingId = listingIdOf.get(listingKey(s));
+    if (!listingId) continue;
+    const k = variantKey(listingId, s.channelSku);
+    const prev = byVariant.get(k);
+    byVariant.set(k, {
+      ...s,
+      listingId,
+      designId: s.designId ?? prev?.designId ?? null,
+      blankVariantId: s.blankVariantId ?? prev?.blankVariantId ?? null,
+    });
+  }
+  const variants = [...byVariant.values()];
+  const before = await tx
+    .select({
+      listingId: listingVariants.listingId,
+      channelVariantId: listingVariants.channelVariantId,
+      blankVariantId: listingVariants.blankVariantId,
+    })
+    .from(listingVariants)
+    .where(
+      and(
+        eq(listingVariants.companyId, companyId),
+        inArray(listingVariants.listingId, [...new Set(variants.map((v) => v.listingId))]),
+      ),
+    );
+  const blankBefore = new Map(
+    before.map((b) => [variantKey(b.listingId, b.channelVariantId), b.blankVariantId]),
+  );
+  await tx
+    .insert(listingVariants)
+    .values(
+      variants.map((v) => ({
+        companyId,
+        listingId: v.listingId,
+        channelVariantId: v.channelSku,
+        channelSku: v.channelSku,
+        title: v.variantTitle,
+        designId: v.designId,
+        blankVariantId: v.blankVariantId,
+        priceCents: v.unitPriceCents,
+      })),
+    )
+    .onConflictDoUpdate({
+      target: [
+        listingVariants.companyId,
+        listingVariants.listingId,
+        listingVariants.channelVariantId,
+      ],
+      set: {
+        title: sql`coalesce(excluded.title, ${listingVariants.title})`,
+        designId: sql`coalesce(excluded.design_id, ${listingVariants.designId})`,
+        blankVariantId: sql`coalesce(excluded.blank_variant_id, ${listingVariants.blankVariantId})`,
+        priceCents: sql`coalesce(excluded.price_cents, ${listingVariants.priceCents})`,
+        updatedAt: new Date(),
+      },
+    });
+
+  const changed = new Set<string>();
+  for (const v of variants) {
+    if (
+      v.blankVariantId &&
+      blankBefore.get(variantKey(v.listingId, v.channelSku)) !== v.blankVariantId
+    )
+      changed.add(v.blankVariantId);
+  }
+  return { listings: listingRows.length, variants: variants.length, blankVariantIds: [...changed] };
+}
+
+/**
+ * After a SKU rule is saved: point the listing variants it matches at the rule's design and
+ * blank (rules are what future imports map by, so the listing follows them). Variants no rule
+ * matches keep the mapping their orders gave them. `skus` narrows the scan (exact rules).
+ */
+export async function refreshListingMappings(
+  tx: Tx,
+  companyId: string,
+  opts: { skus?: string[] } = {},
+): Promise<string[]> {
+  const filters: (SQL | undefined)[] = [
+    eq(listingVariants.companyId, companyId),
+    isNotNull(listingVariants.channelSku),
+  ];
+  if (opts.skus) {
+    if (!opts.skus.length) return [];
+    filters.push(
+      inArray(
+        sql`lower(${listingVariants.channelSku})`,
+        opts.skus.map((s) => s.trim().toLowerCase()),
+      ),
+    );
+  }
+  const rows = await tx
+    .select({
+      id: listingVariants.id,
+      channelSku: listingVariants.channelSku,
+      designId: listingVariants.designId,
+      blankVariantId: listingVariants.blankVariantId,
+      channel: listings.channel,
+      connectionId: listings.connectionId,
+    })
+    .from(listingVariants)
+    .innerJoin(listings, eq(listings.id, listingVariants.listingId))
+    .where(and(...filters));
+  if (!rows.length) return [];
+  // A private matcher: listing refreshes don't count as rule matches.
+  const matcher = await loadMatcher(tx);
+  const changed = new Set<string>();
+  for (const r of rows) {
+    const hit = matcher.match(r.channelSku as string, {
+      channel: r.channel,
+      connectionId: r.connectionId,
+    });
+    if (!hit || (hit.blankVariantId === r.blankVariantId && hit.designId === r.designId)) continue;
+    await tx
+      .update(listingVariants)
+      .set({ designId: hit.designId, blankVariantId: hit.blankVariantId, updatedAt: new Date() })
+      .where(eq(listingVariants.id, r.id));
+    changed.add(hit.blankVariantId);
+  }
+  if (changed.size)
+    await emit(tx, companyId, "stock.availability_changed", { blankVariantIds: [...changed] });
+  return [...changed];
+}
+
+export type PushTarget = {
+  listingVariantId: string;
+  connectionId: string;
+  channelSku: string;
+  blankVariantId: string;
+  quantityCap: number | null;
+  lastPushedQty: number | null;
+};
+
+/** Listing variants that can carry availability: they have a SKU and map to a blank. */
+export async function listPushTargets(tx: Tx, companyId: string): Promise<PushTarget[]> {
+  const rows = await tx
+    .select({
+      listingVariantId: listingVariants.id,
+      connectionId: listings.connectionId,
+      channelSku: listingVariants.channelSku,
+      blankVariantId: listingVariants.blankVariantId,
+      quantityCap: listingVariants.quantityCap,
+      lastPushedQty: listingVariants.lastPushedQty,
+    })
+    .from(listingVariants)
+    .innerJoin(listings, eq(listings.id, listingVariants.listingId))
+    .where(
+      and(
+        eq(listingVariants.companyId, companyId),
+        isNotNull(listingVariants.blankVariantId),
+        isNotNull(listingVariants.channelSku),
+        sql`trim(${listingVariants.channelSku}) <> ''`,
+      ),
+    );
+  return rows as PushTarget[];
+}
+
+/** The quantity last pushed per listing variant (null: never pushed). */
+export async function lastPushedQuantities(
+  tx: Tx,
+  companyId: string,
+  listingVariantIds: string[],
+): Promise<Map<string, number | null>> {
+  if (!listingVariantIds.length) return new Map();
+  const rows = await tx
+    .select({ id: listingVariants.id, qty: listingVariants.lastPushedQty })
+    .from(listingVariants)
+    .where(
+      and(eq(listingVariants.companyId, companyId), inArray(listingVariants.id, listingVariantIds)),
+    );
+  return new Map(rows.map((r) => [r.id, r.qty]));
+}
+
+/** Record what the channel now holds, so an unchanged quantity isn't pushed again. */
+export async function markAvailabilityPushed(
+  tx: Tx,
+  companyId: string,
+  pushed: { listingVariantId: string; available: number }[],
+): Promise<void> {
+  for (const p of pushed) {
+    await tx
+      .update(listingVariants)
+      .set({ lastPushedQty: p.available, updatedAt: new Date() })
+      .where(
+        and(eq(listingVariants.companyId, companyId), eq(listingVariants.id, p.listingVariantId)),
+      );
+  }
 }
