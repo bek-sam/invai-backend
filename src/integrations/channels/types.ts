@@ -114,12 +114,22 @@ export function normalizeAvailability(
   );
 }
 
+/** A channel privacy request (Shopify compliance topics). Ids only: no buyer PII is kept. */
+export type PrivacyWebhookRequest = {
+  topic: "customers/data_request" | "customers/redact" | "shop/redact";
+  channelCustomerId: string | null;
+  channelRequestId: string | null;
+  channelOrderIds: string[];
+};
+
 export type WebhookEvent =
   | { kind: "order_upsert"; topic: string; shopDomain: string | null; order: NormalizedOrder }
   | { kind: "order_cancelled"; topic: string; shopDomain: string | null; channelOrderId: string }
   | { kind: "uninstalled"; topic: string; shopDomain: string | null }
   /** The webhook only names an order (Etsy): fetch it by id and trust the fetch, not the payload. */
   | { kind: "order_ref"; topic: string; shopDomain: string | null; channelOrderId: string }
+  /** Compliance request; `shopDomain` comes from the signed body, not the unsigned header. */
+  | { kind: "privacy"; topic: string; shopDomain: string | null; request: PrivacyWebhookRequest }
   /** `reason` is logged and kept on the delivery record (no PII). */
   | { kind: "ignored"; topic: string; shopDomain: string | null; reason?: string };
 

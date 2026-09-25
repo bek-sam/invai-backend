@@ -1,0 +1,32 @@
+# Shopify app configuration for the Shopify CLI (`shopify app deploy` pushes it to the Partner
+# Dashboard). The app is not registered yet (owner inbox OI-2): client_id and the URLs below are
+# placeholders to replace with the real app's values. The API version matches
+# SHOPIFY_API_VERSION in src/integrations/channels/shopify/common.ts.
+# https://shopify.dev/docs/apps/build/cli-for-apps/app-configuration
+
+name = "InvAI"
+client_id = "REPLACE_WITH_SHOPIFY_API_KEY"
+application_url = "https://app.invai.example"
+embedded = false
+
+[access_scopes]
+# Keep in sync with SHOPIFY_SCOPES (common.ts).
+scopes = "read_orders,write_orders,read_merchant_managed_fulfillment_orders,write_merchant_managed_fulfillment_orders,read_products,read_inventory,write_inventory,read_locations"
+
+[auth]
+redirect_urls = ["https://api.invai.example/webhooks/shopify/oauth/callback"]
+
+[webhooks]
+api_version = "2026-07"
+
+# Mandatory privacy compliance webhooks (App Store requirement), app-scoped. They arrive at the
+# same route as every Shopify webhook; `api/webhooks.ts` verifies the HMAC (401 when it doesn't
+# match), dedupes on X-Shopify-Webhook-Id and handles them inside the request.
+# https://shopify.dev/docs/apps/build/compliance/privacy-law-compliance
+[[webhooks.subscriptions]]
+compliance_topics = ["customers/data_request", "customers/redact", "shop/redact"]
+uri = "https://api.invai.example/webhooks/shopify"
+
+# Order topics (orders/create, orders/updated, orders/cancelled, app/uninstalled) are subscribed
+# per shop through the Admin API at install and re-checked daily
+# (src/integrations/channels/shopify/subscriptions.ts).

@@ -3,6 +3,7 @@ import { Hono } from "hono";
 import { env } from "../env";
 import { verifyStripeWebhook } from "../integrations/billing";
 import { webhookDeliveryId } from "../integrations/channels";
+import { isShopifyComplianceTopic } from "../integrations/channels/shopify/common";
 import { header } from "../integrations/channels/types";
 import { errorData, logger } from "../lib/log";
 import { getJob } from "../lib/queues";
@@ -10,6 +11,7 @@ import { handleStripeEvent } from "../modules/billing/stripe-events";
 import {
   completeShopifyOAuth,
   forgetWebhookDelivery,
+  processWebhookNow,
   recordWebhookDelivery,
   verifyWebhook,
 } from "../modules/channels/sync";
@@ -24,6 +26,9 @@ const log = logger("webhooks");
  *   4. enqueue `channels.<channel>.webhook` and answer 200 fast; the worker does the work.
  * Shopify dedupes on X-Shopify-Webhook-Id, Etsy on webhook-id. Polling catches anything a
  * webhook misses. Channels without webhooks never verify, so they get 401.
+ * Shopify compliance topics (customers/data_request, customers/redact, shop/redact) skip the
+ * queue: they are handled inside the request, so a redaction is done before the 200; a failure
+ * answers 500 with the delivery forgotten, and Shopify retries.
  */
 export const webhooks = new Hono();
 
@@ -78,6 +83,23 @@ webhooks.post("/:channel", async (c) => {
   if (!deliveryId) {
     log.warn("signed webhook without a delivery id; rejected", { channel });
     return c.json({ error: "missing delivery id" }, 400);
+  }
+  if (channel === "shopify" && isShopifyComplianceTopic(header(headers, "x-shopify-topic"))) {
+    if (!(await recordWebhookDelivery(channel, deliveryId))) {
+      log.info("duplicate compliance webhook acknowledged", { channel, deliveryId });
+      return c.json({ ok: true, duplicate: true }, 200);
+    }
+    try {
+      const res = await processWebhookNow(channel, headers, body);
+      return c.json({ ok: true, handled: res.handled }, 200);
+    } catch (err) {
+      log.error("compliance webhook failed; Shopify will retry", {
+        channel,
+        deliveryId,
+        ...errorData(err),
+      });
+      return c.json({ error: "try again" }, 500);
+    }
   }
   const job = getJob(`channels.${channel}.webhook`);
   if (!job) {

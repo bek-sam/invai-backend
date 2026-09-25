@@ -259,9 +259,61 @@ export function restOrderToNormalized(o: RestOrder): NormalizedOrder {
   };
 }
 
+/** The mandatory compliance topics, declared app-scoped in `shopify.app.toml`. */
+export const SHOPIFY_COMPLIANCE_TOPICS = [
+  "customers/data_request",
+  "customers/redact",
+  "shop/redact",
+] as const;
+
+export function isShopifyComplianceTopic(topic: string | null | undefined) {
+  return (SHOPIFY_COMPLIANCE_TOPICS as readonly string[]).includes(topic ?? "");
+}
+
+type CompliancePayload = {
+  shop_domain?: string;
+  customer?: { id?: number | string | null } | null;
+  orders_requested?: (number | string)[] | null;
+  orders_to_redact?: (number | string)[] | null;
+  data_request?: { id?: number | string | null } | null;
+};
+
+/**
+ * Compliance payloads carry the customer's email and phone; only ids are kept. The shop comes
+ * from the HMAC-signed body (`shop_domain`); a header naming a different shop is refused.
+ */
+function parseCompliance(
+  topic: (typeof SHOPIFY_COMPLIANCE_TOPICS)[number],
+  headerShop: string | null,
+  p: CompliancePayload,
+): WebhookEvent {
+  const shopDomain = p.shop_domain ?? null;
+  if (!shopDomain || (headerShop && headerShop !== shopDomain))
+    return { kind: "ignored", topic, shopDomain, reason: "shop domain missing or mismatched" };
+  const ids = (list: (number | string)[] | null | undefined) => (list ?? []).map(String);
+  return {
+    kind: "privacy",
+    topic,
+    shopDomain,
+    request: {
+      topic,
+      channelCustomerId: p.customer?.id != null ? String(p.customer.id) : null,
+      channelRequestId: p.data_request?.id != null ? String(p.data_request.id) : null,
+      channelOrderIds:
+        topic === "customers/data_request" ? ids(p.orders_requested) : ids(p.orders_to_redact),
+    },
+  };
+}
+
 export function parseShopifyWebhook(headers: HeaderBag, body: string): WebhookEvent {
   const topic = header(headers, "x-shopify-topic") ?? "unknown";
   const shopDomain = header(headers, "x-shopify-shop-domain");
+  if (isShopifyComplianceTopic(topic))
+    return parseCompliance(
+      topic as (typeof SHOPIFY_COMPLIANCE_TOPICS)[number],
+      shopDomain,
+      JSON.parse(body) as CompliancePayload,
+    );
   const payload = JSON.parse(body) as RestOrder & { id: number | string };
   switch (topic) {
     case "orders/create":

@@ -2,6 +2,7 @@ import { z } from "zod";
 import { env } from "../../env";
 import { errorData, logger } from "../../lib/log";
 import { defineJob, queues } from "../../lib/queues";
+import { warnOverduePrivacyRequests } from "../privacy/service";
 import { checkWebhookSubscriptions } from "./service";
 import {
   pollableConnections,
@@ -80,12 +81,18 @@ export const purgeWebhookDeliveriesJob = defineJob({
   handler: async () => purgeWebhookDeliveries(),
 });
 
-/** Daily: re-check webhook subscriptions and recreate any the channel dropped (T-3-1). */
+/**
+ * Daily: re-check webhook subscriptions and recreate any the channel dropped, and warn about
+ * privacy requests still open after 20 days (T-3-1).
+ */
 export const checkWebhookSubscriptionsJob = defineJob({
   queue: "sync",
   name: "channels.webhookSubscriptions.check",
   input: z.object({}).passthrough(),
-  handler: async () => checkWebhookSubscriptions(),
+  handler: async () => ({
+    ...(await checkWebhookSubscriptions()),
+    ...(await warnOverduePrivacyRequests()),
+  }),
 });
 
 /** Idempotent: registers the 10-minute poll and the nightly delivery purge (API and worker). */

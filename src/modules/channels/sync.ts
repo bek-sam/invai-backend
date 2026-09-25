@@ -40,6 +40,7 @@ import { getObject, objectKey, putObject } from "../../lib/s3";
 import { assertWithinPlan } from "../billing/service";
 import { markFileReady } from "../files/service";
 import { cancelFromChannel, importNormalizedOrders } from "../orders/import";
+import { handlePrivacyRequest } from "../privacy/service";
 import {
   type ConnectionRow,
   channelWebhookUri,
@@ -441,6 +442,41 @@ export async function processWebhook(
   }
 }
 
+/**
+ * Process a verified, recorded delivery inside the request (Shopify compliance topics: the PII
+ * must be gone before the 200). On failure the delivery record is removed, whatever its status,
+ * so the channel's retry is processed again, and the error is rethrown for a 5xx.
+ */
+export async function processWebhookNow(
+  channel: ConnectionRow["channel"],
+  headers: HeaderBag,
+  body: string,
+): Promise<WebhookResult> {
+  try {
+    const res = await handleWebhook(channel, headers, body);
+    await finishWebhookDelivery(channel, headers, {
+      status: res.result.handled ? "processed" : "ignored",
+      companyId: res.companyId,
+      detail: res.result.handled ? null : res.result.reason,
+    });
+    return res.result;
+  } catch (err) {
+    const deliveryId = webhookDeliveryId(channel, headers);
+    if (deliveryId)
+      await withSystem((tx) =>
+        tx
+          .delete(webhookDeliveries)
+          .where(
+            and(
+              eq(webhookDeliveries.channel, channel),
+              eq(webhookDeliveries.deliveryId, deliveryId),
+            ),
+          ),
+      ).catch(() => {});
+    throw err;
+  }
+}
+
 async function handleWebhook(
   channel: ConnectionRow["channel"],
   headers: HeaderBag,
@@ -463,6 +499,22 @@ async function handleWebhook(
     if (event.reason)
       log.info("webhook skipped", { channel, topic: event.topic, reason: event.reason });
     return skip(event.reason ?? `topic ${event.topic} ignored`);
+  }
+  if (event.kind === "privacy") {
+    const deliveryId = webhookDeliveryId(channel, headers);
+    if (channel !== "shopify" || !event.shopDomain || !deliveryId)
+      return skip("privacy request without a shop or delivery id");
+    const res = await handlePrivacyRequest({
+      channel,
+      shopDomain: event.shopDomain,
+      deliveryId,
+      request: event.request,
+    });
+    if (!res.handled) return skip(res.reason ?? "privacy request not routed");
+    return {
+      result: { handled: true, kind: event.kind, orderIds: [] },
+      companyId: res.companyIds[0] ?? null,
+    };
   }
   if (!event.shopDomain) return skip("no shop domain");
   const live = await withSystem((tx) =>
