@@ -1,5 +1,6 @@
 import { authed } from "../../api/orpc";
 import { withTenant } from "../../db/client";
+import { notImplemented } from "../../lib/errors";
 import { sendSheetToVendor } from "../vendors/service";
 import * as svc from "./service";
 
@@ -84,6 +85,10 @@ export const productionRouter = authed.production.router({
   qc: authed.production.qc.handler(({ input, context: { tenant } }) =>
     withTenant(tenant.companyId, (tx) => svc.qc(tx, tenant, input)),
   ),
+  // T-4-1 fills this in; the stub keeps the router typechecking against the new contract procedure.
+  packOrder: authed.production.packOrder.handler(() => {
+    throw notImplemented("production.packOrder");
+  }),
   staffOutput: authed.production.staffOutput.handler(({ input, context: { tenant } }) =>
     withTenant(tenant.companyId, (tx) => svc.staffOutput(tx, tenant, input)),
   ),
