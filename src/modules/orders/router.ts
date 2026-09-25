@@ -1,6 +1,5 @@
 import { authed } from "../../api/orpc";
 import { withTenant } from "../../db/client";
-import { notImplemented } from "../../lib/errors";
 import { mapItemManually } from "./mapping";
 import * as svc from "./service";
 
@@ -37,10 +36,9 @@ export const ordersRouter = authed.orders.router({
   channelPerformance: authed.orders.channelPerformance.handler(({ input, context: { tenant } }) =>
     withTenant(tenant.companyId, (tx) => svc.channelPerformance(tx, tenant, input)),
   ),
-  // TODO(backend-engineer, T-5-1): implement per wave 5's contract-stub section 1.
-  updateAddress: authed.orders.updateAddress.handler(() => {
-    throw notImplemented("orders.updateAddress");
-  }),
+  updateAddress: authed.orders.updateAddress.handler(({ input, context: { tenant } }) =>
+    withTenant(tenant.companyId, (tx) => svc.updateAddress(tx, tenant, input)),
+  ),
 });
 
 export const orderItemsRouter = authed.orderItems.router({

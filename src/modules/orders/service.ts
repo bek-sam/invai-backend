@@ -1,4 +1,5 @@
 import {
+  type Address,
   CHANNEL_RULES,
   CHANNELS,
   type ChannelPerformance,
@@ -50,13 +51,14 @@ import {
 import { imaging } from "../../integrations/imaging/client";
 import { audit } from "../../lib/audit";
 import { sha256Hex } from "../../lib/crypto";
-import { badRequest, conflict, notFound } from "../../lib/errors";
+import { badRequest, conflict, notFound, ORPCError } from "../../lib/errors";
 import { logger } from "../../lib/log";
 import { emit } from "../../lib/outbox";
 import { publish } from "../../lib/realtime";
 import { releaseForItems } from "../inventory/service";
 import { guardShipmentsForItems } from "../shipping/service";
 import { ARTWORK_ITEM_FLAGS, withFlags } from "./flags";
+import { ALL_ADDRESS_FIELDS, buyerPiiRow, upsertBuyerPii } from "./pii";
 import { todayRange } from "./shipby";
 import { transitionItem } from "./state-machine";
 
@@ -545,6 +547,7 @@ const AUDIT_KIND: Record<string, TimelineEntry["kind"]> = {
   "order.cancelled": "cancelled",
   "order.note": "note",
   "order.tags": "note",
+  "order.address_updated": "address_updated",
   "tracking.pushed": "tracking_pushed",
   "scan.recorded": "scan",
   "sheet.sent": "sheet",
@@ -789,6 +792,126 @@ export async function releaseOrder(tx: Tx, ctx: TenantContext, id: string) {
   await emit(tx, ctx.companyId, "order.released", { orderId: id });
   publishOrder(tx, ctx.companyId, id);
   return getOrder(tx, ctx, id);
+}
+
+/* ------------------------------------ address fix ------------------------------------ */
+
+/**
+ * Shipment states that carry a label (shipping's `LIVE_LABEL`), plus the in-flight `buying` and
+ * `voiding` intents: a label may exist for the old address, so the edit waits for the outcome.
+ */
+const ADDRESS_LOCK_STATES = [
+  "labeled",
+  "in_transit",
+  "delivered",
+  "exception",
+  "returned",
+  "buying",
+  "voiding",
+];
+
+const addressLocked = () =>
+  new ORPCError("ADDRESS_LOCKED", {
+    status: 409,
+    message: "This order already has a shipping label; void it first",
+  });
+const addressInvalid = (detail: string) =>
+  new ORPCError("ADDRESS_INVALID", {
+    status: 422,
+    message: "Ship-to address is not deliverable",
+    data: { detail },
+  });
+
+const clean = (v: string | null | undefined) => {
+  const t = (v ?? "").trim();
+  return t ? t : null;
+};
+
+/**
+ * Fix the ship-to address before a label exists. Format check only (street, city and a US ZIP,
+ * the same test the ship queue and rating apply); no carrier is called, since rating needs a
+ * packed order. Releases an `address_check` hold; otherwise just records the change.
+ */
+export async function updateAddress(
+  tx: Tx,
+  ctx: TenantContext,
+  input: { id: string; address: Address },
+) {
+  // Same lock `shipping.rates` takes first: a rate or buy can't start between check and write.
+  const [order] = await tx.select().from(orders).where(eq(orders.id, input.id)).for("update");
+  if (!order) throw notFound("order", input.id);
+  if (order.status === "cancelled" || order.status === "shipped" || order.status === "delivered")
+    throw conflict(`The order is ${order.status}; its address can't change`);
+  const locked = await tx.execute<{ n: number }>(
+    sql`select 1 as n from shipments s where s.order_id = ${order.id} and s.status in (${sql.join(
+      ADDRESS_LOCK_STATES.map((st) => sql`${st}`),
+      sql`, `,
+    )}) limit 1`,
+  );
+  if (locked.rows.length) throw addressLocked();
+
+  const a = input.address;
+  const street1 = clean(a.street1);
+  const city = clean(a.city);
+  const zip = clean(a.zip);
+  if (!street1) throw addressInvalid("street is required");
+  if (!city) throw addressInvalid("city is required");
+  if (!zip || !/^\d{5}(-\d{4})?$/.test(zip))
+    throw addressInvalid("ZIP must be 5 digits (or ZIP+4)");
+
+  const current = await buyerPiiRow(tx, order.id);
+  const done = await upsertBuyerPii(
+    tx,
+    {
+      companyId: ctx.companyId,
+      orderId: order.id,
+      name: clean(a.name) ?? current?.name ?? "",
+      company: clean(a.company),
+      street1,
+      street2: clean(a.street2),
+      city,
+      state: (clean(a.state) ?? "").toUpperCase(),
+      zip,
+      country: (clean(a.country) ?? "US").toUpperCase(),
+      phone: clean(a.phone),
+      // The form carries no email; keep the one the channel sent.
+      email: clean(a.email) ?? current?.email ?? null,
+    },
+    ALL_ADDRESS_FIELDS,
+  );
+
+  // Units flagged for a bad address are fixed now.
+  const items = await orderItemRows(tx, order.id);
+  for (const i of items)
+    if (i.flags.some((f) => f.code === "address_invalid" && f.active))
+      await tx
+        .update(orderItems)
+        .set({ flags: withFlags(i.flags, [], ["address_invalid"]) })
+        .where(eq(orderItems.id, i.id));
+
+  if (done) {
+    // Quotes on an open (pending or rated) shipment were for the old address. Every labeled or
+    // in-flight shipment was refused above, so shipping's cancel guard only drops those quotes.
+    await guardShipmentsForItems(
+      tx,
+      ctx,
+      items.map((i) => i.id),
+      "cancel",
+    );
+    await audit(tx, {
+      companyId: ctx.companyId,
+      actor: ctx.actor,
+      action: "order.address_updated",
+      entityType: "order",
+      entityId: order.id,
+      // No buyer PII in the audit log.
+      summary: "Ship-to address updated",
+    });
+    await emit(tx, ctx.companyId, "order.updated", { orderId: order.id });
+  }
+  if (order.holdReason === "address_check") return releaseOrder(tx, ctx, order.id);
+  publishOrder(tx, ctx.companyId, order.id);
+  return getOrder(tx, ctx, order.id);
 }
 
 /**

@@ -9,6 +9,7 @@ import { publish } from "../../lib/realtime";
 import { loadMatcher, type Matcher, recordRuleUse } from "../channels/sku";
 import { withFlags } from "./flags";
 import { mapItems } from "./mapping";
+import { upsertBuyerPii } from "./pii";
 import { buyerRefOf, cancelOrder } from "./service";
 import { computeShipBy } from "./shipby";
 import { transitionItem } from "./state-machine";
@@ -344,21 +345,8 @@ async function updateExisting(
 
   // Address updates before the label is bought (buyer asked the channel to change it).
   if (n.shipTo && !SHIPPED.has(o.status) && o.status !== "partially_shipped") {
-    const [pii] = await tx.select().from(buyerPii).where(eq(buyerPii.orderId, o.id)).limit(1);
-    const next = piiValues(ctx.companyId, o.id, n);
-    if (!pii) {
-      await tx.insert(buyerPii).values(next);
-    } else if (
-      pii.street1 !== next.street1 ||
-      (pii.street2 ?? null) !== next.street2 ||
-      pii.city !== next.city ||
-      pii.state !== next.state ||
-      pii.zip !== next.zip ||
-      pii.name !== next.name
-    ) {
-      await tx.update(buyerPii).set(next).where(eq(buyerPii.id, pii.id));
-      changed.push("shipping address");
-    }
+    const done = await upsertBuyerPii(tx, piiValues(ctx.companyId, o.id, n));
+    if (done === "updated") changed.push("shipping address");
   }
   return changed.length ? changed : null;
 }
