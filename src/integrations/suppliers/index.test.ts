@@ -9,28 +9,34 @@ import { mockSupplier } from "./mock";
 import { ssActivewearAdapter } from "./ssactivewear";
 
 const creds = { account: `t13-${Date.now()}`, apiKey: "tenant-key" };
+/** A company id with no row: a real (not sample) company as far as the guard is concerned. */
+const companyId = crypto.randomUUID();
 
 describe("getSupplierAdapter", () => {
-  it("is live only with the tenant's own credentials", () => {
-    expect(getSupplierAdapter("ssactivewear", creds, { production: true })?.provider).toBe("live");
+  it("is live only with the tenant's own credentials", async () => {
+    expect(
+      (await getSupplierAdapter("ssactivewear", creds, { companyId, production: true }))?.provider,
+    ).toBe("live");
     expect(supplierProvider("ssactivewear", creds, true)).toBe("live");
   });
 
-  it("never falls back to platform keys: mock outside production", () => {
-    expect(getSupplierAdapter("ssactivewear", null, { production: false })?.provider).toBe("mock");
+  it("never falls back to platform keys: mock outside production", async () => {
+    expect(
+      (await getSupplierAdapter("ssactivewear", null, { companyId, production: false }))?.provider,
+    ).toBe("mock");
     expect(supplierProvider("ssactivewear", null, false)).toBe("mock");
   });
 
-  it("in production without credentials refuses to build an S&S adapter", () => {
-    expect(() => getSupplierAdapter("ssactivewear", null, { production: true })).toThrow(
-      SupplierNotConnectedError,
-    );
+  it("in production without credentials refuses to build an S&S adapter", async () => {
+    await expect(
+      getSupplierAdapter("ssactivewear", null, { companyId, production: true }),
+    ).rejects.toThrow(SupplierNotConnectedError);
     expect(supplierProvider("ssactivewear", null, true)).toBe("none");
   });
 
-  it("in production a supplier with no API gets no adapter (nothing is faked)", () => {
-    expect(getSupplierAdapter("sanmar", creds, { production: true })).toBeNull();
-    expect(getSupplierAdapter("other", null, { production: true })).toBeNull();
+  it("in production a supplier with no API gets no adapter (nothing is faked)", async () => {
+    expect(await getSupplierAdapter("sanmar", creds, { companyId, production: true })).toBeNull();
+    expect(await getSupplierAdapter("other", null, { companyId, production: true })).toBeNull();
   });
 });
 

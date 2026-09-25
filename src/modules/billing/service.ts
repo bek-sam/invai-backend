@@ -20,6 +20,7 @@ import { audit } from "../../lib/audit";
 import { badRequest, conflict, ORPCError, planLimit } from "../../lib/errors";
 import { logger } from "../../lib/log";
 import { emit } from "../../lib/outbox";
+import { assertNotSampleWorkspace, isSampleRow, realCompanySql } from "../tenancy/demo-flag";
 
 const log = logger("billing");
 
@@ -259,8 +260,8 @@ export async function subscriptionOf(tx: Tx, companyId: string) {
 }
 
 /** True when payments go through real Stripe (the plan then changes only by webhook). */
-export function paymentsLive() {
-  return billingProvider().kind === "live";
+export async function paymentsLive(companyId: string) {
+  return (await billingProvider({ companyId })).kind === "live";
 }
 
 /**
@@ -307,7 +308,7 @@ export async function getStatus(
       ? (sub.currentPeriodEnd?.toISOString() ?? null)
       : null,
     cancelAtPeriodEnd: sub?.cancelAtPeriodEnd ?? false,
-    paymentsEnabled: paymentsLive(),
+    paymentsEnabled: await paymentsLive(ctx.companyId),
     overLimitBehavior: sub?.overLimitBehavior ?? "warn",
   };
 }
@@ -318,15 +319,20 @@ export function paymentRequired(checkoutUrl: string | null, message = "This need
 }
 
 /**
- * Plans apply to real shops only: vendor orgs have no plan, and a demo company (sample data,
- * tenancy.demo) has no subscription, never expires and is never limited.
+ * Plans apply to real shops only: vendor orgs have no plan, and a sample workspace
+ * (tenancy.demo) has no subscription, never expires and is never limited. The seeded demo shop
+ * (`companies.demo` but no demo owner) is a real shop here: it has a plan and its limits.
  */
 async function hasPlan(tx: Tx, companyId: string) {
   const [row] = await tx
-    .select({ type: companies.type, demo: companies.demo })
+    .select({
+      type: companies.type,
+      demoOwnerUserId: companies.demoOwnerUserId,
+      settings: companies.settings,
+    })
     .from(companies)
     .where(eq(companies.id, companyId));
-  return (row?.type ?? "shop") === "shop" && !row?.demo;
+  return (row?.type ?? "shop") === "shop" && !(row && isSampleRow(row));
 }
 
 /**
@@ -416,7 +422,7 @@ async function openCheckout(
   const metadata: Record<string, string> = isPlan
     ? { companyId: ctx.companyId, plan: item.plan }
     : { companyId: ctx.companyId, pack: item.pack };
-  const res = await billingProvider().createCheckout({
+  const res = await (await billingProvider(ctx)).createCheckout({
     companyId: ctx.companyId,
     customerId: sub?.stripeCustomerId ?? null,
     mode: isPlan ? "subscription" : "payment",
@@ -443,6 +449,10 @@ export async function checkout(
   input: { plan: PlanKey } | { pack: string },
 ): Promise<{ url: string }> {
   if (ctx.orgType !== "shop") throw badRequest("Vendor organizations have no plan");
+  await assertNotSampleWorkspace(
+    ctx.companyId,
+    "This is a sample shop, so there's nothing to pay for. Switch to your shop to choose a plan.",
+  );
   let item: { plan: SelfServePlan } | { pack: PackKey };
   if ("plan" in input) {
     if (!isSelfServePlan(input.plan))
@@ -465,7 +475,11 @@ export async function checkout(
 /** `billing.portal`: Stripe's customer portal (payment method, invoices, cancel). */
 export async function portal(ctx: TenantContext): Promise<{ url: string }> {
   if (ctx.orgType !== "shop") throw badRequest("Vendor organizations have no plan");
-  const provider = billingProvider();
+  await assertNotSampleWorkspace(
+    ctx.companyId,
+    "This is a sample shop, so it has no billing account. Switch to your shop to manage billing.",
+  );
+  const provider = await billingProvider(ctx);
   const sub = await withTenant(ctx.companyId, (tx) => subscriptionOf(tx, ctx.companyId));
   if (provider.kind === "live" && !sub?.stripeCustomerId)
     throw badRequest("There's no billing account yet. Choose a plan first.");
@@ -483,7 +497,12 @@ export async function portal(ctx: TenantContext): Promise<{ url: string }> {
  */
 export async function requestPlanChange(ctx: TenantContext, key: PlanKey) {
   if (ctx.orgType !== "shop") throw badRequest("Vendor organizations have no plan");
-  if (!paymentsLive()) return withTenant(ctx.companyId, (tx) => changePlan(tx, ctx, key));
+  await assertNotSampleWorkspace(
+    ctx.companyId,
+    "This is a sample shop, so it has no plan. Switch to your shop to change plans.",
+  );
+  if (!(await paymentsLive(ctx.companyId)))
+    return withTenant(ctx.companyId, (tx) => changePlan(tx, ctx, key));
 
   const sub = await withTenant(ctx.companyId, (tx) => subscriptionOf(tx, ctx.companyId));
   if (key !== "trial") {
@@ -493,7 +512,7 @@ export async function requestPlanChange(ctx: TenantContext, key: PlanKey) {
   }
 
   if (hasLiveSubscription(sub) && sub?.stripeSubscriptionId) {
-    await billingProvider().cancelAtPeriodEnd(sub.stripeSubscriptionId);
+    await (await billingProvider(ctx)).cancelAtPeriodEnd(sub.stripeSubscriptionId);
     return withTenant(ctx.companyId, async (tx) => {
       await tx
         .update(subscriptions)
@@ -661,7 +680,7 @@ export async function expireTrials(now = new Date()) {
             tx
               .select({ id: companies.id })
               .from(companies)
-              .where(and(eq(companies.type, "shop"), eq(companies.demo, false))),
+              .where(and(eq(companies.type, "shop"), realCompanySql())),
           ),
         ),
       )

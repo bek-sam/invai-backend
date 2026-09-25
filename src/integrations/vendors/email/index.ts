@@ -23,12 +23,15 @@ export const emailVendor: VendorAdapter = {
 ${d.note ? `<p>Note: ${escapeHtml(d.note)}</p>` : ""}
 <ul>${link("Download PNG", d.links.png)}${link("Download PDF", d.links.pdf)}${link("Preview", d.links.preview)}</ul>
 <p style="color:#666">Links expire ${escapeHtml(d.links.expiresAt)}.</p>`;
-    const { messageId } = await sendMail({
-      to: d.vendor.email,
-      subject: `Gang sheet ${d.sheetName} from ${d.shopName}`,
-      text: lines.join("\n"),
-      html,
-    });
+    const { messageId } = await sendMail(
+      {
+        to: d.vendor.email,
+        subject: `Gang sheet ${d.sheetName} from ${d.shopName}`,
+        text: lines.join("\n"),
+        html,
+      },
+      { companyId: d.companyId },
+    );
     return { reference: messageId };
   },
 };

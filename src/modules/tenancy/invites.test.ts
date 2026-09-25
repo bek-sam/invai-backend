@@ -147,6 +147,7 @@ describe("team invites", () => {
         sendInviteEmail(
           "slow@test.local",
           {
+            companyId: crypto.randomUUID(),
             locale: "en",
             kind: "staff",
             companyName: "Desert Test",

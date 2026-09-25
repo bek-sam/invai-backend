@@ -113,7 +113,7 @@ describe("purchase order supplier safety", () => {
 
   beforeEach(() => {
     fake = fakeSupplier({ canCancel: true });
-    vi.mocked(suppliersModule.getSupplierAdapter).mockImplementation(() => fake);
+    vi.mocked(suppliersModule.getSupplierAdapter).mockImplementation(async () => fake);
     vi.mocked(outbox.emit).mockClear();
   });
 

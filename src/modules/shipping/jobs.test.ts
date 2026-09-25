@@ -57,6 +57,8 @@ vi.mock("../../integrations/channels", async (importOriginal) => {
   return { ...actual, getChannelAdapter: vi.fn(actual.getChannelAdapter) };
 });
 
+import { shopifyAdapter } from "../../integrations/channels/shopify";
+
 const realGetChannelAdapter = vi
   .mocked(channelsModule.getChannelAdapter)
   .getMockImplementation() as typeof channelsModule.getChannelAdapter;
@@ -160,11 +162,11 @@ beforeEach(() => {
   carrier = fakeCarrier();
   shopifyCalls = 0;
   shopifyFails = false;
-  vi.mocked(carriersModule.carrierAdapter).mockImplementation(() => carrier);
-  vi.mocked(channelsModule.getChannelAdapter).mockImplementation((kind, provider) => {
-    if (kind !== "shopify") return realGetChannelAdapter(kind, provider);
+  vi.mocked(carriersModule.carrierAdapter).mockImplementation(async () => carrier);
+  vi.mocked(channelsModule.getChannelAdapter).mockImplementation(async (kind, provider, scope) => {
+    if (kind !== "shopify") return realGetChannelAdapter(kind, provider, scope);
     const shopify: ChannelAdapter = {
-      ...realGetChannelAdapter("shopify", "mock"),
+      ...shopifyAdapter("mock"),
       async pushTracking() {
         shopifyCalls += 1;
         if (shopifyFails) throw new Error("shopify 502");
@@ -427,7 +429,7 @@ describe("mock timer and daily poll share the state function", () => {
         };
       },
     };
-    vi.mocked(carriersModule.carrierTracking).mockImplementation(() => tracking);
+    vi.mocked(carriersModule.carrierTracking).mockImplementation(async () => tracking);
     const enqueue = vi.spyOn(pollTrackerJob, "enqueue").mockResolvedValue({} as never);
     const sweep = (await runJobInline(trackerPollSweepJob, {})) as { shipments: number };
     const queuedIds = enqueue.mock.calls.map((c) => c[0].shipmentId);

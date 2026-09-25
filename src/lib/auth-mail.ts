@@ -146,7 +146,7 @@ export function sendAuthMail(
 ): Promise<boolean> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   return Promise.race([
-    sendMail({ to, ...mail }),
+    sendMail({ to, ...mail }, "account"),
     new Promise<never>((_, reject) => {
       timer = setTimeout(() => reject(new Error(`timed out after ${timeoutMs} ms`)), timeoutMs);
     }),

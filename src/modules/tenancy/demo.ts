@@ -16,7 +16,8 @@ import * as svc from "./service";
  * tenancy.demo: a user's own sample-data workspace. One demo company per user, found by
  * `companies.demoOwnerUserId` whichever real company they start from. It is an ordinary
  * company (its rows are isolated by the same `company_id` RLS as any other), flagged
- * `demo = true`, so billing, email and marketplace calls leave it out (see isDemoCompany).
+ * `demo = true` and linked by `demoOwnerUserId`, so billing, email, carrier, supplier and marketplace
+ * calls leave it out (see isSampleWorkspace in demo-flag.ts).
  *
  * The sample data comes from the seed's builder (db/seed/builder.ts) with smaller volumes, written
  * under `withTenant(demoId)`. Filling it takes a few seconds, so `start` runs it in the request
@@ -129,14 +130,18 @@ async function fillDemoCompany(companyId: string, userId: string) {
  * Retire a demo company: unlink it from its user and remove every membership, so nobody can open
  * it again and the user's next demo starts fresh. The rows are kept, not deleted: the
  * `inventory_movements` append-only trigger refuses every DELETE (even the cascade from
- * `companies`), and weakening that control for sample data isn't worth it. A retired demo stays
- * `demo = true`, so it is still left out of billing, email and marketplace calls.
+ * `companies`), and weakening that control for sample data isn't worth it. A retired demo gets
+ * `settings.demoRetiredAt`, so it is still a sample workspace: no billing, email or real adapters.
  */
 async function retireDemoCompany(companyId: string) {
   await db.transaction(async (tx) => {
     await tx
       .update(companies)
-      .set({ demoOwnerUserId: null })
+      .set({
+        demoOwnerUserId: null,
+        // Keeps it a sample workspace (isSampleWorkspace) once the owner link is gone.
+        settings: sql`coalesce(${companies.settings}, '{}'::jsonb) || jsonb_build_object('demoRetiredAt', ${new Date().toISOString()}::text)`,
+      })
       .where(and(eq(companies.id, companyId), eq(companies.demo, true)));
     await tx.delete(members).where(eq(members.organizationId, companyId));
   });

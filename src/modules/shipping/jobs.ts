@@ -133,7 +133,7 @@ export const scheduleMockTrackingJob = defineJob({
   input: z.object({ companyId: z.uuid(), shipmentId: z.uuid() }),
   jobId: (i) => `schedule-mock-tracking-${i.shipmentId}`,
   handler: async ({ companyId, shipmentId }) => {
-    if (!isMockCarrier()) return { skipped: true };
+    if (!(await isMockCarrier(companyId))) return { skipped: true };
     await mockTrackingJob.enqueue(
       { companyId, shipmentId, step: "in_transit" },
       { delay: MOCK_TRANSIT_HOURS * 3600_000 },
@@ -473,7 +473,7 @@ export const pollTrackerJob = defineJob({
     );
     if (s?.status !== "labeled" || !s.carrierShipmentId || !s.trackingCode)
       return { skipped: true };
-    const tracking = carrierTracking();
+    const tracking = await carrierTracking({ companyId });
     // EasyPost index and read endpoints allow about 5 requests per second per account.
     if (tracking.provider === "easypost")
       await takeToken("easypost:trackers", { capacity: 5, perMs: 1_000 }, 120_000);

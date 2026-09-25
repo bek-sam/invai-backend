@@ -15,6 +15,7 @@ import {
 import { env } from "../../env";
 import {
   channelMocked,
+  channelPendingApproval,
   getChannelAdapter,
   webhookAdapter,
   webhookDeliveryId,
@@ -44,6 +45,7 @@ import { assertWithinPlan, effectiveStatus } from "../billing/service";
 import { markFileReady } from "../files/service";
 import { cancelFromChannel, importNormalizedOrders } from "../orders/import";
 import { handlePrivacyRequest } from "../privacy/service";
+import { isSampleWorkspace } from "../tenancy/demo-flag";
 import {
   type ConnectionRow,
   channelWebhookUri,
@@ -534,7 +536,7 @@ export async function syncConnection(
     return { imported: 0, skipped: true };
   }
   await setJob(companyId, jobId, { status: "running", progress: 0.1, message: "Fetching orders" });
-  const adapter = getChannelAdapter(conn.channel, conn.provider);
+  const adapter = await getChannelAdapter(conn.channel, conn.provider, conn);
   try {
     const fetched = await adapter.fetchOrders(await freshChannelConn(conn));
     const res = await withTenant(companyId, async (tx) => {
@@ -637,7 +639,7 @@ export async function pollableConnections(now = new Date()) {
     if (seen.has(r.id)) return false;
     seen.add(r.id);
     if ((r.settings as { autoImport?: boolean })?.autoImport === false) return false;
-    if (getChannelAdapter(r.channel, r.provider).pendingApproval) return false;
+    if (channelPendingApproval(r.channel, r.provider)) return false;
     if (r.sub?.status && effectiveStatus(r.sub, now) === "trial_expired") return false;
     if (
       pollFailing(r) &&
@@ -865,8 +867,13 @@ async function handleWebhook(
     // Webhook as a trigger: fetch the order by id outside any transaction.
     let fetched: FetchedOrder | null = null;
     if (event.kind === "order_ref") {
-      if (!adapter.fetchOrder) return skip(`${channel} cannot fetch orders by id`);
-      fetched = await adapter.fetchOrder(toChannelConn(conn), event.channelOrderId);
+      const store = await getChannelAdapter(
+        channel,
+        channelMocked(channel) ? "mock" : "live",
+        conn,
+      );
+      if (!store.fetchOrder) return skip(`${channel} cannot fetch orders by id`);
+      fetched = await store.fetchOrder(toChannelConn(conn), event.channelOrderId);
     }
     await withTenant(conn.companyId, async (tx) => {
       await markConnection(tx, conn.id, { kind: "webhook" });
@@ -1014,14 +1021,19 @@ export async function completeShopifyOAuth(query: Record<string, string>) {
 
   let credentials: ChannelCredentials = { accessToken: "mock-token", scopes: [] };
   let name = conn.name;
-  if (conn.provider === "live" && !env.mocks.shopify) {
+  // A sample workspace never completes a real install (its connect already chose the mock).
+  if (
+    conn.provider === "live" &&
+    !env.mocks.shopify &&
+    !(await isSampleWorkspace(conn.companyId))
+  ) {
     const token = await exchangeShopifyCode(shop, query.code ?? "");
     credentials = token;
     const done = await finishShopifyInstall({ externalShopId: shop, credentials: token });
     name = done.shopName;
   }
   // Subscribe the order webhooks; a topic that fails leaves the connection degraded (health).
-  const webhooks = await getChannelAdapter("shopify", conn.provider).ensureWebhooks?.(
+  const webhooks = await (await getChannelAdapter("shopify", conn.provider, conn)).ensureWebhooks?.(
     { ...toChannelConn(conn), externalShopId: shop, credentials },
     channelWebhookUri("shopify"),
   );

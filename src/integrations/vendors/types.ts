@@ -1,5 +1,7 @@
 /** What a vendor adapter needs to deliver one gang sheet. */
 export type SheetDelivery = {
+  /** The shop sending the sheet (a sample workspace never emails its vendor). */
+  companyId: string;
   sheetId: string;
   sheetName: string;
   shopName: string;

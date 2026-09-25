@@ -1,6 +1,7 @@
 import nodemailer from "nodemailer";
 import { env } from "../../env";
 import { logger } from "../../lib/log";
+import { type CompanyScope, isSampleWorkspace } from "../../modules/tenancy/demo-flag";
 
 const log = logger("mailer");
 
@@ -28,7 +29,20 @@ export function isPlaceholderEmail(address: string) {
   return address.trim().toLowerCase().endsWith(`@${PIN_ONLY_EMAIL_DOMAIN}`);
 }
 
-export async function sendMail(mail: Mail): Promise<{ messageId: string }> {
+/**
+ * Who a mail is sent for. Company mail (invites, vendor sheets) names the company, and a sample
+ * workspace (tenancy.demo) never sends any: its sample people and vendors are not real inboxes.
+ * `"account"` is a person's own account mail (verify email, password reset, security notices
+ * from Better Auth): it is about the user, not any company, so it is always sent. A user in a
+ * sample workspace always also has a real company (tenancy.demo refuses to start without one).
+ */
+export type MailSender = CompanyScope | "account";
+
+export async function sendMail(mail: Mail, sender: MailSender): Promise<{ messageId: string }> {
+  if (sender !== "account" && (await isSampleWorkspace(sender.companyId))) {
+    log.info("mail skipped: sample workspace", { subject: mail.subject });
+    return { messageId: "skipped:sample-workspace" };
+  }
   if (isPlaceholderEmail(mail.to)) {
     log.info("mail skipped: PIN-only placeholder address", { subject: mail.subject });
     return { messageId: "skipped:pin-only" };

@@ -18,7 +18,7 @@ import {
   shipments,
 } from "../../db/schema";
 import { env } from "../../env";
-import { getChannelAdapter } from "../../integrations/channels";
+import { channelPendingApproval, getChannelAdapter } from "../../integrations/channels";
 import {
   refreshShopifyToken,
   ShopifyRefreshError,
@@ -35,7 +35,7 @@ import { badRequest, notFound, ORPCError } from "../../lib/errors";
 import { emit } from "../../lib/outbox";
 import { keyset, type PageInput } from "../../lib/pagination";
 import { assertWithinPlan } from "../billing/service";
-import { isDemoCompany } from "../tenancy/demo-flag";
+import { isSampleWorkspace } from "../tenancy/demo-flag";
 
 /*
  * Channel connections: list/connect/update/disconnect, health, tracking push for shipping.
@@ -201,7 +201,7 @@ export function toChannelConn(row: ConnectionRow): ChannelConn {
 type HealthStats = { ordersLast24h: number; errorsLast24h: number };
 
 function toConnection(row: ConnectionRow, stats: HealthStats): ChannelConnection {
-  const adapter = getChannelAdapter(row.channel, row.provider);
+  const pendingApproval = channelPendingApproval(row.channel, row.provider);
   const lastSync = [row.lastPollAt, row.lastWebhookAt]
     .filter((d): d is Date => !!d)
     .sort((a, b) => b.getTime() - a.getTime())[0];
@@ -239,7 +239,7 @@ function toConnection(row: ConnectionRow, stats: HealthStats): ChannelConnection
       ordersLast24h: stats.ordersLast24h,
       errorsLast24h: stats.errorsLast24h,
       lastError: row.lastError ?? degraded,
-      pendingApproval: adapter.pendingApproval,
+      pendingApproval,
       staleMinutes,
     },
     connectedAt: row.connectedAt?.toISOString() ?? null,
@@ -365,8 +365,9 @@ export async function connect(tx: Tx, ctx: TenantContext, input: ConnectInput) {
     // A pending install already counts; a new or reconnected shop takes a connection slot.
     if (!existing || existing.status === "disconnected")
       await assertWithinPlan(tx, ctx, "connections");
-    // A demo company (sample data) never talks to a real store, whatever keys are configured.
-    const provider = env.mocks.shopify || (await isDemoCompany(ctx.companyId)) ? "mock" : "live";
+    // A sample workspace never talks to a real store, whatever keys are configured.
+    const provider =
+      env.mocks.shopify || (await isSampleWorkspace(ctx.companyId)) ? "mock" : "live";
     const state = randomToken(24);
     const values = {
       name: shop.replace(/\.myshopify\.com$/, ""),
@@ -481,7 +482,7 @@ export async function disconnect(tx: Tx, ctx: TenantContext, id: string) {
       ? toChannelConn(row)
       : null;
   const adapter = remote?.credentials?.accessToken
-    ? getChannelAdapter(row.channel, row.provider)
+    ? await getChannelAdapter(row.channel, row.provider, row)
     : null;
   const cleanUp = adapter?.disconnect?.bind(adapter);
   if (remote && cleanUp)
@@ -556,7 +557,7 @@ export async function checkWebhookSubscriptions() {
   let degraded = 0;
   for (const row of rows) {
     const conn = toChannelConn(row);
-    const adapter = getChannelAdapter(row.channel, row.provider);
+    const adapter = await getChannelAdapter(row.channel, row.provider, row);
     if (!adapter.ensureWebhooks || !conn.credentials?.accessToken) continue;
     const state = await adapter.ensureWebhooks(conn, channelWebhookUri(row.channel));
     const message = webhookFailureMessage(state);
@@ -712,7 +713,7 @@ export async function pushTrackingForShipment(
     };
   }
 
-  const adapter = getChannelAdapter(plan.channel, plan.provider);
+  const adapter = await getChannelAdapter(plan.channel, plan.provider, ctx);
   const conn = await freshChannelConn(plan.row);
   const result = await adapter.pushTracking(conn, plan.push);
   await withTenant(ctx.companyId, (tx) =>

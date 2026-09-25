@@ -41,6 +41,7 @@ import { badRequest, conflict, invalidTransition, notFound, ORPCError } from "..
 import { logger } from "../../lib/log";
 import { emit } from "../../lib/outbox";
 import { keyset, type PageInput } from "../../lib/pagination";
+import { isSampleWorkspace } from "../tenancy/demo-flag";
 import { defaultLocationId, recordMovement } from "./ledger";
 import { daysOfCover, effectiveReorderPoint, planReorder } from "./reorder";
 
@@ -661,7 +662,7 @@ export async function supplierAdapterFor(
     .from(suppliers)
     .where(and(eq(suppliers.companyId, companyId), eq(suppliers.supplier, supplier as Supplier)));
   try {
-    return getSupplierAdapter(supplier, credsOf(row), { account: companyId });
+    return await getSupplierAdapter(supplier, credsOf(row), { companyId });
   } catch (err) {
     if (err instanceof SupplierNotConnectedError) {
       const name = SUPPLIER_NAMES[supplier as Supplier] ?? supplier;
@@ -675,6 +676,7 @@ export async function supplierAdapterFor(
 
 export async function listSuppliers(tx: Tx, ctx: Ctx) {
   const rows = await supplierRows(tx, ctx.companyId);
+  const sample = await isSampleWorkspace(ctx.companyId);
   const counts = await tx
     .select({ supplier: blankVariants.supplier, n: sql<number>`count(*)::int` })
     .from(blankVariants)
@@ -687,7 +689,10 @@ export async function listSuppliers(tx: Tx, ctx: Ctx) {
         supplier,
         name: r?.name ?? SUPPLIER_NAMES[supplier],
         connected: !!r,
-        provider: supplier === "other" ? ("none" as const) : supplierProvider(supplier, credsOf(r)),
+        provider:
+          supplier === "other"
+            ? ("none" as const)
+            : supplierProvider(supplier, credsOf(r), undefined, sample),
         freeFreightThreshold: r?.freeFreightThresholdCents ?? DEFAULT_FREE_FREIGHT[supplier],
         accountNumber: r?.accountNumber ?? null,
         hasApiKey: !!r?.apiKey,
@@ -721,7 +726,7 @@ export async function supplierStock(
     try {
       const creds = credsOf(rows.find((r) => r.supplier === supplier));
       if (supplierProvider(supplier, creds) === "none") continue;
-      const adapter = getSupplierAdapter(supplier, creds, { account: ctx.companyId });
+      const adapter = await getSupplierAdapter(supplier, creds, { companyId: ctx.companyId });
       if (!adapter) continue;
       const stock = await adapter.stock(list.map((b) => b.supplierSku));
       const bySku = new Map(stock.map((s) => [s.sku, s.quantity]));

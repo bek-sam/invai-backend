@@ -1,5 +1,6 @@
 import type { Channel } from "@invai/contracts";
 import { env } from "../../env";
+import { type CompanyScope, isSampleWorkspace } from "../../modules/tenancy/demo-flag";
 import { amazonAdapter } from "./amazon";
 import { csvOnlyAdapter } from "./csv";
 import { etsyAdapter, etsyMocked } from "./etsy";
@@ -15,8 +16,20 @@ export type * from "./types";
  * The adapter for a channel. Shopify and Etsy pick live or mock from the provider (and the env
  * keys); Etsy/Amazon/TikTok/Walmart are pending marketplace approval (CSV import works, tracking
  * push returns `manual`; Etsy webhooks are verified); eBay and generic CSV have no API.
+ *
+ * A sample workspace (tenancy.demo) always gets the mock, whatever its connection's stored
+ * `provider` says: the check is live, on every call, so no caller can reach a real store for it.
  */
-export function getChannelAdapter(kind: Channel, provider?: "live" | "mock"): ChannelAdapter {
+export async function getChannelAdapter(
+  kind: Channel,
+  provider: "live" | "mock" | undefined,
+  scope: CompanyScope,
+): Promise<ChannelAdapter> {
+  const sample = provider !== "mock" && (await isSampleWorkspace(scope.companyId));
+  return pickAdapter(kind, sample ? "mock" : provider);
+}
+
+function pickAdapter(kind: Channel, provider?: "live" | "mock"): ChannelAdapter {
   switch (kind) {
     case "shopify":
       return shopifyAdapter(provider);
@@ -33,6 +46,11 @@ export function getChannelAdapter(kind: Channel, provider?: "live" | "mock"): Ch
   }
 }
 
+/** Metadata only (no network call possible): is this channel waiting on marketplace approval? */
+export function channelPendingApproval(kind: Channel, provider?: "live" | "mock"): boolean {
+  return pickAdapter(kind, provider).pendingApproval;
+}
+
 /** True when this channel's platform-wide key is missing, so it runs on its mock provider. */
 export function channelMocked(kind: Channel): boolean {
   switch (kind) {
@@ -45,9 +63,15 @@ export function channelMocked(kind: Channel): boolean {
   }
 }
 
-/** The adapter webhooks for this channel are verified and parsed with (per-channel mock flag). */
-export function webhookAdapter(kind: Channel): ChannelAdapter {
-  return getChannelAdapter(kind, channelMocked(kind) ? "mock" : "live");
+/**
+ * What inbound webhooks are verified and parsed with (per-channel mock flag). Verify and parse
+ * only: no company is known yet, so anything that calls the store (fetchOrder) goes through
+ * `getChannelAdapter` for the matched connection.
+ */
+export function webhookAdapter(
+  kind: Channel,
+): Pick<ChannelAdapter, "verifyWebhook" | "parseWebhook"> {
+  return pickAdapter(kind, channelMocked(kind) ? "mock" : "live");
 }
 
 /** Each channel's delivery-id header, the key webhook redeliveries are deduplicated on. */

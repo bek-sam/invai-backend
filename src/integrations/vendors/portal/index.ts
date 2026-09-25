@@ -15,12 +15,15 @@ export const portalVendor: VendorAdapter = {
         data: { sheetId: d.sheetId, shopName: d.shopName },
       });
     }
-    const { messageId } = await sendMail({
-      to: d.vendor.email,
-      subject: `New gang sheet ${d.sheetName} from ${d.shopName}`,
-      text: `${d.shopName} sent ${d.sheetName} (${d.transferCount} transfers, ${d.lengthIn.toFixed(1)} in). Open your InvAI vendor inbox to download it.${d.note ? `\nNote: ${d.note}` : ""}`,
-      html: `<p><b>${escapeHtml(d.shopName)}</b> sent <b>${escapeHtml(d.sheetName)}</b> (${d.transferCount} transfers, ${d.lengthIn.toFixed(1)} in).</p><p>Open your InvAI vendor inbox to download it.</p>${d.note ? `<p>Note: ${escapeHtml(d.note)}</p>` : ""}`,
-    });
+    const { messageId } = await sendMail(
+      {
+        to: d.vendor.email,
+        subject: `New gang sheet ${d.sheetName} from ${d.shopName}`,
+        text: `${d.shopName} sent ${d.sheetName} (${d.transferCount} transfers, ${d.lengthIn.toFixed(1)} in). Open your InvAI vendor inbox to download it.${d.note ? `\nNote: ${d.note}` : ""}`,
+        html: `<p><b>${escapeHtml(d.shopName)}</b> sent <b>${escapeHtml(d.sheetName)}</b> (${d.transferCount} transfers, ${d.lengthIn.toFixed(1)} in).</p><p>Open your InvAI vendor inbox to download it.</p>${d.note ? `<p>Note: ${escapeHtml(d.note)}</p>` : ""}`,
+      },
+      { companyId: d.companyId },
+    );
     return { reference: messageId };
   },
 };

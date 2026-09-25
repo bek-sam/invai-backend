@@ -7,6 +7,7 @@ import { env } from "../../env";
 import { escapeHtml, sendMail } from "../../integrations/vendors/mailer";
 import { upstream } from "../../lib/errors";
 import { logger } from "../../lib/log";
+import type { CompanyScope } from "./demo-flag";
 
 /*
  * Invitations are Better Auth organization invitations (`invitations` table). InvAI creates the
@@ -53,8 +54,6 @@ const ROLE_NAMES: Record<Locale, Record<Role, string>> = {
 };
 
 export type InviteEmailInput = {
-  /** Sent from a demo company (sample data): the email is never sent (see sendInviteEmail). */
-  demo?: boolean;
   locale: string | null | undefined;
   kind: "staff" | "vendor";
   companyName: string;
@@ -128,12 +127,13 @@ export const INVITE_EMAIL_TIMEOUT_MS = 15_000;
  */
 export async function deliverInviteMail(
   mail: { to: string; subject: string; text: string; html?: string },
+  from: CompanyScope,
   timeoutMs = INVITE_EMAIL_TIMEOUT_MS,
 ) {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     await Promise.race([
-      sendMail(mail),
+      sendMail(mail, { companyId: from.companyId }),
       new Promise<never>((_, reject) => {
         timer = setTimeout(() => reject(new Error(`timed out after ${timeoutMs} ms`)), timeoutMs);
       }),
@@ -147,19 +147,19 @@ export async function deliverInviteMail(
 }
 
 /** Send the invite email (English or Spanish). See deliverInviteMail for the rules. */
-export async function sendInviteEmail(to: string, input: InviteEmailInput, timeoutMs?: number) {
-  // A demo company is sample data: its invites stay in the app and never reach a real inbox.
-  if (input.demo) {
-    log.info("invite email skipped: demo company", { kind: input.kind });
-    return;
-  }
-  return deliverInviteMail({ to, ...inviteEmail(input) }, timeoutMs);
+export async function sendInviteEmail(
+  to: string,
+  input: InviteEmailInput & CompanyScope,
+  timeoutMs?: number,
+) {
+  // A sample workspace's invites stay in the app: sendMail never sends for it.
+  return deliverInviteMail({ to, ...inviteEmail(input) }, input, timeoutMs);
 }
 
 /** Company name plus the inviter's name and language, for the email. */
 export async function inviteSenders(companyId: string, inviterId: string | null) {
   const [company] = await db
-    .select({ name: companies.name, demo: companies.demo })
+    .select({ name: companies.name })
     .from(companies)
     .where(eq(companies.id, companyId))
     .limit(1);
@@ -171,7 +171,7 @@ export async function inviteSenders(companyId: string, inviterId: string | null)
         .limit(1)
     : [];
   return {
-    demo: company?.demo ?? false,
+    companyId,
     companyName: company?.name ?? "InvAI",
     inviterName: inviter?.name ?? null,
     locale: inviter?.locale ?? "en",

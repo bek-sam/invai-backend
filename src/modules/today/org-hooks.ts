@@ -3,6 +3,7 @@ import { withSystem } from "../../db/client";
 import { companies, locations, subscriptions } from "../../db/schema";
 import { errorData, logger } from "../../lib/log";
 import { emit } from "../../lib/outbox";
+import { isSampleRow } from "../tenancy/demo-flag";
 
 const log = logger("org-hooks");
 
@@ -10,7 +11,7 @@ const TRIAL_DAYS = 14;
 
 /**
  * Runs after Better Auth creates an organization (sign-up). Gives a shop a default "Main"
- * location and a trial subscription (never for a demo company), and emits `company.created`. Idempotent; never throws
+ * location and a trial subscription (never for a sample workspace), and emits `company.created`. Idempotent; never throws
  * (a failure here must not fail sign-up).
  */
 export async function onOrganizationCreated(org: { id: string; type?: string | null }) {
@@ -25,13 +26,13 @@ export async function onOrganizationCreated(org: { id: string; type?: string | n
       if (!existing.length) {
         await tx.insert(locations).values({ companyId: org.id, name: "Main", isDefault: true });
       }
-      // A demo company (sample data) has no plan: no trial to expire and lock it.
+      // A sample workspace (tenancy.demo) has no plan: no trial to expire and lock it.
       const [company] = await tx
-        .select({ demo: companies.demo })
+        .select({ demoOwnerUserId: companies.demoOwnerUserId, settings: companies.settings })
         .from(companies)
         .where(eq(companies.id, org.id))
         .limit(1);
-      if (type === "shop" && !company?.demo) {
+      if (type === "shop" && !(company && isSampleRow(company))) {
         await tx
           .insert(subscriptions)
           .values({

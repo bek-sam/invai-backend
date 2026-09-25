@@ -729,7 +729,11 @@ export async function publishDraft(
   if (conn.channel !== row.channel && conn.channel !== "csv")
     throw badRequest(`Connection is ${conn.channel}; this draft is for ${row.channel}`);
 
-  const adapter = getChannelAdapter(conn.channel, conn.provider) as unknown as MaybeUpsert & {
+  const adapter = (await getChannelAdapter(
+    conn.channel,
+    conn.provider,
+    conn,
+  )) as unknown as MaybeUpsert & {
     pendingApproval?: boolean;
   };
   if (typeof adapter.upsertListing === "function" && conn.mode === "api") {

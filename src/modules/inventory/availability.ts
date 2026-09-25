@@ -1,7 +1,7 @@
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { type Tx, withTenant } from "../../db/client";
 import { channelConnections, stockLevels } from "../../db/schema";
-import { getChannelAdapter } from "../../integrations/channels";
+import { channelPendingApproval, getChannelAdapter } from "../../integrations/channels";
 import { logger } from "../../lib/log";
 import { freshChannelConn, settingsOf } from "../channels/service";
 import { lastPushedQuantities, listPushTargets, markAvailabilityPushed } from "../channels/sku";
@@ -28,7 +28,7 @@ type ConnectionRow = typeof channelConnections.$inferSelect;
 export function canPushAvailability(conn: ConnectionRow): boolean {
   if (conn.channel === "csv" || conn.mode !== "api" || conn.status !== "connected") return false;
   if (!settingsOf(conn).pushAvailability) return false;
-  return !getChannelAdapter(conn.channel, conn.provider).pendingApproval;
+  return !channelPendingApproval(conn.channel, conn.provider);
 }
 
 export type AvailabilityUpdatePlan = {
@@ -140,7 +140,7 @@ export async function pushAvailability(push: AvailabilityPush): Promise<Availabi
   const empty = { pushed: 0, skipped: push.updates.length, notFound: 0, failed: 0 };
   if (!pre?.updates.length) return empty;
 
-  const adapter = getChannelAdapter(pre.conn.channel, pre.conn.provider);
+  const adapter = await getChannelAdapter(pre.conn.channel, pre.conn.provider, pre.conn);
   const conn = await freshChannelConn(pre.conn);
   const res = await adapter.setAvailability(
     conn,

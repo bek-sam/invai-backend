@@ -55,7 +55,7 @@ const setAvailability = vi.fn<SetAvailability>();
 /** A mock Shopify whose setAvailability is observable; every other call is the real mock. */
 function useFakeShopify() {
   vi.mocked(channelsModule.getChannelAdapter).mockImplementation(
-    (kind) =>
+    async (kind) =>
       ({ channel: kind, pendingApproval: false, setAvailability }) as unknown as ChannelAdapter,
   );
 }

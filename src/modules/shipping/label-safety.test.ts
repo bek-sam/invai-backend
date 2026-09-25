@@ -134,7 +134,7 @@ describe("label buy safety", () => {
 
   beforeEach(() => {
     fake = fakeCarrier();
-    vi.mocked(carriersModule.carrierAdapter).mockImplementation(() => fake);
+    vi.mocked(carriersModule.carrierAdapter).mockImplementation(async () => fake);
     vi.mocked(outbox.emit).mockClear();
   });
 

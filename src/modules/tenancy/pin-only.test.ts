@@ -86,7 +86,7 @@ describe("PIN-only floor staff", () => {
 
   it("the placeholder is never mailed or invited", async () => {
     const user = await add("Nemo Nomail");
-    expect(await sendMail({ to: user.email, subject: "x", text: "x" })).toEqual({
+    expect(await sendMail({ to: user.email, subject: "x", text: "x" }, { companyId })).toEqual({
       messageId: "skipped:pin-only",
     });
     await expect(

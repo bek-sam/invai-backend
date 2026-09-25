@@ -110,7 +110,11 @@ async function presetRows(tx: Tx) {
     .orderBy(desc(packagePresets.isDefault), asc(packagePresets.maxUnits));
 }
 
-function toSettings(row: SettingsRow, presets: PresetRow[]): ShippingSettings {
+function toSettings(
+  row: SettingsRow,
+  presets: PresetRow[],
+  carrierProvider: ShippingSettings["carrierProvider"],
+): ShippingSettings {
   return {
     fromAddress: row.fromAddress
       ? { ...row.fromAddress, country: row.fromAddress.country || "US" }
@@ -130,12 +134,13 @@ function toSettings(row: SettingsRow, presets: PresetRow[]): ShippingSettings {
     allowedCarriers: row.allowedCarriers as ShippingSettings["allowedCarriers"],
     labelFormat: row.labelFormat,
     trackingPushEnabled: row.trackingPushEnabled,
-    carrierProvider: carrierAdapter().provider,
+    carrierProvider,
   };
 }
 
 export async function getSettings(tx: Tx, ctx: TenantContext) {
-  return toSettings(await settingsRow(tx, ctx), await presetRows(tx));
+  const { provider } = await carrierAdapter(ctx);
+  return toSettings(await settingsRow(tx, ctx), await presetRows(tx), provider);
 }
 
 export async function updateSettings(tx: Tx, ctx: TenantContext, input: SettingsInput) {
@@ -613,9 +618,9 @@ export async function rateOrder(ctx: TenantContext, input: RatesInput): Promise<
   });
 
   // No transaction and no row lock while the carrier is called.
-  let quote: Awaited<ReturnType<ReturnType<typeof carrierAdapter>["rate"]>>;
+  let quote: Awaited<ReturnType<Awaited<ReturnType<typeof carrierAdapter>>["rate"]>>;
   try {
-    quote = await carrierAdapter().rate({
+    quote = await (await carrierAdapter(ctx)).rate({
       companyId: ctx.companyId,
       shipmentId: plan.shipmentId,
       from: plan.from,
@@ -783,7 +788,7 @@ export async function buyLabel(
     return withTenant(ctx.companyId, (tx) => getShipment(tx, ctx, input.shipmentId));
 
   // No transaction and no row lock while the carrier is called.
-  const adapter = carrierAdapter();
+  const adapter = await carrierAdapter(ctx);
   let label: PurchasedLabel;
   try {
     const found = plan.resume
@@ -1207,7 +1212,7 @@ export async function voidShipment(
   // No transaction and no row lock while the carrier is called.
   let pending = false;
   if (plan.carrierShipmentId && plan.trackingCode) {
-    const adapter = carrierAdapter();
+    const adapter = await carrierAdapter(ctx);
     let res: VoidResult;
     try {
       const back = plan.resume
@@ -1763,4 +1768,5 @@ export async function markDelivered(
   return true;
 }
 
-export const isMockCarrier = () => carrierAdapter().provider === "mock";
+export const isMockCarrier = async (companyId: string) =>
+  (await carrierAdapter({ companyId })).provider === "mock";

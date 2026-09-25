@@ -173,10 +173,14 @@ describe("demo workspace", () => {
     await withSystem((tx) => tx.delete(subscriptions).where(eq(subscriptions.companyId, demoId)));
   });
 
-  it("the org hook gives a demo company no trial subscription", async () => {
+  it("the org hook gives a sample workspace no trial subscription", async () => {
     const other = await createCompany();
+    const owner = await createUser(other.id, "owner");
     await withSystem((tx) =>
-      tx.update(companies).set({ demo: true }).where(eq(companies.id, other.id)),
+      tx
+        .update(companies)
+        .set({ demo: true, demoOwnerUserId: owner.id })
+        .where(eq(companies.id, other.id)),
     );
     await onOrganizationCreated({ id: other.id, type: "shop" });
     const subs = await withTenant(other.id, (tx) => tx.select().from(subscriptions));
@@ -223,7 +227,7 @@ describe("demo workspace", () => {
       sendInviteEmail(
         "someone@example.com",
         {
-          demo: true,
+          companyId: demoId,
           locale: "en",
           kind: "staff",
           companyName: "Sample shop",

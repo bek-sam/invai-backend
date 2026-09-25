@@ -229,11 +229,14 @@ export async function inviteVendor(ctx: TenantContext, input: VendorInviteInput)
     } else {
       // Already has a vendor account: accepting is opening the shop list in their portal.
       const link = `${env.WEB_ORIGIN}/vendor/shops`;
-      await deliverInviteMail({
-        to: email,
-        subject: `${senders.companyName} invited you to InvAI`,
-        text: `${senders.companyName} wants to send you DTF gang sheets through InvAI.\n\nOpen your vendor portal to accept: ${link}\n\nUntil then, sheets arrive by email with download links.`,
-      });
+      await deliverInviteMail(
+        {
+          to: email,
+          subject: `${senders.companyName} invited you to InvAI`,
+          text: `${senders.companyName} wants to send you DTF gang sheets through InvAI.\n\nOpen your vendor portal to accept: ${link}\n\nUntil then, sheets arrive by email with download links.`,
+        },
+        ctx,
+      );
     }
   } catch (err) {
     await removeNewOrg();
@@ -418,6 +421,7 @@ export async function sendSheetToVendor(
     .where(eq(companies.id, ctx.companyId));
   try {
     await vendorAdapter(portal ? "portal" : "email").deliver({
+      companyId: ctx.companyId,
       sheetId: sheet.id,
       sheetName: sheet.name,
       shopName: shop?.name ?? "InvAI shop",

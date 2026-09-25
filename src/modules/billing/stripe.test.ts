@@ -67,7 +67,11 @@ vi.mock("../../integrations/billing", async (orig) => {
   const real = await orig<typeof import("../../integrations/billing")>();
   const { createStripeProvider } = await import("../../integrations/billing/stripe");
   const live = createStripeProvider("sk_test_invai_fake", { fetch: fakeStripeFetch() });
-  return { ...real, billingProvider: () => (stripe.live ? live : real.billingProvider()) };
+  return {
+    ...real,
+    billingProvider: async (scope: { companyId: string }) =>
+      stripe.live ? live : real.billingProvider(scope),
+  };
 });
 
 vi.mock("../../lib/outbox", async (orig) => {
@@ -216,7 +220,7 @@ describe("billing.checkout, portal and changePlan against the Stripe SDK", () =>
 
   it("maps a Stripe failure to UPSTREAM_FAILED", async () => {
     stripe.live = true;
-    const provider = (await import("../../integrations/billing")).billingProvider();
+    const provider = await (await import("../../integrations/billing")).billingProvider(a);
     await expect(
       provider.createCheckout({
         companyId: a.companyId,

@@ -38,6 +38,8 @@ vi.mock("../../lib/outbox", async (importOriginal) => {
   return { ...actual, emit: vi.fn(actual.emit) };
 });
 
+import { shopifyAdapter } from "../../integrations/channels/shopify";
+
 const realGetChannelAdapter = vi
   .mocked(channelsModule.getChannelAdapter)
   .getMockImplementation() as typeof channelsModule.getChannelAdapter;
@@ -105,7 +107,7 @@ type FakeChannel = ChannelAdapter & {
 function fakeShopify(): FakeChannel {
   const fulfilled = new Set<string>();
   const fake: FakeChannel = {
-    ...realGetChannelAdapter("shopify", "mock"),
+    ...shopifyAdapter("mock"),
     notified: [],
     calls: 0,
     onPush: null,
@@ -156,9 +158,9 @@ describe("tracking push, cancel and void after a label", () => {
   beforeEach(() => {
     carrier = fakeCarrier();
     shopify = fakeShopify();
-    vi.mocked(carriersModule.carrierAdapter).mockImplementation(() => carrier);
-    vi.mocked(channelsModule.getChannelAdapter).mockImplementation((kind, provider) =>
-      kind === "shopify" ? shopify : realGetChannelAdapter(kind, provider),
+    vi.mocked(carriersModule.carrierAdapter).mockImplementation(async () => carrier);
+    vi.mocked(channelsModule.getChannelAdapter).mockImplementation(async (kind, provider, scope) =>
+      kind === "shopify" ? shopify : realGetChannelAdapter(kind, provider, scope),
     );
     vi.mocked(outbox.emit).mockClear();
   });
