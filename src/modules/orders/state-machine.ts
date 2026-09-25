@@ -194,26 +194,23 @@ const OPEN_BEFORE_PACKED: OrderItemState[] = [
   "on_hold",
 ];
 
-/** Derived statuses that still mean "a unit is short"; a pack override lifts them to ready_to_ship. */
-const PRE_READY: OrderStatus[] = ["new", "needs_attention", "in_production"];
 const PACKED_OR_LATER: OrderItemState[] = ["packed", "shipped", "delivered"];
 
 /**
- * The stored status for these item states. `deriveOrderStatus` decides, except that an order
- * packed with units missing (`orders.pack_override`) reads `ready_to_ship` while short; on_hold,
- * cancelled and shipping statuses still win. `clearOverride` once every open unit is packed or
- * later for real (or none is left open).
+ * The stored status for these item states (always `deriveOrderStatus`: a lead hand-off doesn't
+ * change it). `clearOverride` once every open unit is packed or later for real, or none is left
+ * open, so `orders.pack_override` only marks orders still waiting on a lead.
  */
 export function orderStatusWithOverride(
   states: readonly OrderItemState[],
   hasOverride: boolean,
 ): { status: OrderStatus; clearOverride: boolean } {
-  const derived = deriveOrderStatus(states);
-  if (!hasOverride) return { status: derived, clearOverride: false };
+  const status = deriveOrderStatus(states);
   const open = states.filter((s) => s !== "cancelled");
-  if (open.every((s) => PACKED_OR_LATER.includes(s)))
-    return { status: derived, clearOverride: true };
-  return { status: PRE_READY.includes(derived) ? "ready_to_ship" : derived, clearOverride: false };
+  return {
+    status,
+    clearOverride: hasOverride && open.every((s) => PACKED_OR_LATER.includes(s)),
+  };
 }
 
 /** Recompute and store the order's rollup status; returns the new status. */

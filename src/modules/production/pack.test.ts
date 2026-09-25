@@ -21,7 +21,7 @@ import {
 import * as svc from "./service";
 
 /*
- * T-4-1: production.packOrder (decision 0002 + the partial-pack override), the override-aware
+ * T-4-1: production.packOrder (decision 0002 + the hand-to-lead override), the lead marker on
  * order status, the receiving station, bin double taps and who may mark sheets received.
  */
 
@@ -165,8 +165,11 @@ describe("production.packOrder", () => {
     expect(ok).toMatchObject({ packed: true, missing: [], override: null });
   });
 
-  it("override: refused for a packer, allowed for an admin, audited and never drops units", async () => {
+  it("override hands a short order to a lead: admin only, audited, tote released, not packed", async () => {
     const { order, ids } = await orderWith(["packed", "packed", "transfer_in"]);
+    await withTenant(companyId, (tx) =>
+      svc.assignBin(tx, admin, { code: `BIN:L-${order.id.slice(0, 6)}`, orderId: order.id }),
+    );
     const input = {
       orderId: order.id,
       idempotencyKey: key(),
@@ -178,7 +181,7 @@ describe("production.packOrder", () => {
     expect((await orderRow(order.id))?.packOverride).toBeNull();
 
     const res = await withTenant(companyId, (tx) => svc.packOrder(tx, admin, input));
-    expect(res.packed).toBe(true);
+    expect(res.packed).toBe(false);
     expect(res.missing).toEqual([{ orderItemId: ids[2], state: "transfer_in" }]);
     expect(res.override).toMatchObject({
       reason: "Lost transfer",
@@ -186,8 +189,18 @@ describe("production.packOrder", () => {
       missingItemIds: [ids[2]],
     });
     const row = await orderRow(order.id);
-    expect(row?.status).toBe("ready_to_ship");
+    // Not shippable: a split shipment isn't supported, so the status stays what the units say.
+    expect(row?.status).toBe("in_production");
     expect(row?.packOverride).toEqual(res.override);
+    const tote = await withTenant(companyId, (tx) =>
+      tx
+        .select()
+        .from(bins)
+        .where(eq(bins.code, `L-${order.id.slice(0, 6)}`)),
+    );
+    expect(tote[0]?.orderId).toBeNull();
+    // No pack scans: nothing was packed out.
+    expect(await count(scans, eq(scans.orderItemId, ids[0] ?? ""))).toBe(0);
     const audits = await withTenant(companyId, (tx) =>
       tx
         .select()
@@ -208,11 +221,11 @@ describe("production.packOrder", () => {
       ),
     ).toBe("CONFLICT");
 
-    // The next item move doesn't clobber the override...
+    // The next item move keeps the lead marker...
     await withTenant(companyId, (tx) =>
       transitionItem(tx, ids[2] ?? "", "pressed", { actor: admin.actor }),
     );
-    expect((await orderRow(order.id))?.status).toBe("ready_to_ship");
+    expect((await orderRow(order.id))?.status).toBe("in_production");
     expect((await orderRow(order.id))?.packOverride).not.toBeNull();
     // ...and it clears itself once the missing unit is genuinely packed.
     await withTenant(companyId, (tx) =>
@@ -221,6 +234,11 @@ describe("production.packOrder", () => {
     const done = await orderRow(order.id);
     expect(done?.status).toBe("ready_to_ship");
     expect(done?.packOverride).toBeNull();
+    // Then the normal pack goes through with a new key.
+    const packed = await withTenant(companyId, (tx) =>
+      svc.packOrder(tx, packer, { orderId: order.id, idempotencyKey: key() }),
+    );
+    expect(packed).toMatchObject({ packed: true, missing: [], override: null });
   });
 
   it("an override is ignored when nothing is missing", async () => {
@@ -285,29 +303,21 @@ describe("production.packOrder", () => {
   });
 });
 
-describe("override-aware order status", () => {
-  it("lifts a short order to ready_to_ship; hold, cancel and shipping still win", () => {
+describe("order status with a lead hand-off", () => {
+  it("never changes the derived status; clears once every open unit is packed or later", () => {
     const f = orderStatusWithOverride;
-    expect(f(["packed", "transfer_in"], false)).toEqual({
+    expect(f(["packed", "transfer_in"], true)).toEqual({
       status: "in_production",
       clearOverride: false,
     });
-    expect(f(["packed", "transfer_in"], true)).toEqual({
-      status: "ready_to_ship",
-      clearOverride: false,
-    });
-    expect(f(["packed", "needs_artwork"], true).status).toBe("ready_to_ship");
     expect(f(["packed", "on_hold"], true)).toEqual({ status: "on_hold", clearOverride: false });
-    expect(f(["shipped", "pressed"], true)).toEqual({
-      status: "partially_shipped",
-      clearOverride: false,
-    });
     expect(f(["packed", "cancelled"], true)).toEqual({
       status: "ready_to_ship",
       clearOverride: true,
     });
     expect(f(["shipped", "shipped"], true)).toEqual({ status: "shipped", clearOverride: true });
     expect(f(["cancelled"], true)).toEqual({ status: "cancelled", clearOverride: true });
+    expect(f(["packed"], false)).toEqual({ status: "ready_to_ship", clearOverride: false });
   });
 });
 

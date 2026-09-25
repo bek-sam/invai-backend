@@ -992,10 +992,12 @@ const packRequestOf = (input: PackOrderInput) => ({
 /**
  * "Mark packed" (decision 0002): every non-cancelled unit must be packed (or already shipped).
  * Otherwise it throws PACK_INCOMPLETE with the missing units, unless `override` is set by
- * someone with `production.override`: then the order is recorded as packed short
- * (`orders.pack_override`, status ready_to_ship) and the missing units are still returned.
- * On success the tote is released and packed units without a pack scan get one, so the order
- * leaves the pack queue. Idempotent on `idempotencyKey`: the first effective result is stored
+ * someone with `production.override`: then the order is handed to a lead, not packed. The
+ * reason is recorded (`orders.pack_override`, cleared once every unit is really packed), the
+ * tote is released, the status stays what the units say, and `packed: false` comes back with
+ * the missing units. A split shipment isn't supported, so a short order never reaches the ship
+ * queue. On a real pack the tote is released and packed units without a pack scan get one, so
+ * the order leaves the pack queue. Idempotent on `idempotencyKey`: the first effective result is stored
  * in `floor_requests` and returned verbatim; a refusal has no effect and isn't stored.
  */
 export async function packOrder(
@@ -1004,7 +1006,7 @@ export async function packOrder(
   input: PackOrderInput,
 ): Promise<PackOrderResult> {
   if (input.override && !ctx.permissions.has("production.override"))
-    throw forbidden("production.override", "Only an owner or admin can pack an order anyway");
+    throw forbidden("production.override", "Only an owner or admin can hand an order to a lead");
 
   // Serializes packs of one order, so a same-key retry waits and then finds the stored result.
   const [order] = await tx
@@ -1061,7 +1063,7 @@ export async function packOrder(
 
   let override: PackOverride | null = null;
   if (missing.length && input.override) {
-    if (!ctx.userId) throw forbidden("production.override", "Sign in as a person to pack anyway");
+    if (!ctx.userId) throw forbidden("production.override", "Sign in as a person to hand it over");
     override = {
       reason: input.override.reason,
       by: ctx.userId,
@@ -1076,14 +1078,15 @@ export async function packOrder(
       action: "order.pack_override",
       entityType: "order",
       entityId: order.id,
-      summary: `Packed ${order.orderNo} with ${missing.length} unit(s) missing: ${override.reason}`,
+      summary: `${order.orderNo} handed to a lead with ${missing.length} unit(s) missing: ${override.reason}`,
       data: { reason: override.reason, missing },
     });
   }
   const status = await recomputeOrderStatus(tx, ctx.companyId, order.id);
+  const packed = missing.length === 0;
 
   // Packed units the packer didn't scan one by one still count as packed by this person.
-  const packedIds = open.filter((i) => i.state === "packed").map((i) => i.id);
+  const packedIds = packed ? open.filter((i) => i.state === "packed").map((i) => i.id) : [];
   const scanned = packedIds.length
     ? await tx
         .select({ id: scans.orderItemId })
@@ -1119,7 +1122,7 @@ export async function packOrder(
   const totes = await tx.select({ code: bins.code }).from(bins).where(eq(bins.orderId, order.id));
   for (const b of totes) await releaseBin(tx, ctx, { code: b.code });
 
-  const result: PackOrderResult = { orderId: order.id, packed: true, missing, override };
+  const result: PackOrderResult = { orderId: order.id, packed, missing, override };
   const [row] = await tx
     .insert(floorRequests)
     .values({
@@ -1139,12 +1142,10 @@ export async function packOrder(
   await audit(tx, {
     companyId: ctx.companyId,
     actor: ctx.actor,
-    action: "order.packed",
     entityType: "order",
     entityId: order.id,
-    summary: override
-      ? `Packed ${order.orderNo} anyway (${missing.length} missing)`
-      : `Packed ${order.orderNo}`,
+    action: packed ? "order.packed" : "order.handed_to_lead",
+    summary: packed ? `Packed ${order.orderNo}` : `${order.orderNo} handed to a lead`,
     data: { idempotencyKey: input.idempotencyKey, override: !!override },
   });
   await publishQueues(tx, ctx.companyId, ["pack"]);
