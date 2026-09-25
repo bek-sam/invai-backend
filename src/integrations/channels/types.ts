@@ -6,6 +6,21 @@ import type { Channel, NormalizedOrder } from "@invai/contracts";
  * touch the database.
  */
 
+/** Result of the last webhook-subscription check (kept in the encrypted credentials). */
+export type WebhookSubscriptionState = {
+  checkedAt: string;
+  subscriptionIds: string[];
+  /** Topics that could not be subscribed; non-empty = the connection is degraded. */
+  failures: { topic: string; message: string }[];
+};
+
+export type ChannelDisconnectResult = {
+  unsubscribed: number;
+  /** The app was removed from the store and its token revoked. */
+  uninstalled: boolean;
+  errors: string[];
+};
+
 export type ChannelCredentials = {
   accessToken?: string;
   refreshToken?: string;
@@ -13,6 +28,7 @@ export type ChannelCredentials = {
   scopes?: string[];
   /** Shopify: the location inventory is set on and fulfillments ship from. */
   locationId?: string | null;
+  webhooks?: WebhookSubscriptionState;
   [key: string]: unknown;
 };
 
@@ -140,6 +156,10 @@ export interface ChannelAdapter {
   ): Promise<SetAvailabilityResult>;
   verifyWebhook(headers: HeaderBag, body: string, opts?: VerifyWebhookOptions): Promise<boolean>;
   parseWebhook(headers: HeaderBag, body: string): Promise<WebhookEvent>;
+  /** Subscribe the order webhooks to `uri` (re-creating any the channel dropped). */
+  ensureWebhooks?(conn: ChannelConn, uri: string): Promise<WebhookSubscriptionState>;
+  /** Unsubscribe the webhooks and revoke the token on the channel's side. Never throws. */
+  disconnect?(conn: ChannelConn, uri: string): Promise<ChannelDisconnectResult>;
   /** Fetch one order by its channel id (webhook `order_ref` events). */
   fetchOrder?(conn: ChannelConn, channelOrderId: string): Promise<FetchedOrder>;
 }

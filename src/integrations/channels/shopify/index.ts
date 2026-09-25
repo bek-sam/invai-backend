@@ -5,7 +5,7 @@ import { shopifyMock } from "./mock";
 
 export * from "./common";
 export { exchangeShopifyCode, finishShopifyInstall, shopifyAuthorizeUrl } from "./live";
-export { mockShopifyOrder } from "./mock";
+export { mockShopifyOrder, mockShopifySubscriptions } from "./mock";
 
 /** The live adapter when SHOPIFY_API_KEY/SECRET are set, else the mock store. */
 export function shopifyAdapter(

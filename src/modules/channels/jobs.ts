@@ -2,6 +2,7 @@ import { z } from "zod";
 import { env } from "../../env";
 import { errorData, logger } from "../../lib/log";
 import { defineJob, queues } from "../../lib/queues";
+import { checkWebhookSubscriptions } from "./service";
 import {
   pollableConnections,
   processWebhook,
@@ -79,6 +80,14 @@ export const purgeWebhookDeliveriesJob = defineJob({
   handler: async () => purgeWebhookDeliveries(),
 });
 
+/** Daily: re-check webhook subscriptions and recreate any the channel dropped (T-3-1). */
+export const checkWebhookSubscriptionsJob = defineJob({
+  queue: "sync",
+  name: "channels.webhookSubscriptions.check",
+  input: z.object({}).passthrough(),
+  handler: async () => checkWebhookSubscriptions(),
+});
+
 /** Idempotent: registers the 10-minute poll and the nightly delivery purge (API and worker). */
 export async function schedulePolling() {
   await queues.sync.upsertJobScheduler(
@@ -90,6 +99,11 @@ export async function schedulePolling() {
     "channels-webhook-deliveries-purge",
     { pattern: "45 4 * * *", tz: "UTC" },
     { name: purgeWebhookDeliveriesJob.name, data: {} },
+  );
+  await queues.sync.upsertJobScheduler(
+    "channels-webhook-subscriptions-check",
+    { pattern: "15 5 * * *", tz: "UTC" },
+    { name: checkWebhookSubscriptionsJob.name, data: {} },
   );
 }
 

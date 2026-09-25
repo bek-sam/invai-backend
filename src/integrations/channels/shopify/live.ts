@@ -1,6 +1,5 @@
 import { env } from "../../../env";
 import { upstream } from "../../../lib/errors";
-import { logger } from "../../../lib/log";
 import {
   type ChannelAdapter,
   type ChannelConn,
@@ -9,16 +8,10 @@ import {
   type TrackingPushResult,
 } from "../types";
 import { ShopifyAuthError, shopifyGraphql } from "./client";
-import {
-  parseShopifyWebhook,
-  SHOPIFY_SCOPES,
-  SHOPIFY_WEBHOOK_TOPICS,
-  verifyShopifyHmac,
-} from "./common";
+import { parseShopifyWebhook, SHOPIFY_SCOPES, verifyShopifyHmac } from "./common";
 import { setShopifyAvailability } from "./inventory";
 import { fetchShopifyOrders, gid } from "./orders";
-
-const log = logger("channels.shopify");
+import { disconnectShopify, ensureShopifyWebhooks } from "./subscriptions";
 
 /*
  * Shopify Admin GraphQL API (2026-07). Orders are pulled with an `updated_at` watermark plus
@@ -44,15 +37,6 @@ const FULFILLMENT_CREATE = /* GraphQL */ `
   mutation FulfillmentCreate($fulfillment: FulfillmentInput!) {
     fulfillmentCreate(fulfillment: $fulfillment) {
       fulfillment { id status }
-      userErrors { field message }
-    }
-  }
-`;
-
-const WEBHOOK_CREATE = /* GraphQL */ `
-  mutation WebhookCreate($topic: WebhookSubscriptionTopic!, $sub: WebhookSubscriptionInput!) {
-    webhookSubscriptionCreate(topic: $topic, webhookSubscription: $sub) {
-      webhookSubscription { id }
       userErrors { field message }
     }
   }
@@ -100,6 +84,14 @@ export const shopifyLive: ChannelAdapter = {
 
   async parseWebhook(headers, body) {
     return parseShopifyWebhook(headers, body);
+  },
+
+  async ensureWebhooks(conn, uri) {
+    return ensureShopifyWebhooks(conn, uri);
+  },
+
+  async disconnect(conn, uri) {
+    return disconnectShopify(conn, uri);
   },
 };
 
@@ -192,21 +184,10 @@ export async function exchangeShopifyCode(shop: string, code: string) {
   return { accessToken: json.access_token, scopes: json.scope.split(",") };
 }
 
-/** After install: shop name + webhook subscriptions pointing at `/webhooks/shopify`. */
+/** After install: the shop's name (webhooks are subscribed by `ensureWebhooks`). */
 export async function finishShopifyInstall(
   conn: Pick<ChannelConn, "externalShopId" | "credentials">,
-  webhookUri: string,
 ) {
   const shop = await shopifyGraphql<{ shop: { name: string } }>(conn, SHOP_QUERY);
-  for (const topic of SHOPIFY_WEBHOOK_TOPICS) {
-    const res = await shopifyGraphql<{
-      webhookSubscriptionCreate: { userErrors: { message: string }[] };
-    }>(conn, WEBHOOK_CREATE, { topic, sub: { uri: webhookUri, format: "JSON" } });
-    if (res.webhookSubscriptionCreate.userErrors.length)
-      log.warn("webhook subscription failed", {
-        topic,
-        errors: res.webhookSubscriptionCreate.userErrors,
-      });
-  }
   return { shopName: shop.shop.name };
 }

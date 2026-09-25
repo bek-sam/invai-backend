@@ -13,7 +13,7 @@ import {
 } from "../../../db/seed/data";
 import { logger } from "../../../lib/log";
 import { type ChannelAdapter, normalizeAvailability } from "../types";
-import { parseShopifyWebhook, verifyShopifyHmac } from "./common";
+import { parseShopifyWebhook, SHOPIFY_WEBHOOK_TOPICS, verifyShopifyHmac } from "./common";
 
 const log = logger("channels.shopify.mock");
 
@@ -97,6 +97,13 @@ export function mockShopifyOrder(n: number, now = new Date()): NormalizedOrder {
   };
 }
 
+/** What the mock store has subscribed, per connection (for tests and the local demo). */
+const mockSubscriptions = new Map<string, string[]>();
+
+export function mockShopifySubscriptions(connectionId: string): string[] {
+  return mockSubscriptions.get(connectionId) ?? [];
+}
+
 export const shopifyMock: ChannelAdapter = {
   channel: "shopify",
   pendingApproval: false,
@@ -145,5 +152,24 @@ export const shopifyMock: ChannelAdapter = {
 
   async parseWebhook(headers, body) {
     return parseShopifyWebhook(headers, body);
+  },
+
+  async ensureWebhooks(conn) {
+    const ids = SHOPIFY_WEBHOOK_TOPICS.map(
+      (t, i) => `gid://shopify/WebhookSubscription/mock-${conn.id.slice(0, 8)}-${i}-${t}`,
+    );
+    mockSubscriptions.set(conn.id, ids);
+    log.info("mock shopify webhooks subscribed", { connectionId: conn.id, topics: ids.length });
+    return { checkedAt: new Date().toISOString(), subscriptionIds: ids, failures: [] };
+  },
+
+  async disconnect(conn) {
+    const ids = mockSubscriptions.get(conn.id) ?? conn.credentials?.webhooks?.subscriptionIds ?? [];
+    mockSubscriptions.delete(conn.id);
+    log.info("mock shopify unsubscribed and uninstalled", {
+      connectionId: conn.id,
+      unsubscribed: ids.length,
+    });
+    return { unsubscribed: ids.length, uninstalled: true, errors: [] };
   },
 };

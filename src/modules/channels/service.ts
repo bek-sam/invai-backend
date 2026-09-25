@@ -8,7 +8,7 @@ import {
 import { and, desc, eq, gt, inArray, sql } from "drizzle-orm";
 import type { z } from "zod";
 import type { TenantContext } from "../../api/context";
-import { type Tx, withSystem, withTenant } from "../../db/client";
+import { afterCommit, type Tx, withSystem, withTenant } from "../../db/client";
 import {
   channelConnections,
   DEFAULT_CONNECTION_SETTINGS,
@@ -20,7 +20,11 @@ import {
 import { env } from "../../env";
 import { getChannelAdapter } from "../../integrations/channels";
 import { shopifyAuthorizeUrl } from "../../integrations/channels/shopify";
-import type { ChannelConn, ChannelCredentials } from "../../integrations/channels/types";
+import type {
+  ChannelConn,
+  ChannelCredentials,
+  WebhookSubscriptionState,
+} from "../../integrations/channels/types";
 import { audit } from "../../lib/audit";
 import { decryptJson, encryptJson, randomToken } from "../../lib/crypto";
 import { badRequest, notFound, ORPCError } from "../../lib/errors";
@@ -38,6 +42,25 @@ type ConnectInput = z.infer<typeof ConnectInputSchema>;
 type ConnectionSettings = z.infer<typeof ConnectionSettingsSchema>;
 
 const STALE_ALERT_MINUTES = 30;
+
+/** Where a channel's webhooks are delivered (the API's public URL). */
+export function channelWebhookUri(channel: ConnectionRow["channel"]) {
+  return `${env.BETTER_AUTH_URL}/webhooks/${channel}`;
+}
+
+/**
+ * The degraded reason when some webhook topics could not be subscribed, else null. The
+ * connection stays `connected` (webhooks that do arrive still route, the poll still runs); health
+ * shows it as not ok with this reason until a check subscribes every topic.
+ */
+export function webhookFailureMessage(state: WebhookSubscriptionState | null | undefined) {
+  if (!state?.failures.length) return null;
+  const topics = state.failures.map((f) => `${f.topic} (${f.message})`).join(", ");
+  return `Webhook subscription failed: ${topics}. Orders still arrive by the 10-minute poll; reconnect the store if this persists.`.slice(
+    0,
+    500,
+  );
+}
 
 export function settingsOf(row: Pick<ConnectionRow, "settings">): ConnectionSettings {
   return { ...DEFAULT_CONNECTION_SETTINGS, ...(row.settings ?? {}) };
@@ -81,6 +104,10 @@ function toConnection(row: ConnectionRow, stats: HealthStats): ChannelConnection
       : null;
   const errored = row.status === "error";
   const stale = staleMinutes !== null && staleMinutes > STALE_ALERT_MINUTES;
+  const degraded =
+    row.status === "connected" && row.mode === "api"
+      ? webhookFailureMessage(toChannelConn(row).credentials?.webhooks)
+      : null;
   return {
     id: row.id,
     channel: row.channel,
@@ -91,13 +118,13 @@ function toConnection(row: ConnectionRow, stats: HealthStats): ChannelConnection
     provider: row.provider,
     settings: settingsOf(row),
     health: {
-      ok: !errored && !stale && row.status !== "disconnected",
+      ok: !errored && !stale && !degraded && row.status !== "disconnected",
       lastWebhookAt: row.lastWebhookAt?.toISOString() ?? null,
       lastPollAt: row.lastPollAt?.toISOString() ?? null,
       lastImportAt: row.lastImportAt?.toISOString() ?? null,
       ordersLast24h: stats.ordersLast24h,
       errorsLast24h: stats.errorsLast24h,
-      lastError: row.lastError,
+      lastError: row.lastError ?? degraded,
       pendingApproval: adapter.pendingApproval,
       staleMinutes,
     },
@@ -326,8 +353,53 @@ export async function updateConnection(
   return getConnection(tx, ctx, input.id);
 }
 
+/**
+ * Disconnect: the row is marked disconnected and its credentials dropped in the transaction; after
+ * it commits, the channel's side is cleaned up with the old credentials (Shopify: delete the
+ * webhook subscriptions, then uninstall the app, which revokes the token). That call never undoes
+ * the disconnect; what failed is audited and kept as the connection's last error.
+ */
 export async function disconnect(tx: Tx, ctx: TenantContext, id: string) {
   const row = await getConnectionRow(tx, id);
+  const remote =
+    row.mode === "api" && (row.status === "connected" || row.status === "error")
+      ? toChannelConn(row)
+      : null;
+  const adapter = remote?.credentials?.accessToken
+    ? getChannelAdapter(row.channel, row.provider)
+    : null;
+  const cleanUp = adapter?.disconnect?.bind(adapter);
+  if (remote && cleanUp)
+    afterCommit(tx, async () => {
+      const res = await cleanUp(remote, channelWebhookUri(row.channel));
+      const label = CHANNEL_RULES[row.channel].label;
+      await withTenant(ctx.companyId, async (t) => {
+        await audit(t, {
+          companyId: ctx.companyId,
+          actor: ctx.actor,
+          action: "settings.changed",
+          entityType: "channel_connection",
+          entityId: id,
+          summary: `${label}: ${res.unsubscribed} webhook subscription(s) removed; ${
+            res.uninstalled ? "app uninstalled and access revoked" : "app not uninstalled"
+          }`,
+          data: { ...res, errors: res.errors.slice(0, 10) },
+        });
+        if (!res.errors.length) return;
+        const failed = `${label} cleanup failed: ${res.errors.join("; ")}`;
+        await t
+          .update(channelConnections)
+          .set({
+            lastError:
+              `Disconnected here, but ${failed}. Remove the app in the ${label} admin.`.slice(
+                0,
+                500,
+              ),
+            lastErrorAt: new Date(),
+          })
+          .where(eq(channelConnections.id, id));
+      });
+    });
   await tx
     .update(channelConnections)
     .set({ status: "disconnected", credentials: null, cursor: row.cursor })
@@ -350,6 +422,49 @@ export async function health(tx: Tx, ctx: TenantContext) {
       .filter((c) => c.status !== "disconnected")
       .map((c) => ({ connectionId: c.id, channel: c.channel, name: c.name, health: c.health })),
   };
+}
+
+/**
+ * Daily: re-list and recreate the webhook subscriptions of every connected API connection whose
+ * adapter manages them (Shopify drops shop-scoped subscriptions after repeated delivery failures).
+ * The result is stored with the credentials, re-read under a row lock so a token refreshed
+ * meanwhile is never overwritten; a failing topic marks the connection degraded.
+ */
+export async function checkWebhookSubscriptions() {
+  const rows = await withSystem((tx) =>
+    tx
+      .select()
+      .from(channelConnections)
+      .where(and(eq(channelConnections.mode, "api"), eq(channelConnections.status, "connected"))),
+  );
+  let checked = 0;
+  let degraded = 0;
+  for (const row of rows) {
+    const conn = toChannelConn(row);
+    const adapter = getChannelAdapter(row.channel, row.provider);
+    if (!adapter.ensureWebhooks || !conn.credentials?.accessToken) continue;
+    const state = await adapter.ensureWebhooks(conn, channelWebhookUri(row.channel));
+    const message = webhookFailureMessage(state);
+    checked++;
+    if (message) degraded++;
+    await withTenant(row.companyId, async (tx) => {
+      const [cur] = await tx
+        .select()
+        .from(channelConnections)
+        .where(eq(channelConnections.id, row.id))
+        .for("update");
+      if (cur?.status !== "connected") return;
+      const credentials = toChannelConn(cur).credentials ?? {};
+      await tx
+        .update(channelConnections)
+        .set({
+          credentials: encryptJson({ ...credentials, webhooks: state }),
+          ...(message ? { lastError: message, lastErrorAt: new Date() } : {}),
+        })
+        .where(eq(channelConnections.id, row.id));
+    });
+  }
+  return { checked, degraded };
 }
 
 /** Record a sync/webhook/import outcome on the connection (health, alerts). */

@@ -1,10 +1,13 @@
 import { and, eq } from "drizzle-orm";
 import { beforeAll, describe, expect, it } from "vitest";
-import { withSystem } from "../../db/client";
-import { channelConnections, orders, webhookDeliveries } from "../../db/schema";
-import { signShopifyBody } from "../../integrations/channels/shopify";
-import { createCompany, createLocation } from "../../test/fixtures";
-import { processWebhook, recordWebhookDelivery } from "./sync";
+import { withSystem, withTenant } from "../../db/client";
+import { auditLog, channelConnections, orders, webhookDeliveries } from "../../db/schema";
+import { mockShopifySubscriptions, signShopifyBody } from "../../integrations/channels/shopify";
+import type { ChannelCredentials } from "../../integrations/channels/types";
+import { decryptJson, encryptJson } from "../../lib/crypto";
+import { createCompany, createLocation, createUser, tenantContext } from "../../test/fixtures";
+import { checkWebhookSubscriptions, connect, disconnect, health } from "./service";
+import { completeShopifyOAuth, processWebhook, recordWebhookDelivery } from "./sync";
 
 const uniq = () => `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
 const orderId = () => String(7_000_000_000 + Math.floor(Math.random() * 900_000_000));
@@ -113,5 +116,88 @@ describe("Shopify order webhooks import paid orders only", () => {
     expect(res).toMatchObject({ handled: true, kind: "order_cancelled" });
     const [o] = await findOrder(companyId, id);
     expect(o?.status).toBe("cancelled");
+  });
+});
+
+describe("Shopify webhook subscriptions and disconnect", () => {
+  let ctx: ReturnType<typeof tenantContext>;
+
+  // A fresh shop per test (the trial plan allows one connection).
+  const install = async () => {
+    const companyId = (await createCompany()).id;
+    ctx = tenantContext(companyId, (await createUser(companyId, "owner")).id, "owner");
+    const shop = `t31-${uniq()}.myshopify.com`;
+    const res = (await withTenant(ctx.companyId, (tx) =>
+      connect(tx, ctx, { channel: "shopify", shopDomain: shop }),
+    )) as { connectionId: string; authorizeUrl: string };
+    const state = new URL(res.authorizeUrl).searchParams.get("state") ?? "";
+    await completeShopifyOAuth({ shop, state, code: "mock" });
+    return res.connectionId;
+  };
+
+  const row = async (id: string) => {
+    const [r] = await withSystem((tx) =>
+      tx.select().from(channelConnections).where(eq(channelConnections.id, id)),
+    );
+    if (!r) throw new Error("no connection");
+    return r;
+  };
+
+  it("OAuth subscribes the order webhooks and keeps their ids with the credentials", async () => {
+    const id = await install();
+    expect(mockShopifySubscriptions(id)).toHaveLength(4);
+    const creds = decryptJson<ChannelCredentials>((await row(id)).credentials ?? "");
+    expect(creds.webhooks?.subscriptionIds).toEqual(mockShopifySubscriptions(id));
+    const h = await withTenant(ctx.companyId, (tx) => health(tx, ctx));
+    expect(h.items.find((i) => i.connectionId === id)?.health).toMatchObject({ lastError: null });
+  });
+
+  it("a failed subscription shows the connection as degraded in channels.health", async () => {
+    const id = await install();
+    const creds = decryptJson<ChannelCredentials>((await row(id)).credentials ?? "");
+    await withSystem((tx) =>
+      tx
+        .update(channelConnections)
+        .set({
+          lastPollAt: new Date(),
+          credentials: encryptJson({
+            ...creds,
+            webhooks: {
+              checkedAt: new Date().toISOString(),
+              subscriptionIds: [],
+              failures: [{ topic: "ORDERS_UPDATED", message: "Access denied" }],
+            },
+          }),
+        })
+        .where(eq(channelConnections.id, id)),
+    );
+    const item = (await withTenant(ctx.companyId, (tx) => health(tx, ctx))).items.find(
+      (i) => i.connectionId === id,
+    );
+    expect((await row(id)).status).toBe("connected");
+    expect(item?.health.ok).toBe(false);
+    expect(item?.health.lastError).toContain("ORDERS_UPDATED (Access denied)");
+    // The daily check re-subscribes (the mock store accepts) and clears the degraded state.
+    await checkWebhookSubscriptions();
+    const after = (await withTenant(ctx.companyId, (tx) => health(tx, ctx))).items.find(
+      (i) => i.connectionId === id,
+    );
+    expect(after?.health.ok).toBe(true);
+  });
+
+  it("disconnect unsubscribes the webhooks and uninstalls, then drops the credentials", async () => {
+    const id = await install();
+    expect(mockShopifySubscriptions(id)).toHaveLength(4);
+    await withTenant(ctx.companyId, (tx) => disconnect(tx, ctx, id));
+    expect(mockShopifySubscriptions(id)).toHaveLength(0);
+    const r = await row(id);
+    expect(r.status).toBe("disconnected");
+    expect(r.credentials).toBeNull();
+    const logs = await withSystem((tx) =>
+      tx.select().from(auditLog).where(eq(auditLog.entityId, id)),
+    );
+    expect(logs.map((l) => l.summary)).toContain(
+      "Shopify: 4 webhook subscription(s) removed; app uninstalled and access revoked",
+    );
   });
 });

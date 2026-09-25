@@ -24,6 +24,7 @@ import {
   verifyOAuthQuery,
 } from "../../integrations/channels/shopify";
 import type {
+  ChannelCredentials,
   FetchedOrder,
   HeaderBag,
   VerifyWebhookOptions,
@@ -41,11 +42,13 @@ import { markFileReady } from "../files/service";
 import { cancelFromChannel, importNormalizedOrders } from "../orders/import";
 import {
   type ConnectionRow,
+  channelWebhookUri,
   getConnectionRow,
   markConnection,
   shopifyConnectedElsewhere,
   toChannelConn,
   toImportReport,
+  webhookFailureMessage,
 } from "./service";
 
 const log = logger("channels.sync");
@@ -629,17 +632,21 @@ export async function completeShopifyOAuth(query: Record<string, string>) {
   if (await shopifyConnectedElsewhere(shop, conn.companyId))
     throw conflict("This Shopify store is connected to another InvAI account");
 
-  let credentials: Record<string, unknown> = { accessToken: "mock-token", scopes: [] };
+  let credentials: ChannelCredentials = { accessToken: "mock-token", scopes: [] };
   let name = conn.name;
   if (conn.provider === "live" && !env.mocks.shopify) {
     const token = await exchangeShopifyCode(shop, query.code ?? "");
     credentials = token;
-    const done = await finishShopifyInstall(
-      { externalShopId: shop, credentials: token },
-      `${env.BETTER_AUTH_URL}/webhooks/shopify`,
-    );
+    const done = await finishShopifyInstall({ externalShopId: shop, credentials: token });
     name = done.shopName;
   }
+  // Subscribe the order webhooks; a topic that fails leaves the connection degraded (health).
+  const webhooks = await getChannelAdapter("shopify", conn.provider).ensureWebhooks?.(
+    { ...toChannelConn(conn), externalShopId: shop, credentials },
+    channelWebhookUri("shopify"),
+  );
+  if (webhooks) credentials = { ...credentials, webhooks };
+  const degraded = webhookFailureMessage(webhooks);
   const isUniqueViolation = (err: unknown) =>
     (err as { cause?: { code?: string } }).cause?.code === "23505" ||
     (err as { code?: string }).code === "23505";
@@ -652,7 +659,8 @@ export async function completeShopifyOAuth(query: Record<string, string>) {
         externalShopId: shop,
         credentials: encryptJson(credentials),
         connectedAt: new Date(),
-        lastError: null,
+        lastError: degraded,
+        lastErrorAt: degraded ? new Date() : null,
       })
       .where(eq(channelConnections.id, conn.id));
     await audit(tx, {
