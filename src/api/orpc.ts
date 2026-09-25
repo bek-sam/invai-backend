@@ -1,7 +1,7 @@
 import { contract, type ProcedureMeta } from "@invai/contracts";
 import { type AnyContractRouter, isContractProcedure } from "@orpc/contract";
 import { implement, type Router } from "@orpc/server";
-import { forbidden, notImplemented, unauthorized } from "../lib/errors";
+import { emailNotVerified, forbidden, notImplemented, unauthorized } from "../lib/errors";
 import { type Context, type TenantContext, tenantOf } from "./context";
 
 /*
@@ -20,6 +20,18 @@ import { type Context, type TenantContext, tenantOf } from "./context";
  */
 
 export const os = implement(contract).$context<Context>();
+
+/**
+ * Procedures that move money: they need a verified email on top of the permission (T-2-3). Label
+ * buys (web and floor) and Stripe checkout and portal. Connecting a channel is deliberately not
+ * here: it's a new shop's first step and spends nothing.
+ */
+export const EMAIL_VERIFIED_PROCEDURES: ReadonlySet<string> = new Set([
+  "shipping.buy",
+  "shipping.batchBuy",
+  "billing.checkout",
+  "billing.portal",
+]);
 
 const guard = os.middleware(async ({ context, next, procedure, path }) => {
   const meta = procedure["~orpc"].meta as ProcedureMeta;
@@ -45,6 +57,9 @@ const guard = os.middleware(async ({ context, next, procedure, path }) => {
 
   if (meta.permission !== "none" && !context.permissions.has(meta.permission)) {
     throw forbidden(meta.permission, `Missing permission ${meta.permission} for ${path.join(".")}`);
+  }
+  if (EMAIL_VERIFIED_PROCEDURES.has(path.join(".")) && !context.emailVerified) {
+    throw emailNotVerified();
   }
   return next();
 });

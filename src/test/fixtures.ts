@@ -58,7 +58,7 @@ export async function createCompany(input: { name?: string; type?: CompanyType }
 export async function createUser(
   companyId: string,
   role: Role,
-  input: { name?: string; email?: string } = {},
+  input: { name?: string; email?: string; emailVerified?: boolean } = {},
 ) {
   return withSystem(async (tx) => {
     const [user] = await tx
@@ -66,6 +66,8 @@ export async function createUser(
       .values({
         name: input.name ?? `${role} ${uniq()}`,
         email: input.email ?? `${role}-${uniq()}@test.local`,
+        // Like the seed: most people have verified their email. Pass false to test the gate.
+        emailVerified: input.emailVerified ?? true,
       })
       .returning();
     if (!user) throw new Error("user insert failed");

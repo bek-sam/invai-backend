@@ -50,6 +50,10 @@ export const ordersRouter = authed.orders.router({
   permissions, sessionKind, station, user, actor }`. The auth mode and permission from the
   procedure's contract `.meta` are enforced before your handler runs.
 - `pub` is the guarded builder without a tenant (only for `auth: "public"` / `"station"` procedures).
+- Procedures that move money also need a verified email: add the path to
+  `EMAIL_VERIFIED_PROCEDURES` in `src/api/orpc.ts` and the guard throws `EMAIL_NOT_VERIFIED` for
+  unverified user and floor sessions (today: `shipping.buy`, `shipping.batchBuy`,
+  `billing.checkout`, `billing.portal`). Don't re-check it in your handler.
 - The top-level `src/api/router.ts` already maps every contract key to your `<name>Router`; you only
   edit your module folder. Delete the `stubRouter` spread once everything is implemented.
 - Vendor portal handlers use `withVendor(tenant.companyId, ...)` so the `*_vendor_read` policies apply.
@@ -135,4 +139,5 @@ export function carrierAdapter(): CarrierAdapter {
 | Pagination | `keyset(createdAtCol, idCol, input)` |
 | CSV | `parseCsvObjects`, `col(row, ...names)`, `toCsv` |
 | Errors | `src/lib/errors.ts` |
+| Account emails | `src/lib/auth-mail.ts`: verification, reset and security-notice templates (en/es), `sendAuthMail` (background, never throws). Used by `src/auth.ts` |
 | Logging | `logger("scope")` |

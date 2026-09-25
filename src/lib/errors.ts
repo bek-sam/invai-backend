@@ -21,6 +21,11 @@ export function forbidden(permission: string, message = "Missing permission") {
   return new ORPCError("FORBIDDEN", { message, data: { permission } });
 }
 
+/** A paid action (label buy, checkout, billing portal) before the email is verified (HTTP 403). */
+export function emailNotVerified() {
+  return new ORPCError("EMAIL_NOT_VERIFIED", { status: 403, message: "Verify your email first" });
+}
+
 export function badRequest(message: string, data?: unknown) {
   return new ORPCError("BAD_REQUEST", { message, data });
 }

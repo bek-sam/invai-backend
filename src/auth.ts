@@ -1,10 +1,16 @@
-import { type BetterAuthPlugin, betterAuth } from "better-auth";
+import { type BetterAuthOptions, type BetterAuthPlugin, betterAuth } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
-import { createAuthEndpoint } from "better-auth/api";
-import { organization } from "better-auth/plugins";
+import {
+  APIError,
+  createAuthEndpoint,
+  createAuthMiddleware,
+  getSessionFromCtx,
+  isAPIError,
+} from "better-auth/api";
+import { organization, twoFactor } from "better-auth/plugins";
 import { createAccessControl } from "better-auth/plugins/access";
 import { adminAc, defaultStatements, ownerAc } from "better-auth/plugins/organization/access";
-import { eq } from "drizzle-orm";
+import { and, eq, gt, sql } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "./db/client";
 import {
@@ -13,10 +19,22 @@ import {
   invitations,
   members,
   sessions,
+  twoFactors,
   users,
   verifications,
 } from "./db/schema";
 import { env } from "./env";
+import {
+  localeOf,
+  resetPasswordEmail,
+  resetPasswordLink,
+  type SecurityNotice,
+  securityNoticeEmail,
+  sendAuthMail,
+  verificationEmail,
+  verifyEmailLink,
+} from "./lib/auth-mail";
+import { logger } from "./lib/log";
 import { invitePreview } from "./modules/tenancy/invites";
 import { onOrganizationCreated } from "./modules/today/org-hooks";
 
@@ -87,17 +105,115 @@ const invitePreviewPlugin = {
   },
 } satisfies BetterAuthPlugin;
 
-export const auth = betterAuth({
+const log = logger("auth");
+
+/*
+ * Account security (T-2-3):
+ * - Email verification: sign-up sends a link to WEB_ORIGIN/verify-email?token=. Unverified users
+ *   can sign in; the procedures that move money refuse them with EMAIL_NOT_VERIFIED
+ *   (EMAIL_VERIFIED_PROCEDURES in src/api/orpc.ts). Accepting an invite marks the email verified.
+ * - Password reset: the link goes to WEB_ORIGIN/reset-password?token=, works once, for 1 hour,
+ *   and signs every session out. The request answers the same way for unknown emails.
+ * - Two-step sign-in (twoFactor plugin): optional TOTP plus backup codes, issuer "InvAI". Turning
+ *   it on needs a verified email. Sign-in answers { twoFactorRedirect: true } while the second
+ *   step is pending. A completed reset also verifies the email (the link reached the inbox).
+ * - Changing the password needs the current one and always signs the other sessions out.
+ * Floor PIN sessions (fs1. tokens, modules/tenancy/floor-auth.ts) are separate and untouched.
+ */
+
+/** Verification links work for 24 hours: a slow or spam-filtered email must not strand a new shop. */
+export const EMAIL_VERIFICATION_TTL_SEC = 24 * 60 * 60;
+/** Reset links work once, for 1 hour. */
+export const RESET_PASSWORD_TTL_SEC = 60 * 60;
+
+type MailUser = { id: string; email: string; locale?: unknown };
+
+function notify(user: MailUser, kind: SecurityNotice) {
+  void sendAuthMail(user.email, kind, securityNoticeEmail(localeOf(user.locale), kind));
+}
+
+/** An unexpired pending invitation for this email: accepting it will verify the email. */
+async function hasPendingInvite(email: string) {
+  const [row] = await db
+    .select({ id: invitations.id })
+    .from(invitations)
+    .where(
+      and(
+        sql`lower(${invitations.email}) = ${email.toLowerCase()}`,
+        eq(invitations.status, "pending"),
+        gt(invitations.expiresAt, new Date()),
+      ),
+    )
+    .limit(1);
+  return !!row;
+}
+
+export const authOptions = {
+  appName: "InvAI",
   database: drizzleAdapter(db, {
     provider: "pg",
-    schema: { users, sessions, accounts, verifications, companies, members, invitations },
+    schema: {
+      users,
+      sessions,
+      accounts,
+      verifications,
+      twoFactors,
+      companies,
+      members,
+      invitations,
+    },
   }),
   secret: env.BETTER_AUTH_SECRET,
   baseURL: env.BETTER_AUTH_URL,
   trustedOrigins: [env.WEB_ORIGIN, env.FLOOR_ORIGIN],
-  emailAndPassword: { enabled: true, minPasswordLength: 8, maxPasswordLength: 128 },
+  emailAndPassword: {
+    enabled: true,
+    minPasswordLength: 8,
+    maxPasswordLength: 128,
+    // Unverified users can sign in; only paid actions need a verified email.
+    requireEmailVerification: false,
+    resetPasswordTokenExpiresIn: RESET_PASSWORD_TTL_SEC,
+    revokeSessionsOnPasswordReset: true,
+    // Not awaited: an unknown email returns at once, so a known one must not wait on SMTP either.
+    sendResetPassword: async ({ user, token }) => {
+      void sendAuthMail(
+        user.email,
+        "reset_password",
+        resetPasswordEmail(localeOf((user as MailUser).locale), resetPasswordLink(token)),
+      );
+    },
+    onPasswordReset: async ({ user }) => {
+      log.info("password reset", { userId: user.id });
+      // The reset link reached this inbox, so the email is proven.
+      if (!user.emailVerified) {
+        await db.update(users).set({ emailVerified: true }).where(eq(users.id, user.id));
+      }
+      notify(user as MailUser, "password_changed");
+    },
+  },
+  emailVerification: {
+    sendOnSignUp: true,
+    sendOnSignIn: false,
+    autoSignInAfterVerification: false,
+    expiresIn: EMAIL_VERIFICATION_TTL_SEC,
+    sendVerificationEmail: async ({ user, token }, request) => {
+      // Server-side sign-ups (the seed) have no request and mark their users verified themselves.
+      if (!request) return;
+      // An invitee signing up on the accept-invite page is verified when they accept.
+      if (new URL(request.url).pathname.endsWith("/sign-up/email")) {
+        if (await hasPendingInvite(user.email)) return;
+      }
+      void sendAuthMail(
+        user.email,
+        "verify_email",
+        verificationEmail(localeOf((user as MailUser).locale), verifyEmailLink(token)),
+      );
+    },
+  },
   disabledPaths: DISABLED_AUTH_PATHS,
   // Per-IP limits on the auth endpoints (Better Auth only enables them in production by default).
+  // Better Auth's own rules also apply: /two-factor/* 3 per 10 s, plus a per-challenge limit of 5
+  // codes and a 15-minute account lock after 10 wrong codes.
   rateLimit: {
     enabled: !env.isTest,
     window: 60,
@@ -108,9 +224,25 @@ export const auth = betterAuth({
       "/organization/create": { window: 60, max: 5 },
       "/invite-preview": { window: 60, max: 30 },
       "/organization/accept-invitation": { window: 60, max: 10 },
+      "/request-password-reset": { window: 15 * 60, max: 5 },
+      "/reset-password": { window: 15 * 60, max: 10 },
+      "/send-verification-email": { window: 15 * 60, max: 5 },
+      "/change-password": { window: 15 * 60, max: 10 },
     },
   },
-  user: { modelName: "users" },
+  user: {
+    modelName: "users",
+    additionalFields: {
+      // The language of account and invite emails; the web account page saves it with updateUser.
+      locale: {
+        type: "string",
+        required: false,
+        defaultValue: "en",
+        input: true,
+        validator: { input: z.enum(["en", "es"]) },
+      },
+    },
+  },
   session: {
     modelName: "sessions",
     expiresIn: 60 * 60 * 24 * 14,
@@ -123,7 +255,47 @@ export const auth = betterAuth({
     useSecureCookies: env.isProd,
     defaultCookieAttributes: { httpOnly: true, sameSite: "lax", secure: env.isProd },
   },
+  hooks: {
+    before: createAuthMiddleware(async (ctx) => {
+      // Changing the password always signs the other sessions out, whatever the client sends.
+      if (ctx.path === "/change-password") {
+        return { context: { body: { ...(ctx.body ?? {}), revokeOtherSessions: true } } };
+      }
+      // Two-step sign-in needs a verified email first. Otherwise someone who signed up with a
+      // stranger's address could turn it on and lock the real owner out even after a reset.
+      if (ctx.path === "/two-factor/enable") {
+        const session = await getSessionFromCtx(ctx);
+        if (session && !session.user.emailVerified) {
+          throw APIError.from("FORBIDDEN", {
+            code: "EMAIL_NOT_VERIFIED",
+            message: "Verify your email first",
+          });
+        }
+      }
+    }),
+    after: createAuthMiddleware(async (ctx) => {
+      if (ctx.path !== "/change-password") return;
+      const returned = ctx.context.returned as { user?: MailUser } | undefined;
+      if (!returned || isAPIError(returned) || !returned.user) return;
+      log.info("password changed", { userId: returned.user.id });
+      notify(returned.user, "password_changed");
+    }),
+  },
   databaseHooks: {
+    user: {
+      update: {
+        // Two-step sign-in flips on in /two-factor/verify-totp (first code) and off in /disable.
+        after: async (user, ctx) => {
+          if (ctx?.path === "/two-factor/verify-totp" && user.twoFactorEnabled === true) {
+            log.info("two-factor on", { userId: user.id });
+            notify(user as MailUser, "two_factor_on");
+          } else if (ctx?.path === "/two-factor/disable" && user.twoFactorEnabled === false) {
+            log.info("two-factor off", { userId: user.id });
+            notify(user as MailUser, "two_factor_off");
+          }
+        },
+      },
+    },
     session: {
       create: {
         // A fresh session starts in the user's first company so `me.get` works right away.
@@ -147,10 +319,22 @@ export const auth = betterAuth({
       roles: authRoles,
       creatorRole: "owner",
       allowUserToCreateOrganization: true,
-      // Emails aren't verified at sign-up. The invitation id (a random UUID) only travels in the
-      // invite email, so opening that link is the proof; accept still requires the invited email.
+      // The invitation id (a random UUID) only travels in the invite email, so opening that link
+      // is the proof; accept still requires the invited email, and then marks it verified.
       requireEmailVerificationOnInvitation: false,
       organizationHooks: {
+        afterAcceptInvitation: async ({ invitation, user }) => {
+          if (user.emailVerified) return;
+          await db
+            .update(users)
+            .set({ emailVerified: true })
+            .where(
+              and(
+                eq(users.id, user.id),
+                sql`lower(${users.email}) = ${invitation.email.toLowerCase()}`,
+              ),
+            );
+        },
         // Default "Main" location, trial subscription, company.created (src/modules/today).
         afterCreateOrganization: async ({ organization: org }) => {
           await onOrganizationCreated({ id: org.id, type: org.type as string | undefined });
@@ -182,7 +366,13 @@ export const auth = betterAuth({
       },
     }),
     invitePreviewPlugin,
+    twoFactor({
+      issuer: "InvAI",
+      schema: { twoFactor: { modelName: "twoFactors" } },
+    }),
   ],
-});
+} satisfies BetterAuthOptions;
+
+export const auth = betterAuth(authOptions);
 
 export type Auth = typeof auth;

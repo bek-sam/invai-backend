@@ -27,6 +27,8 @@ export type Context = {
   headers: Headers;
   sessionKind: SessionKind | null;
   user: { id: string; name: string; email: string } | null;
+  /** The signed-in person's email is verified (user and floor sessions). Paid actions need it. */
+  emailVerified: boolean;
   companyId: string | null;
   orgType: CompanyType | null;
   role: Role | null;
@@ -60,6 +62,7 @@ export function anonymousContext(headers: Headers, ip: string | null): Context {
     headers,
     sessionKind: null,
     user: null,
+    emailVerified: false,
     companyId: null,
     orgType: null,
     role: null,
@@ -124,7 +127,13 @@ async function floorContext(ctx: Context, token: string): Promise<Context | null
   // Role and status come from the live membership, so a role change or deactivation applies to
   // floor sessions at once instead of when the signed token expires.
   const [user] = await db
-    .select({ id: users.id, name: users.name, email: users.email, role: members.role })
+    .select({
+      id: users.id,
+      name: users.name,
+      email: users.email,
+      emailVerified: users.emailVerified,
+      role: members.role,
+    })
     .from(users)
     .innerJoin(members, eq(members.userId, users.id))
     .where(
@@ -149,6 +158,7 @@ async function floorContext(ctx: Context, token: string): Promise<Context | null
     ...ctx,
     sessionKind: "floor",
     user: { id: user.id, name: user.name, email: user.email },
+    emailVerified: user.emailVerified,
     companyId: session.companyId,
     orgType: company.type,
     role: user.role,
@@ -196,6 +206,7 @@ async function userContext(ctx: Context, headers: Headers): Promise<Context | nu
     ...ctx,
     sessionKind: "user",
     user: { id: session.user.id, name: session.user.name, email: session.user.email },
+    emailVerified: session.user.emailVerified === true,
     companyId: active?.orgId ?? null,
     orgType: active?.type ?? null,
     role: active?.role ?? null,
