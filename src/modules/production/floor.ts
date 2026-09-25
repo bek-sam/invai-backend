@@ -851,7 +851,11 @@ async function binView(tx: Tx, row: typeof bins.$inferSelect): Promise<Bin> {
     inBin = live.filter((s) => ["transfer_in", "pressed", "packed"].includes(s.state)).length;
   }
   return {
+    id: row.id,
     code: row.code,
+    // TODO(T-6-2): name/archivedAt need their own db columns (wave 6 stub 4); nothing sets them yet.
+    name: null,
+    archivedAt: null,
     locationId: row.locationId,
     orderId: row.orderId,
     orderNo,

@@ -1,5 +1,6 @@
 import { authed } from "../../api/orpc";
 import { withTenant } from "../../db/client";
+import { notImplemented } from "../../lib/errors";
 import "./jobs";
 import * as svc from "./service";
 
@@ -56,6 +57,10 @@ export const aiRouter = authed.ai.router({
       withTenant(tenant.companyId, (tx) => svc.ledger(tx, tenant, input)),
     ),
   },
+  // T-6-4 (wave 6 stub 5): one CSV row per variant, real SKUs.
+  exportCsv: authed.ai.exportCsv.handler(() => {
+    throw notImplemented("ai.exportCsv");
+  }),
   validate: authed.ai.validate.handler(({ input }) => svc.validate(input.channel, input.content)),
   trademarkCheck: authed.ai.trademarkCheck.handler(({ input, context: { tenant } }) =>
     withTenant(tenant.companyId, (tx) => svc.trademarkCheck(tx, tenant, input)),

@@ -64,6 +64,8 @@ export const SHEET_STATES = [
   "received",
   "failed",
   "cancelled",
+  // Added at the end (additive): in-house printing, when a company prints its own sheets.
+  "printing",
 ] as const;
 export type SheetState = (typeof SHEET_STATES)[number];
 
