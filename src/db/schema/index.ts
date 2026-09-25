@@ -1,6 +1,7 @@
 export * from "./_shared";
 export * from "./ai";
 export * from "./billing";
+export * from "./carriers";
 export * from "./catalog";
 export * from "./channels";
 export * from "./finance";
