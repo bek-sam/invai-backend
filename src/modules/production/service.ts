@@ -3,13 +3,18 @@
  * the floor (queues, scan check, QC, reprints, bins, staff output). Other modules import from here.
  */
 export {
+  archiveBin,
   assignBin,
+  binLabels,
   cancelReprint,
+  createBin,
   listBins,
   listReprints,
   packOrder,
   qc,
   releaseBin,
+  renameBin,
+  reprintReasonsByWeek,
   reprintStats,
   requestReprint,
   scan,
@@ -27,6 +32,8 @@ export {
   getSheet,
   listSheets,
   lockSheet,
+  markSheetPrinted,
+  markSheetPrinting,
   markSheetReceived,
   previewBatch,
   regenerateSheet,

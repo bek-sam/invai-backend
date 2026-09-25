@@ -201,6 +201,9 @@ export const bins = pgTable(
     companyId: companyId(),
     locationId: uuid().references(() => locations.id, { onDelete: "set null" }),
     code: text().notNull(),
+    // T-6-2 (wave 6 stub 4): turns the bin from pure occupancy state into a manageable entity.
+    name: text(),
+    archivedAt: timestamp({ withTimezone: true }),
     orderId: uuid().references(() => orders.id, { onDelete: "set null" }),
     station: text(),
     ...timestamps,

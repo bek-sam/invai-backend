@@ -28,6 +28,7 @@ import {
   transfers,
   users,
 } from "../../db/schema";
+import { env } from "../../env";
 import { audit } from "../../lib/audit";
 import {
   badRequest,
@@ -36,10 +37,12 @@ import {
   invalidTransition,
   notFound,
   ORPCError,
+  upstream,
 } from "../../lib/errors";
 import { emit } from "../../lib/outbox";
 import { keyset, type PageInput } from "../../lib/pagination";
 import { publish } from "../../lib/realtime";
+import { objectKey } from "../../lib/s3";
 import { consumeForItem } from "../inventory/service";
 import { recomputeOrderStatus, transitionItem } from "../orders/state-machine";
 import { type MatchOutcome, matchScan, type ScanAction, type SecondCode } from "./matcher";
@@ -830,6 +833,47 @@ export async function reprintStats(
   };
 }
 
+/** Count by reason and by week, for the reasons report chart (`stats` only has one flat total). */
+export async function reprintReasonsByWeek(
+  tx: Tx,
+  _ctx: TenantContext,
+  input: { from: string; to: string },
+) {
+  const from = new Date(input.from);
+  const to = new Date(input.to);
+  const weekStart = sql`date_trunc('week', ${reprints.requestedAt})`;
+  const rows = await tx
+    .select({
+      weekStart: sql<string>`${weekStart}::date::text`.mapWith(String),
+      reason: reprints.reason,
+      n: sql<number>`count(*)`.mapWith(Number),
+    })
+    .from(reprints)
+    .where(
+      and(
+        gte(reprints.requestedAt, from),
+        lte(reprints.requestedAt, to),
+        sql`${reprints.status} <> 'cancelled'`,
+      ),
+    )
+    .groupBy(weekStart, reprints.reason)
+    .orderBy(weekStart);
+  const byWeek = new Map<
+    string,
+    { total: number; byReason: Partial<Record<ReprintReason, number>> }
+  >();
+  for (const r of rows) {
+    const entry = byWeek.get(r.weekStart) ?? { total: 0, byReason: {} };
+    entry.total += r.n;
+    entry.byReason[r.reason] = r.n;
+    byWeek.set(r.weekStart, entry);
+  }
+  const weeks = [...byWeek.entries()]
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([weekStartDate, v]) => ({ weekStart: weekStartDate, ...v }));
+  return { weeks };
+}
+
 /* ---------------------------------- bins ----------------------------------- */
 
 async function binView(tx: Tx, row: typeof bins.$inferSelect): Promise<Bin> {
@@ -853,9 +897,8 @@ async function binView(tx: Tx, row: typeof bins.$inferSelect): Promise<Bin> {
   return {
     id: row.id,
     code: row.code,
-    // TODO(T-6-2): name/archivedAt need their own db columns (wave 6 stub 4); nothing sets them yet.
-    name: null,
-    archivedAt: null,
+    name: row.name,
+    archivedAt: row.archivedAt?.toISOString() ?? null,
     locationId: row.locationId,
     orderId: row.orderId,
     orderNo,
@@ -869,11 +912,16 @@ async function binView(tx: Tx, row: typeof bins.$inferSelect): Promise<Bin> {
 export async function listBins(
   tx: Tx,
   _ctx: TenantContext,
-  input: { locationId?: string | undefined; onlyOccupied: boolean },
+  input: {
+    locationId?: string | undefined;
+    onlyOccupied: boolean;
+    includeArchived: boolean;
+  },
 ) {
   const filters: (SQL | undefined)[] = [];
   if (input.locationId) filters.push(eq(bins.locationId, input.locationId));
   if (input.onlyOccupied) filters.push(sql`${bins.orderId} is not null`);
+  if (!input.includeArchived) filters.push(sql`${bins.archivedAt} is null`);
   const rows = await tx
     .select()
     .from(bins)
@@ -973,6 +1021,107 @@ export async function releaseBin(
     ),
   );
   return binView(tx, updated ?? row);
+}
+
+export async function createBin(
+  tx: Tx,
+  ctx: TenantContext,
+  input: { code: string; name: string | null; locationId?: string | undefined },
+): Promise<Bin> {
+  const code = input.code.trim();
+  const [existing] = await tx.select({ id: bins.id }).from(bins).where(eq(bins.code, code));
+  if (existing)
+    throw new ORPCError("CODE_TAKEN", {
+      status: 409,
+      message: "A bin with this code already exists",
+    });
+  const [row] = await tx
+    .insert(bins)
+    .values({ companyId: ctx.companyId, code, name: input.name, locationId: input.locationId })
+    .returning();
+  if (!row) throw new Error("bin insert failed");
+  await audit(tx, {
+    companyId: ctx.companyId,
+    actor: ctx.actor,
+    action: "bin.created",
+    entityType: "bin",
+    entityId: row.id,
+    summary: `Bin ${code} created`,
+  });
+  return binView(tx, row);
+}
+
+export async function renameBin(
+  tx: Tx,
+  ctx: TenantContext,
+  input: { id: string; name: string },
+): Promise<Bin> {
+  const [row] = await tx
+    .update(bins)
+    .set({ name: input.name, updatedAt: new Date() })
+    .where(eq(bins.id, input.id))
+    .returning();
+  if (!row) throw notFound("bin", input.id);
+  await audit(tx, {
+    companyId: ctx.companyId,
+    actor: ctx.actor,
+    action: "bin.renamed",
+    entityType: "bin",
+    entityId: row.id,
+    summary: `Bin ${row.code} renamed to ${input.name}`,
+  });
+  return binView(tx, row);
+}
+
+export async function archiveBin(tx: Tx, ctx: TenantContext, input: { id: string }): Promise<Bin> {
+  const [row] = await tx.select().from(bins).where(eq(bins.id, input.id)).for("update");
+  if (!row) throw notFound("bin", input.id);
+  if (row.orderId)
+    throw new ORPCError("BIN_OCCUPIED", { status: 409, message: "Bin holds an order" });
+  const [updated] = await tx
+    .update(bins)
+    .set({ archivedAt: new Date(), updatedAt: new Date() })
+    .where(eq(bins.id, row.id))
+    .returning();
+  await audit(tx, {
+    companyId: ctx.companyId,
+    actor: ctx.actor,
+    action: "bin.archived",
+    entityType: "bin",
+    entityId: row.id,
+    summary: `Bin ${row.code} archived`,
+  });
+  return binView(tx, updated ?? row);
+}
+
+/**
+ * Renders a merged PDF of `BIN:` QR labels through imaging's `/labels/qr` endpoint (imaging
+ * writes the PDF to S3 itself and hands back the key; shared shape with T-6-1's
+ * inventory.blankLabels, which renders `B:<variantId>` labels the same way).
+ */
+export async function binLabels(
+  tx: Tx,
+  ctx: TenantContext,
+  input: { binIds: string[] },
+): Promise<{ key: string }> {
+  const rows = await tx.select().from(bins).where(inArray(bins.id, input.binIds));
+  if (!rows.length) throw notFound("bin", input.binIds[0]);
+  const labels = rows.map((r) => ({
+    code: `BIN:${r.code}`,
+    caption: r.name ?? r.code,
+    size: "4x6" as const,
+  }));
+  const out_key = objectKey(ctx.companyId, "labels", "pdf");
+  const res = await fetch(`${env.IMAGING_URL}/labels/qr`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ labels, out_key }),
+    signal: AbortSignal.timeout(120_000),
+  }).catch((err) => {
+    throw upstream("imaging", err instanceof Error ? err.message : String(err));
+  });
+  if (!res.ok) throw upstream("imaging", await res.text().catch(() => null));
+  return { key: out_key };
 }
 
 /* ------------------------------- pack order -------------------------------- */

@@ -1,6 +1,5 @@
 import { authed } from "../../api/orpc";
 import { withTenant } from "../../db/client";
-import { notImplemented } from "../../lib/errors";
 import { sendSheetToVendor } from "../vendors/service";
 import * as svc from "./service";
 
@@ -31,13 +30,13 @@ export const productionRouter = authed.production.router({
     sendToVendor: authed.production.sheets.sendToVendor.handler(({ input, context: { tenant } }) =>
       withTenant(tenant.companyId, (tx) => sendSheetToVendor(tx, tenant, input)),
     ),
-    // T-6-2 (wave 6 stub 3): in-house print path, ready -> printing -> printed.
-    markPrinting: authed.production.sheets.markPrinting.handler(() => {
-      throw notImplemented("production.sheets.markPrinting");
-    }),
-    markPrinted: authed.production.sheets.markPrinted.handler(() => {
-      throw notImplemented("production.sheets.markPrinted");
-    }),
+    // In-house print path, ready -> printing -> printed (wave 6, T-6-2).
+    markPrinting: authed.production.sheets.markPrinting.handler(({ input, context: { tenant } }) =>
+      withTenant(tenant.companyId, (tx) => svc.markSheetPrinting(tx, tenant, input.id)),
+    ),
+    markPrinted: authed.production.sheets.markPrinted.handler(({ input, context: { tenant } }) =>
+      withTenant(tenant.companyId, (tx) => svc.markSheetPrinted(tx, tenant, input.id)),
+    ),
     markReceived: authed.production.sheets.markReceived.handler(({ input, context: { tenant } }) =>
       withTenant(tenant.companyId, (tx) => svc.markSheetReceived(tx, tenant, input.id)),
     ),
@@ -64,28 +63,29 @@ export const productionRouter = authed.production.router({
     stats: authed.production.reprints.stats.handler(({ input, context: { tenant } }) =>
       withTenant(tenant.companyId, (tx) => svc.reprintStats(tx, tenant, input)),
     ),
-    // T-6-2 (wave 6 stub 6): count by reason and by week, for the reasons report chart.
-    reasonsByWeek: authed.production.reprints.reasonsByWeek.handler(() => {
-      throw notImplemented("production.reprints.reasonsByWeek");
-    }),
+    // Count by reason and by week, for the reasons report chart (wave 6, T-6-2).
+    reasonsByWeek: authed.production.reprints.reasonsByWeek.handler(
+      ({ input, context: { tenant } }) =>
+        withTenant(tenant.companyId, (tx) => svc.reprintReasonsByWeek(tx, tenant, input)),
+    ),
   },
   bins: {
     list: authed.production.bins.list.handler(({ input, context: { tenant } }) =>
       withTenant(tenant.companyId, (tx) => svc.listBins(tx, tenant, input)),
     ),
-    // T-6-2 (wave 6 stub 4): bin CRUD + label rendering.
-    create: authed.production.bins.create.handler(() => {
-      throw notImplemented("production.bins.create");
-    }),
-    rename: authed.production.bins.rename.handler(() => {
-      throw notImplemented("production.bins.rename");
-    }),
-    archive: authed.production.bins.archive.handler(() => {
-      throw notImplemented("production.bins.archive");
-    }),
-    labels: authed.production.bins.labels.handler(() => {
-      throw notImplemented("production.bins.labels");
-    }),
+    // Bin CRUD + label rendering (wave 6, T-6-2).
+    create: authed.production.bins.create.handler(({ input, context: { tenant } }) =>
+      withTenant(tenant.companyId, (tx) => svc.createBin(tx, tenant, input)),
+    ),
+    rename: authed.production.bins.rename.handler(({ input, context: { tenant } }) =>
+      withTenant(tenant.companyId, (tx) => svc.renameBin(tx, tenant, input)),
+    ),
+    archive: authed.production.bins.archive.handler(({ input, context: { tenant } }) =>
+      withTenant(tenant.companyId, (tx) => svc.archiveBin(tx, tenant, input)),
+    ),
+    labels: authed.production.bins.labels.handler(({ input, context: { tenant } }) =>
+      withTenant(tenant.companyId, (tx) => svc.binLabels(tx, tenant, input)),
+    ),
     assign: authed.production.bins.assign.handler(({ input, context: { tenant } }) =>
       withTenant(tenant.companyId, (tx) => svc.assignBin(tx, tenant, input)),
     ),

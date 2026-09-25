@@ -26,6 +26,7 @@ import type { TenantContext } from "../../api/context";
 import { afterCommit, type Tx, withTenant } from "../../db/client";
 import type { SheetSpec } from "../../db/schema";
 import {
+  companies,
   designFiles,
   gangSheetBatches,
   gangSheets,
@@ -1070,6 +1071,48 @@ export async function markSheetReceived(
       data: { station: "pick", waiting: moved.length },
     }).then(() => undefined),
   );
+  return getSheet(tx, ctx, id);
+}
+
+async function companyPrintsInHouse(tx: Tx, companyId: string): Promise<boolean> {
+  const [company] = await tx
+    .select({ settings: companies.settings })
+    .from(companies)
+    .where(eq(companies.id, companyId));
+  return company?.settings?.printsInHouse === true;
+}
+
+/**
+ * In-house path: skips the vendor entirely. Only succeeds when the company prints in-house and
+ * the sheet is `ready` (SHEET_TRANSITIONS enforces the latter via transitionSheet).
+ */
+export async function markSheetPrinting(
+  tx: Tx,
+  ctx: TenantContext,
+  id: string,
+): Promise<GangSheetDetail> {
+  if (!(await companyPrintsInHouse(tx, ctx.companyId)))
+    throw new ORPCError("FORBIDDEN", {
+      status: 403,
+      message: "Company does not print in-house",
+    });
+  const sheet = await lockSheet(tx, id);
+  await transitionSheet(tx, ctx.companyId, ctx.actor, sheet, "printing");
+  return getSheet(tx, ctx, id);
+}
+
+/**
+ * `printing` -> `printed`. Units then flow to the floor exactly as a vendor-printed sheet does:
+ * `printed -> received` is already a valid transition, so the shop marks the same sheet
+ * received (markSheetReceived) once the transfers are cut and ready for pick, no branch needed.
+ */
+export async function markSheetPrinted(
+  tx: Tx,
+  ctx: TenantContext,
+  id: string,
+): Promise<GangSheetDetail> {
+  const sheet = await lockSheet(tx, id);
+  await transitionSheet(tx, ctx.companyId, ctx.actor, sheet, "printed");
   return getSheet(tx, ctx, id);
 }
 
