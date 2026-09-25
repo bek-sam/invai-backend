@@ -84,6 +84,8 @@ export type CompanySettings = {
   onboardingDismissedAt?: string;
   /** ISO time a demo workspace finished filling with sample data (tenancy.demo). */
   demoSeededAt?: string;
+  /** The shop prints its own DTF sheets instead of sending them to a vendor. */
+  printsInHouse?: boolean;
 };
 
 export const sessions = pgTable(

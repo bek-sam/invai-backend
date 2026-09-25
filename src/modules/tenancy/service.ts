@@ -48,6 +48,7 @@ function toOrg(row: typeof companies.$inferSelect): Org {
     timezone: row.timezone,
     plan: row.type === "vendor" ? null : (row.plan ?? "trial"),
     demo: row.demo,
+    printsInHouse: row.settings?.printsInHouse === true,
     createdAt: row.createdAt.toISOString(),
   };
 }
@@ -117,11 +118,20 @@ export async function me(tx: Tx, ctx: Context & { tenant: TenantContext }): Prom
 export async function updateOrg(
   tx: Tx,
   ctx: TenantContext,
-  input: { name?: string; timezone?: string },
+  input: { name?: string; timezone?: string; printsInHouse?: boolean },
 ): Promise<Org> {
   const [row] = await db
     .update(companies)
-    .set({ name: input.name, timezone: input.timezone })
+    .set({
+      name: input.name,
+      timezone: input.timezone,
+      // jsonb merge so other settings keys are never clobbered.
+      ...(input.printsInHouse === undefined
+        ? {}
+        : {
+            settings: sql`coalesce(${companies.settings}, '{}'::jsonb) || ${JSON.stringify({ printsInHouse: input.printsInHouse })}::jsonb`,
+          }),
+    })
     .where(eq(companies.id, ctx.companyId))
     .returning();
   if (!row) throw notFound("company", ctx.companyId);
