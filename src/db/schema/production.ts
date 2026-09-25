@@ -3,6 +3,7 @@ import {
   doublePrecision,
   index,
   integer,
+  jsonb,
   pgTable,
   text,
   timestamp,
@@ -206,6 +207,33 @@ export const bins = pgTable(
     uniqueIndex().on(t.companyId, t.code),
     index().on(t.companyId, t.orderId),
     tenantPolicy("bins"),
+  ],
+).enableRLS();
+
+export const FLOOR_REQUEST_KINDS = ["pack_order"] as const;
+
+/**
+ * The stored first result of an idempotent floor command (`production.packOrder` today), keyed
+ * by the tablet's `idempotencyKey`. A replay returns `result` verbatim; a replay whose request
+ * differs is a conflict. Only effective calls are stored: a refused pack has no effect.
+ */
+export const floorRequests = pgTable(
+  "floor_requests",
+  {
+    id: id(),
+    companyId: companyId(),
+    kind: text(enumText(FLOOR_REQUEST_KINDS)).notNull(),
+    idempotencyKey: text().notNull(),
+    orderId: uuid().references(() => orders.id, { onDelete: "cascade" }),
+    request: jsonObject<Record<string, unknown>>(),
+    result: jsonb().$type<Record<string, unknown>>().notNull(),
+    userId: uuid(),
+    createdAt: timestamp({ withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex().on(t.companyId, t.kind, t.idempotencyKey),
+    index().on(t.companyId, t.orderId),
+    tenantPolicy("floor_requests"),
   ],
 ).enableRLS();
 

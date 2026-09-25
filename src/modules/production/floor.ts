@@ -1,5 +1,9 @@
 import type {
   Bin,
+  OrderItemState,
+  PackOrderInput,
+  PackOrderResult,
+  PackOverride,
   QcInput as QcInputSchema,
   REPRINT_REASONS,
   Reprint,
@@ -16,6 +20,7 @@ import {
   bins,
   blankVariants,
   companies,
+  floorRequests,
   orderItems,
   orders,
   reprints,
@@ -24,12 +29,19 @@ import {
   users,
 } from "../../db/schema";
 import { audit } from "../../lib/audit";
-import { badRequest, invalidTransition, notFound, ORPCError } from "../../lib/errors";
+import {
+  badRequest,
+  conflict,
+  forbidden,
+  invalidTransition,
+  notFound,
+  ORPCError,
+} from "../../lib/errors";
 import { emit } from "../../lib/outbox";
 import { keyset, type PageInput } from "../../lib/pagination";
 import { publish } from "../../lib/realtime";
 import { consumeForItem } from "../inventory/service";
-import { transitionItem } from "../orders/state-machine";
+import { recomputeOrderStatus, transitionItem } from "../orders/state-machine";
 import { type MatchOutcome, matchScan, type ScanAction, type SecondCode } from "./matcher";
 import {
   blankRef,
@@ -957,6 +969,192 @@ export async function releaseBin(
     ),
   );
   return binView(tx, updated ?? row);
+}
+
+/* ------------------------------- pack order -------------------------------- */
+
+type PackMissing = PackOrderResult["missing"];
+const PACKED_OR_LATER: OrderItemState[] = ["packed", "shipped", "delivered"];
+
+const packIncomplete = (missing: PackMissing) =>
+  new ORPCError("PACK_INCOMPLETE", {
+    status: 409,
+    message: "Units are still missing",
+    data: { missing },
+  });
+
+/** What a replay must match to get the stored result back. */
+const packRequestOf = (input: PackOrderInput) => ({
+  orderId: input.orderId,
+  overrideReason: input.override?.reason ?? null,
+});
+
+/**
+ * "Mark packed" (decision 0002): every non-cancelled unit must be packed (or already shipped).
+ * Otherwise it throws PACK_INCOMPLETE with the missing units, unless `override` is set by
+ * someone with `production.override`: then the order is recorded as packed short
+ * (`orders.pack_override`, status ready_to_ship) and the missing units are still returned.
+ * On success the tote is released and packed units without a pack scan get one, so the order
+ * leaves the pack queue. Idempotent on `idempotencyKey`: the first effective result is stored
+ * in `floor_requests` and returned verbatim; a refusal has no effect and isn't stored.
+ */
+export async function packOrder(
+  tx: Tx,
+  ctx: TenantContext,
+  input: PackOrderInput,
+): Promise<PackOrderResult> {
+  if (input.override && !ctx.permissions.has("production.override"))
+    throw forbidden("production.override", "Only an owner or admin can pack an order anyway");
+
+  // Serializes packs of one order, so a same-key retry waits and then finds the stored result.
+  const [order] = await tx
+    .select({
+      id: orders.id,
+      orderNo: orders.orderNo,
+      status: orders.status,
+      shipBy: orders.shipBy,
+    })
+    .from(orders)
+    .where(eq(orders.id, input.orderId))
+    .for("update");
+  if (!order) throw notFound("order", input.orderId);
+
+  const request = packRequestOf(input);
+  const stored = async () => {
+    const [prior] = await tx
+      .select({ request: floorRequests.request, result: floorRequests.result })
+      .from(floorRequests)
+      .where(
+        and(
+          eq(floorRequests.kind, "pack_order"),
+          eq(floorRequests.idempotencyKey, input.idempotencyKey),
+        ),
+      )
+      .limit(1);
+    if (!prior) return null;
+    const same =
+      prior.request.orderId === request.orderId &&
+      (prior.request.overrideReason ?? null) === request.overrideReason;
+    if (!same) throw conflict("This idempotencyKey was already used for a different pack");
+    return prior.result as PackOrderResult;
+  };
+  const replay = await stored();
+  if (replay) return replay;
+
+  if (order.status === "on_hold") throw conflict("Order is on hold; release it before packing");
+  const items = await tx
+    .select({
+      id: orderItems.id,
+      state: orderItems.state,
+      lineNo: orderItems.lineNo,
+      unitNo: orderItems.unitNo,
+    })
+    .from(orderItems)
+    .where(eq(orderItems.orderId, order.id))
+    .orderBy(orderItems.lineNo, orderItems.unitNo);
+  const open = items.filter((i) => i.state !== "cancelled");
+  if (!open.length) throw conflict("Order has no units left to pack");
+  const missing: PackMissing = open
+    .filter((i) => !PACKED_OR_LATER.includes(i.state))
+    .map((i) => ({ orderItemId: i.id, state: i.state }));
+  if (missing.length && !input.override) throw packIncomplete(missing);
+
+  let override: PackOverride | null = null;
+  if (missing.length && input.override) {
+    if (!ctx.userId) throw forbidden("production.override", "Sign in as a person to pack anyway");
+    override = {
+      reason: input.override.reason,
+      by: ctx.userId,
+      byName: ctx.user?.name ?? "",
+      at: new Date().toISOString(),
+      missingItemIds: missing.map((m) => m.orderItemId),
+    };
+    await tx.update(orders).set({ packOverride: override }).where(eq(orders.id, order.id));
+    await audit(tx, {
+      companyId: ctx.companyId,
+      actor: ctx.actor,
+      action: "order.pack_override",
+      entityType: "order",
+      entityId: order.id,
+      summary: `Packed ${order.orderNo} with ${missing.length} unit(s) missing: ${override.reason}`,
+      data: { reason: override.reason, missing },
+    });
+  }
+  const status = await recomputeOrderStatus(tx, ctx.companyId, order.id);
+
+  // Packed units the packer didn't scan one by one still count as packed by this person.
+  const packedIds = open.filter((i) => i.state === "packed").map((i) => i.id);
+  const scanned = packedIds.length
+    ? await tx
+        .select({ id: scans.orderItemId })
+        .from(scans)
+        .where(
+          and(inArray(scans.orderItemId, packedIds), eq(scans.action, "pack"), eq(scans.ok, true)),
+        )
+    : [];
+  const hasScan = new Set(scanned.map((r) => r.id));
+  const stationId = ctx.station?.id ?? null;
+  for (const id of packedIds.filter((x) => !hasScan.has(x))) {
+    const [t] = await tx
+      .select({ transferId: orderItems.transferId })
+      .from(orderItems)
+      .where(eq(orderItems.id, id));
+    await tx.insert(scans).values({
+      companyId: ctx.companyId,
+      clientScanId: crypto.randomUUID(),
+      stationId,
+      station: "pack",
+      action: "pack",
+      userId: ctx.userId,
+      transferCode: t?.transferId ? `T:${t.transferId}` : id,
+      transferId: t?.transferId ?? null,
+      orderItemId: id,
+      ok: true,
+      mismatch: null,
+      result: { ok: true, packOrder: input.idempotencyKey },
+      scannedAt: new Date(),
+    });
+  }
+
+  const totes = await tx.select({ code: bins.code }).from(bins).where(eq(bins.orderId, order.id));
+  for (const b of totes) await releaseBin(tx, ctx, { code: b.code });
+
+  const result: PackOrderResult = { orderId: order.id, packed: true, missing, override };
+  const [row] = await tx
+    .insert(floorRequests)
+    .values({
+      companyId: ctx.companyId,
+      kind: "pack_order",
+      idempotencyKey: input.idempotencyKey,
+      orderId: order.id,
+      request,
+      result,
+      userId: ctx.userId,
+    })
+    .onConflictDoNothing()
+    .returning({ id: floorRequests.id });
+  // Same key stored concurrently for another order (same-order packs are serialized above):
+  // roll everything back rather than apply a second effect under one key.
+  if (!row) throw conflict("This idempotencyKey was already used for a different pack");
+  await audit(tx, {
+    companyId: ctx.companyId,
+    actor: ctx.actor,
+    action: "order.packed",
+    entityType: "order",
+    entityId: order.id,
+    summary: override
+      ? `Packed ${order.orderNo} anyway (${missing.length} missing)`
+      : `Packed ${order.orderNo}`,
+    data: { idempotencyKey: input.idempotencyKey, override: !!override },
+  });
+  await publishQueues(tx, ctx.companyId, ["pack"]);
+  const atRisk =
+    !["shipped", "delivered", "cancelled"].includes(status) &&
+    order.shipBy.getTime() <= Date.now() + 24 * 3600_000;
+  afterCommit(tx, async () => {
+    await publish(ctx.companyId, "order.updated", { orderId: order.id, status, atRisk });
+  });
+  return result;
 }
 
 /* ------------------------------ staff output ------------------------------- */

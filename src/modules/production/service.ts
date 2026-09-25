@@ -7,6 +7,7 @@ export {
   cancelReprint,
   listBins,
   listReprints,
+  packOrder,
   qc,
   releaseBin,
   reprintStats,
