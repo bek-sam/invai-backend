@@ -26,6 +26,7 @@ import { decryptJson, encryptJson, randomToken } from "../../lib/crypto";
 import { badRequest, notFound, ORPCError } from "../../lib/errors";
 import { emit } from "../../lib/outbox";
 import { keyset, type PageInput } from "../../lib/pagination";
+import { assertWithinPlan } from "../billing/service";
 
 /*
  * Channel connections: list/connect/update/disconnect, health, tracking push for shipping.
@@ -220,6 +221,9 @@ export async function connect(tx: Tx, ctx: TenantContext, input: ConnectInput) {
         message: "This shop is already connected",
       });
     }
+    // A pending install already counts; a new or reconnected shop takes a connection slot.
+    if (!existing || existing.status === "disconnected")
+      await assertWithinPlan(tx, ctx, "connections");
     const provider = env.mocks.shopify ? "mock" : "live";
     const state = randomToken(24);
     const values = {
@@ -267,6 +271,7 @@ export async function connect(tx: Tx, ctx: TenantContext, input: ConnectInput) {
   }
 
   const mode = input.mode;
+  await assertWithinPlan(tx, ctx, "connections");
   const [row] = await tx
     .insert(channelConnections)
     .values({

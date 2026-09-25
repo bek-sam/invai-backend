@@ -1,10 +1,12 @@
 import { CHANNELS, type Channel } from "@invai/contracts";
 import { Hono } from "hono";
 import { env } from "../env";
+import { verifyStripeWebhook } from "../integrations/billing";
 import { webhookDeliveryId } from "../integrations/channels";
 import { header } from "../integrations/channels/types";
 import { errorData, logger } from "../lib/log";
 import { getJob } from "../lib/queues";
+import { handleStripeEvent } from "../modules/billing/stripe-events";
 import {
   completeShopifyOAuth,
   forgetWebhookDelivery,
@@ -24,6 +26,39 @@ const log = logger("webhooks");
  * webhook misses. Channels without webhooks never verify, so they get 401.
  */
 export const webhooks = new Hono();
+
+/**
+ * Stripe billing webhooks: their own route (Stripe isn't a marketplace channel), registered
+ * before `/:channel`.
+ *   1. verify `Stripe-Signature` on the raw body (5-minute tolerance; 401 and nothing written),
+ *   2. apply the event in one transaction that also records its id in `billing_webhook_events`
+ *      (a replay gets 200 and changes nothing),
+ *   3. on failure answer 500 with nothing recorded, so Stripe retries.
+ * The work is a few row updates, so it runs inline instead of through the queue.
+ */
+webhooks.post("/stripe", async (c) => {
+  const body = await c.req.text();
+  const event = verifyStripeWebhook(body, c.req.header("stripe-signature"));
+  if (!event) {
+    log.warn("stripe webhook with a bad or missing signature");
+    return c.json({ error: "invalid signature" }, 401);
+  }
+  try {
+    const res = await handleStripeEvent(event);
+    if (res.outcome === "duplicate") {
+      log.info("duplicate stripe event acknowledged", { eventId: event.id });
+      return c.json({ ok: true, duplicate: true }, 200);
+    }
+    return c.json({ ok: true, outcome: res.outcome }, 200);
+  } catch (err) {
+    log.error("stripe webhook failed; Stripe will retry", {
+      eventId: event.id,
+      type: event.type,
+      ...errorData(err),
+    });
+    return c.json({ error: "try again" }, 500);
+  }
+});
 
 webhooks.post("/:channel", async (c) => {
   const param = c.req.param("channel");

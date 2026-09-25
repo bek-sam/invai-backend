@@ -1,7 +1,7 @@
 import { and, eq, sql } from "drizzle-orm";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { withSystem, withTenant } from "../../db/client";
-import { channelConnections, orders, webhookDeliveries } from "../../db/schema";
+import { channelConnections, companies, orders, webhookDeliveries } from "../../db/schema";
 import { signEtsyWebhook } from "../../integrations/channels/etsy";
 import { MOCK_ETSY_WEBHOOK_SECRET } from "../../integrations/channels/etsy/webhooks";
 import { signShopifyBody } from "../../integrations/channels/shopify";
@@ -225,6 +225,10 @@ describe("Shopify OAuth state", () => {
   beforeAll(async () => {
     const c = (await createCompany()).id;
     ctx = tenantContext(c, (await createUser(c, "owner")).id, "owner");
+    // Many installs in one company; the trial's connection limit is tested in billing (T-2-1).
+    await withSystem((tx) =>
+      tx.update(companies).set({ plan: "scale" }).where(eq(companies.id, c)),
+    );
   });
 
   const start = async (shop: string) => {

@@ -21,6 +21,7 @@ import {
 import { audit } from "../../lib/audit";
 import { badRequest, conflict, forbidden, notFound } from "../../lib/errors";
 import { keyset, type PageInput } from "../../lib/pagination";
+import { assertWithinPlan } from "../billing/service";
 import { issueStationToken, revokeStationTokens, setPin } from "./floor-auth";
 import {
   cancelPendingInvitations,
@@ -333,6 +334,8 @@ export async function inviteUser(
     .limit(1);
   if (existing && existing.status !== "invited")
     throw conflict("That person is already on the team");
+  // A pending invite holds a seat; re-inviting the same email replaces it, so it isn't counted.
+  await assertWithinPlan(tx, ctx, "users", 1, { exceptInviteEmail: email });
   const [invitation] = await tx
     .insert(invitations)
     .values({

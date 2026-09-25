@@ -3,7 +3,7 @@ import { beforeAll, describe, expect, it, vi } from "vitest";
 import { app } from "../../api/app";
 import { buildContext } from "../../api/context";
 import { db, withSystem, withTenant } from "../../db/client";
-import { invitations, members, users } from "../../db/schema";
+import { companies, invitations, members, users } from "../../db/schema";
 import { env } from "../../env";
 import { createCompany, createUser, tenantContext } from "../../test/fixtures";
 
@@ -85,6 +85,10 @@ describe("team invites", () => {
   beforeAll(async () => {
     companyId = (await createCompany({ name: "Desert Test" })).id;
     owner = tenantContext(companyId, (await createUser(companyId, "owner")).id, "owner");
+    // These tests send many invites; the trial's 3-seat limit is tested in billing (T-2-1).
+    await withSystem((tx) =>
+      tx.update(companies).set({ plan: "scale" }).where(eq(companies.id, companyId)),
+    );
   });
 
   it("creates a Better Auth invitation and emails an /accept-invite link, with no user row", async () => {
