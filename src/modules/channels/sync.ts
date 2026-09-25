@@ -253,6 +253,8 @@ async function runCsvImport(
         .where(eq(importRuns.id, runId))
         .for("update");
       if (!run) throw notFound("import", runId);
+      // Marked failed meanwhile (a duplicate run's last attempt, the worker's failure hook): stop.
+      if (run.status !== "running") throw new Error(`import ${runId} is ${run.status}; stopping`);
       if (jobId) {
         // Another run of this job got here first (a stalled job picked up twice): stop.
         const [j] = await tx.select().from(jobs).where(eq(jobs.id, jobId)).limit(1);
@@ -398,6 +400,9 @@ export const importCsvJob = defineJob({
   input: z.object({ companyId: z.uuid(), importRunId: z.uuid() }),
   jobId: (i) => `import-csv-${i.importRunId}`,
   options: { attempts: 5, backoff: RETRY_BACKOFF, priority: 10 },
+  // BullMQ gave up without the handler's last attempt (stalled too often): fail the run too.
+  onFinalFailure: ({ companyId, importRunId }, error) =>
+    failCsvImport(companyId, importRunId, new Error(error)),
   handler: async ({ companyId, importRunId }, job) => {
     const [run] = await withTenant(companyId, (tx) =>
       tx

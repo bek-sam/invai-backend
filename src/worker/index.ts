@@ -10,6 +10,7 @@ import {
   QUEUE_NAMES,
   redis,
 } from "../lib/queues";
+import { onJobFailed } from "./job-failures";
 import { startOutboxRelay } from "./outbox-relay";
 
 const log = logger("worker");
@@ -31,15 +32,18 @@ const workers = QUEUE_NAMES.map((queue) => {
     },
     { connection: redis, concurrency: QUEUE_CONCURRENCY[queue] },
   );
-  worker.on("failed", (job, err) =>
+  worker.on("failed", (job, err) => {
     log.error("job failed", {
       queue,
       job: job?.name,
       id: job?.id,
       attempts: job?.attemptsMade,
+      final: !!job?.finishedOn,
       ...errorData(err),
-    }),
-  );
+    });
+    void onJobFailed(job ? getJob(job.name) : undefined, job, err);
+  });
+  worker.on("stalled", (id) => log.warn("job stalled; it will run again", { queue, id }));
   worker.on("completed", (job) => log.debug("job done", { queue, job: job.name, id: job.id }));
   return worker;
 });

@@ -61,6 +61,12 @@ export type JobDefinition<I> = {
   handler: JobHandler<I>;
   jobId?: (input: I) => string;
   options?: JobsOptions;
+  /**
+   * Runs in the worker when BullMQ gives up on the job for good, including failures the handler
+   * never saw (stalled too often, bad input). Mark the module's own entity failed here; the
+   * worker already marks the user-visible `jobs` row when the input carries `jobId`.
+   */
+  onFinalFailure?: (input: I, error: string) => Promise<void>;
 };
 
 export type DefinedJob<I> = JobDefinition<I> & {

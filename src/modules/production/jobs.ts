@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { z } from "zod";
 import { withTenant } from "../../db/client";
 import { gangSheetBatches, gangSheets, jobs } from "../../db/schema";
@@ -7,7 +7,13 @@ import { imaging } from "../../integrations/imaging/client";
 import { logger } from "../../lib/log";
 import { defineJob, isFinalAttempt, onEvent, RETRY_BACKOFF } from "../../lib/queues";
 import { updateJobRow } from "./job-rows";
-import { runBuildSheets, runRegenerateSheet, scrapTransfers } from "./service";
+import {
+  lockSheet,
+  runBuildSheets,
+  runRegenerateSheet,
+  scrapTransfers,
+  transitionSheet,
+} from "./service";
 
 const log = logger("production.jobs");
 
@@ -55,6 +61,14 @@ export const buildSheetsJob = defineJob({
   input: z.object({ companyId: z.uuid(), batchId: z.uuid(), jobId: z.uuid() }),
   jobId: (i) => `build-sheets-${i.batchId}`,
   options: RENDER_RETRY,
+  // BullMQ gave up outside the handler (stalled too often): the batch must not stay building.
+  onFinalFailure: ({ companyId, batchId }, error) =>
+    withTenant(companyId, async (tx) => {
+      await tx
+        .update(gangSheetBatches)
+        .set({ status: "failed", error })
+        .where(and(eq(gangSheetBatches.id, batchId), eq(gangSheetBatches.status, "building")));
+    }),
   handler: async ({ companyId, batchId, jobId }, job) => {
     const [batch] = await withTenant(companyId, (tx) =>
       tx
@@ -95,6 +109,12 @@ export const regenerateSheetJob = defineJob({
   input: z.object({ companyId: z.uuid(), sheetId: z.uuid(), jobId: z.uuid() }),
   jobId: (i) => `regenerate-sheet-${i.jobId}`,
   options: RENDER_RETRY,
+  onFinalFailure: ({ companyId, sheetId }, error) =>
+    withTenant(companyId, async (tx) => {
+      const cur = await lockSheet(tx, sheetId);
+      if (cur.status === "building")
+        await transitionSheet(tx, companyId, { kind: "system" }, cur, "failed", { error });
+    }),
   handler: async ({ companyId, sheetId, jobId }, job) => {
     const [sheet] = await withTenant(companyId, (tx) =>
       tx

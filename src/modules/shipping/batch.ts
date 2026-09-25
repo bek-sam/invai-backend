@@ -87,6 +87,8 @@ async function saveResult(companyId: string, jobId: string, orderId: string, r: 
     const [row] = await tx.select().from(jobs).where(eq(jobs.id, jobId)).for("update");
     if (!row) return;
     const input = row.input as BatchInput;
+    // A label this batch bought stays counted: a duplicate run can't downgrade it to failed.
+    if (input.results[orderId]?.status === "labeled" && r.status !== "labeled") return;
     await tx
       .update(jobs)
       .set({ input: { ...input, results: { ...input.results, [orderId]: r } } })
@@ -256,6 +258,11 @@ export async function runBatchBuy(companyId: string, jobId: string) {
     );
   }
 
+  // The row is the record (a duplicate run may have written it too); summarise from it.
+  const [latest] = await withTenant(companyId, (tx) =>
+    tx.select({ input: jobs.input }).from(jobs).where(eq(jobs.id, jobId)).limit(1),
+  );
+  if (latest) batch = latest.input as BatchInput;
   const results = batch.orderIds.map(
     (orderId): OrderResult =>
       batch.results[orderId] ?? {

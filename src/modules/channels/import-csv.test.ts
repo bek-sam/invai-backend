@@ -202,6 +202,16 @@ describe("CSV import: inline for small files, a chunked job for large ones", () 
     );
   });
 
+  it("does not import a run already marked failed (by the failure hook or a duplicate run)", async () => {
+    const key = await upload(genericCsv("X", 2 * CSV_CHUNK_ORDERS));
+    const report = await importCsv(ctx, { id: connId, fileKey: key, format: "generic" });
+    await withSystem((tx) =>
+      tx.update(importRuns).set({ status: "failed" }).where(eq(importRuns.id, report.importId)),
+    );
+    await runJobInline(importCsvJob, { companyId, importRunId: report.importId });
+    expect(await orderCount("X")).toHaveLength(0);
+  });
+
   it("marks the run and its job failed on the last attempt, keeping committed chunks", async () => {
     const n = 2 * CSV_CHUNK_ORDERS;
     const key = await upload(genericCsv("F", n));
