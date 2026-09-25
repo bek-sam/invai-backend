@@ -44,6 +44,10 @@ export const inventoryRouter = t.router({
     cancel: t.purchaseOrders.cancel.handler(({ input, context: { tenant } }) =>
       svc.cancelPo(tenant, input.id),
     ),
+    // T-6-1 (wave 6 stub 1): manual-placement transition for suppliers with no ordering API.
+    markPlaced: t.purchaseOrders.markPlaced.handler(({ input, context: { tenant } }) =>
+      withTenant(tenant.companyId, (tx) => svc.markPlacedPo(tx, tenant, input)),
+    ),
   },
   suppliers: {
     list: t.suppliers.list.handler(({ context: { tenant } }) =>
@@ -72,5 +76,9 @@ export const inventoryRouter = t.router({
   ),
   createPoFromSuggestion: t.createPoFromSuggestion.handler(({ input, context: { tenant } }) =>
     withTenant(tenant.companyId, (tx) => svc.createPoFromSuggestion(tx, tenant, input)),
+  ),
+  // T-6-2 depends on this: renders a merged QR-label PDF for blanks; returns its S3 key.
+  blankLabels: t.blankLabels.handler(({ input, context: { tenant } }) =>
+    withTenant(tenant.companyId, (tx) => svc.blankLabels(tx, tenant, input)),
   ),
 });

@@ -258,8 +258,10 @@ describe("purchase order supplier safety", () => {
       const stuck = await row(po.id);
       expect(stuck.status).toBe("submitting");
       expect(stuck.supplierOrderId).toBeNull();
-      // The API doesn't expose the internal state.
-      expect((await withTenant(companyId, (tx) => svc.getPo(tx, ctx, po.id))).status).toBe("draft");
+      // The API exposes `submitting` (wave 6, T-6-1) so the office sees the in-flight PO.
+      expect((await withTenant(companyId, (tx) => svc.getPo(tx, ctx, po.id))).status).toBe(
+        "submitting",
+      );
 
       const retried = await svc.submitPo(ctx, po.id);
       expect(fake.calls.find).toBe(1);

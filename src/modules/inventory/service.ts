@@ -9,7 +9,7 @@ import type {
   ReorderSuggestion,
   StockLevel,
 } from "@invai/contracts";
-import { and, asc, eq, gte, inArray, lte, sql } from "drizzle-orm";
+import { and, asc, eq, gte, inArray, lt, lte, sql } from "drizzle-orm";
 import type { z } from "zod";
 import type { TenantContext } from "../../api/context";
 import { type Tx, withTenant } from "../../db/client";
@@ -26,6 +26,7 @@ import {
   users,
 } from "../../db/schema";
 import { SUPPLIERS } from "../../db/schema/catalog";
+import { env } from "../../env";
 import {
   getSupplierAdapter,
   type SupplierAdapter,
@@ -37,10 +38,18 @@ import {
   supplierProvider,
 } from "../../integrations/suppliers";
 import { audit } from "../../lib/audit";
-import { badRequest, conflict, invalidTransition, notFound, ORPCError } from "../../lib/errors";
+import {
+  badRequest,
+  conflict,
+  invalidTransition,
+  notFound,
+  ORPCError,
+  upstream,
+} from "../../lib/errors";
 import { logger } from "../../lib/log";
 import { emit } from "../../lib/outbox";
 import { keyset, type PageInput } from "../../lib/pagination";
+import { objectKey } from "../../lib/s3";
 import { isSampleWorkspace } from "../tenancy/demo-flag";
 import { defaultLocationId, recordMovement } from "./ledger";
 import { daysOfCover, effectiveReorderPoint, planReorder } from "./reorder";
@@ -853,8 +862,7 @@ async function toPurchaseOrders(tx: Tx, rows: PoRow[]): Promise<PurchaseOrder[]>
     id: r.id,
     poNo: r.poNo,
     supplier: r.supplier,
-    // `submitting` is internal until contracts PO_STATES has it; nothing is confirmed yet.
-    status: r.status === "submitting" ? "draft" : r.status,
+    status: r.status,
     locationId: r.locationId,
     lines: lines
       .filter((l) => l.purchaseOrderId === r.id)
@@ -908,9 +916,7 @@ export async function listPos(
   input: PageInput & { status?: PoRow["status"][]; supplier?: Supplier },
 ) {
   const page = keyset(purchaseOrders.createdAt, purchaseOrders.id, input);
-  const status = input.status?.includes("draft")
-    ? [...input.status, "submitting" as const]
-    : input.status;
+  const status = input.status;
   const rows = await tx
     .select()
     .from(purchaseOrders)
@@ -1448,4 +1454,100 @@ export async function cancelPo(ctx: Ctx, id: string): Promise<PurchaseOrder> {
     }
     return getPo(tx, ctx, id);
   });
+}
+
+/**
+ * Records that a PO was placed by hand, for suppliers with no ordering API (B-86). Valid only
+ * from `draft`. No outbound call, so it's naturally idempotent: the same `supplierOrderRef` on
+ * an already-`submitted` PO is a no-op; anything else non-draft is `INVALID_TRANSITION`.
+ */
+export async function markPlacedPo(
+  tx: Tx,
+  ctx: Ctx,
+  input: { id: string; supplierOrderRef: string },
+): Promise<PurchaseOrder> {
+  const po = await loadPo(tx, ctx, input.id);
+  if (po.status === "submitted" && po.supplierOrderId === input.supplierOrderRef) {
+    return getPo(tx, ctx, po.id);
+  }
+  if (po.status !== "draft") {
+    throw invalidTransition("purchase_order", po.id, po.status, "submitted");
+  }
+  await tx
+    .update(purchaseOrders)
+    .set({
+      status: "submitted",
+      supplierOrderId: input.supplierOrderRef,
+      submittedAt: new Date(),
+    })
+    .where(eq(purchaseOrders.id, po.id));
+  await emit(tx, ctx.companyId, "po.submitted", { purchaseOrderId: po.id, supplier: po.supplier });
+  await audit(tx, {
+    companyId: ctx.companyId,
+    actor: ctx.actor,
+    action: "purchase_order.mark_placed",
+    entityType: "purchase_order",
+    entityId: po.id,
+    summary: `${po.poNo} marked placed by hand as ${input.supplierOrderRef}`,
+  });
+  return getPo(tx, ctx, po.id);
+}
+
+/** A `submitting` PO whose call started this long ago never came back: raise it as stuck. */
+export const STUCK_SUBMITTING_MS = 15 * 60_000;
+
+export async function stuckSubmittingPos(tx: Tx, companyId: string) {
+  return tx
+    .select()
+    .from(purchaseOrders)
+    .where(
+      and(
+        eq(purchaseOrders.companyId, companyId),
+        eq(purchaseOrders.status, "submitting"),
+        lt(purchaseOrders.submitAttemptedAt, new Date(Date.now() - STUCK_SUBMITTING_MS)),
+      ),
+    );
+}
+
+/**
+ * Renders a merged PDF of QR labels for these blanks (bin/shelf labelling) through imaging's
+ * `/labels/qr` endpoint (alongside its existing `/labels/mock`; imaging writes the PDF to S3
+ * itself and hands back the key). Shared with T-6-2's bin labels, same endpoint shape.
+ */
+async function renderQrLabels(
+  companyId: string,
+  labels: { code: string; caption: string; size: "4x6" | "2x1" }[],
+): Promise<string> {
+  const out_key = objectKey(companyId, "labels", "pdf");
+  const res = await fetch(`${env.IMAGING_URL}/labels/qr`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ labels, out_key }),
+    signal: AbortSignal.timeout(120_000),
+  }).catch((err) => {
+    throw upstream("imaging", err instanceof Error ? err.message : String(err));
+  });
+  if (!res.ok) throw upstream("imaging", await res.text().catch(() => null));
+  return out_key;
+}
+
+export async function blankLabels(
+  tx: Tx,
+  ctx: Ctx,
+  input: { variantIds: string[] },
+): Promise<{ key: string }> {
+  const blanks = await tx
+    .select()
+    .from(blankVariants)
+    .where(
+      and(eq(blankVariants.companyId, ctx.companyId), inArray(blankVariants.id, input.variantIds)),
+    );
+  if (!blanks.length) throw notFound("blank variant", input.variantIds[0]);
+  const labels = blanks.map((b) => ({
+    code: b.id,
+    caption: `${b.brand} ${b.style} · ${b.color} · ${b.size}`,
+    size: "2x1" as const,
+  }));
+  const key = await renderQrLabels(ctx.companyId, labels);
+  return { key };
 }

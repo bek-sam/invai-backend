@@ -1,13 +1,77 @@
 import { randomUUID } from "node:crypto";
+import { eq } from "drizzle-orm";
 import { z } from "zod";
-import { withTenant } from "../../db/client";
-import { logger } from "../../lib/log";
+import { withSystem, withTenant } from "../../db/client";
+import { companies } from "../../db/schema";
+import { env } from "../../env";
+import { errorData, logger } from "../../lib/log";
 import { emit } from "../../lib/outbox";
-import { defineJob, onEvent } from "../../lib/queues";
+import { defineJob, onEvent, queues } from "../../lib/queues";
 import { recordListingsForItems } from "../channels/sku";
+import { raiseAlert } from "../today/service";
 import { planAvailability, pushAvailability } from "./availability";
+import { stuckSubmittingPos } from "./service";
 
 const log = logger("inventory.jobs");
+
+export const STUCK_SUBMITTING_SWEEP_EVERY_MS = 5 * 60_000;
+
+/** One company's sweep for POs stuck in `submitting` past `STUCK_SUBMITTING_MS`. */
+export const stuckSubmittingPoJob = defineJob({
+  queue: "reports",
+  name: "inventory.stuckSubmittingPos",
+  input: z.object({ companyId: z.uuid(), bucket: z.number().int() }),
+  jobId: (i) => `po-stuck-submitting-${i.companyId}-${i.bucket}`,
+  handler: async ({ companyId }) =>
+    withTenant(companyId, async (tx) => {
+      const stuck = await stuckSubmittingPos(tx, companyId);
+      for (const po of stuck) {
+        // No dedicated alert kind for this yet; reuse the closest one that stays open, the way
+        // shipping's stuck-intent sweep reuses `tracking_push_failed` for its own stuck calls.
+        await raiseAlert(tx, companyId, {
+          kind: "sync_broken",
+          severity: "warning",
+          title: `${po.poNo} is stuck sending to the supplier`,
+          message: 'It\'s been in "submitting" for over 15 minutes with no confirmation back.',
+          entityType: "purchase_order",
+          entityId: po.id,
+          dedupeKey: `po-stuck-submitting-${po.id}`,
+          data: { poNo: po.poNo, supplier: po.supplier },
+        });
+      }
+      return { stuck: stuck.length };
+    }),
+});
+
+/** Fan-out over every shop (cross-tenant: owner connection, ids only). */
+export const stuckSubmittingSweepJob = defineJob({
+  queue: "reports",
+  name: "inventory.stuckSubmittingSweep",
+  input: z.object({}).passthrough(),
+  handler: async () => {
+    const shops = await withSystem((tx) =>
+      tx.select({ id: companies.id }).from(companies).where(eq(companies.type, "shop")),
+    );
+    const bucket = Math.floor(Date.now() / STUCK_SUBMITTING_SWEEP_EVERY_MS);
+    for (const s of shops) await stuckSubmittingPoJob.enqueue({ companyId: s.id, bucket });
+    return { shops: shops.length };
+  },
+});
+
+/** Idempotent: registers the 5-minute stuck-submitting sweep. */
+export async function scheduleStuckSubmittingSweep() {
+  await queues.reports.upsertJobScheduler(
+    "inventory-stuck-submitting",
+    { every: STUCK_SUBMITTING_SWEEP_EVERY_MS },
+    { name: stuckSubmittingSweepJob.name, data: {} },
+  );
+}
+
+if (!env.isTest) {
+  scheduleStuckSubmittingSweep().catch((err) =>
+    log.warn("could not register the stuck-submitting scheduler", errorData(err)),
+  );
+}
 
 /** Debounce window for channel availability pushes (per company). */
 export const AVAILABILITY_DEBOUNCE_MS = 30_000;
