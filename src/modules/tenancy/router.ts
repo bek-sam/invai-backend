@@ -3,7 +3,7 @@ import { stationTokenFromHeaders } from "../../api/context";
 import { authed, pub } from "../../api/orpc";
 import { auth } from "../../auth";
 import { withTenant } from "../../db/client";
-import { badRequest, forbidden, unauthorized } from "../../lib/errors";
+import { badRequest, forbidden, notImplemented, unauthorized } from "../../lib/errors";
 import { pinLogin, resolveStationToken, revokeFloorSession } from "./floor-auth";
 import * as svc from "./service";
 
@@ -60,6 +60,14 @@ export const teamRouter = authed.team.router({
   setPin: authed.team.setPin.handler(({ input, context: { tenant } }) =>
     withTenant(tenant.companyId, (tx) => svc.setUserPin(tx, tenant, input)),
   ),
+  // TODO(backend-foundation, T-5-4): implement per wave 5's contract-stub section 4
+  // (real partial-unique-index dedup on `invitations`).
+  resend: authed.team.resend.handler(() => {
+    throw notImplemented("team.resend");
+  }),
+  revoke: authed.team.revoke.handler(() => {
+    throw notImplemented("team.revoke");
+  }),
 });
 
 export const locationsRouter = authed.locations.router({
@@ -127,4 +135,19 @@ export const auditRouter = authed.audit.router({
   list: authed.audit.list.handler(({ input, context: { tenant } }) =>
     withTenant(tenant.companyId, (tx) => svc.listAudit(tx, tenant, input)),
   ),
+});
+
+// TODO(backend-foundation, T-5-3): implement per wave 5's contract-stub section 3
+// (companies.demoOwnerUserId migration, seed-builder parameterization, billing/marketplace/mail
+// exclusion).
+export const demoRouter = authed.demo.router({
+  start: authed.demo.start.handler(() => {
+    throw notImplemented("demo.start");
+  }),
+  reset: authed.demo.reset.handler(() => {
+    throw notImplemented("demo.reset");
+  }),
+  leave: authed.demo.leave.handler(() => {
+    throw notImplemented("demo.leave");
+  }),
 });

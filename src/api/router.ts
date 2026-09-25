@@ -11,6 +11,7 @@ import { productionRouter } from "../modules/production/router";
 import { shippingRouter } from "../modules/shipping/router";
 import {
   auditRouter,
+  demoRouter,
   floorRouter,
   locationsRouter,
   meRouter,
@@ -32,6 +33,7 @@ export const router = os.router({
   stations: stationsRouter,
   floor: floorRouter,
   audit: auditRouter,
+  demo: demoRouter,
   today: todayRouter,
   alerts: alertsRouter,
   orders: ordersRouter,
