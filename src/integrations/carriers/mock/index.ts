@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { getObject, headObject, putObject } from "../../../lib/s3";
 import { imaging } from "../../imaging/client";
+import type { TrackerUpdate, TrackingAdapter } from "../tracking";
 import {
   type CarrierAdapter,
   CarrierError,
@@ -20,7 +21,8 @@ import {
  * what an earlier process bought, like EasyPost `GET /shipments/{id}` would.
  */
 
-type MockRecord = { label: PurchasedLabel; refundStatus: string | null };
+/** `boughtAt` is missing on records written before tracking existed. */
+type MockRecord = { label: PurchasedLabel; refundStatus: string | null; boughtAt?: string };
 
 const recordKey = (companyId: string, carrierShipmentId: string) =>
   labelObjectKey(companyId, carrierShipmentId).replace(/\.pdf$/, ".json");
@@ -169,7 +171,11 @@ export const mockCarrier: CarrierAdapter = {
       carrierLabelId: `pl_mock_${trackingCode.slice(-10)}`,
       postageCents: req.rate.rateCents,
     };
-    await writeRecord(req.companyId, req.carrierShipmentId, { label, refundStatus: null });
+    await writeRecord(req.companyId, req.carrierShipmentId, {
+      label,
+      refundStatus: null,
+      boughtAt: new Date().toISOString(),
+    });
     return label;
   },
 
@@ -183,5 +189,45 @@ export const mockCarrier: CarrierAdapter = {
     if (record && !record.refundStatus)
       await writeRecord(companyId, carrierShipmentId, { ...record, refundStatus: "refunded" });
     return { ok: true, pending: false };
+  },
+};
+
+/** Hours from purchase to the mock "in transit" and "delivered" scans (same env as the timer). */
+const mockHours = (name: string, fallback: number) => {
+  const v = Number(process.env[name]);
+  return Number.isFinite(v) && process.env[name] ? v : fallback;
+};
+
+/**
+ * Mock tracker for the fallback poll: in transit after MOCK_CARRIER_TRANSIT_HOURS and delivered
+ * after MOCK_CARRIER_DELIVERY_HOURS from the purchase, the same clock as the mock timer jobs.
+ */
+export const mockTracking: TrackingAdapter = {
+  provider: "mock",
+  async track({ companyId, carrierShipmentId, trackingCode }): Promise<TrackerUpdate | null> {
+    const record = await readRecord(companyId, carrierShipmentId);
+    if (!record) return null;
+    const bought = record.boughtAt ? new Date(record.boughtAt) : null;
+    const hours = bought ? (Date.now() - bought.getTime()) / 3600_000 : 0;
+    const transit = mockHours("MOCK_CARRIER_TRANSIT_HOURS", 2);
+    const delivery = mockHours("MOCK_CARRIER_DELIVERY_HOURS", 72);
+    const at = (h: number) => new Date((bought?.getTime() ?? Date.now()) + h * 3600_000);
+    const status = !bought
+      ? "unknown"
+      : hours >= delivery
+        ? "delivered"
+        : hours >= transit
+          ? "in_transit"
+          : "pre_transit";
+    return {
+      trackerId: null,
+      trackingCode: record.label.trackingCode ?? trackingCode,
+      carrierShipmentId,
+      status,
+      statusDetail: null,
+      occurredAt:
+        status === "delivered" ? at(delivery) : status === "in_transit" ? at(transit) : new Date(),
+      deliveredAt: status === "delivered" ? at(delivery) : null,
+    };
   },
 };

@@ -20,6 +20,7 @@ import { buildContext } from "./context";
 import { events } from "./events";
 import { router } from "./router";
 import { webhooks } from "./webhooks";
+import { carrierWebhooks } from "./webhooks-carriers";
 import "../modules/jobs";
 
 const log = logger("api");
@@ -126,6 +127,15 @@ const noMockWebhooksInProd = async (c: Context, next: Next) => {
 };
 app.use("/webhooks/shopify", noMockWebhooksInProd);
 app.use("/webhooks/shopify/*", noMockWebhooksInProd);
+// Same for EasyPost: without EASYPOST_WEBHOOK_SECRET the route checks the mock dev secret.
+const noMockEasypostWebhooksInProd = async (c: Context, next: Next) => {
+  if (env.isProd && !env.EASYPOST_WEBHOOK_SECRET) return c.json({ error: "not found" }, 404);
+  await next();
+};
+app.use("/webhooks/easypost", noMockEasypostWebhooksInProd);
+app.use("/webhooks/easypost/*", noMockEasypostWebhooksInProd);
+// Carrier webhooks are their own top-level route, registered before `/webhooks/:channel`.
+app.route("/webhooks/easypost", carrierWebhooks);
 app.route("/webhooks", webhooks);
 app.route(REALTIME_SSE_PATH, events);
 

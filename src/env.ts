@@ -63,6 +63,8 @@ const raw = createEnv({
 
     ANTHROPIC_API_KEY: secret(z.string()),
     EASYPOST_API_KEY: secret(z.string()),
+    /** EasyPost webhook HMAC secret (`X-Hmac-Signature`); unset uses the mock dev secret. */
+    EASYPOST_WEBHOOK_SECRET: secret(z.string()),
     SHOPIFY_API_KEY: secret(z.string()),
     SHOPIFY_API_SECRET: secret(z.string()),
     SS_ACTIVEWEAR_ACCOUNT: secret(z.string()),
