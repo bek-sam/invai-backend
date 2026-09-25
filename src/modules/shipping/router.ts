@@ -1,5 +1,6 @@
 import { authed } from "../../api/orpc";
 import { afterCommit, withTenant } from "../../db/client";
+import { startBatchBuy } from "./batch";
 import { pushTrackingJob } from "./jobs";
 import * as svc from "./service";
 
@@ -48,8 +49,9 @@ export const shippingRouter = authed.shipping.router({
     svc.rateOrder(tenant, input),
   ),
   buy: authed.shipping.buy.handler(({ input, context: { tenant } }) => svc.buyLabel(tenant, input)),
+  // Always a job (B-61): answers `queued` with the job id; progress via production.jobs.get.
   batchBuy: authed.shipping.batchBuy.handler(({ input, context: { tenant } }) =>
-    svc.batchBuy(tenant, input),
+    startBatchBuy(tenant, input),
   ),
   batchLabelPdf: authed.shipping.batchLabelPdf.handler(({ input, context: { tenant } }) =>
     withTenant(tenant.companyId, (tx) => svc.batchLabelPdf(tx, tenant, input)),

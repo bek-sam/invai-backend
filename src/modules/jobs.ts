@@ -11,6 +11,7 @@ import "./production/jobs";
 import "./vendors/jobs";
 import "./inventory/jobs";
 import "./shipping/jobs";
+import "./shipping/batch";
 import "./finance/jobs";
 import "./ai/jobs";
 import "./billing/jobs";

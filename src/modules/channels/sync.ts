@@ -1,5 +1,6 @@
 import type { CsvFormat, ImportReport, NormalizedOrder } from "@invai/contracts";
 import { and, eq, inArray, lt } from "drizzle-orm";
+import { z } from "zod";
 import { systemContext, type TenantContext } from "../../api/context";
 import { afterCommit, type Tx, withSystem, withTenant } from "../../db/client";
 import {
@@ -36,6 +37,7 @@ import { decryptJson, encryptField, encryptJson, safeEqual } from "../../lib/cry
 import { badRequest, conflict, notFound, ORPCError } from "../../lib/errors";
 import { errorData, logger } from "../../lib/log";
 import { emit } from "../../lib/outbox";
+import { defineJob, isFinalAttempt, onEvent, RETRY_BACKOFF } from "../../lib/queues";
 import { publish } from "../../lib/realtime";
 import { getObject, objectKey, putObject } from "../../lib/s3";
 import { assertWithinPlan, effectiveStatus } from "../billing/service";
@@ -47,6 +49,7 @@ import {
   channelWebhookUri,
   freshChannelConn,
   getConnectionRow,
+  listImports,
   markConnection,
   shopifyConnectedElsewhere,
   toChannelConn,
@@ -75,23 +78,89 @@ async function checkPlan(tx: Tx, ctx: TenantContext, list: NormalizedOrder[], ch
 
 /* ------------------------------------ CSV import ------------------------------------ */
 
+/**
+ * Files with at most this many rows import inside the request (in short chunk transactions) and
+ * answer with the finished report; larger ones answer at once with a `queued` report and run
+ * as the `channels.importCsv` job (wave 3 architect review: sync-compatible for small files).
+ */
+export const CSV_INLINE_MAX_ROWS = 300;
+/** Orders per chunk transaction: each chunk commits on its own, so no import holds one long lock. */
+export const CSV_CHUNK_ORDERS = 100;
+
+type ImportRunRow = typeof importRuns.$inferSelect;
+type CsvJobInput = { importRunId: string; cursor: number };
+
+/** The contract report of a run: `pending` shows as `queued`; `jobId` when it runs as a job. */
+function csvImportReport(row: ImportRunRow, jobId: string | null): ImportReport {
+  const report = toImportReport(row);
+  const status =
+    row.status === "pending" ? "queued" : row.status === "running" ? "running" : report.status;
+  return { ...report, status, jobId };
+}
+
+/**
+ * channels.importCsv. Validates and parses the file in the request (a wrong format fails at
+ * once), checks the plan, records the run, then either imports it right here (small files) or
+ * queues the job. The job row shares the run's id, so `jobId === importId` for queued imports.
+ */
 export async function importCsv(
-  tx: Tx,
   ctx: TenantContext,
   input: { id: string; fileKey: string; format: CsvFormat },
 ): Promise<ImportReport> {
-  const conn = await getConnectionRow(tx, input.id);
-  if (conn.status === "disconnected") throw conflict("This connection is disconnected");
-  if (!input.fileKey.startsWith(`${ctx.companyId}/`)) throw notFound("file");
+  const start = await withTenant(ctx.companyId, async (tx) => {
+    const conn = await getConnectionRow(tx, input.id);
+    if (conn.status === "disconnected") throw conflict("This connection is disconnected");
+    if (!input.fileKey.startsWith(`${ctx.companyId}/`)) throw notFound("file");
+    const parsed = await readCsv(input.fileKey, input.format, conn.channel);
+    await checkPlan(tx, ctx, parsed.orders, conn.channel);
+    const inline = parsed.rowsTotal <= CSV_INLINE_MAX_ROWS;
+    const [run] = await tx
+      .insert(importRuns)
+      .values({
+        companyId: ctx.companyId,
+        connectionId: conn.id,
+        format: input.format,
+        fileKey: input.fileKey,
+        status: inline ? "running" : "pending",
+        rowsTotal: parsed.rowsTotal,
+        createdBy: ctx.userId,
+      })
+      .returning();
+    if (!run) throw new Error("import run insert failed");
+    if (!inline) {
+      const jobInput: CsvJobInput = { importRunId: run.id, cursor: 0 };
+      await tx.insert(jobs).values({
+        id: run.id,
+        companyId: ctx.companyId,
+        kind: "csv_import",
+        status: "queued",
+        message: `Queued: ${parsed.rowsTotal} rows`,
+        input: jobInput,
+        createdBy: ctx.userId,
+      });
+      await emit(tx, ctx.companyId, "channels.import_requested", { importRunId: run.id });
+    }
+    return { run, inline, parsed };
+  });
+  if (!start.inline) return csvImportReport(start.run, start.run.id);
+  try {
+    return await runCsvImport(ctx, start.run.id, start.parsed);
+  } catch (err) {
+    await failCsvImport(ctx.companyId, start.run.id, err);
+    throw err;
+  }
+}
+
+async function readCsv(fileKey: string, format: CsvFormat, channel: ConnectionRow["channel"]) {
   let text: string;
   try {
-    text = (await getObject(input.fileKey)).toString("utf8");
+    text = (await getObject(fileKey)).toString("utf8");
   } catch {
     throw notFound("file");
   }
   let parsed: ReturnType<typeof parseOrdersCsv>;
   try {
-    parsed = parseOrdersCsv(input.format, text, conn.channel);
+    parsed = parseOrdersCsv(format, text, channel);
   } catch (err) {
     const detail = err instanceof Error ? err.message : String(err);
     throw new ORPCError("CSV_UNREADABLE", {
@@ -108,76 +177,286 @@ export async function importCsv(
         detail: `${parsed.rowsTotal} rows; split the export into files of ${MAX_CSV_ROWS} rows or fewer`,
       },
     });
-  await checkPlan(tx, ctx, parsed.orders, conn.channel);
+  return parsed;
+}
 
-  const [run] = await tx
-    .insert(importRuns)
-    .values({
-      companyId: ctx.companyId,
-      connectionId: conn.id,
-      format: input.format,
-      fileKey: input.fileKey,
-      status: "running",
-      rowsTotal: parsed.rowsTotal,
-      createdBy: ctx.userId,
-    })
-    .returning();
-  if (!run) throw new Error("import run insert failed");
+async function publishCsvProgress(companyId: string, row: typeof jobs.$inferSelect | undefined) {
+  if (!row) return;
+  await publish(companyId, "job.progress", {
+    jobId: row.id,
+    kind: row.kind,
+    status: row.status,
+    progress: row.progress,
+    message: row.message,
+    resultIds: row.resultIds,
+  });
+}
 
-  const res = await importNormalizedOrders(tx, ctx, conn, parsed.orders, {
-    source: "csv",
-    importRunId: run.id,
-    cancelledChannelOrderIds: parsed.cancelledChannelOrderIds,
+/**
+ * Import a recorded run in chunks of CSV_CHUNK_ORDERS orders, each in its own short tenant
+ * transaction that also advances the run's counts and (for a job) the cursor, so a crashed or
+ * retried job resumes after the last committed chunk and counts every order once. Re-running a
+ * finished run returns its report. Personalized artwork is queued by the mapping and rendered
+ * by its own job after each chunk commits.
+ */
+async function runCsvImport(
+  ctx: TenantContext,
+  runId: string,
+  preParsed?: ReturnType<typeof parseOrdersCsv>,
+): Promise<ImportReport> {
+  const { companyId } = ctx;
+  const load = await withTenant(companyId, async (tx) => {
+    const [run] = await tx.select().from(importRuns).where(eq(importRuns.id, runId)).limit(1);
+    if (!run) throw notFound("import", runId);
+    const [job] = await tx.select().from(jobs).where(eq(jobs.id, runId)).limit(1);
+    const conn = await getConnectionRow(tx, run.connectionId);
+    return { run, job: job ?? null, conn };
   });
-  const errors = [
-    ...parsed.errors,
-    ...res.errors.map((e) => ({
-      row: parsed.orderRows[e.index] ?? 1,
-      message: `Order ${e.channelOrderId ?? "?"}: ${e.message}`,
-    })),
-  ].sort((a, b) => a.row - b.row);
+  const jobId = load.job?.id ?? null;
+  if (load.run.status === "completed" || load.run.status === "failed")
+    return csvImportReport(load.run, jobId);
+  const { conn } = load;
+  const parsed = preParsed ?? (await readCsv(load.run.fileKey, load.run.format, conn.channel));
+  const parseErrorRows = new Set(parsed.errors.map((e) => e.row));
+  let cursor = (load.job?.input as CsvJobInput | null)?.cursor ?? 0;
+  const total = parsed.orders.length;
+  const progressOf = (done: number) => (total ? Math.min(0.99, done / total) : 0.99);
 
-  const [done] = await tx
-    .update(importRuns)
-    .set({
-      status: "completed",
-      ordersImported: res.imported,
-      ordersUpdated: res.updated,
-      ordersSkipped: res.skipped,
-      rowsFailed: new Set(errors.map((e) => e.row)).size,
-      itemsNeedingMapping: res.itemsNeedingMapping,
-      errors: errors.slice(0, 500),
-      orderIds: res.orderIds,
-      finishedAt: new Date(),
-    })
-    .where(eq(importRuns.id, run.id))
-    .returning();
-  await markConnection(tx, conn.id, { kind: "import" });
-  await markFileReady(tx, input.fileKey);
-  await audit(tx, {
-    companyId: ctx.companyId,
-    actor: ctx.actor,
-    action: "channel.import",
-    entityType: "channel_connection",
-    entityId: conn.id,
-    summary: `${input.format} CSV: ${res.imported} new, ${res.updated} updated, ${res.skipped} unchanged, ${errors.length} error(s)`,
-    data: { importId: run.id },
-  });
-  await emit(tx, ctx.companyId, "import.completed", {
-    importId: run.id,
-    connectionId: conn.id,
-    orderIds: res.orderIds,
-  });
-  afterCommit(tx, async () => {
-    await publish(ctx.companyId, "import.completed", {
-      importId: run.id,
-      connectionId: conn.id,
-      ordersImported: res.imported,
-      rowsFailed: errors.length,
+  if (cursor === 0) {
+    const row = await withTenant(companyId, async (tx) => {
+      await tx
+        .update(importRuns)
+        .set({
+          status: "running",
+          errors: parsed.errors.slice(0, 500),
+          rowsFailed: parseErrorRows.size,
+        })
+        .where(eq(importRuns.id, runId));
+      if (!jobId) return undefined;
+      const [j] = await tx
+        .update(jobs)
+        .set({ status: "running", progress: 0, message: `Importing ${total} orders` })
+        .where(eq(jobs.id, jobId))
+        .returning();
+      return j;
     });
-    await publish(ctx.companyId, "today.changed", { reason: "import" });
+    await publishCsvProgress(companyId, row);
+  }
+
+  while (cursor < total) {
+    const from = cursor;
+    const slice = parsed.orders.slice(from, from + CSV_CHUNK_ORDERS);
+    const jobRow = await withTenant(companyId, async (tx) => {
+      const [run] = await tx
+        .select()
+        .from(importRuns)
+        .where(eq(importRuns.id, runId))
+        .for("update");
+      if (!run) throw notFound("import", runId);
+      if (jobId) {
+        // Another run of this job got here first (a stalled job picked up twice): stop.
+        const [j] = await tx.select().from(jobs).where(eq(jobs.id, jobId)).limit(1);
+        if (((j?.input as CsvJobInput | null)?.cursor ?? 0) !== from)
+          throw new Error(`import ${runId}: chunk at ${from} already applied`);
+      }
+      const res = await importNormalizedOrders(tx, ctx, conn, slice, {
+        source: "csv",
+        importRunId: runId,
+      });
+      const chunkErrors = res.errors.map((e) => ({
+        row: parsed.orderRows[from + e.index] ?? 1,
+        message: `Order ${e.channelOrderId ?? "?"}: ${e.message}`,
+      }));
+      const newRows = new Set(chunkErrors.map((e) => e.row).filter((r) => !parseErrorRows.has(r)));
+      await tx
+        .update(importRuns)
+        .set({
+          ordersImported: run.ordersImported + res.imported,
+          ordersUpdated: run.ordersUpdated + res.updated,
+          ordersSkipped: run.ordersSkipped + res.skipped,
+          rowsFailed: run.rowsFailed + newRows.size,
+          itemsNeedingMapping: run.itemsNeedingMapping + res.itemsNeedingMapping,
+          errors: [...run.errors, ...chunkErrors].slice(0, 500),
+          orderIds: [...run.orderIds, ...res.orderIds],
+        })
+        .where(eq(importRuns.id, runId));
+      if (!jobId) return undefined;
+      const next = from + slice.length;
+      const [j] = await tx
+        .update(jobs)
+        .set({
+          input: { importRunId: runId, cursor: next } satisfies CsvJobInput,
+          progress: progressOf(next),
+          message: `Imported ${next} of ${total} orders`,
+        })
+        .where(eq(jobs.id, jobId))
+        .returning();
+      return j;
+    });
+    cursor = from + slice.length;
+    await publishCsvProgress(companyId, jobRow);
+  }
+
+  const out = await withTenant(companyId, async (tx) => {
+    const [run] = await tx.select().from(importRuns).where(eq(importRuns.id, runId)).for("update");
+    if (!run) throw notFound("import", runId);
+    if (run.status !== "running") return { done: run, jobRow: undefined, cancelled: 0 };
+    const cancelled = parsed.cancelledChannelOrderIds.length
+      ? (
+          await importNormalizedOrders(tx, ctx, conn, [], {
+            source: "csv",
+            importRunId: runId,
+            cancelledChannelOrderIds: parsed.cancelledChannelOrderIds,
+          })
+        ).cancelled
+      : 0;
+    const errors = [...run.errors].sort((a, b) => a.row - b.row);
+    const [done] = await tx
+      .update(importRuns)
+      .set({ status: "completed", errors, finishedAt: new Date() })
+      .where(eq(importRuns.id, runId))
+      .returning();
+    if (!done) throw new Error("import run update failed");
+    await markConnection(tx, conn.id, { kind: "import" });
+    await markFileReady(tx, run.fileKey);
+    await audit(tx, {
+      companyId,
+      actor: ctx.actor,
+      action: "channel.import",
+      entityType: "channel_connection",
+      entityId: conn.id,
+      summary: `${run.format} CSV: ${done.ordersImported} new, ${done.ordersUpdated} updated, ${done.ordersSkipped} unchanged, ${done.errors.length} error(s)`,
+      data: { importId: runId },
+    });
+    await emit(tx, companyId, "import.completed", {
+      importId: runId,
+      connectionId: conn.id,
+      orderIds: done.orderIds,
+    });
+    let jobRow: typeof jobs.$inferSelect | undefined;
+    if (jobId)
+      [jobRow] = await tx
+        .update(jobs)
+        .set({
+          status: "done",
+          progress: 1,
+          message: `${done.ordersImported} new, ${done.ordersUpdated} updated, ${done.ordersSkipped} unchanged, ${done.rowsFailed} row(s) failed`,
+          finishedAt: new Date(),
+        })
+        .where(eq(jobs.id, jobId))
+        .returning();
+    afterCommit(tx, async () => {
+      await publish(companyId, "import.completed", {
+        importId: runId,
+        connectionId: conn.id,
+        ordersImported: done.ordersImported,
+        rowsFailed: done.errors.length,
+      });
+      await publish(companyId, "today.changed", { reason: "import" });
+    });
+    return { done, jobRow, cancelled };
   });
-  return toImportReport(done ?? run);
+  await publishCsvProgress(companyId, out.jobRow);
+  return csvImportReport(out.done, jobId);
+}
+
+/** Mark a run (and its job row) failed; chunks already committed stay imported and counted. */
+async function failCsvImport(companyId: string, runId: string, err: unknown) {
+  const message = err instanceof Error ? err.message : String(err);
+  log.error("csv import failed", { companyId, importId: runId, error: message });
+  const jobRow = await withTenant(companyId, async (tx) => {
+    const [run] = await tx.select().from(importRuns).where(eq(importRuns.id, runId)).for("update");
+    if (!run || run.status === "completed" || run.status === "failed") return undefined;
+    await tx
+      .update(importRuns)
+      .set({
+        status: "failed",
+        errors: [
+          ...run.errors,
+          { row: 0, message: "The import stopped before the end; rows after this were not read" },
+        ].slice(0, 501),
+        finishedAt: new Date(),
+      })
+      .where(eq(importRuns.id, runId));
+    const [j] = await tx
+      .update(jobs)
+      .set({ status: "failed", progress: 1, error: message, finishedAt: new Date() })
+      .where(eq(jobs.id, runId))
+      .returning();
+    return j;
+  });
+  await publishCsvProgress(companyId, jobRow);
+}
+
+/**
+ * The `channels.importCsv` job for files over CSV_INLINE_MAX_ROWS. Bulk work: low priority on
+ * the sync queue. Retries resume from the committed cursor; the last attempt marks it failed.
+ */
+export const importCsvJob = defineJob({
+  queue: "sync",
+  name: "channels.importCsv",
+  input: z.object({ companyId: z.uuid(), importRunId: z.uuid() }),
+  jobId: (i) => `import-csv-${i.importRunId}`,
+  options: { attempts: 5, backoff: RETRY_BACKOFF, priority: 10 },
+  handler: async ({ companyId, importRunId }, job) => {
+    const [run] = await withTenant(companyId, (tx) =>
+      tx
+        .select({ createdBy: importRuns.createdBy })
+        .from(importRuns)
+        .where(eq(importRuns.id, importRunId))
+        .limit(1),
+    );
+    const ctx = { ...systemContext(companyId), userId: run?.createdBy ?? null };
+    try {
+      const report = await runCsvImport(ctx, importRunId);
+      return { status: report.status, ordersImported: report.ordersImported };
+    } catch (err) {
+      if (isFinalAttempt(job)) await failCsvImport(companyId, importRunId, err);
+      else
+        log.warn("csv import chunk failed, will retry", {
+          companyId,
+          importRunId,
+          ...errorData(err),
+        });
+      throw err;
+    }
+  },
+});
+
+onEvent("channels.import_requested", importCsvJob, (e) => ({
+  companyId: e.companyId,
+  importRunId: String(e.payload.importRunId),
+}));
+
+/** channels.imports: the connection's runs, with `queued`/`running` and the job id where one exists. */
+export async function listCsvImports(
+  tx: Tx,
+  ctx: TenantContext,
+  input: Parameters<typeof listImports>[2],
+) {
+  const page = await listImports(tx, ctx, input);
+  const ids = page.items.map((r) => r.importId);
+  if (!ids.length) return page;
+  const [runs, jobRows] = await Promise.all([
+    tx
+      .select({ id: importRuns.id, status: importRuns.status })
+      .from(importRuns)
+      .where(inArray(importRuns.id, ids)),
+    tx.select({ id: jobs.id }).from(jobs).where(inArray(jobs.id, ids)),
+  ]);
+  const statusOf = new Map(runs.map((r) => [r.id, r.status]));
+  const hasJob = new Set(jobRows.map((j) => j.id));
+  return {
+    ...page,
+    items: page.items.map((r): ImportReport => {
+      const s = statusOf.get(r.importId);
+      return {
+        ...r,
+        status: s === "pending" ? "queued" : s === "running" ? "running" : r.status,
+        jobId: hasJob.has(r.importId) ? r.importId : null,
+      };
+    }),
+  };
 }
 
 /* ------------------------------------ API sync ------------------------------------ */

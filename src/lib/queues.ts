@@ -98,10 +98,34 @@ export function listJobs(): DefinedJob<unknown>[] {
   return [...registry.values()];
 }
 
-/** Run a job the way the worker would (validates input). Handy in tests. */
-export async function runJobInline<I>(job: DefinedJob<I>, input: I) {
+/** Run a job the way the worker would (validates input). Handy in tests. `attempt` (1-based)
+ * and `attempts` let a test play a retry: by default the inline run is the job's last attempt. */
+export async function runJobInline<I>(
+  job: DefinedJob<I>,
+  input: I,
+  run: { attempt?: number; attempts?: number } = {},
+) {
   const data = job.input.parse(input);
-  return job.handler(data, { id: "inline", name: job.name, data } as Job<I>);
+  const attempts = run.attempts ?? 1;
+  return job.handler(data, {
+    id: "inline",
+    name: job.name,
+    data,
+    opts: { attempts },
+    attemptsMade: (run.attempt ?? attempts) - 1,
+  } as Job<I>);
+}
+
+/** Backoff for jobs a person may be waiting on: exponential with jitter (research 11 G9). */
+export const RETRY_BACKOFF = { type: "exponential", delay: 5_000, jitter: 0.5 } as const;
+
+/**
+ * True when this run is the job's last try: a handler records a permanent failure on its entity
+ * (job row, item flag) only then, and otherwise throws so BullMQ retries with backoff.
+ * `attemptsMade` counts finished failed attempts; a stalled (killed) run doesn't count.
+ */
+export function isFinalAttempt(job: Pick<Job, "attemptsMade" | "opts">): boolean {
+  return (job.attemptsMade ?? 0) + 1 >= (job.opts?.attempts ?? 1);
 }
 
 /* ---- Outbox event subscriptions ------------------------------------------------------- */

@@ -9,15 +9,17 @@ import { conflict, notFound } from "../../lib/errors";
 import { emit } from "../../lib/outbox";
 import { createRule, loadMatcher, type Matcher, recordRuleUse } from "../channels/sku";
 import { releaseForItems, reserveForItems } from "../inventory/service";
-import { renderItemArtwork } from "../personalization/service";
+import { requestItemRender } from "../personalization/service";
 import { withFlags } from "./flags";
 import { getItem, getItemRow } from "./service";
 import { transitionItem } from "./state-machine";
 
 /*
  * Applying a mapping (design + blank) to order items: the manual map, SKU rules at import and
- * re-mapping after a rule is learned all end here. Mapped items move to `ready`, personalized
- * designs render their artwork (flags -> `needs_artwork`) and the blank is reserved.
+ * re-mapping after a rule is learned all end here. Mapped items move to `ready` and the blank is
+ * reserved. Personalized designs queue their artwork render (`artwork.render_requested`): the
+ * job renders after commit, never inside this transaction, and a flagged or failed render moves
+ * the unit to `needs_artwork`.
  */
 
 type SkuRuleInput = z.infer<typeof SkuRuleInputSchema>;
@@ -82,6 +84,7 @@ export async function mapItems(
   const items = await tx.select().from(orderItems).where(inArray(orderItems.id, itemIds));
   const mapped: string[] = [];
   const toReserve: string[] = [];
+  const toRender: string[] = [];
   for (const item of items) {
     if (!MAPPABLE.has(item.state)) continue;
     if (item.state === "on_hold" && item.heldFromState && !MAPPABLE.has(item.heldFromState))
@@ -125,20 +128,9 @@ export async function mapItems(
       state = "ready";
     }
     if (design.templateId) {
-      const { clean } = await renderItemArtwork(tx, ctx, item.id, {
-        templateId: design.templateId,
-      });
-      if (!clean && state === "ready") {
-        await transitionItem(tx, item.id, "needs_artwork", {
-          actor: ctx.actor,
-          reason: "artwork_flagged",
-        });
-      } else if (clean && state === "needs_artwork") {
-        await transitionItem(tx, item.id, "ready", {
-          actor: ctx.actor,
-          reason: "artwork_rendered",
-        });
-      }
+      // Rendered by personalization.renderArtwork after this commits; the job settles the state.
+      await requestItemRender(tx, ctx, item.id, { templateId: design.templateId });
+      toRender.push(item.id);
     } else if (state === "needs_artwork") {
       await transitionItem(tx, item.id, "ready", { actor: ctx.actor, reason: "not_personalized" });
     }
@@ -146,6 +138,8 @@ export async function mapItems(
     toReserve.push(item.id);
   }
   if (toReserve.length) await reserveForItems(tx, ctx, toReserve);
+  if (toRender.length)
+    await emit(tx, ctx.companyId, "artwork.render_requested", { orderItemIds: toRender });
   if (mapped.length) {
     await emit(tx, ctx.companyId, "item.mapped", {
       orderItemIds: mapped,

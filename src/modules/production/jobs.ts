@@ -1,11 +1,52 @@
+import { createHash } from "node:crypto";
+import { eq } from "drizzle-orm";
 import { z } from "zod";
 import { withTenant } from "../../db/client";
+import { gangSheetBatches, gangSheets, jobs } from "../../db/schema";
+import { imaging } from "../../integrations/imaging/client";
 import { logger } from "../../lib/log";
-import { defineJob, onEvent } from "../../lib/queues";
+import { defineJob, isFinalAttempt, onEvent, RETRY_BACKOFF } from "../../lib/queues";
 import { updateJobRow } from "./job-rows";
 import { runBuildSheets, runRegenerateSheet, scrapTransfers } from "./service";
 
 const log = logger("production.jobs");
+
+/*
+ * Build and regenerate retry with backoff (B-100). Imaging failures inside a run are recorded on
+ * the sheet and don't throw; what throws is a crash (DB, network) or imaging being down at start,
+ * and those retry. A retry of a run that already finished (job row done/failed, batch or sheet
+ * no longer `building`) does nothing. Only the last attempt marks the job row failed.
+ */
+const RENDER_RETRY = { attempts: 4, backoff: RETRY_BACKOFF };
+
+async function imagingReady() {
+  if (!(await imaging.isUp())) throw new Error("imaging is not reachable; retrying");
+}
+
+async function jobFinished(companyId: string, jobId: string) {
+  const [row] = await withTenant(companyId, (tx) =>
+    tx.select({ status: jobs.status }).from(jobs).where(eq(jobs.id, jobId)).limit(1),
+  );
+  return !row || row.status === "done" || row.status === "failed";
+}
+
+async function onRunError(
+  err: unknown,
+  final: boolean,
+  companyId: string,
+  jobId: string,
+  what: string,
+  context: Record<string, unknown>,
+) {
+  const error = err instanceof Error ? err.message : String(err);
+  if (final) {
+    log.error(`${what} failed`, { companyId, ...context, error });
+    await updateJobRow(companyId, jobId, { status: "failed", progress: 1, error });
+  } else {
+    log.warn(`${what} failed, will retry`, { companyId, ...context, error });
+    await updateJobRow(companyId, jobId, { message: `Retrying after an error: ${error}` });
+  }
+}
 
 /** Nest + compose a batch into gang sheets (render queue: imaging is memory heavy). */
 export const buildSheetsJob = defineJob({
@@ -13,13 +54,30 @@ export const buildSheetsJob = defineJob({
   name: "production.buildSheets",
   input: z.object({ companyId: z.uuid(), batchId: z.uuid(), jobId: z.uuid() }),
   jobId: (i) => `build-sheets-${i.batchId}`,
-  options: { attempts: 1 },
-  handler: async ({ companyId, batchId, jobId }) => {
+  options: RENDER_RETRY,
+  handler: async ({ companyId, batchId, jobId }, job) => {
+    const [batch] = await withTenant(companyId, (tx) =>
+      tx
+        .select({ status: gangSheetBatches.status })
+        .from(gangSheetBatches)
+        .where(eq(gangSheetBatches.id, batchId))
+        .limit(1),
+    );
+    if (batch?.status !== "building" || (await jobFinished(companyId, jobId)))
+      return { skipped: true };
     try {
+      await imagingReady();
       return await runBuildSheets(companyId, batchId, jobId);
     } catch (err) {
-      log.error("build sheets crashed", { batchId, error: String(err) });
-      await updateJobRow(companyId, jobId, { status: "failed", progress: 1, error: String(err) });
+      const final = isFinalAttempt(job);
+      await onRunError(err, final, companyId, jobId, "build sheets", { batchId });
+      if (final)
+        await withTenant(companyId, (tx) =>
+          tx
+            .update(gangSheetBatches)
+            .set({ status: "failed", error: err instanceof Error ? err.message : String(err) })
+            .where(eq(gangSheetBatches.id, batchId)),
+        );
       throw err;
     }
   },
@@ -36,12 +94,24 @@ export const regenerateSheetJob = defineJob({
   name: "production.regenerateSheet",
   input: z.object({ companyId: z.uuid(), sheetId: z.uuid(), jobId: z.uuid() }),
   jobId: (i) => `regenerate-sheet-${i.jobId}`,
-  options: { attempts: 1 },
-  handler: async ({ companyId, sheetId, jobId }) => {
+  options: RENDER_RETRY,
+  handler: async ({ companyId, sheetId, jobId }, job) => {
+    const [sheet] = await withTenant(companyId, (tx) =>
+      tx
+        .select({ status: gangSheets.status })
+        .from(gangSheets)
+        .where(eq(gangSheets.id, sheetId))
+        .limit(1),
+    );
+    if (sheet?.status !== "building" || (await jobFinished(companyId, jobId)))
+      return { skipped: true };
     try {
+      await imagingReady();
       await runRegenerateSheet(companyId, sheetId, jobId);
     } catch (err) {
-      await updateJobRow(companyId, jobId, { status: "failed", progress: 1, error: String(err) });
+      await onRunError(err, isFinalAttempt(job), companyId, jobId, "regenerate sheet", {
+        sheetId,
+      });
       throw err;
     }
   },
@@ -53,12 +123,20 @@ onEvent("sheet.regenerate_requested", regenerateSheetJob, (e) => ({
   jobId: String(e.payload.jobId),
 }));
 
+/** Content hash of the transfer set, so two partial cancels of one order get distinct job ids. */
+export function transferSetHash(transferIds: string[]) {
+  return createHash("sha256")
+    .update([...transferIds].sort().join(","))
+    .digest("hex")
+    .slice(0, 16);
+}
+
 /** A cancelled item whose transfer was already nested: scrap the transfer, free the sheet slot. */
 export const scrapCancelledJob = defineJob({
   queue: "sync",
   name: "production.scrapCancelled",
   input: z.object({ companyId: z.uuid(), orderId: z.uuid(), transferIds: z.array(z.uuid()) }),
-  jobId: (i) => `scrap-cancelled-${i.orderId}-${i.transferIds.length}`,
+  jobId: (i) => `scrap-cancelled-${i.orderId}-${transferSetHash(i.transferIds)}`,
   handler: async ({ companyId, transferIds }) => {
     await withTenant(companyId, (tx) => scrapTransfers(tx, transferIds));
   },

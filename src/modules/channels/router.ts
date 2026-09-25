@@ -3,7 +3,7 @@ import { withTenant } from "../../db/client";
 import { bulkApply, remapUnmapped } from "../orders/mapping";
 import * as svc from "./service";
 import * as sku from "./sku";
-import { importCsv, startSync } from "./sync";
+import { importCsv, listCsvImports, startSync } from "./sync";
 
 export const channelsRouter = authed.channels.router({
   list: authed.channels.list.handler(({ context: { tenant } }) =>
@@ -24,11 +24,12 @@ export const channelsRouter = authed.channels.router({
   syncNow: authed.channels.syncNow.handler(({ input, context: { tenant } }) =>
     withTenant(tenant.companyId, (tx) => startSync(tx, tenant, input.id)),
   ),
+  // Opens its own short transactions: small files import in chunks here, large ones in a job.
   importCsv: authed.channels.importCsv.handler(({ input, context: { tenant } }) =>
-    withTenant(tenant.companyId, (tx) => importCsv(tx, tenant, input)),
+    importCsv(tenant, input),
   ),
   imports: authed.channels.imports.handler(({ input, context: { tenant } }) =>
-    withTenant(tenant.companyId, (tx) => svc.listImports(tx, tenant, input)),
+    withTenant(tenant.companyId, (tx) => listCsvImports(tx, tenant, input)),
   ),
   health: authed.channels.health.handler(({ context: { tenant } }) =>
     withTenant(tenant.companyId, (tx) => svc.health(tx, tenant)),

@@ -7,7 +7,7 @@ import type {
 import { and, eq, ilike, inArray, lte, or, type SQL, sql } from "drizzle-orm";
 import type { z } from "zod";
 import type { TenantContext } from "../../api/context";
-import { afterCommit, type Tx } from "../../db/client";
+import { afterCommit, type Tx, withTenant } from "../../db/client";
 import {
   type ArtworkFlag,
   designs,
@@ -306,6 +306,8 @@ export type RenderOutcome = {
   heightPx: number | null;
   flags: ArtworkFlag[];
   error: string | null;
+  /** A failure worth retrying (imaging down, 5xx, 429, timeout) rather than a refused request. */
+  transient?: boolean;
 };
 
 function renderTemplatePayload(
@@ -369,6 +371,7 @@ export async function renderValues(
       heightPx: null,
       flags: local,
       error: detail,
+      transient: !(err instanceof ImagingError) || err.status >= 500 || err.status === 429,
     };
   }
 }
@@ -399,7 +402,12 @@ async function applyOutcomeToItem(
   tx: Tx,
   ctx: TenantContext,
   item: ItemRow,
-  outcome: { status: ArtworkRow["status"]; fileKey: string | null; flags: ArtworkFlag[] },
+  outcome: {
+    status: ArtworkRow["status"];
+    fileKey: string | null;
+    flags: ArtworkFlag[];
+    error?: string | null;
+  },
 ) {
   const itemFlags = outcome.flags
     .map((f) => ({
@@ -415,7 +423,9 @@ async function applyOutcomeToItem(
             {
               code: "artwork_qa_failed",
               severity: "error" as const,
-              message: "Personalization render failed",
+              message: outcome.error
+                ? `Personalization render failed: ${outcome.error.slice(0, 200)}`
+                : "Personalization render failed",
             },
           ]
         : [],
@@ -441,17 +451,19 @@ async function applyOutcomeToItem(
   }
 }
 
-/**
- * Render (or re-render) the personalized artwork of one order item from its current values
- * (or the buyer's answers the first time). Stores item_artwork, mirrors status/flags onto the
- * item and returns whether the artwork is clean. State transitions are the caller's job.
- */
-export async function renderItemArtwork(
+type RenderPlan = {
+  item: ItemRow;
+  existing: ArtworkRow | undefined;
+  templateId: string;
+  template: TemplateRow;
+  values: Record<string, string>;
+};
+
+async function planItemRender(
   tx: Tx,
-  ctx: TenantContext,
   itemId: string,
-  opts: { templateId?: string; values?: Record<string, string> } = {},
-): Promise<{ clean: boolean; artwork: ArtworkRow }> {
+  opts: { templateId?: string; values?: Record<string, string> },
+): Promise<RenderPlan> {
   const [item] = await tx.select().from(orderItems).where(eq(orderItems.id, itemId)).limit(1);
   if (!item) throw notFound("order_item", itemId);
   const [existing] = await tx
@@ -472,8 +484,18 @@ export async function renderItemArtwork(
   const template = await templateRow(tx, templateId);
   const values =
     opts.values ?? existing?.values ?? valuesFromAnswers(template.slots, item.personalization);
+  return { item, existing, templateId, template, values };
+}
 
-  const out = await renderValues(template, values, objectKey(ctx.companyId, "artwork", "png"));
+/** Store a render outcome on item_artwork and mirror its status and flags onto the item. */
+async function saveItemRender(
+  tx: Tx,
+  ctx: TenantContext,
+  plan: Omit<RenderPlan, "template">,
+  out: RenderOutcome,
+): Promise<{ clean: boolean; artwork: ArtworkRow }> {
+  const { item, existing, templateId, values } = plan;
+  const itemId = item.id;
   const now = new Date();
   const set = {
     templateId,
@@ -526,6 +548,129 @@ export async function renderItemArtwork(
     await publish(ctx.companyId, "artwork.rendered", { orderItemId: itemId, status: out.status });
   });
   return { clean: out.status === "rendered", artwork };
+}
+
+/**
+ * Render (or re-render) the personalized artwork of one order item from its current values
+ * (or the buyer's answers the first time). Stores item_artwork, mirrors status/flags onto the
+ * item and returns whether the artwork is clean. State transitions are the caller's job.
+ * Interactive, one item: imports and mappings use `requestItemRender` + the render job instead.
+ */
+export async function renderItemArtwork(
+  tx: Tx,
+  ctx: TenantContext,
+  itemId: string,
+  opts: { templateId?: string; values?: Record<string, string> } = {},
+): Promise<{ clean: boolean; artwork: ArtworkRow }> {
+  const plan = await planItemRender(tx, itemId, opts);
+  const out = await renderValues(
+    plan.template,
+    plan.values,
+    objectKey(ctx.companyId, "artwork", "png"),
+  );
+  return saveItemRender(tx, ctx, plan, out);
+}
+
+/* ----------------------------- render in the background ----------------------------- */
+
+/**
+ * Queue a render for a newly mapped personalized item (B-61): the artwork row goes `pending`
+ * with the values to render, the item's artwork status goes `pending` (batches skip it), and
+ * nothing calls imaging here. The caller emits `artwork.render_requested` in the same
+ * transaction; `personalization.renderArtwork` renders after commit.
+ */
+export async function requestItemRender(
+  tx: Tx,
+  ctx: TenantContext,
+  itemId: string,
+  opts: { templateId?: string } = {},
+) {
+  const plan = await planItemRender(tx, itemId, opts);
+  const set = {
+    templateId: plan.templateId,
+    values: plan.values,
+    flags: [],
+    status: "pending" as const,
+    error: null,
+    approvedBy: null,
+    approvedAt: null,
+  };
+  if (plan.existing)
+    await tx.update(itemArtwork).set(set).where(eq(itemArtwork.id, plan.existing.id));
+  else
+    await tx.insert(itemArtwork).values({ companyId: ctx.companyId, orderItemId: itemId, ...set });
+  await tx
+    .update(orderItems)
+    .set({
+      artworkStatus: "pending",
+      flags: withFlags(plan.item.flags, [], ARTWORK_ITEM_FLAGS),
+    })
+    .where(eq(orderItems.id, itemId));
+}
+
+/** States in which a queued render still applies (the unit isn't on a sheet or gone). */
+const RENDERABLE = new Set(["imported", "ready", "needs_artwork", "on_hold"]);
+
+export type BackgroundRender = "rendered" | "flagged" | "failed" | "retry" | "skipped";
+
+/**
+ * Worker side of a queued render, one item. Reads in one short transaction, calls imaging with
+ * none open, then saves under a row lock only if the artwork is still the `pending` render it
+ * read (a staff edit or a second run in between wins; the repeat is `skipped`). A transient
+ * failure returns `retry` without saving unless `final`; then it is saved as failed, the item
+ * is flagged `artwork_qa_failed` with the reason and moves to `needs_artwork`.
+ */
+export async function renderPendingItem(
+  ctx: TenantContext,
+  itemId: string,
+  final: boolean,
+): Promise<BackgroundRender> {
+  const plan = await withTenant(ctx.companyId, async (tx) => {
+    const [a] = await tx
+      .select()
+      .from(itemArtwork)
+      .where(eq(itemArtwork.orderItemId, itemId))
+      .limit(1);
+    if (a?.status !== "pending") return null;
+    const p = await planItemRender(tx, itemId, { templateId: a.templateId, values: a.values });
+    return RENDERABLE.has(p.item.state) ? p : null;
+  });
+  if (!plan) return "skipped";
+  const out = await renderValues(
+    plan.template,
+    plan.values,
+    objectKey(ctx.companyId, "artwork", "png"),
+  );
+  if (out.status === "failed" && out.transient && !final) return "retry";
+  return withTenant(ctx.companyId, async (tx) => {
+    const [item] = await tx
+      .select()
+      .from(orderItems)
+      .where(eq(orderItems.id, itemId))
+      .for("update");
+    const [a] = await tx
+      .select()
+      .from(itemArtwork)
+      .where(eq(itemArtwork.orderItemId, itemId))
+      .limit(1);
+    if (
+      !item ||
+      !RENDERABLE.has(item.state) ||
+      a?.status !== "pending" ||
+      a.templateId !== plan.templateId ||
+      JSON.stringify(a.values) !== JSON.stringify(plan.values)
+    )
+      return "skipped";
+    const { clean } = await saveItemRender(tx, ctx, { ...plan, item, existing: a }, out);
+    await settleItemState(
+      tx,
+      ctx,
+      itemId,
+      clean,
+      clean ? "artwork_rendered" : out.status === "failed" ? "artwork_failed" : "artwork_flagged",
+    );
+    return out.status;
+  });
 }
 
 /** Move the item between ready and needs_artwork to match its artwork. */

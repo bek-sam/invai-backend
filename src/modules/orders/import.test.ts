@@ -8,6 +8,7 @@ import { withSystem, withTenant } from "../../db/client";
 import { buyerPii, designs, orderItems, orders, outboxEvents } from "../../db/schema";
 import { parseOrdersCsv } from "../../integrations/channels/csv";
 import { imaging } from "../../integrations/imaging/client";
+import { runJobInline } from "../../lib/queues";
 import { ensureBucket, objectKey, putObject } from "../../lib/s3";
 import {
   createCompany,
@@ -20,6 +21,7 @@ import { bulkImportBlanks, createDesign } from "../catalog/service";
 import { getConnectionRow } from "../channels/service";
 import { createRule, testRule } from "../channels/sku";
 import { importCsv } from "../channels/sync";
+import { renderArtworkJob } from "../personalization/jobs";
 import { createTemplate } from "../personalization/service";
 import { importNormalizedOrders } from "./import";
 import { purgeBuyerPii } from "./jobs";
@@ -152,9 +154,7 @@ describe("CSV import pipeline", () => {
   it("imports the Etsy export: one item per unit, mapped, personalized, unmapped", async () => {
     const key = objectKey(companyId, "csv", "csv");
     await putObject(key, fixture("etsy-sold-order-items.csv"), "text/csv");
-    const report = await withTenant(companyId, (tx) =>
-      importCsv(tx, ctx, { id: etsyConnId, fileKey: key, format: "etsy" }),
-    );
+    const report = await importCsv(ctx, { id: etsyConnId, fileKey: key, format: "etsy" });
     expect(report).toMatchObject({
       status: "completed",
       rowsTotal: 6,
@@ -182,6 +182,21 @@ describe("CSV import pipeline", () => {
     expect(unmapped[0]?.state).toBe("needs_mapping");
     expect(unmapped[0]?.flags.map((f) => f.code)).toEqual(["needs_mapping"]);
 
+    // The import only queues the personalization renders (B-61); the render job runs after.
+    const queued = [
+      ...(await itemsOf(byChannelId.get("3310000002") as string)),
+      ...(await itemsOf(byChannelId.get("3310000003") as string)),
+    ];
+    expect(queued.map((i) => i.artworkStatus)).toEqual(["pending", "pending"]);
+    const requested = await withSystem((tx) =>
+      tx.select().from(outboxEvents).where(eq(outboxEvents.name, "artwork.render_requested")),
+    );
+    const orderItemIds = requested
+      .filter((e) => e.companyId === companyId)
+      .flatMap((e) => e.payload.orderItemIds as string[]);
+    expect(orderItemIds.sort()).toEqual(queued.map((i) => i.id).sort());
+    await runJobInline(renderArtworkJob, { companyId, orderItemIds });
+
     const ashley = (await itemsOf(byChannelId.get("3310000002") as string))[0];
     const jessica = (await itemsOf(byChannelId.get("3310000003") as string))[0];
     if (imagingUp) {
@@ -206,9 +221,7 @@ describe("CSV import pipeline", () => {
   it("is idempotent: the same file again skips every order", async () => {
     const key = objectKey(companyId, "csv", "csv");
     await putObject(key, fixture("etsy-sold-order-items.csv"), "text/csv");
-    const report = await withTenant(companyId, (tx) =>
-      importCsv(tx, ctx, { id: etsyConnId, fileKey: key, format: "etsy" }),
-    );
+    const report = await importCsv(ctx, { id: etsyConnId, fileKey: key, format: "etsy" });
     expect(report).toMatchObject({ ordersImported: 0, ordersUpdated: 0, ordersSkipped: 4 });
     const count = await withTenant(companyId, (tx) =>
       tx.select({ id: orderItems.id }).from(orderItems),
