@@ -6,17 +6,13 @@ import { db, type Tx, withTenant } from "../../db/client";
 import type { Address, Role, StationKind } from "../../db/schema";
 import {
   auditLog,
-  blankVariants,
-  channelConnections,
   companies,
   invitations,
   locations,
   members,
-  skuRules,
   staffPins,
   stations,
   users,
-  vendorConnections,
 } from "../../db/schema";
 import { audit } from "../../lib/audit";
 import { badRequest, conflict, forbidden, notFound, notImplemented } from "../../lib/errors";
@@ -32,6 +28,7 @@ import {
   STAFF_INVITE_DAYS,
   sendInviteEmail,
 } from "./invites";
+import { onboardingChecklist } from "./onboarding";
 
 /*
  * Tenancy: who am I, the team, locations, stations, audit. Better Auth tables (users, members,
@@ -90,31 +87,6 @@ async function memberRows(tx: Tx, companyId: string, where?: SQL) {
 
 /* ------------------------------------ me ------------------------------------ */
 
-/** Onboarding checklist. `tx` is tenant-scoped, so the counts are already per company. */
-async function onboarding(tx: Tx, companyId: string): Promise<Me["onboarding"]> {
-  const n = async (rows: { n: number }[]) => (rows[0]?.n ?? 0) > 0;
-  const [memberCount] = await db
-    .select({ n: count() })
-    .from(members)
-    .where(eq(members.organizationId, companyId));
-  return {
-    channelConnected: await n(await tx.select({ n: count() }).from(channelConnections)),
-    blanksImported: await n(await tx.select({ n: count() }).from(blankVariants)),
-    skusMapped: await n(await tx.select({ n: count() }).from(skuRules)),
-    vendorAdded: await n(await tx.select({ n: count() }).from(vendorConnections)),
-    staffInvited: (memberCount?.n ?? 0) > 1 || (await pendingInvitations(tx, companyId)).length > 0,
-    // TODO(T-5-3): compute the wave 5 steps; honest `false` until then.
-    shipFromAddress: false,
-    carrier: false,
-    tabletPaired: false,
-    designsUploaded: false,
-    costsSet: false,
-    planChosen: false,
-    dismissed: false,
-    dismissedAt: null,
-  };
-}
-
 /** Build the `Me` payload for the current session. `tx` is the tenant transaction. */
 export async function me(tx: Tx, ctx: Context & { tenant: TenantContext }): Promise<Me> {
   const { tenant } = ctx;
@@ -137,7 +109,7 @@ export async function me(tx: Tx, ctx: Context & { tenant: TenantContext }): Prom
     station: tenant.station
       ? { id: tenant.station.id, name: tenant.station.name, kind: tenant.station.kind }
       : null,
-    onboarding: company.type === "vendor" ? null : await onboarding(tx, tenant.companyId),
+    onboarding: company.type === "vendor" ? null : await onboardingChecklist(tx, tenant.companyId),
   };
 }
 

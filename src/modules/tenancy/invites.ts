@@ -53,6 +53,8 @@ const ROLE_NAMES: Record<Locale, Record<Role, string>> = {
 };
 
 export type InviteEmailInput = {
+  /** Sent from a demo company (sample data): the email is never sent (see sendInviteEmail). */
+  demo?: boolean;
   locale: string | null | undefined;
   kind: "staff" | "vendor";
   companyName: string;
@@ -145,14 +147,19 @@ export async function deliverInviteMail(
 }
 
 /** Send the invite email (English or Spanish). See deliverInviteMail for the rules. */
-export function sendInviteEmail(to: string, input: InviteEmailInput, timeoutMs?: number) {
+export async function sendInviteEmail(to: string, input: InviteEmailInput, timeoutMs?: number) {
+  // A demo company is sample data: its invites stay in the app and never reach a real inbox.
+  if (input.demo) {
+    log.info("invite email skipped: demo company", { kind: input.kind });
+    return;
+  }
   return deliverInviteMail({ to, ...inviteEmail(input) }, timeoutMs);
 }
 
 /** Company name plus the inviter's name and language, for the email. */
 export async function inviteSenders(companyId: string, inviterId: string | null) {
   const [company] = await db
-    .select({ name: companies.name })
+    .select({ name: companies.name, demo: companies.demo })
     .from(companies)
     .where(eq(companies.id, companyId))
     .limit(1);
@@ -164,6 +171,7 @@ export async function inviteSenders(companyId: string, inviterId: string | null)
         .limit(1)
     : [];
   return {
+    demo: company?.demo ?? false,
     companyName: company?.name ?? "InvAI",
     inviterName: inviter?.name ?? null,
     locale: inviter?.locale ?? "en",

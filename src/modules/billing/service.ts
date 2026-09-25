@@ -317,12 +317,16 @@ export function paymentRequired(checkoutUrl: string | null, message = "This need
   return new ORPCError("PAYMENT_REQUIRED", { status: 402, message, data: { checkoutUrl } });
 }
 
-async function companyType(tx: Tx, companyId: string) {
+/**
+ * Plans apply to real shops only: vendor orgs have no plan, and a demo company (sample data,
+ * tenancy.demo) has no subscription, never expires and is never limited.
+ */
+async function hasPlan(tx: Tx, companyId: string) {
   const [row] = await tx
-    .select({ type: companies.type })
+    .select({ type: companies.type, demo: companies.demo })
     .from(companies)
     .where(eq(companies.id, companyId));
-  return row?.type ?? "shop";
+  return (row?.type ?? "shop") === "shop" && !row?.demo;
 }
 
 /**
@@ -331,7 +335,7 @@ async function companyType(tx: Tx, companyId: string) {
  * moving orders already in the system through the floor are never gated. Vendors have no plan.
  */
 export async function assertPaidActionAllowed(tx: Tx, ctx: Pick<TenantContext, "companyId">) {
-  if ((await companyType(tx, ctx.companyId)) !== "shop") return;
+  if (!(await hasPlan(tx, ctx.companyId))) return;
   const sub = await subscriptionOf(tx, ctx.companyId);
   if (effectiveStatus(sub) === "trial_expired")
     throw paymentRequired(null, "Your free trial has ended. Choose a plan to keep going.");
@@ -573,8 +577,7 @@ export async function assertWithinPlan(
   adding = 1,
   opts: { exceptInviteEmail?: string } = {},
 ): Promise<{ used: number; limit: number | null; overLimit: boolean }> {
-  if ((await companyType(tx, ctx.companyId)) !== "shop")
-    return { used: 0, limit: null, overLimit: false };
+  if (!(await hasPlan(tx, ctx.companyId))) return { used: 0, limit: null, overLimit: false };
   if (meterName === "orders") await assertPaidActionAllowed(tx, ctx);
   const plan = await getPlan(tx, ctx.companyId);
   const limit = {
@@ -655,7 +658,10 @@ export async function expireTrials(now = new Date()) {
           isNull(subscriptions.stripeSubscriptionId),
           inArray(
             subscriptions.companyId,
-            tx.select({ id: companies.id }).from(companies).where(eq(companies.type, "shop")),
+            tx
+              .select({ id: companies.id })
+              .from(companies)
+              .where(and(eq(companies.type, "shop"), eq(companies.demo, false))),
           ),
         ),
       )

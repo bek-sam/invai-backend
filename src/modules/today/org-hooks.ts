@@ -1,6 +1,6 @@
 import { eq } from "drizzle-orm";
 import { withSystem } from "../../db/client";
-import { locations, subscriptions } from "../../db/schema";
+import { companies, locations, subscriptions } from "../../db/schema";
 import { errorData, logger } from "../../lib/log";
 import { emit } from "../../lib/outbox";
 
@@ -10,7 +10,7 @@ const TRIAL_DAYS = 14;
 
 /**
  * Runs after Better Auth creates an organization (sign-up). Gives a shop a default "Main"
- * location and a trial subscription, and emits `company.created`. Idempotent; never throws
+ * location and a trial subscription (never for a demo company), and emits `company.created`. Idempotent; never throws
  * (a failure here must not fail sign-up).
  */
 export async function onOrganizationCreated(org: { id: string; type?: string | null }) {
@@ -25,7 +25,13 @@ export async function onOrganizationCreated(org: { id: string; type?: string | n
       if (!existing.length) {
         await tx.insert(locations).values({ companyId: org.id, name: "Main", isDefault: true });
       }
-      if (type === "shop") {
+      // A demo company (sample data) has no plan: no trial to expire and lock it.
+      const [company] = await tx
+        .select({ demo: companies.demo })
+        .from(companies)
+        .where(eq(companies.id, org.id))
+        .limit(1);
+      if (type === "shop" && !company?.demo) {
         await tx
           .insert(subscriptions)
           .values({

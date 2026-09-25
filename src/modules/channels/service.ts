@@ -35,6 +35,7 @@ import { badRequest, notFound, ORPCError } from "../../lib/errors";
 import { emit } from "../../lib/outbox";
 import { keyset, type PageInput } from "../../lib/pagination";
 import { assertWithinPlan } from "../billing/service";
+import { isDemoCompany } from "../tenancy/demo-flag";
 
 /*
  * Channel connections: list/connect/update/disconnect, health, tracking push for shipping.
@@ -364,7 +365,8 @@ export async function connect(tx: Tx, ctx: TenantContext, input: ConnectInput) {
     // A pending install already counts; a new or reconnected shop takes a connection slot.
     if (!existing || existing.status === "disconnected")
       await assertWithinPlan(tx, ctx, "connections");
-    const provider = env.mocks.shopify ? "mock" : "live";
+    // A demo company (sample data) never talks to a real store, whatever keys are configured.
+    const provider = env.mocks.shopify || (await isDemoCompany(ctx.companyId)) ? "mock" : "live";
     const state = randomToken(24);
     const values = {
       name: shop.replace(/\.myshopify\.com$/, ""),
