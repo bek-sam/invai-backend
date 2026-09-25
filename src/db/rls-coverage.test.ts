@@ -15,6 +15,9 @@ const GLOBAL_TABLES = new Set([
   "sessions",
   "accounts",
   "verifications",
+  // twoFactor plugin (T-2-3): one row per user, keyed by user_id, no company. Read by Better Auth
+  // over the app connection like `accounts`; the TOTP secret and backup codes are encrypted.
+  "two_factors",
   "companies",
   "members",
   "invitations",
