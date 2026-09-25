@@ -246,6 +246,52 @@ describe("team invites", () => {
     expect(again.id).not.toBe(inv.id);
   });
 
+  it("a revoke racing an accept never cancels the accepted invite", async () => {
+    type RevokeTx = Parameters<typeof svc.revokeInvite>[0];
+    const cancels: ((tx: RevokeTx, id: string) => Promise<unknown>)[] = [
+      (tx, id) => svc.revokeInvite(tx, owner, id),
+      (tx, id) => svc.setMemberStatus(tx, owner, id, "deactivated"),
+    ];
+    for (const cancel of cancels) {
+      const inv = await invite(uniqEmail("race"));
+      // The accept commits on another connection after the revoke read the pending row and
+      // before its UPDATE runs.
+      const acceptFirst = (tx: RevokeTx) =>
+        new Proxy(tx, {
+          get(target, prop, receiver) {
+            const value = Reflect.get(target, prop, receiver);
+            if (prop !== "update") return typeof value === "function" ? value.bind(target) : value;
+            return (table: typeof invitations) => {
+              const builder = target.update(table);
+              return {
+                set: (values: Partial<typeof invitations.$inferInsert>) => {
+                  const setB = builder.set(values);
+                  return {
+                    where: (cond: Parameters<typeof setB.where>[0]) => {
+                      const whereB = setB.where(cond);
+                      return {
+                        returning: (cols: Parameters<typeof whereB.returning>[0]) =>
+                          db
+                            .update(invitations)
+                            .set({ status: "accepted" })
+                            .where(eq(invitations.id, inv.id))
+                            .then(() => whereB.returning(cols)),
+                      };
+                    },
+                  };
+                },
+              };
+            };
+          },
+        }) as RevokeTx;
+      await expect(
+        withTenant(companyId, (tx) => cancel(acceptFirst(tx), inv.id)),
+      ).rejects.toMatchObject({ code: "CONFLICT" });
+      const [row] = await db.select().from(invitations).where(eq(invitations.id, inv.id));
+      expect(row?.status).toBe("accepted");
+    }
+  });
+
   it("an admin can't resend or revoke an owner invite", async () => {
     const inv = await invite(uniqEmail("own"), "owner" as "office");
     const admin = tenantContext(companyId, (await createUser(companyId, "admin")).id, "admin");

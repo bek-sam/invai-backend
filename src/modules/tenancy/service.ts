@@ -434,7 +434,13 @@ export async function revokeInvite(tx: Tx, ctx: TenantContext, userId: string) {
   const invitation = await pendingInvitation(tx, ctx.companyId, userId);
   if (!invitation) throw notInvited();
   assertCanManage(ctx, invitation.role as Role);
-  await tx.update(invitations).set({ status: "canceled" }).where(eq(invitations.id, invitation.id));
+  // Only while still pending: an accept that lands between the read and here must win.
+  const [row] = await tx
+    .update(invitations)
+    .set({ status: "canceled" })
+    .where(and(eq(invitations.id, invitation.id), eq(invitations.status, "pending")))
+    .returning({ id: invitations.id });
+  if (!row) throw conflict("That invite was just accepted or canceled");
   await audit(tx, {
     companyId: ctx.companyId,
     actor: ctx.actor,
@@ -555,10 +561,12 @@ export async function setMemberStatus(
       status === "deactivated" ? await pendingInvitation(tx, ctx.companyId, userId) : null;
     if (!invitation) throw notFound("user", userId);
     assertCanManage(ctx, invitation.role as Role);
-    await tx
+    const [canceled] = await tx
       .update(invitations)
       .set({ status: "canceled" })
-      .where(eq(invitations.id, invitation.id));
+      .where(and(eq(invitations.id, invitation.id), eq(invitations.status, "pending")))
+      .returning({ id: invitations.id });
+    if (!canceled) throw conflict("That invite was just accepted or canceled");
     await audit(tx, {
       companyId: ctx.companyId,
       actor: ctx.actor,
