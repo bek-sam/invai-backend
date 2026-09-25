@@ -168,22 +168,6 @@ export function shopifyAuthorizeUrl(shop: string, state: string, redirectUri: st
   return u.toString();
 }
 
-export async function exchangeShopifyCode(shop: string, code: string) {
-  const res = await fetch(`https://${shop}/admin/oauth/access_token`, {
-    method: "POST",
-    headers: { "content-type": "application/json", accept: "application/json" },
-    body: JSON.stringify({
-      client_id: env.SHOPIFY_API_KEY,
-      client_secret: env.SHOPIFY_API_SECRET,
-      code,
-    }),
-    signal: AbortSignal.timeout(15_000),
-  });
-  if (!res.ok) throw upstream("Shopify", `token exchange failed (${res.status})`);
-  const json = (await res.json()) as { access_token: string; scope: string };
-  return { accessToken: json.access_token, scopes: json.scope.split(",") };
-}
-
 /** After install: the shop's name (webhooks are subscribed by `ensureWebhooks`). */
 export async function finishShopifyInstall(
   conn: Pick<ChannelConn, "externalShopId" | "credentials">,

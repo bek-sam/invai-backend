@@ -3,8 +3,14 @@ import type { ChannelAdapter } from "../types";
 import { shopifyLive } from "./live";
 import { shopifyMock } from "./mock";
 
+export {
+  credentialsFromToken,
+  exchangeShopifyCode,
+  refreshShopifyToken,
+  ShopifyRefreshError,
+} from "./auth";
 export * from "./common";
-export { exchangeShopifyCode, finishShopifyInstall, shopifyAuthorizeUrl } from "./live";
+export { finishShopifyInstall, shopifyAuthorizeUrl } from "./live";
 export { mockShopifyOrder, mockShopifySubscriptions } from "./mock";
 
 /** The live adapter when SHOPIFY_API_KEY/SECRET are set, else the mock store. */

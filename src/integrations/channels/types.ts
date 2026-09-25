@@ -24,7 +24,12 @@ export type ChannelDisconnectResult = {
 export type ChannelCredentials = {
   accessToken?: string;
   refreshToken?: string;
+  /** When the access token expires (expiring offline tokens: 1 hour). */
   expiresAt?: string | null;
+  /** When the refresh token expires (Shopify: 90 days); the shop must reconnect after it. */
+  refreshTokenExpiresAt?: string | null;
+  /** The last refresh failed: the connection is flagged until a refresh or reconnect works. */
+  refreshError?: { at: string; message: string; permanent: boolean } | null;
   scopes?: string[];
   /** Shopify: the location inventory is set on and fulfillments ship from. */
   locationId?: string | null;

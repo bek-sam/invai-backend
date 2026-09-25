@@ -3,7 +3,7 @@ import { env } from "../../env";
 import { errorData, logger } from "../../lib/log";
 import { defineJob, queues } from "../../lib/queues";
 import { warnOverduePrivacyRequests } from "../privacy/service";
-import { checkWebhookSubscriptions } from "./service";
+import { checkWebhookSubscriptions, refreshExpiringTokens } from "./service";
 import {
   pollableConnections,
   processWebhook,
@@ -34,6 +34,11 @@ export const pollChannelsJob = defineJob({
   name: "channels.poll",
   input: z.object({}).passthrough(),
   handler: async () => {
+    // Expiring access tokens first (1 hour; refreshed when under 20 minutes are left).
+    const tokens = await refreshExpiringTokens().catch((err) => {
+      log.warn("token refresh sweep failed", errorData(err));
+      return null;
+    });
     const conns = await pollableConnections();
     const bucket = Math.floor(Date.now() / POLL_EVERY_MS);
     for (const c of conns) {
@@ -42,7 +47,7 @@ export const pollChannelsJob = defineJob({
         { jobId: `poll-${c.id}-${bucket}` },
       );
     }
-    return { connections: conns.length };
+    return { connections: conns.length, tokens };
   },
 });
 

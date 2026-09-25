@@ -1,12 +1,20 @@
 import { and, eq } from "drizzle-orm";
-import { beforeAll, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { withSystem, withTenant } from "../../db/client";
 import { auditLog, channelConnections, orders, webhookDeliveries } from "../../db/schema";
 import { mockShopifySubscriptions, signShopifyBody } from "../../integrations/channels/shopify";
 import type { ChannelCredentials } from "../../integrations/channels/types";
 import { decryptJson, encryptJson } from "../../lib/crypto";
 import { createCompany, createLocation, createUser, tenantContext } from "../../test/fixtures";
-import { checkWebhookSubscriptions, connect, disconnect, health } from "./service";
+import {
+  checkWebhookSubscriptions,
+  connect,
+  disconnect,
+  freshChannelConn,
+  health,
+  refreshConnectionToken,
+  refreshExpiringTokens,
+} from "./service";
 import { completeShopifyOAuth, processWebhook, recordWebhookDelivery } from "./sync";
 
 const uniq = () => `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
@@ -199,5 +207,99 @@ describe("Shopify webhook subscriptions and disconnect", () => {
     expect(logs.map((l) => l.summary)).toContain(
       "Shopify: 4 webhook subscription(s) removed; app uninstalled and access revoked",
     );
+  });
+});
+
+describe("Shopify token refresh (expiring offline tokens)", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  async function liveConnection(expiresInMs: number) {
+    const companyId = (await createCompany()).id;
+    return shopifyConnection(companyId, `t31-${uniq()}.myshopify.com`, {
+      provider: "live",
+      credentials: encryptJson({
+        accessToken: "shpat_old",
+        refreshToken: "shprt_old",
+        expiresAt: new Date(Date.now() + expiresInMs).toISOString(),
+      }),
+    });
+  }
+
+  const credsOf = async (id: string) => {
+    const [r] = await withSystem((tx) =>
+      tx.select().from(channelConnections).where(eq(channelConnections.id, id)),
+    );
+    return { row: r, creds: decryptJson<ChannelCredentials>(r?.credentials ?? "") };
+  };
+
+  function stubRefresh(status = 200) {
+    let n = 0;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        n++;
+        await new Promise((r) => setTimeout(r, 50));
+        return new Response(
+          JSON.stringify(
+            status === 200
+              ? {
+                  access_token: `shpat_new_${n}`,
+                  expires_in: 3600,
+                  refresh_token: `shprt_new_${n}`,
+                  refresh_token_expires_in: 7776000,
+                }
+              : { error: "invalid_grant" },
+          ),
+          { status },
+        );
+      }),
+    );
+    return () => n;
+  }
+
+  it("refreshes before expiry and stores the rotated access and refresh tokens", async () => {
+    const conn = await liveConnection(5 * 60_000);
+    const calls = stubRefresh();
+    const fresh = await freshChannelConn(conn);
+    expect(calls()).toBe(1);
+    expect(fresh.credentials?.accessToken).toBe("shpat_new_1");
+    const { creds } = await credsOf(conn.id);
+    expect(creds).toMatchObject({ accessToken: "shpat_new_1", refreshToken: "shprt_new_1" });
+    expect(new Date(creds.expiresAt ?? 0).getTime()).toBeGreaterThan(Date.now() + 50 * 60_000);
+  });
+
+  it("leaves a token with time left alone", async () => {
+    const conn = await liveConnection(50 * 60_000);
+    const calls = stubRefresh();
+    expect((await freshChannelConn(conn)).credentials?.accessToken).toBe("shpat_old");
+    expect(calls()).toBe(0);
+  });
+
+  it("two workers at once spend the refresh token once (row lock)", async () => {
+    const conn = await liveConnection(60_000);
+    const calls = stubRefresh();
+    const [a, b] = await Promise.all([
+      refreshConnectionToken(conn.companyId, conn.id),
+      refreshConnectionToken(conn.companyId, conn.id),
+    ]);
+    expect(calls()).toBe(1);
+    expect(a?.credentials?.accessToken).toBe("shpat_new_1");
+    expect(b?.credentials?.accessToken).toBe("shpat_new_1");
+  });
+
+  it("a refused refresh flags the connection in health and keeps the old credentials", async () => {
+    const conn = await liveConnection(60_000);
+    stubRefresh(401);
+    const res = await refreshExpiringTokens();
+    expect(res.failed).toBeGreaterThanOrEqual(1);
+    const { row, creds } = await credsOf(conn.id);
+    expect(creds.refreshToken).toBe("shprt_old");
+    expect(creds.refreshError).toMatchObject({ permanent: true });
+    expect(row?.lastError).toContain("Reconnect the store");
+    const ctx = tenantContext(conn.companyId, null as never, "owner");
+    const item = (await withTenant(conn.companyId, (tx) => health(tx, ctx))).items.find(
+      (i) => i.connectionId === conn.id,
+    );
+    expect(item?.health.ok).toBe(false);
   });
 });

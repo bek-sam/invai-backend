@@ -44,6 +44,7 @@ import { handlePrivacyRequest } from "../privacy/service";
 import {
   type ConnectionRow,
   channelWebhookUri,
+  freshChannelConn,
   getConnectionRow,
   markConnection,
   shopifyConnectedElsewhere,
@@ -251,7 +252,7 @@ export async function syncConnection(
   await setJob(companyId, jobId, { status: "running", progress: 0.1, message: "Fetching orders" });
   const adapter = getChannelAdapter(conn.channel, conn.provider);
   try {
-    const fetched = await adapter.fetchOrders(toChannelConn(conn));
+    const fetched = await adapter.fetchOrders(await freshChannelConn(conn));
     const res = await withTenant(companyId, async (tx) => {
       await checkPlan(tx, ctx, fetched.orders, conn.channel);
       const out = await importNormalizedOrders(tx, ctx, conn, fetched.orders, {

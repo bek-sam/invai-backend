@@ -19,7 +19,11 @@ import {
 } from "../../db/schema";
 import { env } from "../../env";
 import { getChannelAdapter } from "../../integrations/channels";
-import { shopifyAuthorizeUrl } from "../../integrations/channels/shopify";
+import {
+  refreshShopifyToken,
+  ShopifyRefreshError,
+  shopifyAuthorizeUrl,
+} from "../../integrations/channels/shopify";
 import type {
   ChannelConn,
   ChannelCredentials,
@@ -42,6 +46,110 @@ type ConnectInput = z.infer<typeof ConnectInputSchema>;
 type ConnectionSettings = z.infer<typeof ConnectionSettingsSchema>;
 
 const STALE_ALERT_MINUTES = 30;
+
+/* ------------------------------ expiring access tokens (B-05) ------------------------------ */
+
+/** Refresh when the access token has less than this left (it lasts 1 hour; the poll runs every 10). */
+export const TOKEN_REFRESH_AHEAD_MS = 20 * 60_000;
+
+export function tokenNeedsRefresh(c: ChannelCredentials | null | undefined, now = Date.now()) {
+  if (!c?.refreshToken || !c.expiresAt) return false;
+  return new Date(c.expiresAt).getTime() - now < TOKEN_REFRESH_AHEAD_MS;
+}
+
+/**
+ * Refresh one connection's expiring token under a row lock (research 10 R1): two workers never
+ * spend the same refresh token, and the rotated pair is stored with its expiry in one update.
+ * A second caller waiting on the lock finds the fresh token and doesn't refresh again. On failure
+ * the old credentials stay, the connection is flagged (`refreshError`, last error, health not ok)
+ * and the stale connection is returned; the caller's API call then fails as before.
+ */
+export async function refreshConnectionToken(
+  companyId: string,
+  connectionId: string,
+  opts: { force?: boolean } = {},
+): Promise<ChannelConn | null> {
+  return withTenant(companyId, async (tx) => {
+    const [row] = await tx
+      .select()
+      .from(channelConnections)
+      .where(eq(channelConnections.id, connectionId))
+      .for("update");
+    if (!row) return null;
+    const conn = toChannelConn(row);
+    const creds = conn.credentials;
+    if (
+      row.channel !== "shopify" ||
+      row.provider !== "live" ||
+      !row.externalShopId ||
+      !creds?.refreshToken ||
+      (!opts.force && !tokenNeedsRefresh(creds))
+    )
+      return conn;
+    try {
+      const fresh = await refreshShopifyToken(row.externalShopId, creds.refreshToken);
+      const next: ChannelCredentials = { ...creds, ...fresh, refreshError: null };
+      await tx
+        .update(channelConnections)
+        .set({
+          credentials: encryptJson(next),
+          ...(creds.refreshError ? { lastError: null } : {}),
+        })
+        .where(eq(channelConnections.id, row.id));
+      return { ...conn, credentials: next };
+    } catch (err) {
+      const permanent = err instanceof ShopifyRefreshError && err.permanent;
+      const message = err instanceof Error ? err.message : String(err);
+      const flagged: ChannelCredentials = {
+        ...creds,
+        refreshError: { at: new Date().toISOString(), message, permanent },
+      };
+      await tx
+        .update(channelConnections)
+        .set({
+          credentials: encryptJson(flagged),
+          lastError: permanent
+            ? "Shopify no longer accepts this connection's access. Reconnect the store."
+            : `Shopify access could not be renewed (${message}); retrying.`,
+          lastErrorAt: new Date(),
+        })
+        .where(eq(channelConnections.id, row.id));
+      return { ...conn, credentials: flagged };
+    }
+  });
+}
+
+/** The adapter view of a connection, with its token refreshed first when it is about to expire. */
+export async function freshChannelConn(row: ConnectionRow): Promise<ChannelConn> {
+  const conn = toChannelConn(row);
+  if (!tokenNeedsRefresh(conn.credentials)) return conn;
+  return (await refreshConnectionToken(row.companyId, row.id)) ?? conn;
+}
+
+/** Every 10 minutes (with the poll): refresh the tokens that expire within 20 minutes. */
+export async function refreshExpiringTokens(now = Date.now()) {
+  const rows = await withSystem((tx) =>
+    tx
+      .select()
+      .from(channelConnections)
+      .where(
+        and(
+          eq(channelConnections.mode, "api"),
+          eq(channelConnections.provider, "live"),
+          inArray(channelConnections.status, ["connected", "error"]),
+        ),
+      ),
+  );
+  let refreshed = 0;
+  let failed = 0;
+  for (const row of rows) {
+    if (!tokenNeedsRefresh(toChannelConn(row).credentials, now)) continue;
+    const conn = await refreshConnectionToken(row.companyId, row.id);
+    if (conn?.credentials?.refreshError) failed++;
+    else refreshed++;
+  }
+  return { refreshed, failed };
+}
 
 /** Where a channel's webhooks are delivered (the API's public URL). */
 export function channelWebhookUri(channel: ConnectionRow["channel"]) {
@@ -104,9 +212,14 @@ function toConnection(row: ConnectionRow, stats: HealthStats): ChannelConnection
       : null;
   const errored = row.status === "error";
   const stale = staleMinutes !== null && staleMinutes > STALE_ALERT_MINUTES;
+  const creds = row.mode === "api" ? toChannelConn(row).credentials : null;
   const degraded =
-    row.status === "connected" && row.mode === "api"
-      ? webhookFailureMessage(toChannelConn(row).credentials?.webhooks)
+    row.status === "connected" || row.status === "error"
+      ? creds?.refreshError
+        ? "Shopify access could not be renewed. Reconnect the store if this persists."
+        : row.status === "connected"
+          ? webhookFailureMessage(creds?.webhooks)
+          : null
       : null;
   return {
     id: row.id,
@@ -577,7 +690,7 @@ export async function pushTrackingForShipment(
     for (const i of items) byLine.set(i.channelLineId, (byLine.get(i.channelLineId) ?? 0) + 1);
     return {
       kind: "push" as const,
-      conn: toChannelConn(conn),
+      row: conn,
       channel: conn.channel,
       provider: conn.provider,
       orderId: order.id,
@@ -600,7 +713,8 @@ export async function pushTrackingForShipment(
   }
 
   const adapter = getChannelAdapter(plan.channel, plan.provider);
-  const result = await adapter.pushTracking(plan.conn, plan.push);
+  const conn = await freshChannelConn(plan.row);
+  const result = await adapter.pushTracking(conn, plan.push);
   await withTenant(ctx.companyId, (tx) =>
     audit(tx, {
       companyId: ctx.companyId,
@@ -617,7 +731,7 @@ export async function pushTrackingForShipment(
   );
   return {
     status: result.status,
-    connectionId: plan.conn.id,
+    connectionId: conn.id,
     externalId: result.externalId,
     message: result.message,
   };
