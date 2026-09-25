@@ -3,6 +3,7 @@ import {
   doublePrecision,
   index,
   integer,
+  jsonb,
   pgTable,
   text,
   timestamp,
@@ -100,6 +101,9 @@ export const orders = pgTable(
     cancelReason: text(enumText(CANCEL_REASONS)),
     cancelNote: text(),
     cancelledAt: timestamp({ withTimezone: true }),
+    /** Set when the order was packed with units missing (production.packOrder override); cleared
+     * by recomputeOrderStatus once every non-cancelled unit is genuinely packed. */
+    packOverride: jsonb().$type<PackOverride>(),
     binId: uuid(),
     /** S3 key of the raw channel payload (encrypted archive, 30-day lifecycle). */
     rawPayloadKey: text(),
@@ -117,6 +121,15 @@ export const orders = pgTable(
     tenantPolicy("orders"),
   ],
 ).enableRLS();
+
+/** Same shape as the contract's PackOverride (`at` is an ISO string). */
+export type PackOverride = {
+  reason: string;
+  by: string;
+  byName: string;
+  at: string;
+  missingItemIds: string[];
+};
 
 export type PersonalizationAnswer = {
   question: string;

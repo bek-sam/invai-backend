@@ -157,6 +157,7 @@ function toOrder(r: OrderJoin, ctx: TenantContext): Order {
       o.cancelReason && o.cancelledAt
         ? { reason: o.cancelReason, note: o.cancelNote, at: o.cancelledAt.toISOString() }
         : null,
+    packOverride: o.packOverride ?? null,
     buyerName: pii?.name ?? "Buyer (data purged)",
     shipTo:
       pii && canSeeAddress && pii.street1

@@ -225,7 +225,7 @@ export const locations = pgTable(
   (t) => [index().on(t.companyId), tenantPolicy("locations")],
 ).enableRLS();
 
-export const STATION_KINDS = ["pick", "press", "qc", "pack"] as const;
+export const STATION_KINDS = ["pick", "press", "qc", "pack", "receiving"] as const;
 export type StationKind = (typeof STATION_KINDS)[number];
 
 /** A tablet or scanner post. `kind` null lets staff pick the screen on the tablet. */

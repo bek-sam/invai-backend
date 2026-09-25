@@ -121,6 +121,8 @@ async function packFinishedOrders(tx: Tx, orderIds: string[]) {
 }
 
 async function stationItemIds(tx: Tx, station: Station, orderId?: string): Promise<string[]> {
+  // Receiving checks in POs and vendor sheets, not order units: it has no unit queue.
+  if (station === "receiving") return [];
   const byOrder = orderId ? eq(orderItems.orderId, orderId) : undefined;
   if (station === "pack") {
     const complete = await completePackedOrders(tx, orderId);
@@ -278,11 +280,21 @@ async function resolveSecond(
   return { kind: "blank", blank: blank ? blankRef(blank) : null };
 }
 
-const DEFAULT_ACTION: Record<Station, ScanAction> = {
+/** Null: the station has no transfer-scan step (receiving uses its own procedures). */
+const DEFAULT_ACTION: Record<Station, ScanAction | null> = {
   pick: "pick",
   press: "press",
   qc: "qc_pass",
   pack: "pack",
+  receiving: null,
+};
+
+const NO_SCAN_STEP: MatchOutcome = {
+  ok: false,
+  mismatch: "wrong_station",
+  message: "This station doesn't scan transfers",
+  nextAction: "nothing",
+  moveTo: null,
 };
 
 function buildResult(
@@ -348,6 +360,12 @@ export async function scan(tx: Tx, ctx: TenantContext, input: ScanInput): Promis
   const replay = await storedResult(tx, input.clientScanId);
   if (replay) return replay;
   const action = input.action ?? DEFAULT_ACTION[input.station];
+  // Nothing to record or move: answer the same way every time, so a replay needs no stored row.
+  if (!action)
+    return buildResult(input, { transfer: null, view: null }, { kind: "none" }, NO_SCAN_STEP, {
+      state: null,
+      openUnits: null,
+    });
   const stationId = input.stationId ?? ctx.station?.id ?? null;
   const resolved = await resolveTransfer(tx, input.transferCode);
   // A concurrent replay may have committed while we waited for the row lock.
