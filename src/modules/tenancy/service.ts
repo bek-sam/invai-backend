@@ -19,7 +19,7 @@ import {
   vendorConnections,
 } from "../../db/schema";
 import { audit } from "../../lib/audit";
-import { badRequest, conflict, forbidden, notFound } from "../../lib/errors";
+import { badRequest, conflict, forbidden, notFound, notImplemented } from "../../lib/errors";
 import { keyset, type PageInput } from "../../lib/pagination";
 import { assertWithinPlan } from "../billing/service";
 import { issueStationToken, revokeStationTokens, setPin } from "./floor-auth";
@@ -68,6 +68,7 @@ function toUser(row: MemberRow): User {
     role: row.member.role,
     status: row.member.status,
     hasPin: row.hasPin,
+    pinOnly: false, // TODO(T-5-4): PIN-only staff
     lastSeenAt: row.user.lastSeenAt?.toISOString() ?? null,
     createdAt: row.member.createdAt.toISOString(),
   };
@@ -102,6 +103,15 @@ async function onboarding(tx: Tx, companyId: string): Promise<Me["onboarding"]> 
     skusMapped: await n(await tx.select({ n: count() }).from(skuRules)),
     vendorAdded: await n(await tx.select({ n: count() }).from(vendorConnections)),
     staffInvited: (memberCount?.n ?? 0) > 1 || (await pendingInvitations(tx, companyId)).length > 0,
+    // TODO(T-5-3): compute the wave 5 steps; honest `false` until then.
+    shipFromAddress: false,
+    carrier: false,
+    tabletPaired: false,
+    designsUploaded: false,
+    costsSet: false,
+    planChosen: false,
+    dismissed: false,
+    dismissedAt: null,
   };
 }
 
@@ -233,6 +243,7 @@ function invitedUser(row: typeof invitations.$inferSelect, name?: string): User 
     role: row.role as Role,
     status: "invited",
     hasPin: false,
+    pinOnly: false,
     lastSeenAt: null,
     createdAt: row.createdAt.toISOString(),
   };
@@ -267,9 +278,14 @@ async function pendingInvitation(tx: Tx, companyId: string, id: string) {
  */
 export async function inviteTeammate(
   ctx: TenantContext,
-  input: { email: string; name: string; role: Role },
+  input: { email?: string; name: string; role: Role; pinOnly?: boolean },
 ): Promise<User> {
-  const invitation = await withTenant(ctx.companyId, (tx) => inviteUser(tx, ctx, input));
+  // TODO(T-5-4): PIN-only floor staff (no email) are built in T-5-4.
+  if (input.pinOnly || !input.email) throw notImplemented("team.invite with pinOnly");
+  const email = input.email;
+  const invitation = await withTenant(ctx.companyId, (tx) =>
+    inviteUser(tx, ctx, { email, name: input.name, role: input.role }),
+  );
   const senders = await inviteSenders(ctx.companyId, ctx.userId);
   try {
     await sendInviteEmail(invitation.email, {
