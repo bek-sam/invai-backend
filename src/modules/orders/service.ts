@@ -55,6 +55,7 @@ import { logger } from "../../lib/log";
 import { emit } from "../../lib/outbox";
 import { publish } from "../../lib/realtime";
 import { releaseForItems } from "../inventory/service";
+import { guardShipmentsForItems } from "../shipping/service";
 import { ARTWORK_ITEM_FLAGS, withFlags } from "./flags";
 import { todayRange } from "./shipby";
 import { transitionItem } from "./state-machine";
@@ -734,6 +735,13 @@ export async function holdOrder(
   const items = (await orderItemRows(tx, input.id)).filter((i) => PRE_SHIPPED.has(i.state));
   if (items.length === 0)
     throw conflict("Nothing to hold: every item is shipped, cancelled or already on hold");
+  // Locks their shipments first: a tracking push can't start while the hold goes on.
+  await guardShipmentsForItems(
+    tx,
+    ctx,
+    items.map((i) => i.id),
+    "hold",
+  );
   for (const i of items)
     await transitionItem(tx, i.id, "on_hold", {
       actor: ctx.actor,
@@ -809,6 +817,18 @@ export async function cancelOrder(
   }
   if (targets.length === 0)
     throw conflict("Nothing to cancel: every item is shipped or already cancelled");
+  if (targets.some((i) => i.state === "shipped" || i.state === "delivered"))
+    throw conflict(
+      "This unit already shipped: its tracking was sent to the channel or the carrier has the package. Cancel or refund it on the channel.",
+    );
+  // Locks their shipments, refuses when tracking was already sent, and blocks the push; the
+  // label is voided by the shipping job on `order.cancelled`, outside this transaction.
+  await guardShipmentsForItems(
+    tx,
+    ctx,
+    targets.map((i) => i.id),
+    input.reason === "channel_cancelled" ? "channel_cancel" : "cancel",
+  );
 
   const nested = new Set(["on_sheet", "transfer_in"]);
   const scrappedTransferIds = targets

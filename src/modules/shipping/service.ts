@@ -32,6 +32,7 @@ import {
   carrierAdapter,
   type Parcel,
   type PurchasedLabel,
+  type VoidResult,
 } from "../../integrations/carriers";
 import { type Actor, audit } from "../../lib/audit";
 import { badRequest, conflict, notFound, ORPCError, upstream } from "../../lib/errors";
@@ -40,6 +41,7 @@ import { emit } from "../../lib/outbox";
 import { keyset, type PageInput } from "../../lib/pagination";
 import { publish } from "../../lib/realtime";
 import { getObject, objectKey, presignGet, putObject } from "../../lib/s3";
+import { assertPaidActionAllowed } from "../billing/service";
 import { pushTrackingForShipment } from "../channels/service";
 import { transitionItem } from "../orders/state-machine";
 import { createJobRow, updateJobRow } from "../production/service";
@@ -49,8 +51,9 @@ const log = logger("shipping");
 /*
  * Shipping: rate-shop packed orders, buy labels (EasyPost or the mock carrier), merge 4x6 label
  * PDFs, push tracking to the channel and follow the package to delivery. Items move
- * packed -> shipped once tracking is pushed (or right away when the channel needs no push), per
- * the pack decision in v1-plan section 6.
+ * packed -> shipped once tracking is pushed, or on the carrier's first scan when the channel
+ * gets no push (CSV-only, manual upload, push off), so a label can be voided until then. Every
+ * carrier and channel call runs with no transaction open, after a committed intent (R8).
  */
 
 type ShipmentRow = typeof shipments.$inferSelect;
@@ -703,6 +706,8 @@ async function settleBuy(ctx: TenantContext, shipmentId: string, outcome: "not_d
 export async function buyLabel(
   ctx: TenantContext,
   input: { shipmentId: string; rateId: string },
+  /** `readBackOnly`: finish a pending buy from the carrier's records, never buy (cancel job). */
+  opts: { readBackOnly?: boolean } = {},
 ): Promise<Shipment> {
   const plan = await withTenant(ctx.companyId, async (tx): Promise<BuyPlan> => {
     const [s] = await tx
@@ -715,6 +720,7 @@ export async function buyLabel(
     if (s.status === "voided" || s.status === "voiding")
       throw conflict("Shipment was voided; rate the order again");
     const resume = s.status === "buying";
+    if (opts.readBackOnly && !resume) return { kind: "done" };
     if (resume) {
       if (s.selectedRateId !== input.rateId)
         throw conflict(
@@ -724,6 +730,8 @@ export async function buyLabel(
       if (since !== null && since < BUY_IN_FLIGHT_MS)
         throw conflict("This label is being bought right now. Check again in a minute.");
     }
+    // A new purchase needs a paid plan (or a live trial). Finishing one already made doesn't.
+    if (!resume) await assertPaidActionAllowed(tx, ctx);
     const quote = s.rateQuotes.find((q) => q.rateId === input.rateId);
     if (!quote || !s.ratedAt || !s.carrierShipmentId) throw rateExpired();
     const expired = Date.now() - s.ratedAt.getTime() > RATE_TTL_MS;
@@ -787,8 +795,10 @@ export async function buyLabel(
           })
         ).label
       : null;
-    if (!found && plan.expired) {
+    if (!found && (plan.expired || opts.readBackOnly)) {
       await settleBuy(ctx, input.shipmentId, "not_done");
+      if (opts.readBackOnly)
+        return withTenant(ctx.companyId, (tx) => getShipment(tx, ctx, input.shipmentId));
       throw rateExpired();
     }
     label = found ?? (await adapter.buy(plan.req));
@@ -851,7 +861,16 @@ async function recordLabel(
   const pack = (await orderPacks(tx, [order.id])).get(order.id);
   const itemIds = pack?.itemIds ?? s.orderItemIds;
   const settings = await settingsRow(tx, ctx);
-  const needsPush = settings.trackingPushEnabled && !NO_PUSH_CHANNELS.has(order.channel);
+  // A unit of this package was cancelled while the label was being bought: never push it, the
+  // `order.cancelled` job voids it.
+  const cancelled = s.orderItemIds.length
+    ? await tx
+        .select({ id: orderItems.id })
+        .from(orderItems)
+        .where(and(inArray(orderItems.id, s.orderItemIds), eq(orderItems.state, "cancelled")))
+    : [];
+  const needsPush =
+    settings.trackingPushEnabled && !NO_PUSH_CHANNELS.has(order.channel) && !cancelled.length;
   const now = new Date();
   await tx
     .insert(labels)
@@ -887,7 +906,7 @@ async function recordLabel(
       orderItemIds: itemIds,
       trackingPushStatus: needsPush ? "pending" : "not_required",
       trackingPushAttempts: 0,
-      trackingPushError: null,
+      trackingPushError: cancelled.length ? "Cancelled: the label is being voided" : null,
       labeledAt: now,
       voidedAt: null,
     })
@@ -913,7 +932,7 @@ async function recordLabel(
     trackingCode: label.trackingCode,
     carrier: quote.carrier,
   });
-  if (!needsPush) await shipItems(tx, ctx.actor, itemIds, "label bought (no tracking push needed)");
+  // Units stay packed until tracking is pushed or the carrier scans the package (R11).
   afterCommit(tx, () =>
     publish(ctx.companyId, {
       type: "shipment.updated",
@@ -967,6 +986,7 @@ export async function batchBuy(
   },
 ): Promise<BatchBuyResult> {
   const { job, strategy } = await withTenant(ctx.companyId, async (tx) => {
+    await assertPaidActionAllowed(tx, ctx);
     const settings = await settingsRow(tx, ctx);
     const job = await createJobRow(tx, ctx, "batch_labels", { orderIds: input.orderIds });
     return { job, strategy: input.strategy ?? settings.defaultStrategy };
@@ -1096,75 +1116,177 @@ export async function batchLabelPdf(
 
 /* ----------------------------------- void ---------------------------------- */
 
+/** A `voiding` shipment whose refund call started this recently may still be in flight. */
+export const VOID_IN_FLIGHT_MS = 2 * 60_000;
+
+const voidRejected = (detail: string) =>
+  new ORPCError("VOID_REJECTED", {
+    status: 409,
+    message: "Carrier refused the void",
+    data: { detail },
+  });
+
+type VoidPlan =
+  | { kind: "done" }
+  | {
+      kind: "call";
+      resume: boolean;
+      carrierShipmentId: string | null;
+      trackingCode: string | null;
+    };
+
+/**
+ * Void a label (refund through the carrier), once. Works until the package ships: while its
+ * units are packed and no tracking was sent to the channel. Tx 1 records the intent
+ * (`voiding`), the carrier refund runs with no transaction open, and tx 2 records the void. A
+ * retry of a `voiding` shipment reads the carrier back first. A shipment being voided is never
+ * pushed.
+ */
 export async function voidShipment(
-  tx: Tx,
   ctx: TenantContext,
   input: { id: string; reason?: string | undefined },
-) {
-  const [s] = await tx.select().from(shipments).where(eq(shipments.id, input.id)).for("update");
-  if (!s) throw notFound("shipment", input.id);
-  if (s.status === "voided") return getShipment(tx, ctx, s.id);
-  const rejected = (detail: string) =>
-    new ORPCError("VOID_REJECTED", {
-      status: 409,
-      message: "Carrier refused the void",
-      data: { detail },
-    });
-  if (s.status !== "labeled") throw rejected(`a ${s.status} shipment can't be voided`);
-  const shipped = s.orderItemIds.length
-    ? await tx
-        .select({ id: orderItems.id })
-        .from(orderItems)
-        .where(
-          and(
-            inArray(orderItems.id, s.orderItemIds),
-            inArray(orderItems.state, ["shipped", "delivered"]),
-          ),
-        )
-    : [];
-  if (shipped.length) throw rejected("tracking was already pushed to the channel");
-  if (s.carrierShipmentId && s.trackingCode) {
-    let res: Awaited<ReturnType<ReturnType<typeof carrierAdapter>["void"]>>;
-    try {
-      res = await carrierAdapter().void({
-        companyId: ctx.companyId,
-        carrierShipmentId: s.carrierShipmentId,
-        trackingCode: s.trackingCode,
-      });
-    } catch (err) {
-      throw rejected(err instanceof Error ? err.message : String(err));
+): Promise<Shipment> {
+  const plan = await withTenant(ctx.companyId, async (tx): Promise<VoidPlan> => {
+    const [s] = await tx.select().from(shipments).where(eq(shipments.id, input.id)).for("update");
+    if (!s) throw notFound("shipment", input.id);
+    if (s.status === "voided") return { kind: "done" };
+    const resume = s.status === "voiding";
+    if (resume) {
+      const since = s.voidAttemptedAt ? Date.now() - s.voidAttemptedAt.getTime() : null;
+      if (since !== null && since < VOID_IN_FLIGHT_MS)
+        throw conflict("This label is being voided right now. Check again in a minute.");
+    } else {
+      if (s.status === "buying")
+        throw conflict("A label is being bought for this order right now. Try again in a minute.");
+      if (s.status !== "labeled")
+        throw voidRejected(`a ${apiStatus(s.status)} shipment can't be voided`);
+      if (s.trackingPushStatus === "pushed")
+        throw voidRejected("tracking was already sent to the channel");
+      if (s.trackingPushStatus === "pushing")
+        throw conflict("Tracking is being sent to the channel right now. Try again in a minute.");
+      const shipped = s.orderItemIds.length
+        ? await tx
+            .select({ id: orderItems.id })
+            .from(orderItems)
+            .where(
+              and(
+                inArray(orderItems.id, s.orderItemIds),
+                inArray(orderItems.state, ["shipped", "delivered"]),
+              ),
+            )
+        : [];
+      if (shipped.length) throw voidRejected("the package already shipped");
     }
-    if (!res.ok) throw rejected(res.detail);
+    await tx
+      .update(shipments)
+      .set({ status: "voiding", voidAttemptedAt: new Date() })
+      .where(eq(shipments.id, s.id));
+    return {
+      kind: "call",
+      resume,
+      carrierShipmentId: s.carrierShipmentId,
+      trackingCode: s.trackingCode,
+    };
+  });
+  if (plan.kind === "done")
+    return withTenant(ctx.companyId, (tx) => getShipment(tx, ctx, input.id));
+
+  // Back to labeled when nothing was refunded; unknown stays `voiding` for a read-back.
+  const settle = (outcome: "not_done" | "unknown") =>
+    withTenant(ctx.companyId, (tx) =>
+      tx
+        .update(shipments)
+        .set(
+          outcome === "unknown"
+            ? { voidAttemptedAt: null }
+            : { status: "labeled", voidAttemptedAt: null },
+        )
+        .where(and(eq(shipments.id, input.id), eq(shipments.status, "voiding"))),
+    );
+
+  // No transaction and no row lock while the carrier is called.
+  let pending = false;
+  if (plan.carrierShipmentId && plan.trackingCode) {
+    const adapter = carrierAdapter();
+    let res: VoidResult;
+    try {
+      const back = plan.resume
+        ? await adapter.lookup({
+            companyId: ctx.companyId,
+            shipmentId: input.id,
+            carrierShipmentId: plan.carrierShipmentId,
+          })
+        : null;
+      const asked = back?.refundStatus;
+      res =
+        asked && asked !== "rejected" && asked !== "not_applicable"
+          ? { ok: true, pending: asked !== "refunded" }
+          : await adapter.void({
+              companyId: ctx.companyId,
+              carrierShipmentId: plan.carrierShipmentId,
+              trackingCode: plan.trackingCode,
+            });
+    } catch (err) {
+      const unknown = !(err instanceof CarrierError) || err.outcome === "unknown";
+      await settle(unknown ? "unknown" : "not_done");
+      const detail = err instanceof Error ? err.message : String(err);
+      log.warn("label void failed", { shipmentId: input.id, unknown, detail });
+      if (unknown)
+        throw new ORPCError("UPSTREAM_FAILED", {
+          status: 502,
+          message: "We couldn't confirm the void with the carrier. Void again to check.",
+          data: { service: "carrier", detail },
+        });
+      throw voidRejected(detail);
+    }
+    if (!res.ok) {
+      await settle("not_done");
+      throw voidRejected(res.detail);
+    }
+    pending = res.pending;
   }
+
+  return withTenant(ctx.companyId, async (tx) => {
+    const [s] = await tx.select().from(shipments).where(eq(shipments.id, input.id)).for("update");
+    if (s?.status === "voiding") await recordVoid(tx, ctx, s, pending, input.reason);
+    return getShipment(tx, ctx, input.id);
+  });
+}
+
+async function recordVoid(
+  tx: Tx,
+  ctx: TenantContext,
+  s: ShipmentRow,
+  pending: boolean,
+  reason: string | undefined,
+) {
   const now = new Date();
   await tx
     .update(labels)
-    .set({ status: "voided", voidedAt: now })
+    .set({ status: pending ? "refund_pending" : "voided", voidedAt: now })
     .where(and(eq(labels.shipmentId, s.id), eq(labels.status, "purchased")));
   await tx
     .update(shipments)
     .set({
       status: "voided",
       voidedAt: now,
+      voidAttemptedAt: null,
       trackingPushStatus: "not_required",
       trackingCode: null,
     })
     .where(eq(shipments.id, s.id));
-  await tx
-    .update(orderItems)
-    .set({ shipmentId: null })
-    .where(and(eq(orderItems.shipmentId, s.id)));
+  await tx.update(orderItems).set({ shipmentId: null }).where(eq(orderItems.shipmentId, s.id));
   await audit(tx, {
     companyId: ctx.companyId,
     actor: ctx.actor,
     action: "label.voided",
     entityType: "shipment",
     entityId: s.id,
-    summary: `Label ${s.trackingCode} voided${input.reason ? `: ${input.reason}` : ""}`,
+    summary: `Label ${s.trackingCode} voided${pending ? " (refund pending)" : ""}${reason ? `: ${reason}` : ""}`,
   });
   await emit(tx, ctx.companyId, "shipment.status_changed", {
     shipmentId: s.id,
-    from: s.status,
+    from: "labeled",
     to: "voided",
   });
   await emit(tx, ctx.companyId, "shipment.voided", { shipmentId: s.id, orderId: s.orderId });
@@ -1174,22 +1296,236 @@ export async function voidShipment(
       data: { shipmentId: s.id, orderId: s.orderId, status: "voided" },
     }).then(() => undefined),
   );
-  return getShipment(tx, ctx, s.id);
+}
+
+/* ------------------------- cancel and hold after a label --------------------- */
+
+/**
+ * Called by orders inside a cancel or hold transaction, before the units move. Locks the
+ * shipments that carry these units, so a tracking push can't start in between:
+ *   - cancel: refused when tracking was already sent or is being sent (a channel cancel is not
+ *     refused, the channel already cancelled). Otherwise the push is blocked and a quote is
+ *     dropped; the `order.cancelled` job voids the label outside the transaction.
+ *   - hold: refused while a push is in flight. The push checks holds when it runs and waits for
+ *     the release (`order.released` job).
+ */
+export async function guardShipmentsForItems(
+  tx: Tx,
+  _ctx: TenantContext,
+  itemIds: string[],
+  action: "cancel" | "channel_cancel" | "hold",
+) {
+  if (!itemIds.length) return;
+  const rows = await tx
+    .select()
+    .from(shipments)
+    .where(
+      and(
+        sql`${shipments.orderItemIds} && ${sql`array[${sql.join(
+          itemIds.map((id) => sql`${id}`),
+          sql`, `,
+        )}]::uuid[]`}`,
+        inArray(shipments.status, ["pending", "rated", "buying", "labeled", "voiding"]),
+      ),
+    )
+    .for("update");
+  for (const s of rows) {
+    const sending = s.trackingPushStatus === "pushing" || s.trackingPushStatus === "pushed";
+    if (action === "hold") {
+      if (s.trackingPushStatus === "pushing")
+        throw conflict(
+          "Tracking for this package is being sent to the channel right now. Try again in a minute.",
+        );
+      if (s.status === "labeled" && s.trackingPushStatus === "pending")
+        await tx
+          .update(shipments)
+          .set({ trackingPushError: "On hold: tracking is sent when the hold is released" })
+          .where(eq(shipments.id, s.id));
+      continue;
+    }
+    if (action === "cancel" && sending && s.status === "labeled")
+      throw conflict(
+        s.trackingPushStatus === "pushed"
+          ? "Tracking for this package was already sent to the channel, so it can't be cancelled here. Cancel or refund it on the channel."
+          : "Tracking for this package is being sent to the channel right now. Try again in a minute.",
+      );
+    if (s.status === "pending" || s.status === "rated") {
+      // The package changed: its quotes are stale.
+      await tx
+        .update(shipments)
+        .set({ status: "pending", rateQuotes: [], ratedAt: null })
+        .where(eq(shipments.id, s.id));
+    } else if (s.status === "labeled" && !sending) {
+      await tx
+        .update(shipments)
+        .set({
+          trackingPushStatus: "not_required",
+          trackingPushError: "Cancelled: the label is being voided",
+        })
+        .where(eq(shipments.id, s.id));
+    }
+  }
+}
+
+/**
+ * The `order.cancelled` job: void every label of the order that hasn't shipped. A buy still in
+ * flight is waited for ("retry"); a buy whose outcome is unknown is read back (never bought
+ * again) and voided if the carrier sold it.
+ */
+export async function voidCancelledLabels(
+  ctx: TenantContext,
+  orderId: string,
+): Promise<{ voided: number; failed: number; retry: boolean }> {
+  const rows = await withTenant(ctx.companyId, (tx) =>
+    tx
+      .select()
+      .from(shipments)
+      .where(
+        and(
+          eq(shipments.orderId, orderId),
+          inArray(shipments.status, ["buying", "labeled", "voiding"]),
+        ),
+      ),
+  );
+  const out = { voided: 0, failed: 0, retry: false };
+  for (const s of rows) {
+    try {
+      if (s.status === "buying") {
+        const since = s.buyAttemptedAt ? Date.now() - s.buyAttemptedAt.getTime() : null;
+        if (since !== null && since < BUY_IN_FLIGHT_MS) {
+          out.retry = true;
+          continue;
+        }
+        const resolved = await buyLabel(
+          ctx,
+          { shipmentId: s.id, rateId: s.selectedRateId ?? "" },
+          { readBackOnly: true },
+        );
+        if (resolved.status !== "labeled") continue;
+      }
+      await voidShipment(ctx, { id: s.id, reason: "order cancelled" });
+      out.voided += 1;
+    } catch (err) {
+      const code = (err as { code?: string }).code;
+      if (code === "CONFLICT" || code === "UPSTREAM_FAILED") {
+        out.retry = true;
+        continue;
+      }
+      out.failed += 1;
+      const detail = err instanceof Error ? err.message : String(err);
+      log.warn("label of a cancelled order not voided", { shipmentId: s.id, detail });
+      await withTenant(ctx.companyId, (tx) =>
+        audit(tx, {
+          companyId: ctx.companyId,
+          actor: ctx.actor,
+          action: "label.void_failed",
+          entityType: "shipment",
+          entityId: s.id,
+          summary: `The order was cancelled but its label couldn't be voided: ${detail}`,
+        }),
+      );
+    }
+  }
+  return out;
+}
+
+/** The `order.released` job: push the tracking a hold was holding back. */
+export async function pushReleasedShipments(ctx: TenantContext, orderId: string) {
+  const rows = await withTenant(ctx.companyId, (tx) =>
+    tx
+      .select({ id: shipments.id })
+      .from(shipments)
+      .where(
+        and(
+          eq(shipments.orderId, orderId),
+          inArray(shipments.status, LIVE_LABEL),
+          inArray(shipments.trackingPushStatus, ["pending", "pushing"]),
+        ),
+      ),
+  );
+  const outcomes = [];
+  for (const r of rows) outcomes.push(await pushTracking(ctx.companyId, ctx, r.id));
+  return outcomes;
 }
 
 /* ------------------------------- tracking push ------------------------------ */
 
 export const PUSH_MAX_ATTEMPTS = 5;
+/** A `pushing` shipment whose channel call started this recently may still be in flight. */
+export const PUSH_IN_FLIGHT_MS = 60_000;
+
+export type PushOutcome = "pushed" | "skipped" | "held" | "busy" | "retry" | "failed";
 
 /**
- * Push one shipment's tracking to its channel (B1's `pushTrackingForShipment`). On success the
- * items move packed -> shipped. Returns "retry" when the caller should try again later.
+ * Push one shipment's tracking to its channel, once per shipment and tracking code. Tx 1 checks
+ * the units at push time (cancelled units are left out, a held unit waits for its release) and
+ * records the intent (`pushing`); the channel is called with no transaction open; tx 2 records
+ * the result. Items move packed -> shipped only on a real push; for channels with no push
+ * (CSV-only, manual upload, push off) they ship on the carrier's first scan (`markInTransit`).
+ * "busy" and "retry" mean the caller should try again later.
  */
 export async function pushTracking(
   companyId: string,
   ctx: TenantContext,
   shipmentId: string,
-): Promise<"pushed" | "skipped" | "retry" | "failed"> {
+): Promise<PushOutcome> {
+  const plan = await withTenant(companyId, async (tx) => {
+    const [s] = await tx.select().from(shipments).where(eq(shipments.id, shipmentId)).for("update");
+    if (s && BUSY.includes(s.status)) return { kind: "busy" as const };
+    if (!s?.trackingCode || !LIVE_LABEL.includes(s.status)) return { kind: "skipped" as const };
+    if (s.trackingPushStatus === "pushed" || s.trackingPushStatus === "not_required")
+      return { kind: "skipped" as const };
+    if (
+      s.trackingPushStatus === "pushing" &&
+      s.pushAttemptedAt &&
+      Date.now() - s.pushAttemptedAt.getTime() < PUSH_IN_FLIGHT_MS
+    )
+      return { kind: "busy" as const };
+    const items = s.orderItemIds.length
+      ? await tx
+          .select({ id: orderItems.id, state: orderItems.state })
+          .from(orderItems)
+          .where(inArray(orderItems.id, s.orderItemIds))
+      : [];
+    const live = items.filter((i) => i.state !== "cancelled");
+    if (!live.length) {
+      await tx
+        .update(shipments)
+        .set({
+          trackingPushStatus: "not_required",
+          pushAttemptedAt: null,
+          trackingPushError: "Every unit was cancelled",
+        })
+        .where(eq(shipments.id, s.id));
+      return { kind: "skipped" as const };
+    }
+    if (live.some((i) => i.state === "on_hold")) {
+      await tx
+        .update(shipments)
+        .set({
+          trackingPushStatus: "pending",
+          pushAttemptedAt: null,
+          trackingPushError: "On hold: tracking is sent when the hold is released",
+        })
+        .where(eq(shipments.id, s.id));
+      return { kind: "held" as const };
+    }
+    await tx
+      .update(shipments)
+      .set({ trackingPushStatus: "pushing", pushAttemptedAt: new Date() })
+      .where(eq(shipments.id, s.id));
+    return { kind: "push" as const, itemIds: live.map((i) => i.id) };
+  });
+  if (plan.kind !== "push") return plan.kind;
+
+  // No transaction and no row lock while the channel is called.
+  let res: Awaited<ReturnType<typeof pushTrackingForShipment>>;
+  try {
+    res = await pushTrackingForShipment(ctx, shipmentId, plan.itemIds);
+  } catch (err) {
+    return recordPushFailure(companyId, shipmentId, err);
+  }
+
   try {
     return await withTenant(companyId, async (tx) => {
       const [s] = await tx
@@ -1197,71 +1533,89 @@ export async function pushTracking(
         .from(shipments)
         .where(eq(shipments.id, shipmentId))
         .for("update");
-      if (!s?.trackingCode || !LIVE_LABEL.includes(s.status)) return "skipped" as const;
-      if (s.trackingPushStatus === "pushed" || s.trackingPushStatus === "not_required")
-        return "skipped" as const;
-      const res = await pushTrackingForShipment(tx, ctx, shipmentId);
-      const now = new Date();
+      if (s?.trackingPushStatus !== "pushing") return "skipped" as const;
+      const pushed = res.status === "pushed";
       await tx
         .update(shipments)
         .set({
-          trackingPushStatus: res.status === "pushed" ? "pushed" : "not_required",
-          trackingPushedAt: res.status === "pushed" ? now : null,
+          trackingPushStatus: pushed ? "pushed" : "not_required",
+          trackingPushedAt: pushed ? new Date() : null,
+          pushAttemptedAt: null,
           trackingPushAttempts: s.trackingPushAttempts + 1,
           trackingPushError:
             res.status === "manual"
               ? (res.message ?? "Upload tracking on the channel by hand")
-              : null,
+              : res.status === "not_required"
+                ? res.message
+                : null,
         })
         .where(eq(shipments.id, s.id));
-      if (res.status === "pushed")
+      if (pushed) {
         await emit(tx, companyId, "tracking.pushed", {
           shipmentId: s.id,
           connectionId: res.connectionId,
         });
-      await shipItems(tx, ctx.actor, s.orderItemIds, `tracking ${res.status}`);
+        await shipItems(tx, ctx.actor, plan.itemIds, "tracking pushed");
+      }
       afterCommit(tx, () =>
         publish(companyId, {
           type: "shipment.updated",
-          data: { shipmentId: s.id, orderId: s.orderId, status: s.status },
+          data: { shipmentId: s.id, orderId: s.orderId, status: apiStatus(s.status) },
         }).then(() => undefined),
       );
-      return "pushed" as const;
+      return pushed ? ("pushed" as const) : ("skipped" as const);
     });
   } catch (err) {
-    const error = err instanceof Error ? err.message : String(err);
-    return withTenant(companyId, async (tx) => {
-      const [s] = await tx
-        .select()
-        .from(shipments)
-        .where(eq(shipments.id, shipmentId))
-        .for("update");
-      if (!s) return "failed" as const;
-      const attempts = s.trackingPushAttempts + 1;
-      const final = attempts >= PUSH_MAX_ATTEMPTS;
-      await tx
-        .update(shipments)
-        .set({
-          trackingPushAttempts: attempts,
-          trackingPushError: error,
-          trackingPushStatus: final ? "failed" : "pending",
-        })
-        .where(eq(shipments.id, s.id));
-      const [o] = await tx
-        .select({ connectionId: orders.connectionId })
-        .from(orders)
-        .where(eq(orders.id, s.orderId));
-      if (final && o)
-        await emit(tx, companyId, "tracking.push_failed", {
-          shipmentId: s.id,
-          connectionId: o.connectionId,
-          error,
-          attempts,
-        });
-      log.warn("tracking push failed", { shipmentId, attempts, error });
-      return final ? ("failed" as const) : ("retry" as const);
+    // The channel has the tracking but we couldn't record it: clear the in-flight mark so the
+    // next attempt goes again at once (the channel call is safe to repeat, see above).
+    log.error("tracking pushed but saving it failed", {
+      shipmentId,
+      error: err instanceof Error ? err.message : String(err),
     });
+    await withTenant(companyId, (tx) =>
+      tx
+        .update(shipments)
+        .set({ pushAttemptedAt: null })
+        .where(and(eq(shipments.id, shipmentId), eq(shipments.trackingPushStatus, "pushing"))),
+    ).catch(() => {});
+    return "retry";
   }
+}
+
+async function recordPushFailure(
+  companyId: string,
+  shipmentId: string,
+  err: unknown,
+): Promise<PushOutcome> {
+  const error = err instanceof Error ? err.message : String(err);
+  return withTenant(companyId, async (tx) => {
+    const [s] = await tx.select().from(shipments).where(eq(shipments.id, shipmentId)).for("update");
+    if (!s) return "failed" as const;
+    const attempts = s.trackingPushAttempts + 1;
+    const final = attempts >= PUSH_MAX_ATTEMPTS;
+    await tx
+      .update(shipments)
+      .set({
+        trackingPushAttempts: attempts,
+        trackingPushError: error,
+        trackingPushStatus: final ? "failed" : "pending",
+        pushAttemptedAt: null,
+      })
+      .where(eq(shipments.id, s.id));
+    const [o] = await tx
+      .select({ connectionId: orders.connectionId })
+      .from(orders)
+      .where(eq(orders.id, s.orderId));
+    if (final && o)
+      await emit(tx, companyId, "tracking.push_failed", {
+        shipmentId: s.id,
+        connectionId: o.connectionId,
+        error,
+        attempts,
+      });
+    log.warn("tracking push failed", { shipmentId, attempts, error });
+    return final ? ("failed" as const) : ("retry" as const);
+  });
 }
 
 type PushRow = { s: ShipmentRow; orderNo: string; channel: Shipment["channel"] };
@@ -1311,7 +1665,13 @@ export async function resetTrackingPush(tx: Tx, _ctx: TenantContext, shipmentId:
   if (!s) throw notFound("shipment", shipmentId);
   if (!s.trackingCode || !LIVE_LABEL.includes(s.status))
     throw conflict("Shipment has no live label");
-  if (s.trackingPushStatus !== "pushed")
+  // A `pushing` shipment keeps its state: the next attempt resumes it (or waits while in flight).
+  if (s.trackingPushStatus === "pushing")
+    await tx
+      .update(shipments)
+      .set({ trackingPushAttempts: 0, trackingPushError: null })
+      .where(eq(shipments.id, s.id));
+  else if (s.trackingPushStatus !== "pushed")
     await tx
       .update(shipments)
       .set({ trackingPushStatus: "pending", trackingPushAttempts: 0, trackingPushError: null })
@@ -1334,6 +1694,9 @@ export async function markInTransit(tx: Tx, ctx: TenantContext, shipmentId: stri
     .update(shipments)
     .set({ status: "in_transit", trackingStatus: "in_transit" })
     .where(eq(shipments.id, s.id));
+  // The carrier's first scan ships the units even when no tracking was pushed (CSV-only and
+  // manual-upload channels, push off): marketplace clocks run on the scan (research 10 R11).
+  await shipItems(tx, ctx.actor, s.orderItemIds, "carrier accepted the package");
   await emit(tx, ctx.companyId, "shipment.status_changed", {
     shipmentId: s.id,
     from: "labeled",
@@ -1363,6 +1726,7 @@ export async function markDelivered(
     .update(shipments)
     .set({ status: "delivered", trackingStatus: "delivered", deliveredAt: at })
     .where(eq(shipments.id, s.id));
+  await shipItems(tx, ctx.actor, s.orderItemIds, "carrier delivered");
   const items = s.orderItemIds.length
     ? await tx
         .select({ id: orderItems.id, state: orderItems.state })

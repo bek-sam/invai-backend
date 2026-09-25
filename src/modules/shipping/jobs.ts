@@ -9,7 +9,9 @@ import {
   markDelivered,
   markInTransit,
   PUSH_MAX_ATTEMPTS,
+  pushReleasedShipments,
   pushTracking,
+  voidCancelledLabels,
 } from "./service";
 
 /**
@@ -28,7 +30,9 @@ export const pushTrackingJob = defineJob({
   options: { attempts: PUSH_MAX_ATTEMPTS, backoff: { type: "exponential", delay: 5_000 } },
   handler: async ({ companyId, shipmentId }) => {
     const outcome = await pushTracking(companyId, systemContext(companyId), shipmentId);
-    if (outcome === "retry") throw new Error(`tracking push for ${shipmentId} will be retried`);
+    // "held" is not retried: the `order.released` job pushes it after the hold.
+    if (outcome === "retry" || outcome === "busy")
+      throw new Error(`tracking push for ${shipmentId} will be retried (${outcome})`);
     return { outcome };
   },
 });
@@ -37,6 +41,46 @@ onEvent("shipment.labeled", pushTrackingJob, (e) => ({
   companyId: e.companyId,
   shipmentId: String(e.payload.shipmentId),
   attempt: 0,
+}));
+
+/**
+ * An order (or some of its units) was cancelled: void its labels that haven't shipped (the
+ * cancel already blocked their tracking push). Retries while a buy or void is in flight.
+ */
+export const voidCancelledLabelsJob = defineJob({
+  queue: "ship",
+  name: "shipping.voidCancelledLabels",
+  input: z.object({ companyId: z.uuid(), orderId: z.uuid() }),
+  options: { attempts: 8, backoff: { type: "exponential", delay: 5_000 } },
+  handler: async ({ companyId, orderId }) => {
+    const out = await voidCancelledLabels(systemContext(companyId), orderId);
+    if (out.retry) throw new Error(`labels of cancelled order ${orderId}: will retry`);
+    return out;
+  },
+});
+
+onEvent("order.cancelled", voidCancelledLabelsJob, (e) => ({
+  companyId: e.companyId,
+  orderId: String(e.payload.orderId),
+}));
+
+/** A hold was released: push the tracking it held back. */
+export const pushReleasedJob = defineJob({
+  queue: "ship",
+  name: "shipping.pushReleased",
+  input: z.object({ companyId: z.uuid(), orderId: z.uuid() }),
+  options: { attempts: PUSH_MAX_ATTEMPTS, backoff: { type: "exponential", delay: 5_000 } },
+  handler: async ({ companyId, orderId }) => {
+    const outcomes = await pushReleasedShipments(systemContext(companyId), orderId);
+    if (outcomes.some((o) => o === "retry" || o === "busy"))
+      throw new Error(`tracking push after release of ${orderId}: will retry`);
+    return { outcomes };
+  },
+});
+
+onEvent("order.released", pushReleasedJob, (e) => ({
+  companyId: e.companyId,
+  orderId: String(e.payload.orderId),
 }));
 
 /** Mock carrier only: simulate the package moving and arriving. */

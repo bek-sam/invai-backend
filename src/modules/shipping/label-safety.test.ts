@@ -1,7 +1,7 @@
 import { and, eq } from "drizzle-orm";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { withSystem, withTenant } from "../../db/client";
-import { buyerPii, labels, orders, shipments } from "../../db/schema";
+import { buyerPii, labels, orders, shipments, subscriptions } from "../../db/schema";
 import type { BuyRequest, CarrierAdapter, PurchasedLabel } from "../../integrations/carriers";
 import * as carriersModule from "../../integrations/carriers";
 import * as outbox from "../../lib/outbox";
@@ -429,6 +429,45 @@ describe("label buy safety", () => {
           .where(and(eq(labels.shipmentId, shipmentId), eq(labels.status, "purchased"))),
       );
       expect(purchased).toHaveLength(1);
+    });
+
+    it("an expired trial can't buy a new label but can finish one already bought", async () => {
+      const fresh = await rated();
+      const pending = await rated();
+      await withSystem((tx) =>
+        tx
+          .update(shipments)
+          .set({ status: "buying", selectedRateId: pending.rateId, buyAttemptedAt: null })
+          .where(eq(shipments.id, pending.shipmentId)),
+      );
+      await withSystem((tx) =>
+        tx.insert(subscriptions).values({
+          companyId,
+          planKey: "trial",
+          status: "trialing",
+          trialEndsAt: new Date(Date.now() - 60_000),
+        }),
+      );
+      try {
+        await expect(
+          svc.buyLabel(ctx, { shipmentId: fresh.shipmentId, rateId: fresh.rateId }),
+        ).rejects.toMatchObject({ code: "PAYMENT_REQUIRED" });
+        await expect(svc.batchBuy(ctx, { orderIds: [fresh.order.id] })).rejects.toMatchObject({
+          code: "PAYMENT_REQUIRED",
+        });
+        expect(fake.calls.buy).toBe(0);
+        expect((await row(fresh.shipmentId)).status).toBe("rated");
+        // The carrier may already have charged for the pending one: finishing it is allowed.
+        const finished = await svc.buyLabel(ctx, {
+          shipmentId: pending.shipmentId,
+          rateId: pending.rateId,
+        });
+        expect(finished.status).toBe("labeled");
+      } finally {
+        await withSystem((tx) =>
+          tx.delete(subscriptions).where(eq(subscriptions.companyId, companyId)),
+        );
+      }
     });
 
     it("another company can't buy or read this shipment", async () => {

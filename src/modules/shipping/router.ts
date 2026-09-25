@@ -55,6 +55,6 @@ export const shippingRouter = authed.shipping.router({
     withTenant(tenant.companyId, (tx) => svc.batchLabelPdf(tx, tenant, input)),
   ),
   void: authed.shipping.void.handler(({ input, context: { tenant } }) =>
-    withTenant(tenant.companyId, (tx) => svc.voidShipment(tx, tenant, input)),
+    svc.voidShipment(tenant, input),
   ),
 });

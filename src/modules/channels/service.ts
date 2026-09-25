@@ -8,7 +8,7 @@ import {
 import { and, desc, eq, gt, inArray, sql } from "drizzle-orm";
 import type { z } from "zod";
 import type { TenantContext } from "../../api/context";
-import { type Tx, withSystem } from "../../db/client";
+import { type Tx, withSystem, withTenant } from "../../db/client";
 import {
   channelConnections,
   DEFAULT_CONNECTION_SETTINGS,
@@ -423,66 +423,86 @@ export type PushTrackingResult = {
 };
 
 /**
- * Push a labeled shipment's tracking to the order's channel. Called by the shipping module from
- * its push job. Returns `not_required` when the connection has tracking push off (or is
+ * Push a labeled shipment's tracking for the given units to the order's channel. The shipping
+ * module calls this with no transaction open, after it committed its own `pushing` intent: the
+ * reads run in one short transaction, the channel is called with none open, and the audit is
+ * written after. Returns `not_required` when the connection has tracking push off (or is
  * disconnected) and `manual` for channels without API access (the shop uploads it by hand).
  * Throws UPSTREAM_FAILED when the channel rejects it, so the caller can retry and record it.
+ * Adapters must be safe to call again after a lost answer: Shopify only fulfills lines that
+ * still have quantity remaining, so a retry doesn't notify the buyer twice.
  */
 export async function pushTrackingForShipment(
-  tx: Tx,
   ctx: TenantContext,
   shipmentId: string,
+  orderItemIds: string[],
 ): Promise<PushTrackingResult> {
-  const [shipment] = await tx.select().from(shipments).where(eq(shipments.id, shipmentId)).limit(1);
-  if (!shipment) throw notFound("shipment", shipmentId);
-  if (!shipment.trackingCode || !shipment.carrier)
-    throw badRequest("Shipment has no tracking code yet");
-  const [order] = await tx.select().from(orders).where(eq(orders.id, shipment.orderId)).limit(1);
-  if (!order) throw notFound("order", shipment.orderId);
-  const conn = await getConnectionRow(tx, order.connectionId);
-  if (conn.status === "disconnected" || !settingsOf(conn).pushTracking) {
+  const plan = await withTenant(ctx.companyId, async (tx) => {
+    const [shipment] = await tx
+      .select()
+      .from(shipments)
+      .where(eq(shipments.id, shipmentId))
+      .limit(1);
+    if (!shipment) throw notFound("shipment", shipmentId);
+    if (!shipment.trackingCode || !shipment.carrier)
+      throw badRequest("Shipment has no tracking code yet");
+    const [order] = await tx.select().from(orders).where(eq(orders.id, shipment.orderId)).limit(1);
+    if (!order) throw notFound("order", shipment.orderId);
+    const conn = await getConnectionRow(tx, order.connectionId);
+    if (conn.status === "disconnected" || !settingsOf(conn).pushTracking)
+      return { kind: "off" as const, connectionId: conn.id };
+    // Only the units the caller checked at push time, and never a cancelled one.
+    const items = orderItemIds.length
+      ? await tx
+          .select({ channelLineId: orderItems.channelLineId })
+          .from(orderItems)
+          .where(and(inArray(orderItems.id, orderItemIds), sql`${orderItems.state} <> 'cancelled'`))
+      : [];
+    const byLine = new Map<string, number>();
+    for (const i of items) byLine.set(i.channelLineId, (byLine.get(i.channelLineId) ?? 0) + 1);
+    return {
+      kind: "push" as const,
+      conn: toChannelConn(conn),
+      channel: conn.channel,
+      provider: conn.provider,
+      orderId: order.id,
+      push: {
+        channelOrderId: order.channelOrderId,
+        carrier: shipment.carrier,
+        trackingCode: shipment.trackingCode,
+        trackingUrl: shipment.trackingUrl,
+        items: [...byLine].map(([channelLineId, quantity]) => ({ channelLineId, quantity })),
+      },
+    };
+  });
+  if (plan.kind === "off") {
     return {
       status: "not_required",
-      connectionId: conn.id,
+      connectionId: plan.connectionId,
       externalId: null,
       message: "Tracking push is off for this channel",
     };
   }
 
-  const items = await tx
-    .select({ channelLineId: orderItems.channelLineId })
-    .from(orderItems)
-    .where(
-      shipment.orderItemIds.length
-        ? inArray(orderItems.id, shipment.orderItemIds)
-        : and(eq(orderItems.orderId, order.id), sql`${orderItems.state} <> 'cancelled'`),
-    );
-  const byLine = new Map<string, number>();
-  for (const i of items) byLine.set(i.channelLineId, (byLine.get(i.channelLineId) ?? 0) + 1);
-
-  const adapter = getChannelAdapter(conn.channel, conn.provider);
-  const result = await adapter.pushTracking(toChannelConn(conn), {
-    channelOrderId: order.channelOrderId,
-    carrier: shipment.carrier,
-    trackingCode: shipment.trackingCode,
-    trackingUrl: shipment.trackingUrl,
-    items: [...byLine].map(([channelLineId, quantity]) => ({ channelLineId, quantity })),
-  });
-  await audit(tx, {
-    companyId: ctx.companyId,
-    actor: ctx.actor,
-    action: "tracking.pushed",
-    entityType: "order",
-    entityId: order.id,
-    summary:
-      result.status === "pushed"
-        ? `Tracking ${shipment.trackingCode} pushed to ${CHANNEL_RULES[conn.channel].label}`
-        : (result.message ?? "Tracking needs a manual upload"),
-    data: { shipmentId, status: result.status, externalId: result.externalId },
-  });
+  const adapter = getChannelAdapter(plan.channel, plan.provider);
+  const result = await adapter.pushTracking(plan.conn, plan.push);
+  await withTenant(ctx.companyId, (tx) =>
+    audit(tx, {
+      companyId: ctx.companyId,
+      actor: ctx.actor,
+      action: "tracking.pushed",
+      entityType: "order",
+      entityId: plan.orderId,
+      summary:
+        result.status === "pushed"
+          ? `Tracking ${plan.push.trackingCode} pushed to ${CHANNEL_RULES[plan.channel].label}`
+          : (result.message ?? "Tracking needs a manual upload"),
+      data: { shipmentId, status: result.status, externalId: result.externalId },
+    }),
+  );
   return {
     status: result.status,
-    connectionId: conn.id,
+    connectionId: plan.conn.id,
     externalId: result.externalId,
     message: result.message,
   };
