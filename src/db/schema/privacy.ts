@@ -4,7 +4,11 @@ import { CHANNELS, channelConnections } from "./channels";
 import { companyId } from "./tenancy";
 
 /** Shopify compliance topics (https://shopify.dev/docs/apps/build/compliance/privacy-law-compliance). */
-export const PRIVACY_TOPICS = ["customers/data_request", "customers/redact", "shop/redact"] as const;
+export const PRIVACY_TOPICS = [
+  "customers/data_request",
+  "customers/redact",
+  "shop/redact",
+] as const;
 export const PRIVACY_REQUEST_STATUSES = ["open", "completed"] as const;
 
 /** The strictest clock: Shopify wants every compliance request completed within 30 days. */
