@@ -60,6 +60,13 @@ export const companies = pgTable("companies", {
   plan: text(enumText(PLAN_KEYS)).default("trial"),
   timezone: text().notNull().default("America/Phoenix"),
   demo: boolean().notNull().default(false),
+  /**
+   * Set on a user's own sample-data workspace (tenancy.demo.*): one per user, found by this
+   * column whichever real company the user started it from. Null for every real company.
+   */
+  demoOwnerUserId: uuid()
+    .unique()
+    .references(() => users.id, { onDelete: "cascade" }),
   settings: jsonObject<CompanySettings>(),
   ...timestamps,
 });
@@ -68,6 +75,10 @@ export type CompanySettings = {
   riskWindowHours?: number;
   itemsPerHour?: number;
   shiftEndHour?: number;
+  /** ISO time the setup checklist on Today was dismissed; absent = shown. */
+  onboardingDismissedAt?: string;
+  /** ISO time a demo workspace finished filling with sample data (tenancy.demo). */
+  demoSeededAt?: string;
 };
 
 export const sessions = pgTable(
