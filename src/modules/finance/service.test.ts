@@ -2,6 +2,7 @@ import { eq } from "drizzle-orm";
 import { beforeAll, describe, expect, it } from "vitest";
 import { withSystem, withTenant } from "../../db/client";
 import { adSpend, blankVariants, orderItems, orders, shipments } from "../../db/schema";
+import { getObject } from "../../lib/s3";
 import {
   createCompany,
   createConnection,
@@ -133,6 +134,77 @@ describe("finance service", () => {
     const after = await withTenant(companyId, (tx) => svc.orderProfit(tx, ctx, order.id));
     expect(after.refunds).toBe(2750);
     expect(after.blankCost).toBe(300);
+  });
+
+  it("exports the profit summary to CSV, matching the on-screen rows", async () => {
+    const conn = await createConnection(companyId, "shopify");
+    const { order } = await createOrder(companyId, conn.id, {
+      units: 1,
+      state: "shipped",
+      channel: "shopify",
+    });
+    await withSystem((tx) =>
+      tx
+        .update(orderItems)
+        .set({ blankVariantId: blankId, printWidthIn: 10, printHeightIn: 10 })
+        .where(eq(orderItems.orderId, order.id)),
+    );
+    await withTenant(companyId, (tx) => svc.recomputeProfit(tx, ctx, { orderIds: [order.id] }));
+
+    const period = {
+      from: new Date(Date.now() - 86400_000).toISOString(),
+      to: new Date(Date.now() + 86400_000).toISOString(),
+    };
+    const input: svc.ProfitInput = { dimension: "channel", period, channel: "shopify" };
+    const summary = await withTenant(companyId, (tx) => svc.getProfit(tx, ctx, input));
+    const { key } = await withTenant(companyId, (tx) => svc.exportProfitCsv(tx, ctx, input));
+    expect(key).toMatch(new RegExp(`^${companyId}/profit-export/`));
+
+    const csv = (await getObject(key)).toString("utf8");
+    const [header, ...rows] = csv.trim().split("\r\n");
+    expect(header?.split(",")).toEqual([
+      "key",
+      "label",
+      "orders",
+      "units",
+      "revenue",
+      "channelFees",
+      "blankCost",
+      "transferCost",
+      "labelCost",
+      "packagingCost",
+      "laborCost",
+      "adsCost",
+      "refunds",
+      "net",
+      "marginPct",
+    ]);
+    expect(rows).toHaveLength(summary.rows.length + 1); // + the totals row
+    const row = summary.rows[0];
+    expect(row).toBeDefined();
+    expect(rows[0]).toBe(
+      [
+        row?.key,
+        row?.label,
+        row?.orders,
+        row?.units,
+        ((row?.revenue ?? 0) / 100).toFixed(2),
+        ((row?.channelFees ?? 0) / 100).toFixed(2),
+        ((row?.blankCost ?? 0) / 100).toFixed(2),
+        ((row?.transferCost ?? 0) / 100).toFixed(2),
+        ((row?.labelCost ?? 0) / 100).toFixed(2),
+        ((row?.packagingCost ?? 0) / 100).toFixed(2),
+        ((row?.laborCost ?? 0) / 100).toFixed(2),
+        ((row?.adsCost ?? 0) / 100).toFixed(2),
+        ((row?.refunds ?? 0) / 100).toFixed(2),
+        ((row?.net ?? 0) / 100).toFixed(2),
+        row?.marginPct == null ? "" : (row.marginPct * 100).toFixed(1),
+      ].join(","),
+    );
+    const total = rows[rows.length - 1]?.split(",");
+    expect(total?.[0]).toBe("TOTAL");
+    expect(total?.[1]).toBe("Total");
+    expect(Number(total?.at(-2))).toBeCloseTo(summary.totals.net / 100, 2);
   });
 
   it("parses ad spend CSV values", () => {

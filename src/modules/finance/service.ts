@@ -29,12 +29,12 @@ import {
   transfers,
 } from "../../db/schema";
 import { audit } from "../../lib/audit";
-import { col, parseCsvObjects } from "../../lib/csv";
+import { col, parseCsvObjects, toCsv } from "../../lib/csv";
 import { badRequest, notFound } from "../../lib/errors";
 import { emit } from "../../lib/outbox";
 import { keyset, type PageInput } from "../../lib/pagination";
 import { publish } from "../../lib/realtime";
-import { getObject } from "../../lib/s3";
+import { getObject, objectKey, putObject } from "../../lib/s3";
 import {
   allocate,
   allocateAdSpend,
@@ -914,6 +914,65 @@ export async function getProfit(
     incomplete: (missing?.n ?? 0) > 0,
     computedAt: (computedAt ?? new Date()).toISOString(),
   };
+}
+
+/* ------------------------------ export csv ----------------------------------- */
+
+const PROFIT_CSV_MONEY_COLS = [
+  "revenue",
+  "channelFees",
+  "blankCost",
+  "transferCost",
+  "labelCost",
+  "packagingCost",
+  "laborCost",
+  "adsCost",
+  "refunds",
+  "net",
+] as const;
+const PROFIT_CSV_HEADERS = [
+  "key",
+  "label",
+  "orders",
+  "units",
+  ...PROFIT_CSV_MONEY_COLS,
+  "marginPct",
+];
+
+function profitCsvRow(row: {
+  key: string;
+  label: string;
+  orders: number | "";
+  units: number | "";
+}): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...row };
+  for (const c of PROFIT_CSV_MONEY_COLS) {
+    const cents = (row as unknown as Record<string, number>)[c] ?? 0;
+    out[c] = (cents / 100).toFixed(2);
+  }
+  const margin = (row as unknown as { marginPct: number | null }).marginPct;
+  out.marginPct = margin == null ? "" : (margin * 100).toFixed(1);
+  return out;
+}
+
+/**
+ * CSV export of a profit summary: the exact rows `getProfit` would render on screen for the same
+ * filters, plus a totals row. `finance.exportCsv` (wave 6 stub 7).
+ */
+export async function exportProfitCsv(
+  tx: Tx,
+  ctx: Pick<TenantContext, "companyId">,
+  input: ProfitInput,
+): Promise<{ key: string }> {
+  const summary = await getProfit(tx, ctx, input);
+  const rows = [
+    ...summary.rows.map(profitCsvRow),
+    profitCsvRow({ key: "TOTAL", label: "Total", orders: "", units: "", ...summary.totals }),
+  ];
+  const csv = toCsv(rows, [...PROFIT_CSV_HEADERS]);
+  const key = objectKey(ctx.companyId, "profit-export", "csv");
+  await putObject(key, csv, "text/csv");
+  return { key };
 }
 
 export async function orderProfit(

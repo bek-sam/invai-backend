@@ -1,6 +1,5 @@
 import { authed } from "../../api/orpc";
 import { afterCommit, withTenant } from "../../db/client";
-import { notImplemented } from "../../lib/errors";
 import { recomputeJob } from "./jobs";
 import * as svc from "./service";
 
@@ -34,9 +33,9 @@ export const financeRouter = authed.finance.router({
     withTenant(tenant.companyId, (tx) => svc.getProfit(tx, tenant, input)),
   ),
   // T-6-3 (wave 6 stub 7): same filters as `profit`, so the export matches what's on screen.
-  exportCsv: authed.finance.exportCsv.handler(() => {
-    throw notImplemented("finance.exportCsv");
-  }),
+  exportCsv: authed.finance.exportCsv.handler(({ input, context: { tenant } }) =>
+    withTenant(tenant.companyId, (tx) => svc.exportProfitCsv(tx, tenant, input)),
+  ),
   orderProfit: authed.finance.orderProfit.handler(({ input, context: { tenant } }) =>
     withTenant(tenant.companyId, (tx) => svc.orderProfit(tx, tenant, input.orderId)),
   ),
