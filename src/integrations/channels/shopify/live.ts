@@ -2,15 +2,16 @@ import type { NormalizedOrder } from "@invai/contracts";
 import { env } from "../../../env";
 import { upstream } from "../../../lib/errors";
 import { logger } from "../../../lib/log";
-import type { ChannelAdapter, ChannelConn } from "../types";
+import { type ChannelAdapter, type ChannelConn, normalizeAvailability } from "../types";
+import { shopifyGraphql } from "./client";
 import {
   cents,
   parseShopifyWebhook,
-  SHOPIFY_API_VERSION,
   SHOPIFY_SCOPES,
   SHOPIFY_WEBHOOK_TOPICS,
   verifyShopifyHmac,
 } from "./common";
+import { setShopifyAvailability } from "./inventory";
 
 const log = logger("channels.shopify");
 
@@ -19,51 +20,6 @@ const log = logger("channels.shopify");
  * page cursors, tracking goes through fulfillment orders + `fulfillmentCreate`, availability
  * through `inventorySetQuantities`. Access tokens are offline tokens from the OAuth install.
  */
-
-type GqlResponse<T> = {
-  data?: T;
-  errors?: { message: string }[];
-  extensions?: { cost?: { throttleStatus?: { currentlyAvailable: number } } };
-};
-
-export async function shopifyGraphql<T>(
-  conn: Pick<ChannelConn, "externalShopId" | "credentials">,
-  query: string,
-  variables: Record<string, unknown> = {},
-): Promise<T> {
-  const shop = conn.externalShopId;
-  const token = conn.credentials?.accessToken;
-  if (!shop || !token) throw upstream("Shopify", "connection has no access token; reconnect");
-  const url = `https://${shop}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "content-type": "application/json", "x-shopify-access-token": token },
-      body: JSON.stringify({ query, variables }),
-      signal: AbortSignal.timeout(30_000),
-    }).catch((err) => {
-      throw upstream("Shopify", err instanceof Error ? err.message : String(err));
-    });
-    if (res.status === 429) {
-      await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
-      continue;
-    }
-    if (res.status === 401 || res.status === 403)
-      throw upstream("Shopify", `access denied (${res.status}); reconnect the store`);
-    const json = (await res.json()) as GqlResponse<T>;
-    if (json.errors?.length) {
-      const throttled = json.errors.some((e) => /throttled/i.test(e.message));
-      if (throttled && attempt < 2) {
-        await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
-        continue;
-      }
-      throw upstream("Shopify", json.errors.map((e) => e.message).join("; "));
-    }
-    if (!json.data) throw upstream("Shopify", `empty response (${res.status})`);
-    return json.data;
-  }
-  throw upstream("Shopify", "rate limited");
-}
 
 const ORDERS_QUERY = /* GraphQL */ `
   query Orders($first: Int!, $after: String, $query: String) {
@@ -229,25 +185,6 @@ const FULFILLMENT_CREATE = /* GraphQL */ `
   }
 `;
 
-const VARIANT_BY_SKU = /* GraphQL */ `
-  query VariantBySku($query: String!) {
-    productVariants(first: 1, query: $query) { nodes { id sku inventoryItem { id } } }
-  }
-`;
-
-const INVENTORY_SET = /* GraphQL */ `
-  mutation InventorySet($input: InventorySetQuantitiesInput!) {
-    inventorySetQuantities(input: $input) {
-      inventoryAdjustmentGroup { id }
-      userErrors { field message code }
-    }
-  }
-`;
-
-const LOCATIONS_QUERY = /* GraphQL */ `
-  query { locations(first: 1, query: "active:true") { nodes { id } } }
-`;
-
 const WEBHOOK_CREATE = /* GraphQL */ `
   mutation WebhookCreate($topic: WebhookSubscriptionTopic!, $sub: WebhookSubscriptionInput!) {
     webhookSubscriptionCreate(topic: $topic, webhookSubscription: $sub) {
@@ -349,37 +286,8 @@ export const shopifyLive: ChannelAdapter = {
     };
   },
 
-  async setAvailability(conn, updates) {
-    let locationId = conn.credentials?.locationId ?? null;
-    if (!locationId) {
-      const loc = await shopifyGraphql<{ locations: { nodes: { id: string }[] } }>(
-        conn,
-        LOCATIONS_QUERY,
-      );
-      locationId = loc.locations.nodes[0]?.id ?? null;
-    }
-    if (!locationId) throw upstream("Shopify", "store has no active location");
-    const quantities: { inventoryItemId: string; locationId: string; quantity: number }[] = [];
-    for (const u of updates) {
-      const v = await shopifyGraphql<{
-        productVariants: { nodes: { inventoryItem: { id: string } }[] };
-      }>(conn, VARIANT_BY_SKU, { query: `sku:${JSON.stringify(u.channelSku)}` });
-      const item = v.productVariants.nodes[0]?.inventoryItem.id;
-      if (item)
-        quantities.push({ inventoryItemId: item, locationId, quantity: Math.max(0, u.quantity) });
-    }
-    if (quantities.length === 0) return { updated: 0 };
-    const res = await shopifyGraphql<{
-      inventorySetQuantities: { userErrors: { message: string }[] };
-    }>(conn, INVENTORY_SET, {
-      input: { name: "available", reason: "correction", ignoreCompareQuantity: true, quantities },
-    });
-    if (res.inventorySetQuantities.userErrors.length)
-      throw upstream(
-        "Shopify",
-        res.inventorySetQuantities.userErrors.map((e) => e.message).join("; "),
-      );
-    return { updated: quantities.length };
+  async setAvailability(conn, updates, opts) {
+    return setShopifyAvailability(conn, normalizeAvailability(updates), opts);
   },
 
   async verifyWebhook(headers, body) {

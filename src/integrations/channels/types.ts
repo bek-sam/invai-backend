@@ -51,7 +51,52 @@ export type TrackingPushResult = {
   message: string | null;
 };
 
-export type AvailabilityUpdate = { channelSku: string; quantity: number };
+/**
+ * One listing variant's availability to set on the channel (wave 3 agreed interface). Adapters
+ * never touch the database, so the caller passes the channel SKU it recorded for the variant.
+ */
+export type AvailabilityUpdate = {
+  /** Our `listing_variants.id`; results are keyed by it. */
+  listingVariantId: string;
+  channelSku: string;
+  /** The quantity to set (negative values are sent as 0). */
+  available: number;
+};
+
+/** @deprecated The pre-wave-3 shape; `normalizeAvailability` maps it. Remove once no caller uses it. */
+export type LegacyAvailabilityUpdate = { channelSku: string; quantity: number };
+
+export type SetAvailabilityOptions = {
+  /**
+   * Stable per push intent (e.g. stored with the push): a retry of the same push reuses it, so the
+   * channel applies it once. Omitted: a fresh key per call.
+   */
+  idempotencyKey?: string;
+};
+
+export type AvailabilityItemResult = {
+  listingVariantId: string;
+  /** `set`: the channel now holds `available`; `not_found`: no variant or no stock level there. */
+  status: "set" | "not_found" | "failed";
+  available: number | null;
+  message: string | null;
+};
+
+export type SetAvailabilityResult = {
+  updated: number;
+  /** Per listing variant (live adapters always fill it; channels without inventory sync omit it). */
+  results?: AvailabilityItemResult[];
+};
+
+export function normalizeAvailability(
+  updates: (AvailabilityUpdate | LegacyAvailabilityUpdate)[],
+): AvailabilityUpdate[] {
+  return updates.map((u) =>
+    "available" in u
+      ? u
+      : { listingVariantId: u.channelSku, channelSku: u.channelSku, available: u.quantity },
+  );
+}
 
 export type WebhookEvent =
   | { kind: "order_upsert"; topic: string; shopDomain: string | null; order: NormalizedOrder }
@@ -83,7 +128,15 @@ export interface ChannelAdapter {
   pendingApproval: boolean;
   fetchOrders(conn: ChannelConn): Promise<FetchOrdersResult>;
   pushTracking(conn: ChannelConn, push: TrackingPush): Promise<TrackingPushResult>;
-  setAvailability(conn: ChannelConn, updates: AvailabilityUpdate[]): Promise<{ updated: number }>;
+  /**
+   * Set available quantities on the channel. Shopify: compare-and-set (`changeFromQuantity` =
+   * the quantity just read) under an `@idempotent` key; a stale compare re-reads and retries once.
+   */
+  setAvailability(
+    conn: ChannelConn,
+    updates: (AvailabilityUpdate | LegacyAvailabilityUpdate)[],
+    opts?: SetAvailabilityOptions,
+  ): Promise<SetAvailabilityResult>;
   verifyWebhook(headers: HeaderBag, body: string, opts?: VerifyWebhookOptions): Promise<boolean>;
   parseWebhook(headers: HeaderBag, body: string): Promise<WebhookEvent>;
   /** Fetch one order by its channel id (webhook `order_ref` events). */

@@ -12,7 +12,7 @@ import {
   TEMPLATES,
 } from "../../../db/seed/data";
 import { logger } from "../../../lib/log";
-import type { ChannelAdapter } from "../types";
+import { type ChannelAdapter, normalizeAvailability } from "../types";
 import { parseShopifyWebhook, verifyShopifyHmac } from "./common";
 
 const log = logger("channels.shopify.mock");
@@ -122,8 +122,21 @@ export const shopifyMock: ChannelAdapter = {
     };
   },
 
-  async setAvailability(_conn, updates) {
-    return { updated: updates.length };
+  async setAvailability(conn, updates) {
+    const list = normalizeAvailability(updates);
+    log.info("mock shopify availability", {
+      connectionId: conn.id,
+      items: list.map((u) => ({ sku: u.channelSku, available: Math.max(0, u.available) })),
+    });
+    return {
+      updated: list.length,
+      results: list.map((u) => ({
+        listingVariantId: u.listingVariantId,
+        status: "set" as const,
+        available: Math.max(0, Math.trunc(u.available)),
+        message: null,
+      })),
+    };
   },
 
   async verifyWebhook(headers, body) {
