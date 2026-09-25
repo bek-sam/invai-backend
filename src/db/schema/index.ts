@@ -8,6 +8,7 @@ export * from "./finance";
 export * from "./inventory";
 export * from "./orders";
 export * from "./personalization";
+export * from "./privacy";
 export * from "./production";
 export * from "./shipping";
 export * from "./tenancy";

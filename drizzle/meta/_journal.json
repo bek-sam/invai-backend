@@ -99,6 +99,13 @@
       "when": 1790308374894,
       "tag": "0013_carriers_webhook_events",
       "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1790309012581,
+      "tag": "0014_privacy_requests",
+      "breakpoints": true
     }
   ]
 }
