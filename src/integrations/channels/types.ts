@@ -104,7 +104,8 @@ export type WebhookEvent =
   | { kind: "uninstalled"; topic: string; shopDomain: string | null }
   /** The webhook only names an order (Etsy): fetch it by id and trust the fetch, not the payload. */
   | { kind: "order_ref"; topic: string; shopDomain: string | null; channelOrderId: string }
-  | { kind: "ignored"; topic: string; shopDomain: string | null };
+  /** `reason` is logged and kept on the delivery record (no PII). */
+  | { kind: "ignored"; topic: string; shopDomain: string | null; reason?: string };
 
 /** One order fetched by id: `order` null when the channel no longer has it. */
 export type FetchedOrder = { order: NormalizedOrder | null; cancelled: boolean };

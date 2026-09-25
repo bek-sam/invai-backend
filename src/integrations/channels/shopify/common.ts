@@ -59,6 +59,79 @@ export function verifyOAuthQuery(query: Record<string, string>, secret = shopify
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
+/*
+ * Which orders we produce (T-3-1, B-28/B-63). Only paid money ships: PAID, PARTIALLY_PAID and
+ * PARTIALLY_REFUNDED (paid, some refunded; the rest still ships) are imported. PENDING (this is
+ * also every cash-on-delivery order), AUTHORIZED and anything unknown are skipped and logged,
+ * and a later `orders/paid`/`orders/updated` or the poll imports the order once it is paid.
+ * REFUNDED, VOIDED and EXPIRED cancel whatever was imported. Values: REST `financial_status`
+ * (lowercase) and GraphQL `displayFinancialStatus` (uppercase).
+ * https://shopify.dev/docs/api/admin-graphql/latest/enums/OrderDisplayFinancialStatus
+ */
+export type PaymentDecision = "import" | "cancel" | "skip";
+
+export function paymentDecision(status: string | null | undefined): PaymentDecision {
+  switch ((status ?? "").toLowerCase()) {
+    case "paid":
+    case "partially_paid":
+    case "partially_refunded":
+      return "import";
+    case "refunded":
+    case "voided":
+    case "expired":
+      return "cancel";
+    default:
+      return "skip";
+  }
+}
+
+export type ShopifyAddressParts = {
+  name?: string | null;
+  company?: string | null;
+  address1?: string | null;
+  address2?: string | null;
+  city?: string | null;
+  state?: string | null;
+  zip?: string | null;
+  country?: string | null;
+  phone?: string | null;
+};
+
+const text = (v: string | null | undefined) => (v?.trim() ? v.trim() : null);
+
+/**
+ * The ship-to, or null when Shopify withheld it. Without protected customer data Level 2 the
+ * address fields come back null with HTTP 200; we never fill them with empty strings, so the order
+ * waits for an address instead of reaching a label.
+ * https://shopify.dev/docs/apps/launch/protected-customer-data
+ */
+export function shipToOf(a: ShopifyAddressParts | null | undefined, buyerName: string) {
+  if (!a) return null;
+  const street1 = text(a.address1);
+  const city = text(a.city);
+  const zip = text(a.zip);
+  const country = text(a.country);
+  if (!street1 || !city || !zip || !country) return null;
+  return {
+    name: text(a.name) ?? buyerName,
+    company: text(a.company),
+    street1,
+    street2: text(a.address2),
+    city,
+    state: text(a.state) ?? "",
+    zip,
+    country: country.slice(0, 2).toUpperCase(),
+    phone: text(a.phone),
+    email: null,
+  };
+}
+
+/**
+ * Display label when Shopify withheld the buyer's name. `NormalizedOrder.buyerName` and
+ * `buyer_pii.name` are required strings, so this is a label, not a made-up person.
+ */
+export const UNKNOWN_BUYER = "Shopify customer";
+
 export const cents = (amount: string | number | null | undefined) =>
   Math.round(Number(amount ?? 0) * 100) || 0;
 
@@ -87,6 +160,8 @@ export type RestOrder = {
   created_at: string;
   processed_at?: string | null;
   cancelled_at?: string | null;
+  updated_at?: string | null;
+  financial_status?: string | null;
   email?: string | null;
   contact_email?: string | null;
   note?: string | null;
@@ -106,6 +181,8 @@ export type RestOrder = {
     name?: string;
     variant_title?: string | null;
     quantity: number;
+    /** Quantity after order edits and removals (what is left to make). */
+    current_quantity?: number | null;
     price?: string;
     product_id?: number | string | null;
     variant_id?: number | string | null;
@@ -119,12 +196,15 @@ const email = (v: string | null | undefined) =>
 const isRushTitle = (t: string | null | undefined) =>
   !!t && /rush|express|overnight|priority/i.test(t);
 
+/** Units still ordered on a line: after edits (`current_quantity`) when Shopify sends it. */
+const restQuantity = (li: RestOrder["line_items"][number]) => li.current_quantity ?? li.quantity;
+
 export function restOrderToNormalized(o: RestOrder): NormalizedOrder {
   const a = o.shipping_address;
   const buyerName =
-    a?.name ||
-    [o.customer?.first_name, o.customer?.last_name].filter(Boolean).join(" ") ||
-    "Shopify customer";
+    text(a?.name) ||
+    [o.customer?.first_name, o.customer?.last_name].filter((v) => text(v)).join(" ") ||
+    UNKNOWN_BUYER;
   const shippingTitle = o.shipping_lines?.[0]?.title ?? null;
   const shipping =
     o.total_shipping_price_set?.shop_money?.amount !== undefined
@@ -139,20 +219,20 @@ export function restOrderToNormalized(o: RestOrder): NormalizedOrder {
     isRush: isRushTitle(shippingTitle),
     buyerName,
     buyerEmail: email(o.email ?? o.contact_email),
-    shipTo: a
-      ? {
-          name: buyerName,
-          company: a.company || null,
-          street1: a.address1 ?? "",
-          street2: a.address2 || null,
-          city: a.city ?? "",
-          state: a.province_code ?? a.province ?? "",
-          zip: a.zip ?? "",
-          country: (a.country_code ?? "US").slice(0, 2).toUpperCase(),
-          phone: a.phone || null,
-          email: null,
-        }
-      : null,
+    shipTo: shipToOf(
+      a && {
+        name: a.name,
+        company: a.company,
+        address1: a.address1,
+        address2: a.address2,
+        city: a.city,
+        state: a.province_code ?? a.province,
+        zip: a.zip,
+        country: a.country_code,
+        phone: a.phone,
+      },
+      buyerName,
+    ),
     shippingMethod: shippingTitle,
     totals: {
       subtotal: cents(o.subtotal_price),
@@ -163,14 +243,14 @@ export function restOrderToNormalized(o: RestOrder): NormalizedOrder {
     },
     buyerNote: o.note || null,
     items: o.line_items
-      .filter((li) => li.quantity > 0)
+      .filter((li) => restQuantity(li) > 0)
       .map((li) => ({
         channelLineId: String(li.id),
         channelSku: li.sku ?? "",
         channelListingId: li.product_id != null ? String(li.product_id) : null,
         title: li.title ?? li.name ?? "",
         variantTitle: li.variant_title || null,
-        quantity: li.quantity,
+        quantity: restQuantity(li),
         unitPrice: cents(li.price),
         personalization: (li.properties ?? [])
           .filter((p) => p.name && !p.name.startsWith("_"))
@@ -186,11 +266,30 @@ export function parseShopifyWebhook(headers: HeaderBag, body: string): WebhookEv
   switch (topic) {
     case "orders/create":
     case "orders/updated":
-    case "orders/paid":
+    case "orders/paid": {
+      const channelOrderId = String(payload.id);
       if (payload.cancelled_at)
-        return { kind: "order_cancelled", topic, shopDomain, channelOrderId: String(payload.id) };
-      if (!payload.line_items?.length) return { kind: "ignored", topic, shopDomain };
-      return { kind: "order_upsert", topic, shopDomain, order: restOrderToNormalized(payload) };
+        return { kind: "order_cancelled", topic, shopDomain, channelOrderId };
+      const decision = paymentDecision(payload.financial_status);
+      if (decision === "cancel")
+        return { kind: "order_cancelled", topic, shopDomain, channelOrderId };
+      if (decision === "skip")
+        return {
+          kind: "ignored",
+          topic,
+          shopDomain,
+          reason: `order ${channelOrderId} not paid (${payload.financial_status ?? "no financial_status"}); skipped`,
+        };
+      const order = restOrderToNormalized(payload);
+      if (!order.items.length)
+        return {
+          kind: "ignored",
+          topic,
+          shopDomain,
+          reason: `order ${channelOrderId} has no lines`,
+        };
+      return { kind: "order_upsert", topic, shopDomain, order };
+    }
     case "orders/cancelled":
       return { kind: "order_cancelled", topic, shopDomain, channelOrderId: String(payload.id) };
     case "app/uninstalled":

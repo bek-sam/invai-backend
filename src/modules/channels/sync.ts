@@ -455,7 +455,12 @@ async function handleWebhook(
   }
   const adapter = webhookAdapter(channel);
   const event = await adapter.parseWebhook(headers, body);
-  if (event.kind === "ignored") return skip(`topic ${event.topic} ignored`);
+  if (event.kind === "ignored") {
+    // e.g. an unpaid (pending, cash-on-delivery, authorized) Shopify order: logged, not imported.
+    if (event.reason)
+      log.info("webhook skipped", { channel, topic: event.topic, reason: event.reason });
+    return skip(event.reason ?? `topic ${event.topic} ignored`);
+  }
   if (!event.shopDomain) return skip("no shop domain");
   const live = await withSystem((tx) =>
     tx
