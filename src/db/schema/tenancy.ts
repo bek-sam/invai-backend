@@ -39,6 +39,11 @@ export const users = pgTable("users", {
   lastSeenAt: timestamp({ withTimezone: true }),
   /** Better Auth twoFactor plugin: true once the user confirmed an authenticator code. */
   twoFactorEnabled: boolean().notNull().default(false),
+  /**
+   * PIN-only floor staff: no password, no `accounts` row, so no web sign-in. Their `email` is a
+   * synthetic placeholder (`PIN_ONLY_EMAIL_DOMAIN`) that nothing may ever mail or display.
+   */
+  pinOnly: boolean().notNull().default(false),
   ...timestamps,
 });
 
@@ -201,7 +206,14 @@ export const invitations = pgTable(
       .references(() => users.id, { onDelete: "cascade" }),
     createdAt: createdAt(),
   },
-  (t) => [index().on(t.organizationId), index().on(t.email)],
+  (t) => [
+    index().on(t.organizationId),
+    index().on(t.email),
+    // One pending invite per company and email: a second invite resends the first.
+    uniqueIndex("invitations_pending_org_email_unique")
+      .on(t.organizationId, t.email)
+      .where(sql`${t.status} = 'pending'`),
+  ],
 );
 
 /** Every tenant table starts with this column. */

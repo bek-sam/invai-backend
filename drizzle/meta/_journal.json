@@ -127,6 +127,13 @@
       "when": 1790359950652,
       "tag": "0017_tenancy_demo_owner",
       "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1790360946798,
+      "tag": "0018_team_pin_only_invites",
+      "breakpoints": true
     }
   ]
 }

@@ -123,7 +123,7 @@ describe("team invites", () => {
     expect(mail.sent.at(-1)?.text).toContain(inv.id);
   });
 
-  it("removes the committed invitation when the email fails, and keeps an older link working", async () => {
+  it("a failed resend leaves the earlier invite and its link exactly as they were", async () => {
     const email = uniqEmail("retry");
     const first = await invite(email);
     mail.fail = true;
@@ -174,18 +174,85 @@ describe("team invites", () => {
     expect(await db.select().from(invitations).where(eq(invitations.email, email))).toHaveLength(0);
   });
 
-  it("re-inviting replaces the pending invitation; members can't be invited again", async () => {
+  it("re-inviting resends the one pending invite (new role, new expiry); members can't be invited again", async () => {
     const email = uniqEmail("again");
     const first = await invite(email);
+    await db
+      .update(invitations)
+      .set({ expiresAt: new Date(Date.now() + 86_400_000) })
+      .where(eq(invitations.id, first.id));
+    const sentBefore = mail.sent.length;
     const second = await invite(email, "presser");
+    expect(second).toMatchObject({ id: first.id, role: "presser", status: "invited" });
+    expect(mail.sent.length).toBe(sentBefore + 1);
+    expect(linkId(mail.sent.at(-1) as Sent)).toBe(first.id);
     const rows = await db.select().from(invitations).where(eq(invitations.email, email));
-    expect(rows.find((r) => r.id === first.id)?.status).toBe("canceled");
-    expect(rows.find((r) => r.id === second.id)).toMatchObject({
-      status: "pending",
-      role: "presser",
-    });
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ status: "pending", role: "presser" });
+    expect(rows[0]?.expiresAt?.getTime()).toBeGreaterThan(Date.now() + 6 * 86_400_000);
     const member = await createUser(companyId, "office", { email: uniqEmail("member") });
     await expect(invite(member.email)).rejects.toMatchObject({ code: "CONFLICT" });
+  });
+
+  it("the database allows one pending invite per company and email", async () => {
+    const email = uniqEmail("dup");
+    await invite(email);
+    await expect(
+      db.insert(invitations).values({
+        organizationId: companyId,
+        email,
+        role: "office",
+        status: "pending",
+        inviterId: owner.userId as string,
+      }),
+    ).rejects.toMatchObject({ cause: { code: "23505" } });
+    // Canceled and accepted rows don't count.
+    await db.insert(invitations).values({
+      organizationId: companyId,
+      email,
+      role: "office",
+      status: "canceled",
+      inviterId: owner.userId as string,
+    });
+  });
+
+  it("team.resend sends the invite again; team.revoke cancels it; both refuse non-invites", async () => {
+    const email = uniqEmail("resend");
+    const inv = await invite(email);
+    await db
+      .update(invitations)
+      .set({ expiresAt: new Date(Date.now() + 60_000) })
+      .where(eq(invitations.id, inv.id));
+    const resent = await svc.resendInvite(owner, inv.id);
+    expect(resent).toMatchObject({ id: inv.id, status: "invited", role: "office" });
+    expect(mail.sent.at(-1)?.to).toBe(email);
+    const [row] = await db.select().from(invitations).where(eq(invitations.id, inv.id));
+    expect(row?.expiresAt?.getTime()).toBeGreaterThan(Date.now() + 6 * 86_400_000);
+
+    expect(await withTenant(companyId, (tx) => svc.revokeInvite(tx, owner, inv.id))).toEqual({
+      ok: true,
+    });
+    expect(await invitePreview(inv.id)).toMatchObject({ status: "not_found" });
+    await expect(svc.resendInvite(owner, inv.id)).rejects.toMatchObject({ code: "NOT_INVITED" });
+    await expect(
+      withTenant(companyId, (tx) => svc.revokeInvite(tx, owner, inv.id)),
+    ).rejects.toMatchObject({ code: "NOT_INVITED" });
+    // A member is not an invitation.
+    await expect(svc.resendInvite(owner, owner.userId as string)).rejects.toMatchObject({
+      code: "NOT_INVITED",
+    });
+    // Revoking frees the email for a brand-new invite.
+    const again = await invite(email);
+    expect(again.id).not.toBe(inv.id);
+  });
+
+  it("an admin can't resend or revoke an owner invite", async () => {
+    const inv = await invite(uniqEmail("own"), "owner" as "office");
+    const admin = tenantContext(companyId, (await createUser(companyId, "admin")).id, "admin");
+    await expect(svc.resendInvite(admin, inv.id)).rejects.toMatchObject({ code: "FORBIDDEN" });
+    await expect(
+      withTenant(companyId, (tx) => svc.revokeInvite(tx, admin, inv.id)),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
   });
 
   it("the invitee signs up with the invited email and becomes an active member with that role", async () => {

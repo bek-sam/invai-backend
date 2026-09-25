@@ -3,7 +3,7 @@ import { stationTokenFromHeaders } from "../../api/context";
 import { authed, pub } from "../../api/orpc";
 import { auth } from "../../auth";
 import { withTenant } from "../../db/client";
-import { badRequest, forbidden, notImplemented, unauthorized } from "../../lib/errors";
+import { badRequest, forbidden, unauthorized } from "../../lib/errors";
 import { leaveDemo, resetDemo, startDemo } from "./demo";
 import { pinLogin, resolveStationToken, revokeFloorSession } from "./floor-auth";
 import * as svc from "./service";
@@ -61,14 +61,13 @@ export const teamRouter = authed.team.router({
   setPin: authed.team.setPin.handler(({ input, context: { tenant } }) =>
     withTenant(tenant.companyId, (tx) => svc.setUserPin(tx, tenant, input)),
   ),
-  // TODO(backend-foundation, T-5-4): implement per wave 5's contract-stub section 4
-  // (real partial-unique-index dedup on `invitations`).
-  resend: authed.team.resend.handler(() => {
-    throw notImplemented("team.resend");
-  }),
-  revoke: authed.team.revoke.handler(() => {
-    throw notImplemented("team.revoke");
-  }),
+  // Not wrapped in withTenant: it sends the email between two short transactions.
+  resend: authed.team.resend.handler(({ input, context: { tenant } }) =>
+    svc.resendInvite(tenant, input.userId),
+  ),
+  revoke: authed.team.revoke.handler(({ input, context: { tenant } }) =>
+    withTenant(tenant.companyId, (tx) => svc.revokeInvite(tx, tenant, input.userId)),
+  ),
 });
 
 export const locationsRouter = authed.locations.router({

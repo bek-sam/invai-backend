@@ -1,5 +1,6 @@
+import { randomUUID } from "node:crypto";
 import type { AuditEntry, Location, Me, Org, StationDevice, User } from "@invai/contracts";
-import { AUDIT_ACTIONS, ROLE_PERMISSIONS } from "@invai/contracts";
+import { AUDIT_ACTIONS, FLOOR_ROLES, ROLE_PERMISSIONS } from "@invai/contracts";
 import { and, asc, count, desc, eq, gte, inArray, lte, type SQL, sql } from "drizzle-orm";
 import type { Context, TenantContext } from "../../api/context";
 import { db, type Tx, withTenant } from "../../db/client";
@@ -14,13 +15,13 @@ import {
   stations,
   users,
 } from "../../db/schema";
+import { isPlaceholderEmail, PIN_ONLY_EMAIL_DOMAIN } from "../../integrations/vendors/mailer";
 import { audit } from "../../lib/audit";
-import { badRequest, conflict, forbidden, notFound, notImplemented } from "../../lib/errors";
+import { badRequest, conflict, forbidden, notFound, ORPCError } from "../../lib/errors";
 import { keyset, type PageInput } from "../../lib/pagination";
 import { assertWithinPlan } from "../billing/service";
 import { issueStationToken, revokeStationTokens, setPin } from "./floor-auth";
 import {
-  cancelPendingInvitations,
   inviteExpiry,
   inviteLink,
   inviteSenders,
@@ -65,7 +66,7 @@ function toUser(row: MemberRow): User {
     role: row.member.role,
     status: row.member.status,
     hasPin: row.hasPin,
-    pinOnly: false, // TODO(T-5-4): PIN-only staff
+    pinOnly: row.user.pinOnly,
     lastSeenAt: row.user.lastSeenAt?.toISOString() ?? null,
     createdAt: row.member.createdAt.toISOString(),
   };
@@ -237,27 +238,35 @@ async function pendingInvitation(tx: Tx, companyId: string, id: string) {
 }
 
 /**
- * team.invite: invite someone by email. A Better Auth invitation (no user row until they sign
- * up) and an email with /accept-invite/<id>; accepting makes them an active member with this role.
+ * team.invite: invite someone by email, or (`pinOnly`) add floor staff who only use a PIN.
+ *
+ * By email: a Better Auth invitation (no user row until they sign up) and an email with
+ * /accept-invite/<id>; accepting makes them an active member with this role. There is at most one
+ * pending invite per company and email (partial unique index), so inviting an email that already
+ * has one resends it (new expiry, the role asked for) instead of making a second.
  *
  * The email is sent with no transaction open, so a slow mail server never holds a pooled
  * connection or a row lock (idempotent-side-effect):
  *   1. `inviteUser` checks the team rules and commits a pending invitation (short transaction);
  *   2. the email is sent;
- *   3. on success a second short transaction replaces older invitations for this email and writes
- *      the audit row; on failure it deletes the new invitation and the call fails with
- *      UPSTREAM_FAILED, so "Invitation sent" always means sent.
+ *   3. on success a second short transaction writes the audit row; on failure a new invitation is
+ *      deleted (a resent one is left as it was) and the call fails with UPSTREAM_FAILED, so
+ *      "Invitation sent" always means sent.
  */
 export async function inviteTeammate(
   ctx: TenantContext,
   input: { email?: string; name: string; role: Role; pinOnly?: boolean },
 ): Promise<User> {
-  // TODO(T-5-4): PIN-only floor staff (no email) are built in T-5-4.
-  if (input.pinOnly || !input.email) throw notImplemented("team.invite with pinOnly");
+  if (input.pinOnly)
+    return withTenant(ctx.companyId, (tx) =>
+      addPinOnlyStaff(tx, ctx, { name: input.name, role: input.role }),
+    );
+  if (!input.email) throw badRequest("An email is required unless the teammate is PIN-only");
   const email = input.email;
   const invitation = await withTenant(ctx.companyId, (tx) =>
     inviteUser(tx, ctx, { email, name: input.name, role: input.role }),
   );
+  if (invitation.resent) return resendInvitation(ctx, invitation, input.role, input.name);
   const senders = await inviteSenders(ctx.companyId, ctx.userId);
   try {
     await sendInviteEmail(invitation.email, {
@@ -274,7 +283,6 @@ export async function inviteTeammate(
     throw err;
   }
   await withTenant(ctx.companyId, async (tx) => {
-    await cancelPendingInvitations(tx, ctx.companyId, invitation.email, invitation.id);
     // Before invitations were real, an invite made a member row that could never sign in.
     await tx
       .delete(members)
@@ -300,19 +308,25 @@ export async function inviteTeammate(
   return invitedUser(invitation, input.name);
 }
 
+const isUniqueViolation = (err: unknown) =>
+  (err as { cause?: { code?: string } }).cause?.code === "23505" ||
+  (err as { code?: string }).code === "23505";
+
 /**
- * Step 1 of `inviteTeammate`: check the team rules and write a pending invitation. Sends no
- * email; the router calls `inviteTeammate`, which sends it after this transaction commits.
+ * Step 1 of `inviteTeammate`: check the team rules and write a pending invitation, or return the
+ * pending one for this email with `resent: true` (the caller resends it). Sends no email; the
+ * router calls `inviteTeammate`, which sends it after this transaction commits.
  */
 export async function inviteUser(
   tx: Tx,
   ctx: TenantContext,
   input: { email: string; name: string; role: Role },
-): Promise<typeof invitations.$inferSelect> {
+): Promise<typeof invitations.$inferSelect & { resent: boolean }> {
   if (!ctx.userId) throw forbidden("team.manage", "Sign in as a person to invite teammates");
   assertRoleFitsOrg(ctx, input.role);
   assertCanManage(ctx, null, input.role);
   const email = input.email.trim().toLowerCase();
+  if (isPlaceholderEmail(email)) throw badRequest("That address can't receive email");
   // users carries no RLS (Better Auth table), so the app role can look it up directly.
   const [existing] = await tx
     .select({ status: members.status })
@@ -322,21 +336,158 @@ export async function inviteUser(
     .limit(1);
   if (existing && existing.status !== "invited")
     throw conflict("That person is already on the team");
-  // A pending invite holds a seat; re-inviting the same email replaces it, so it isn't counted.
+  const [pending] = await tx
+    .select()
+    .from(invitations)
+    .where(
+      and(
+        eq(invitations.organizationId, ctx.companyId),
+        eq(invitations.email, email),
+        eq(invitations.status, "pending"),
+      ),
+    )
+    .limit(1);
+  if (pending) {
+    assertCanManage(ctx, pending.role as Role, input.role);
+    return { ...pending, resent: true };
+  }
   await assertWithinPlan(tx, ctx, "users", 1, { exceptInviteEmail: email });
-  const [invitation] = await tx
-    .insert(invitations)
+  try {
+    const [invitation] = await tx
+      .insert(invitations)
+      .values({
+        organizationId: ctx.companyId,
+        email,
+        role: input.role,
+        status: "pending",
+        inviterId: ctx.userId,
+        expiresAt: inviteExpiry(STAFF_INVITE_DAYS),
+      })
+      .returning();
+    if (!invitation) throw new Error("invitation insert failed");
+    return { ...invitation, resent: false };
+  } catch (err) {
+    // Two invites for the same email at once: the index lets one through.
+    if (isUniqueViolation(err)) throw conflict("An earlier invite is still pending");
+    throw err;
+  }
+}
+
+/**
+ * Send a pending invitation's email again with a fresh expiry (and `role`, when a re-invite asks
+ * for another one). The row changes only after the email went out, so a failed send leaves the
+ * earlier invite exactly as it was.
+ */
+async function resendInvitation(
+  ctx: TenantContext,
+  invitation: typeof invitations.$inferSelect,
+  role: Role,
+  name?: string,
+): Promise<User> {
+  const expiresAt = inviteExpiry(STAFF_INVITE_DAYS);
+  const senders = await inviteSenders(ctx.companyId, ctx.userId);
+  await sendInviteEmail(invitation.email, {
+    ...senders,
+    kind: "staff",
+    role,
+    link: inviteLink(invitation.id),
+    expiresAt,
+  });
+  const row = await withTenant(ctx.companyId, async (tx) => {
+    const [row] = await tx
+      .update(invitations)
+      .set({ expiresAt, role })
+      .where(and(eq(invitations.id, invitation.id), eq(invitations.status, "pending")))
+      .returning();
+    if (!row) throw notInvited();
+    await audit(tx, {
+      companyId: ctx.companyId,
+      actor: ctx.actor,
+      action: "team.invite",
+      entityType: "invitation",
+      entityId: row.id,
+      summary: `Invite resent to ${row.email} as ${role}`,
+    });
+    return row;
+  });
+  return invitedUser(row, name);
+}
+
+const notInvited = () =>
+  new ORPCError("NOT_INVITED", {
+    status: 409,
+    message: "This teammate has no pending invitation",
+  });
+
+/** team.resend: send a pending invitation again (new expiry). `userId` is the invitation id. */
+export async function resendInvite(ctx: TenantContext, userId: string): Promise<User> {
+  const invitation = await withTenant(ctx.companyId, (tx) =>
+    pendingInvitation(tx, ctx.companyId, userId),
+  );
+  if (!invitation) throw notInvited();
+  assertCanManage(ctx, invitation.role as Role);
+  return resendInvitation(ctx, invitation, invitation.role as Role);
+}
+
+/** team.revoke: cancel a pending invitation; its link stops working and the seat is freed. */
+export async function revokeInvite(tx: Tx, ctx: TenantContext, userId: string) {
+  const invitation = await pendingInvitation(tx, ctx.companyId, userId);
+  if (!invitation) throw notInvited();
+  assertCanManage(ctx, invitation.role as Role);
+  await tx.update(invitations).set({ status: "canceled" }).where(eq(invitations.id, invitation.id));
+  await audit(tx, {
+    companyId: ctx.companyId,
+    actor: ctx.actor,
+    action: "team.deactivated",
+    entityType: "invitation",
+    entityId: invitation.id,
+    summary: `Invitation to ${invitation.email} revoked`,
+  });
+  return { ok: true as const };
+}
+
+/**
+ * team.invite with `pinOnly`: floor staff who sign in on a tablet with a PIN and never on the web.
+ * Better Auth's `users.email` is NOT NULL UNIQUE, so they get a synthetic, non-deliverable
+ * placeholder (`pin+<uuid>@floor.invai.internal`) that the mailer refuses and the web never shows.
+ * No `auth.api.signUpEmail`: no password, no `accounts` row (nothing to sign in with on the web),
+ * no verification mail. The caller sets the PIN next with `team.setPin`.
+ */
+export async function addPinOnlyStaff(
+  tx: Tx,
+  ctx: TenantContext,
+  input: { name: string; role: Role },
+): Promise<User> {
+  if (!ctx.userId) throw forbidden("team.manage", "Sign in as a person to add teammates");
+  if (!(FLOOR_ROLES as readonly string[]).includes(input.role))
+    throw badRequest("PIN-only staff must have a floor role (presser, packer or receiver)");
+  assertRoleFitsOrg(ctx, input.role);
+  const name = input.name.trim();
+  if (!name) throw badRequest("A name is required");
+  await assertWithinPlan(tx, ctx, "users", 1);
+  // users and members carry no RLS (Better Auth tables); scoped by company id explicitly.
+  const [user] = await tx
+    .insert(users)
     .values({
-      organizationId: ctx.companyId,
-      email,
-      role: input.role,
-      status: "pending",
-      inviterId: ctx.userId,
-      expiresAt: inviteExpiry(STAFF_INVITE_DAYS),
+      name,
+      email: `pin+${randomUUID()}@${PIN_ONLY_EMAIL_DOMAIN}`,
+      emailVerified: false,
+      pinOnly: true,
     })
-    .returning();
-  if (!invitation) throw new Error("invitation insert failed");
-  return invitation;
+    .returning({ id: users.id });
+  if (!user) throw new Error("user insert failed");
+  await tx
+    .insert(members)
+    .values({ organizationId: ctx.companyId, userId: user.id, role: input.role, status: "active" });
+  await audit(tx, {
+    companyId: ctx.companyId,
+    actor: ctx.actor,
+    action: "team.invite",
+    entityType: "user",
+    entityId: user.id,
+    summary: `${name} added as ${input.role} (PIN only)`,
+  });
+  return getMember(tx, ctx.companyId, user.id);
 }
 
 export async function changeRole(
@@ -361,6 +512,15 @@ export async function changeRole(
     return invitedUser(row);
   }
   assertCanManage(ctx, current, input.role);
+  if (!(FLOOR_ROLES as readonly string[]).includes(input.role)) {
+    const [target] = await tx
+      .select({ pinOnly: users.pinOnly })
+      .from(users)
+      .where(eq(users.id, input.userId))
+      .limit(1);
+    if (target?.pinOnly)
+      throw badRequest("PIN-only staff keep a floor role; invite them by email for web access");
+  }
   if (current === "owner" && input.role !== "owner" && (await activeOwnerCount(ctx.companyId)) <= 1)
     throw conflict("A company needs at least one owner");
   const [row] = await db
