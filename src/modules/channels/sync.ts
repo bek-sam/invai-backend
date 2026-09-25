@@ -7,6 +7,7 @@ import {
   importRuns,
   jobs,
   orders,
+  subscriptions,
   WEBHOOK_DELIVERY_RETENTION_MS,
   webhookDeliveries,
 } from "../../db/schema";
@@ -37,7 +38,7 @@ import { errorData, logger } from "../../lib/log";
 import { emit } from "../../lib/outbox";
 import { publish } from "../../lib/realtime";
 import { getObject, objectKey, putObject } from "../../lib/s3";
-import { assertWithinPlan } from "../billing/service";
+import { assertWithinPlan, effectiveStatus } from "../billing/service";
 import { markFileReady } from "../files/service";
 import { cancelFromChannel, importNormalizedOrders } from "../orders/import";
 import { handlePrivacyRequest } from "../privacy/service";
@@ -50,7 +51,6 @@ import {
   shopifyConnectedElsewhere,
   toChannelConn,
   toImportReport,
-  webhookFailureMessage,
 } from "./service";
 
 const log = logger("channels.sync");
@@ -285,10 +285,12 @@ export async function syncConnection(
     log.warn("sync failed", { companyId, connectionId, ...errorData(err) });
     await withTenant(companyId, async (tx) => {
       await markConnection(tx, conn.id, { kind: "error", error: message });
-      await emit(tx, companyId, "connection.sync_failed", {
-        connectionId,
-        error: message.slice(0, 500),
-      });
+      // Once per outage, not on every retry and every poll (B-99).
+      if (!pollFailing(conn))
+        await emit(tx, companyId, "connection.sync_failed", {
+          connectionId,
+          error: message.slice(0, 500),
+        });
     });
     await setJob(companyId, jobId, {
       status: "failed",
@@ -301,25 +303,66 @@ export async function syncConnection(
   }
 }
 
-/** API connections due for a poll (cross-tenant; the poll scheduler fans out per connection). */
-export async function pollableConnections() {
-  return withSystem((tx) =>
+/** A connection whose last poll failed (or that is in `error`) waits this long between tries. */
+export const POLL_ERROR_BACKOFF_MS = 60 * 60_000;
+
+/** True when the connection's most recent sync attempt failed. */
+export function pollFailing(
+  row: Pick<ConnectionRow, "status" | "lastErrorAt" | "lastPollAt">,
+): boolean {
+  if (row.status === "error") return true;
+  return !!row.lastErrorAt && (!row.lastPollAt || row.lastErrorAt > row.lastPollAt);
+}
+
+/**
+ * API connections due for a poll (cross-tenant; the poll scheduler fans out per connection).
+ * Skipped (B-99): auto-import off; channels whose API is pending marketplace approval (they can
+ * only fail); companies whose trial expired without a plan (imports are refused anyway); and a
+ * failing connection until POLL_ERROR_BACKOFF_MS after its last error, so a broken connection
+ * is retried hourly instead of failing (and alerting) every 10 minutes.
+ */
+export async function pollableConnections(now = new Date()) {
+  const rows = await withSystem((tx) =>
     tx
       .select({
         id: channelConnections.id,
         companyId: channelConnections.companyId,
+        channel: channelConnections.channel,
+        provider: channelConnections.provider,
+        status: channelConnections.status,
         settings: channelConnections.settings,
+        lastErrorAt: channelConnections.lastErrorAt,
+        lastPollAt: channelConnections.lastPollAt,
+        sub: {
+          status: subscriptions.status,
+          trialEndsAt: subscriptions.trialEndsAt,
+          stripeSubscriptionId: subscriptions.stripeSubscriptionId,
+        },
       })
       .from(channelConnections)
+      .leftJoin(subscriptions, eq(subscriptions.companyId, channelConnections.companyId))
       .where(
         and(
           eq(channelConnections.mode, "api"),
           inArray(channelConnections.status, ["connected", "error"]),
         ),
       ),
-  ).then((rows) =>
-    rows.filter((r) => (r.settings as { autoImport?: boolean })?.autoImport !== false),
   );
+  const seen = new Set<string>();
+  return rows.filter((r) => {
+    if (seen.has(r.id)) return false;
+    seen.add(r.id);
+    if ((r.settings as { autoImport?: boolean })?.autoImport === false) return false;
+    if (getChannelAdapter(r.channel, r.provider).pendingApproval) return false;
+    if (r.sub?.status && effectiveStatus(r.sub, now) === "trial_expired") return false;
+    if (
+      pollFailing(r) &&
+      r.lastErrorAt &&
+      now.getTime() - r.lastErrorAt.getTime() < POLL_ERROR_BACKOFF_MS
+    )
+      return false;
+    return true;
+  });
 }
 
 /* ------------------------------------ webhooks ------------------------------------ */
@@ -699,7 +742,6 @@ export async function completeShopifyOAuth(query: Record<string, string>) {
     channelWebhookUri("shopify"),
   );
   if (webhooks) credentials = { ...credentials, webhooks };
-  const degraded = webhookFailureMessage(webhooks);
   const isUniqueViolation = (err: unknown) =>
     (err as { cause?: { code?: string } }).cause?.code === "23505" ||
     (err as { code?: string }).code === "23505";
@@ -712,8 +754,8 @@ export async function completeShopifyOAuth(query: Record<string, string>) {
         externalShopId: shop,
         credentials: encryptJson(credentials),
         connectedAt: new Date(),
-        lastError: degraded,
-        lastErrorAt: degraded ? new Date() : null,
+        lastError: null,
+        lastErrorAt: null,
       })
       .where(eq(channelConnections.id, conn.id));
     await audit(tx, {

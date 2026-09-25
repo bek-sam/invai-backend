@@ -570,10 +570,8 @@ export async function checkWebhookSubscriptions() {
       const credentials = toChannelConn(cur).credentials ?? {};
       await tx
         .update(channelConnections)
-        .set({
-          credentials: encryptJson({ ...credentials, webhooks: state }),
-          ...(message ? { lastError: message, lastErrorAt: new Date() } : {}),
-        })
+        // Health reads the degraded state from here; lastError stays the poll's (backoff, B-99).
+        .set({ credentials: encryptJson({ ...credentials, webhooks: state }) })
         .where(eq(channelConnections.id, row.id));
     });
   }

@@ -1,7 +1,14 @@
 import { and, eq } from "drizzle-orm";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { withSystem, withTenant } from "../../db/client";
-import { auditLog, channelConnections, orders, webhookDeliveries } from "../../db/schema";
+import {
+  auditLog,
+  channelConnections,
+  orders,
+  outboxEvents,
+  subscriptions,
+  webhookDeliveries,
+} from "../../db/schema";
 import { mockShopifySubscriptions, signShopifyBody } from "../../integrations/channels/shopify";
 import type { ChannelCredentials } from "../../integrations/channels/types";
 import { decryptJson, encryptJson } from "../../lib/crypto";
@@ -15,7 +22,13 @@ import {
   refreshConnectionToken,
   refreshExpiringTokens,
 } from "./service";
-import { completeShopifyOAuth, processWebhook, recordWebhookDelivery } from "./sync";
+import {
+  completeShopifyOAuth,
+  pollableConnections,
+  processWebhook,
+  recordWebhookDelivery,
+  syncConnection,
+} from "./sync";
 
 const uniq = () => `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
 const orderId = () => String(7_000_000_000 + Math.floor(Math.random() * 900_000_000));
@@ -301,5 +314,67 @@ describe("Shopify token refresh (expiring offline tokens)", () => {
       (i) => i.connectionId === conn.id,
     );
     expect(item?.health.ok).toBe(false);
+  });
+});
+
+describe("the poller skips connections that can only fail (B-99)", () => {
+  const minutesAgo = (m: number) => new Date(Date.now() - m * 60_000);
+
+  it("skips pending-approval channels, failing connections inside the backoff and expired trials", async () => {
+    const co = (await createCompany()).id;
+    const ok = await shopifyConnection(co, `t31-${uniq()}.myshopify.com`);
+    const amazon = await shopifyConnection(co, `t31-amz-${uniq()}`, {
+      channel: "amazon",
+      status: "error",
+      lastError: "Amazon API access is pending marketplace approval; use CSV import",
+      lastErrorAt: minutesAgo(600),
+    });
+    const failingRecent = await shopifyConnection(co, `t31-${uniq()}.myshopify.com`, {
+      lastPollAt: minutesAgo(30),
+      lastErrorAt: minutesAgo(5),
+    });
+    const failingOld = await shopifyConnection(co, `t31-${uniq()}.myshopify.com`, {
+      lastPollAt: minutesAgo(300),
+      lastErrorAt: minutesAgo(90),
+    });
+    const recovered = await shopifyConnection(co, `t31-${uniq()}.myshopify.com`, {
+      lastErrorAt: minutesAgo(20),
+      lastPollAt: minutesAgo(5),
+    });
+    const expired = (await createCompany()).id;
+    await withSystem((tx) =>
+      tx.insert(subscriptions).values({
+        companyId: expired,
+        planKey: "trial",
+        status: "trialing",
+        trialEndsAt: minutesAgo(60),
+      }),
+    );
+    const expiredConn = await shopifyConnection(expired, `t31-${uniq()}.myshopify.com`);
+
+    const ids = new Set((await pollableConnections()).map((c) => c.id));
+    expect(ids.has(ok.id)).toBe(true);
+    expect(ids.has(recovered.id)).toBe(true);
+    expect(ids.has(failingOld.id)).toBe(true);
+    expect(ids.has(amazon.id)).toBe(false);
+    expect(ids.has(failingRecent.id)).toBe(false);
+    expect(ids.has(expiredConn.id)).toBe(false);
+  });
+
+  it("a failing connection emits sync_failed once per outage, not on every retry", async () => {
+    const co = (await createCompany()).id;
+    const conn = await shopifyConnection(co, `t31-amz-${uniq()}`, { channel: "amazon" });
+    await expect(syncConnection(co, conn.id)).rejects.toThrow();
+    await expect(syncConnection(co, conn.id)).rejects.toThrow();
+    await expect(syncConnection(co, conn.id)).rejects.toThrow();
+    const events = await withSystem((tx) =>
+      tx
+        .select()
+        .from(outboxEvents)
+        .where(
+          and(eq(outboxEvents.companyId, co), eq(outboxEvents.name, "connection.sync_failed")),
+        ),
+    );
+    expect(events).toHaveLength(1);
   });
 });
