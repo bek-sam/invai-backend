@@ -60,6 +60,41 @@ export const adSpend = pgTable(
   (t) => [index().on(t.companyId, t.channel, t.day), tenantPolicy("ad_spend")],
 ).enableRLS();
 
+/**
+ * T-7-2: dated refund ledger (contracts `RefundEvent`). A refund is attributed to its own
+ * date, not the order's `placedAt` (`profit_lines.refundsCents` can't do that -- see the wave
+ * 7 stub note). Shopify/CSV ingestion upserts by (companyId, channel, channelRefundId); manual
+ * entries (source "manual") have no channelRefundId, so the unique index (nulls excluded) never
+ * blocks them.
+ */
+export const refundEvents = pgTable(
+  "refund_events",
+  {
+    id: id(),
+    companyId: companyId(),
+    orderId: uuid()
+      .notNull()
+      .references(() => orders.id, { onDelete: "cascade" }),
+    /** null = order-level (e.g. a shipping refund), not tied to one item. */
+    orderItemId: uuid().references(() => orderItems.id, { onDelete: "cascade" }),
+    channel: text(enumText(CHANNELS)).notNull(),
+    source: text(enumText(["shopify", "csv", "manual"] as const)).notNull(),
+    amountCents: integer().notNull(),
+    feeRecoveredCents: integer().notNull().default(0),
+    /** Shopify refund id / CSV row ref; null for manual entries. */
+    channelRefundId: text(),
+    refundedAt: timestamp({ withTimezone: true }).notNull(),
+    note: text(),
+    ...timestamps,
+  },
+  (t) => [
+    uniqueIndex().on(t.companyId, t.channel, t.channelRefundId),
+    index().on(t.companyId, t.orderId),
+    index().on(t.companyId, t.refundedAt),
+    tenantPolicy("refund_events"),
+  ],
+).enableRLS();
+
 export const ESTIMATED_BUCKETS = [
   "channelFees",
   "blankCost",

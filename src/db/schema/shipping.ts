@@ -142,6 +142,13 @@ export const shipments = pgTable(
     labeledAt: timestamp({ withTimezone: true }),
     deliveredAt: timestamp({ withTimezone: true }),
     voidedAt: timestamp({ withTimezone: true }),
+    /**
+     * T-7-1: last time this shipment's tracking was included in a CSV tracking export
+     * (`shipping.exportTracking`). Separate from `trackingPushedAt` -- `manual` push status is
+     * already conflated with "pushed" in void logic (B-67, shipping/service.ts:1040); this is a
+     * distinct, re-settable timestamp that a re-export simply overwrites.
+     */
+    exportedAt: timestamp({ withTimezone: true }),
     ...timestamps,
   },
   (t) => [

@@ -144,6 +144,7 @@ export function gqlOrderToNormalized(o: GqlOrder): NormalizedOrder {
     channelOrderId: o.legacyResourceId,
     orderNo: o.name,
     placedAt: new Date(o.processedAt ?? o.createdAt).toISOString(),
+    sourceUpdatedAt: new Date(o.updatedAt).toISOString(),
     shipBy: null,
     isRush: !!title && /rush|express|overnight|priority/i.test(title),
     buyerName,

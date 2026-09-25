@@ -74,6 +74,7 @@ export function mockShopifyOrder(n: number, now = new Date()): NormalizedOrder {
     channelOrderId: String(6_200_000_000 + n),
     orderNo: `#${3000 + n}`,
     placedAt: new Date(now.getTime() - r.int(1, 20) * 60_000).toISOString(),
+    sourceUpdatedAt: null,
     shipBy: null,
     isRush: rush,
     buyerName: `${first} ${last}`,

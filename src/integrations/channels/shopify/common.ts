@@ -215,6 +215,7 @@ export function restOrderToNormalized(o: RestOrder): NormalizedOrder {
     channelOrderId: String(o.id),
     orderNo: o.name ?? `#${o.order_number ?? o.id}`,
     placedAt: new Date(o.processed_at ?? o.created_at).toISOString(),
+    sourceUpdatedAt: o.updated_at ? new Date(o.updated_at).toISOString() : null,
     shipBy: null,
     isRush: isRushTitle(shippingTitle),
     buyerName,

@@ -106,6 +106,7 @@ function order(lines: { sku: string; listing: string; qty?: number }[]): Normali
     channelOrderId: `t33-${seq}-${Date.now()}`,
     orderNo: `#T33-${seq}`,
     placedAt: new Date().toISOString(),
+    sourceUpdatedAt: null,
     shipBy: null,
     isRush: false,
     buyerName: "Test Buyer",
