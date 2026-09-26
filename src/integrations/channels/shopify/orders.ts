@@ -1,8 +1,9 @@
 import type { NormalizedOrder } from "@invai/contracts";
 import { logger } from "../../../lib/log";
-import type { ChannelConn, FetchOrdersResult } from "../types";
+import type { ChannelConn, ChannelRefund, FetchOrdersResult } from "../types";
 import { shopifyGraphql } from "./client";
 import { cents, paymentDecision, shipToOf, UNKNOWN_BUYER } from "./common";
+import { fetchOrderRefunds, hasRefunds } from "./refunds";
 
 const log = logger("channels.shopify.orders");
 
@@ -218,6 +219,7 @@ export async function fetchShopifyOrders(conn: ChannelConn): Promise<FetchOrders
   const orders: NormalizedOrder[] = [];
   const cancelled: string[] = [];
   const skipped: { id: string; status: string | null }[] = [];
+  const refunds: ChannelRefund[] = [];
   let after: string | null = null;
   let watermark = conn.cursor;
   for (let page = 0; page < MAX_PAGES; page++) {
@@ -229,6 +231,9 @@ export async function fetchShopifyOrders(conn: ChannelConn): Promise<FetchOrders
     );
     for (const o of data.orders.nodes) {
       if (!watermark || o.updatedAt > watermark) watermark = o.updatedAt;
+      // T-7-2: refunds after the sale (a fully refunded shipped order still cancels nothing).
+      if (hasRefunds(o.displayFinancialStatus))
+        refunds.push(...(await fetchOrderRefunds(conn, o.id, o.legacyResourceId)));
       const decision = o.cancelledAt ? "cancel" : paymentDecision(o.displayFinancialStatus);
       if (decision === "cancel") cancelled.push(o.legacyResourceId);
       else if (decision === "skip")
@@ -248,5 +253,5 @@ export async function fetchShopifyOrders(conn: ChannelConn): Promise<FetchOrders
       count: skipped.length,
       orders: skipped.slice(0, 20),
     });
-  return { orders, cancelledChannelOrderIds: cancelled, nextCursor: watermark };
+  return { orders, cancelledChannelOrderIds: cancelled, nextCursor: watermark, refunds };
 }

@@ -1,5 +1,6 @@
 import { CHANNEL_RULES, type Channel } from "@invai/contracts";
 import type { ChannelFeeTable } from "../../db/schema";
+import { type FeeCategory, referralFeeCents, referralPct, usesSchedule } from "./fees";
 
 /*
  * Pure profit math (no DB). Every amount is integer cents; splits use largest-remainder
@@ -126,25 +127,47 @@ export function feeTableFor(tables: FeeTable[], channel: Channel): FeeTable {
 /**
  * Fees for one order: transaction % on item + shipping revenue, payment processing % + fixed
  * on the buyer total, a per-order fee and the listing (renewal) fee per unit sold.
+ *
+ * T-7-2: on Amazon, Walmart and TikTok the transaction line is the channel's referral fee,
+ * charged per unit on the category/price tier (`fees.ts`), when `unitSales` is given and the
+ * shop still uses the default rate. `referralPerUnit` then lines up with `unitSales`.
  */
 export function orderFees(
   table: FeeTable,
-  input: { revenueCents: number; buyerTotalCents: number; units: number },
-): { total: number; lines: { label: string; amount: number }[] } {
+  input: {
+    revenueCents: number;
+    buyerTotalCents: number;
+    units: number;
+    unitSales?: { cents: number; category: FeeCategory }[];
+  },
+): { total: number; lines: { label: string; amount: number }[]; referralPerUnit: number[] | null } {
   const lines: { label: string; amount: number }[] = [];
   const add = (label: string, amount: number) => {
     const a = Math.round(amount);
     if (a > 0) lines.push({ label, amount: a });
   };
-  if (input.units <= 0) return { total: 0, lines };
-  add(`Transaction ${table.transactionPct}%`, (input.revenueCents * table.transactionPct) / 100);
+  if (input.units <= 0) return { total: 0, lines, referralPerUnit: null };
+  let referralPerUnit: number[] | null = null;
+  if (input.unitSales?.length && usesSchedule(table)) {
+    const channel = table.channel as Channel;
+    referralPerUnit = input.unitSales.map((u) => referralFeeCents(channel, u.category, u.cents));
+    const pcts = [
+      ...new Set(input.unitSales.map((u) => referralPct(channel, u.category, u.cents))),
+    ].sort((a, b) => a - b);
+    add(
+      `Referral ${pcts.join("/")}%`,
+      referralPerUnit.reduce((a, b) => a + b, 0),
+    );
+  } else {
+    add(`Transaction ${table.transactionPct}%`, (input.revenueCents * table.transactionPct) / 100);
+  }
   add(
     `Payment processing ${table.paymentPct}% + ${table.paymentFixedCents}¢`,
     (input.buyerTotalCents * table.paymentPct) / 100 + table.paymentFixedCents,
   );
   add("Per-order fee", table.perOrderCents);
   add(`Listing fee × ${input.units}`, table.listingFeeCents * input.units);
-  return { total: lines.reduce((a, l) => a + l.amount, 0), lines };
+  return { total: lines.reduce((a, l) => a + l.amount, 0), lines, referralPerUnit };
 }
 
 /**

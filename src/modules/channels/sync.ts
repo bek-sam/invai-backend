@@ -43,6 +43,7 @@ import { publish } from "../../lib/realtime";
 import { getObject, objectKey, putObject } from "../../lib/s3";
 import { assertWithinPlan, effectiveStatus } from "../billing/service";
 import { markFileReady } from "../files/service";
+import { ingestChannelRefunds } from "../finance/refunds";
 import { cancelFromChannel, importNormalizedOrders } from "../orders/import";
 import { handlePrivacyRequest } from "../privacy/service";
 import { isSampleWorkspace } from "../tenancy/demo-flag";
@@ -267,6 +268,11 @@ async function runCsvImport(
         source: "csv",
         importRunId: runId,
       });
+      // T-7-2: refunds the file lists for this chunk's orders (dated ledger, upserted).
+      const sliceIds = new Set(slice.map((o) => o.channelOrderId));
+      const sliceRefunds = (parsed.refunds ?? []).filter((r) => sliceIds.has(r.channelOrderId));
+      if (sliceRefunds.length)
+        await ingestChannelRefunds(tx, companyId, conn.channel, "csv", sliceRefunds);
       const chunkErrors = res.errors.map((e) => ({
         row: parsed.orderRows[from + e.index] ?? 1,
         message: `Order ${e.channelOrderId ?? "?"}: ${e.message}`,
@@ -545,6 +551,9 @@ export async function syncConnection(
         source: "api",
         cancelledChannelOrderIds: fetched.cancelledChannelOrderIds,
       });
+      // T-7-2: refunds after the sale (dated ledger, upserted by channel refund id).
+      if (fetched.refunds?.length)
+        await ingestChannelRefunds(tx, companyId, conn.channel, "shopify", fetched.refunds);
       await markConnection(tx, conn.id, { kind: "poll", cursor: fetched.nextCursor });
       if (conn.status === "error")
         await tx

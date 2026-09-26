@@ -1,5 +1,6 @@
 import type { Channel, CsvFormat, NormalizedOrder, PersonalizationAnswer } from "@invai/contracts";
 import { parseCsv } from "../../../lib/csv";
+import type { ChannelRefund } from "../types";
 
 /*
  * Marketplace CSV exports -> NormalizedOrder. One parser per export format, using each
@@ -18,6 +19,9 @@ export type ParsedCsv = {
   orderRows: number[];
   rowsTotal: number;
   errors: CsvRowError[];
+  /** T-7-2: refunds the export lists (Shopify "Refunded Amount", TikTok "Order Refund Amount",
+   * generic `refund_amount`), one order-level refund per order, before tax. */
+  refunds?: ChannelRefund[];
 };
 
 export class CsvFormatError extends Error {}
@@ -217,6 +221,7 @@ function newCollector() {
   const drafts = new Map<string, Draft>();
   const errors: CsvRowError[] = [];
   const cancelled = new Set<string>();
+  const refundTotals = new Map<string, { cents: number; at: string | null; taxInside: boolean }>();
   return {
     drafts,
     errors,
@@ -224,9 +229,16 @@ function newCollector() {
     fail(row: Row, message: string) {
       errors.push({ row: row.line, message });
     },
+    /** An order's refunded total (the first non-zero value wins; exports repeat it per line). */
+    refund(orderId: string, raw: string, at: Date | null, taxInside: boolean) {
+      const cents = Math.abs(money(raw) ?? 0);
+      if (cents > 0 && !refundTotals.has(orderId))
+        refundTotals.set(orderId, { cents, at: at?.toISOString() ?? null, taxInside });
+    },
     finish(): Omit<ParsedCsv, "rowsTotal"> {
       const orders: NormalizedOrder[] = [];
       const orderRows: number[] = [];
+      const refunds: ChannelRefund[] = [];
       for (const [id, d] of drafts) {
         if (cancelled.has(id)) continue;
         if (d.items.length === 0) continue;
@@ -246,8 +258,28 @@ function newCollector() {
           items: d.items,
         });
         orderRows.push(d.firstLine);
+        const r = refundTotals.get(id);
+        const o = orders[orders.length - 1];
+        if (r && o) {
+          // Refund totals that include sales tax: take out the order's tax share.
+          const { total, tax } = o.totals;
+          const exTax =
+            r.taxInside && tax > 0 && total > 0
+              ? Math.round((r.cents * (total - tax)) / total)
+              : r.cents;
+          if (exTax > 0)
+            refunds.push({
+              channelOrderId: id,
+              channelRefundId: `${id}:csv-refund`,
+              channelLineId: null,
+              quantity: 1,
+              amountCents: Math.min(exTax, Math.max(0, total - tax)),
+              refundedAt: r.at,
+              note: "From the order export",
+            });
+        }
       }
-      return { orders, orderRows, cancelledChannelOrderIds: [...cancelled], errors };
+      return { orders, orderRows, cancelledChannelOrderIds: [...cancelled], errors, refunds };
     },
   };
 }
@@ -557,6 +589,7 @@ function parseTiktok(text: string): ParsedCsv {
     const placedAt = requireDate(c, row, row.get("Paid Time", "Created Time"), "Created Time");
     const qty = checkQty(c, row, row.get("Quantity"));
     if (!placedAt || qty === null) continue;
+    c.refund(orderId, row.get("Order Refund Amount"), null, true);
     const unit =
       money(row.get("SKU Subtotal After Discount")) !== null
         ? Math.round((money(row.get("SKU Subtotal After Discount")) as number) / qty)
@@ -732,6 +765,7 @@ function parseShopify(text: string): ParsedCsv {
       continue;
     }
     const placedAt = requireDate(c, row, head.get("Created at", "Paid at"), "Created at");
+    c.refund(id, head.get("Refunded Amount"), null, true);
     const qty = checkQty(c, row, row.get("Lineitem quantity"));
     if (!placedAt || qty === null) continue;
     const lineName = row.get("Lineitem name");
@@ -821,6 +855,12 @@ function parseGeneric(text: string, channel: Channel): ParsedCsv {
     }
     const placedRaw = row.get("placed_at", "order date", "created_at", "date");
     const placedAt = placedRaw ? requireDate(c, row, placedRaw, "placed_at") : new Date();
+    c.refund(
+      orderId,
+      row.get("refund_amount", "refunded amount"),
+      parseDate(row.get("refunded_at", "refund date")),
+      false,
+    );
     const qty = checkQty(c, row, row.get("quantity", "qty"));
     if (!placedAt || qty === null) continue;
     const buyer = row.get("buyer_name", "ship_name", "customer", "name") || "Customer";

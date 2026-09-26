@@ -25,6 +25,7 @@ import {
   orderItems,
   orders,
   profitLines,
+  refundEvents,
   shipments,
   transfers,
 } from "../../db/schema";
@@ -35,11 +36,13 @@ import { emit } from "../../lib/outbox";
 import { keyset, type PageInput } from "../../lib/pagination";
 import { publish } from "../../lib/realtime";
 import { getObject, objectKey, putObject } from "../../lib/s3";
+import { feeCategoryOf } from "./fees";
 import {
   allocate,
   allocateAdSpend,
   type Buckets,
   defaultFeeTable,
+  emptyBuckets,
   type FeeTable,
   feeTableFor,
   finalize,
@@ -49,6 +52,7 @@ import {
   sumBuckets,
   transferCost,
 } from "./profit";
+import { listRefunds } from "./refunds";
 
 /*
  * Finance: cost settings, ad spend and true profit per order item. Profit lines are
@@ -89,7 +93,7 @@ export async function ensureCostSettings(tx: Tx, companyId: string): Promise<Cos
 }
 
 /** Saved fee tables plus CHANNEL_RULES defaults for channels the shop never edited. */
-function feeTablesOf(row: CostSettingsRow): FeeTable[] {
+export function feeTablesOf(row: CostSettingsRow): FeeTable[] {
   const saved = row.feeTables as FeeTable[];
   return [
     ...saved,
@@ -516,6 +520,8 @@ async function computeChunk(
             id: blankVariants.id,
             cost: blankVariants.costCents,
             styleCode: blankVariants.styleCode,
+            style: blankVariants.style,
+            styleName: blankVariants.styleName,
           })
           .from(blankVariants)
           .where(inArray(blankVariants.id, blankIds))
@@ -608,9 +614,16 @@ async function computeChunk(
       order.shippingCents,
       sellable.map(() => 1),
     );
+    // Sales tax is never revenue (T-7-2). Shopify shops that price tax-inclusive send item and
+    // shipping prices with the tax inside (total = subtotal + shipping); take it back out.
+    const taxInside = taxInclusive(order);
+    const gross = sellable.map(
+      (it, k) => it.unitPriceCents - (discount[k] ?? 0) + (shipping[k] ?? 0),
+    );
+    const taxOut = taxInside ? allocate(order.taxCents, gross) : [];
     const revenue = new Map<string, number>();
     sellable.forEach((it, k) => {
-      revenue.set(it.id, it.unitPriceCents - (discount[k] ?? 0) + (shipping[k] ?? 0));
+      revenue.set(it.id, (gross[k] ?? 0) - (taxOut[k] ?? 0));
     });
     const rev = (id: string) => revenue.get(id) ?? 0;
 
@@ -623,9 +636,13 @@ async function computeChunk(
       revenueCents: activeRevenue,
       buyerTotalCents: activeRevenue + taxShare,
       units: activeSellable.length,
+      unitSales: activeSellable.map((i) => ({
+        cents: rev(i.id),
+        category: categoryOf(i.blankVariantId ? blanks.get(i.blankVariantId) : undefined),
+      })),
     });
-    const feeSplit = allocate(
-      fees.total,
+    const feeSplit = splitFees(
+      fees,
       activeSellable.map((i) => rev(i.id)),
     );
     const packSplit = allocate(
@@ -729,6 +746,35 @@ async function computeChunk(
     }
   }
   return out;
+}
+
+/** Shopify prices that already include tax: the order total adds no tax on top. */
+export function taxInclusive(o: {
+  channel: string;
+  subtotalCents: number;
+  shippingCents: number;
+  taxCents: number;
+  totalCents: number;
+}): boolean {
+  return (
+    o.channel === "shopify" &&
+    o.taxCents > 0 &&
+    Math.abs(o.totalCents - (o.subtotalCents + o.shippingCents)) <= 1
+  );
+}
+
+function categoryOf(blank: { style: string | null; styleName: string | null } | undefined) {
+  return feeCategoryOf(blank?.style ? `${blank.style} ${blank.styleName ?? ""}` : null);
+}
+
+/** Per-unit fee shares: each unit's own referral fee, the rest by revenue share. */
+export function splitFees(
+  fees: { total: number; referralPerUnit: number[] | null },
+  revenues: number[],
+): number[] {
+  const referral = fees.referralPerUnit ?? revenues.map(() => 0);
+  const rest = allocate(fees.total - referral.reduce((a, b) => a + b, 0), revenues);
+  return revenues.map((_, k) => (referral[k] ?? 0) + (rest[k] ?? 0));
 }
 
 async function upsertLines(tx: Tx, companyId: string, lines: LineOut[]): Promise<number> {
@@ -865,7 +911,10 @@ export async function getProfit(
   if (input.dimension === "design") q = q.leftJoin(designs, eq(designs.id, profitLines.designId));
   if (input.dimension === "blank")
     q = q.leftJoin(blankVariants, eq(blankVariants.id, profitLines.blankVariantId));
-  const groups = await q.where(and(...filters)).groupBy(key);
+  // GROUP BY the first select column: the day key binds the time zone as a parameter, and
+  // Postgres won't match `$1` in the select list to `$5` in GROUP BY (500 on the day view).
+  const groups = await q.where(and(...filters)).groupBy(sql`1`);
+  mergeRefunds(groups, await refundGroups(tx, ctx.companyId, input, tz));
 
   const rows = groups.map((g) => {
     const b = finalize(g);
@@ -914,6 +963,94 @@ export async function getProfit(
     incomplete: (missing?.n ?? 0) > 0,
     computedAt: (computedAt ?? new Date()).toISOString(),
   };
+}
+
+/**
+ * T-7-2: refunds and the channel fee they give back, per dimension key, dated by the refund's
+ * own `refundedAt` (not the order's placed-at), so a refund lands in its own period.
+ */
+async function refundGroups(tx: Tx, companyId: string, input: ProfitInput, tz: string) {
+  const r = refundEvents;
+  const keyExpr: Record<ProfitInput["dimension"], SQL<string>> = {
+    order: sql<string>`${r.orderId}::text`,
+    design: sql<string>`coalesce(${orderItems.designId}::text, 'unmapped')`,
+    blank: sql<string>`coalesce(${blankVariants.styleCode}, 'unmapped')`,
+    channel: sql<string>`${r.channel}`,
+    day: sql<string>`to_char(${r.refundedAt} at time zone ${tz}, 'YYYY-MM-DD')`,
+  };
+  const labelExpr: Record<ProfitInput["dimension"], SQL<string | null>> = {
+    order: sql<string | null>`max(${orders.orderNo})`,
+    design: sql<string | null>`max(${designs.name})`,
+    blank: sql<
+      string | null
+    >`max(${blankVariants.brand} || ' ' || ${blankVariants.styleCode} || coalesce(' ' || ${blankVariants.styleName}, ''))`,
+    channel: sql<string | null>`null`,
+    day: sql<string | null>`null`,
+  };
+  const key = keyExpr[input.dimension];
+  return tx
+    .select({
+      key,
+      label: labelExpr[input.dimension],
+      amount: sql<number>`coalesce(sum(${r.amountCents}), 0)::int`,
+      recovered: sql<number>`coalesce(sum(${r.feeRecoveredCents}), 0)::int`,
+    })
+    .from(r)
+    .innerJoin(orders, eq(orders.id, r.orderId))
+    .leftJoin(orderItems, eq(orderItems.id, r.orderItemId))
+    .leftJoin(designs, eq(designs.id, orderItems.designId))
+    .leftJoin(blankVariants, eq(blankVariants.id, orderItems.blankVariantId))
+    .where(
+      and(
+        eq(r.companyId, companyId),
+        gte(r.refundedAt, new Date(input.period.from)),
+        lt(r.refundedAt, new Date(input.period.to)),
+        input.channel ? eq(r.channel, input.channel) : undefined,
+        input.designId ? eq(orderItems.designId, input.designId) : undefined,
+      ),
+    )
+    .groupBy(sql`1`);
+}
+
+type ProfitGroup = Omit<Buckets, "net" | "marginPct"> & {
+  key: string;
+  label: string | null;
+  orders: number;
+  units: number;
+  computedAt: Date | null;
+};
+
+/** Add refund events into the profit groups: refunds up, channel fees down by what came back. */
+export function mergeRefunds(
+  groups: ProfitGroup[],
+  refunds: { key: string; label: string | null; amount: number; recovered: number }[],
+): void {
+  const byKey = new Map(groups.map((g) => [g.key, g]));
+  for (const r of refunds) {
+    let g = byKey.get(r.key);
+    if (!g) {
+      g = {
+        key: r.key,
+        label: r.label,
+        revenue: 0,
+        channelFees: 0,
+        blankCost: 0,
+        transferCost: 0,
+        labelCost: 0,
+        packagingCost: 0,
+        laborCost: 0,
+        adsCost: 0,
+        refunds: 0,
+        orders: 0,
+        units: 0,
+        computedAt: null,
+      };
+      groups.push(g);
+      byKey.set(r.key, g);
+    }
+    g.refunds += r.amount;
+    g.channelFees -= r.recovered;
+  }
 }
 
 /* ------------------------------ export csv ----------------------------------- */
@@ -999,6 +1136,8 @@ export async function orderProfit(
           styleCode: blankVariants.styleCode,
           color: blankVariants.color,
           size: blankVariants.size,
+          style: blankVariants.style,
+          styleName: blankVariants.styleName,
         })
         .from(orderItems)
         .leftJoin(designs, eq(designs.id, orderItems.designId))
@@ -1017,20 +1156,33 @@ export async function orderProfit(
     return (ia?.lineNo ?? 0) - (ib?.lineNo ?? 0) || (ia?.unitNo ?? 0) - (ib?.unitNo ?? 0);
   });
 
+  // T-7-2: refunds after shipment (the ledger), on their item's line; order-level ones on totals.
+  const { items: refundRows } = await listRefunds(tx, orderId);
+  const refundOf = (itemId: string | null) =>
+    refundRows
+      .filter((r) => r.orderItemId === itemId)
+      .reduce((a, r) => ({ amount: a.amount + r.amountCents, fee: a.fee + r.feeRecoveredCents }), {
+        amount: 0,
+        fee: 0,
+      });
   const toBuckets = (l: typeof profitLines.$inferSelect) =>
     finalize({
       revenue: l.revenueCents,
-      channelFees: l.channelFeesCents,
+      channelFees: l.channelFeesCents - refundOf(l.orderItemId).fee,
       blankCost: l.blankCostCents,
       transferCost: l.transferCostCents,
       labelCost: l.labelCostCents,
       packagingCost: l.packagingCostCents,
       laborCost: l.laborCostCents,
       adsCost: l.adsCostCents,
-      refunds: l.refundsCents,
+      refunds: l.refundsCents + refundOf(l.orderItemId).amount,
     });
   const bucketLines = lines.map(toBuckets);
-  const totals = sumBuckets(bucketLines);
+  const orderLevel = refundOf(null);
+  const totals = sumBuckets([
+    ...bucketLines,
+    { ...emptyBuckets(), refunds: orderLevel.amount, channelFees: -orderLevel.fee },
+  ]);
 
   // Fee breakdown from the same settings the lines used (kept units only).
   const settings = await ensureCostSettings(tx, ctx.companyId);
@@ -1042,7 +1194,15 @@ export async function orderProfit(
     revenueCents: keptRevenue,
     buyerTotalCents: keptRevenue + taxShare,
     units: kept.length,
+    unitSales: kept.map((l) => ({
+      cents: l.revenueCents,
+      category: categoryOf(items.get(l.orderItemId)),
+    })),
   });
+  const recovered = refundRows.reduce((a, r) => a + r.feeRecoveredCents, 0);
+  const feeLines = recovered
+    ? [...fees.lines, { label: "Fee returned on refunds", amount: -recovered }]
+    : fees.lines;
 
   const estimated = new Set<string>();
   for (const l of lines) for (const e of l.estimated) estimated.add(e);
@@ -1054,7 +1214,7 @@ export async function orderProfit(
     placedAt: order.placedAt.toISOString(),
     price: order.subtotalCents,
     shippingCharged: order.shippingCents,
-    feeBreakdown: fees.lines,
+    feeBreakdown: feeLines,
     lines: lines.map((l, idx) => {
       const it = items.get(l.orderItemId);
       return {

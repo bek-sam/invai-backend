@@ -49,11 +49,31 @@ export type ChannelConn = {
   credentials: ChannelCredentials | null;
 };
 
+/**
+ * T-7-2: one refund (or one line of one) the channel reports after the sale. Finance upserts
+ * these into `refund_events` by (channel, channelRefundId), so a re-read never double-counts.
+ */
+export type ChannelRefund = {
+  channelOrderId: string;
+  /** Stable per refund line, e.g. `<refund id>:<line id>` or `<refund id>:order`. */
+  channelRefundId: string;
+  /** null = order-level (shipping, an adjustment, or a file with one refund total per order). */
+  channelLineId: string | null;
+  /** Units of that line refunded (1 for order-level). */
+  quantity: number;
+  amountCents: number;
+  /** null = the source has no refund date (some CSV exports); finance uses the import time. */
+  refundedAt: string | null;
+  note: string | null;
+};
+
 export type FetchOrdersResult = {
   orders: NormalizedOrder[];
   /** Orders the channel reports as cancelled since the last cursor. */
   cancelledChannelOrderIds: string[];
   nextCursor: string | null;
+  /** Refunds on the fetched orders (T-7-2); absent = the adapter doesn't read refunds. */
+  refunds?: ChannelRefund[];
 };
 
 export type TrackingPush = {

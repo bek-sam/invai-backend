@@ -12,7 +12,7 @@ import {
   TEMPLATES,
 } from "../../../db/seed/data";
 import { logger } from "../../../lib/log";
-import { type ChannelAdapter, normalizeAvailability } from "../types";
+import { type ChannelAdapter, type ChannelRefund, normalizeAvailability } from "../types";
 import { parseShopifyWebhook, SHOPIFY_WEBHOOK_TOPICS, verifyShopifyHmac } from "./common";
 
 const log = logger("channels.shopify.mock");
@@ -98,6 +98,28 @@ export function mockShopifyOrder(n: number, now = new Date()): NormalizedOrder {
   };
 }
 
+/**
+ * T-7-2: every third poll, the buyer of an order fetched earlier (order `seq`, already shipped
+ * in the demo) is refunded one unit of its first line, dated now. Stable ids: re-polls upsert.
+ */
+export function mockShopifyRefunds(seq: number, now = new Date()): ChannelRefund[] {
+  if (seq <= 0 || seq % 3 !== 0) return [];
+  const o = mockShopifyOrder(seq, now);
+  const line = o.items[0];
+  if (!line) return [];
+  return [
+    {
+      channelOrderId: o.channelOrderId,
+      channelRefundId: `mock-${seq}:${line.channelLineId}`,
+      channelLineId: line.channelLineId,
+      quantity: 1,
+      amountCents: line.unitPrice,
+      refundedAt: now.toISOString(),
+      note: "Mock refund: arrived damaged",
+    },
+  ];
+}
+
 /** What the mock store has subscribed, per connection (for tests and the local demo). */
 const mockSubscriptions = new Map<string, string[]>();
 
@@ -114,7 +136,12 @@ export const shopifyMock: ChannelAdapter = {
     const count = 1 + ((seq * 31 + 7) % 3);
     const orders = Array.from({ length: count }, (_, i) => mockShopifyOrder(seq + i + 1));
     log.info("mock shopify fetch", { connectionId: conn.id, orders: orders.length });
-    return { orders, cancelledChannelOrderIds: [], nextCursor: `mock:${seq + count}` };
+    return {
+      orders,
+      cancelledChannelOrderIds: [],
+      nextCursor: `mock:${seq + count}`,
+      refunds: mockShopifyRefunds(seq),
+    };
   },
 
   async pushTracking(conn, push) {

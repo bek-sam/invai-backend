@@ -1,7 +1,7 @@
 import { authed } from "../../api/orpc";
 import { afterCommit, withTenant } from "../../db/client";
-import { notImplemented } from "../../lib/errors";
 import { recomputeJob } from "./jobs";
+import * as refunds from "./refunds";
 import * as svc from "./service";
 
 export const financeRouter = authed.finance.router({
@@ -30,15 +30,14 @@ export const financeRouter = authed.finance.router({
       withTenant(tenant.companyId, (tx) => svc.importAdSpendCsv(tx, tenant, input.fileKey)),
     ),
   },
-  // T-7-2 (wave 7 stub 2): dated refund ledger. Router-only stub -- modules/finance/service.ts
-  // is wave 6's T-6-3 territory this wave, so this is a minimal hunk, not a real implementation.
+  // T-7-2: dated refund ledger (a refund lands in its own period).
   refunds: {
-    record: authed.finance.refunds.record.handler(() => {
-      throw notImplemented("finance.refunds.record");
-    }),
-    list: authed.finance.refunds.list.handler(() => {
-      throw notImplemented("finance.refunds.list");
-    }),
+    record: authed.finance.refunds.record.handler(({ input, context: { tenant } }) =>
+      withTenant(tenant.companyId, (tx) => refunds.recordRefund(tx, tenant, input)),
+    ),
+    list: authed.finance.refunds.list.handler(({ input, context: { tenant } }) =>
+      withTenant(tenant.companyId, (tx) => refunds.listRefunds(tx, input.orderId)),
+    ),
   },
   profit: authed.finance.profit.handler(({ input, context: { tenant } }) =>
     withTenant(tenant.companyId, (tx) => svc.getProfit(tx, tenant, input)),
