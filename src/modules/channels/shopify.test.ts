@@ -287,16 +287,25 @@ describe("Shopify token refresh (expiring offline tokens)", () => {
     return () => n;
   }
 
-  it("refreshes before expiry and stores the rotated access and refresh tokens", async () => {
-    const conn = await liveConnection(5 * 60_000);
-    const calls = stubRefresh();
-    const fresh = await freshChannelConn(conn);
-    expect(calls()).toBe(1);
-    expect(fresh.credentials?.accessToken).toBe("shpat_new_1");
-    const { creds } = await credsOf(conn.id);
-    expect(creds).toMatchObject({ accessToken: "shpat_new_1", refreshToken: "shprt_new_1" });
-    expect(new Date(creds.expiresAt ?? 0).getTime()).toBeGreaterThan(Date.now() + 50 * 60_000);
-  });
+  it(
+    "refreshes before expiry and stores the rotated access and refresh tokens",
+    async () => {
+      const conn = await liveConnection(5 * 60_000);
+      const calls = stubRefresh();
+      const fresh = await freshChannelConn(conn);
+      expect(calls()).toBe(1);
+      expect(fresh.credentials?.accessToken).toBe("shpat_new_1");
+      const { creds } = await credsOf(conn.id);
+      expect(creds).toMatchObject({ accessToken: "shpat_new_1", refreshToken: "shprt_new_1" });
+      // The mock issues a 60-minute token (expires_in: 3600) from whenever the refresh call ran.
+      // Comparing against `Date.now()` here (after the refresh call, the DB round trip and any
+      // host contention in between) only had a 10-minute margin, which a slow/shared dev DB can
+      // burn through; 40 minutes leaves real headroom while still proving the new expiry is well
+      // in the future rather than reusing the old ~5-minute one.
+      expect(new Date(creds.expiresAt ?? 0).getTime()).toBeGreaterThan(Date.now() + 40 * 60_000);
+    },
+    60_000,
+  );
 
   it("leaves a token with time left alone", async () => {
     const conn = await liveConnection(50 * 60_000);
@@ -305,17 +314,24 @@ describe("Shopify token refresh (expiring offline tokens)", () => {
     expect(calls()).toBe(0);
   });
 
-  it("two workers at once spend the refresh token once (row lock)", async () => {
-    const conn = await liveConnection(60_000);
-    const calls = stubRefresh();
-    const [a, b] = await Promise.all([
-      refreshConnectionToken(conn.companyId, conn.id),
-      refreshConnectionToken(conn.companyId, conn.id),
-    ]);
-    expect(calls()).toBe(1);
-    expect(a?.credentials?.accessToken).toBe("shpat_new_1");
-    expect(b?.credentials?.accessToken).toBe("shpat_new_1");
-  });
+  it(
+    "two workers at once spend the refresh token once (row lock)",
+    async () => {
+      // Real row-locked concurrency, same reasoning as the OAuth-state race in
+      // webhooks.test.ts: correct regardless of speed, but a shared/loaded dev DB can make the
+      // lock wait long enough to trip the file's default 30s timeout on an otherwise-passing run.
+      const conn = await liveConnection(60_000);
+      const calls = stubRefresh();
+      const [a, b] = await Promise.all([
+        refreshConnectionToken(conn.companyId, conn.id),
+        refreshConnectionToken(conn.companyId, conn.id),
+      ]);
+      expect(calls()).toBe(1);
+      expect(a?.credentials?.accessToken).toBe("shpat_new_1");
+      expect(b?.credentials?.accessToken).toBe("shpat_new_1");
+    },
+    60_000,
+  );
 
   it("a refused refresh flags the connection in health and keeps the old credentials", async () => {
     const conn = await liveConnection(60_000);
