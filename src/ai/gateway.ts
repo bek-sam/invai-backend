@@ -78,9 +78,45 @@ async function failJob(companyId: string, aiJobId: string, err: unknown) {
   await withTenant(companyId, (tx) =>
     tx
       .update(aiJobs)
-      .set({ status: "failed", error: (err as Error).message, finishedAt: new Date() })
+      .set({
+        status: "failed",
+        error: sanitizeText(String((err as Error).message)),
+        finishedAt: new Date(),
+      })
       .where(eq(aiJobs.id, aiJobId)),
   ).catch((e) => log.error("could not mark ai job failed", { error: (e as Error).message }));
+}
+
+/**
+ * C0 control characters other than tab, newline and carriage return, plus DEL. NUL in particular
+ * can't be stored: Postgres text and jsonb reject it (22P05), so a stray NUL in a design name or a
+ * pasted personalization would crash the ai_jobs insert. None of them carry meaning for the model.
+ */
+// biome-ignore lint/suspicious/noControlCharactersInRegex: matching control characters is the point
+const UNSTORABLE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
+
+/** A surrogate half without its partner: jsonb rejects the `\ud800` escape JSON.stringify emits. */
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+
+/** One string made safe for Postgres text/jsonb and the model: controls dropped, lone surrogates → U+FFFD. */
+export function sanitizeText(text: string): string {
+  return text.replace(UNSTORABLE, "").replace(LONE_SURROGATE, "\uFFFD");
+}
+
+/**
+ * The gateway-boundary sanitizer: every string in `value` (object keys too) through
+ * `sanitizeText`. Applied to vars and assistant input before they are stored or sent, and to
+ * model output before it is stored or returned.
+ */
+export function sanitizeDeep<T>(value: T): T {
+  if (typeof value === "string") return sanitizeText(value) as T;
+  if (Array.isArray(value)) return value.map((v) => sanitizeDeep(v)) as T;
+  if (value && typeof value === "object" && Object.getPrototypeOf(value) === Object.prototype) {
+    return Object.fromEntries(
+      Object.entries(value).map(([k, v]) => [sanitizeText(k), sanitizeDeep(v)]),
+    ) as T;
+  }
+  return value;
 }
 
 function toApiError(err: unknown): unknown {
@@ -165,7 +201,7 @@ export async function runStructured<V, O>(
 ): Promise<{ output: O; credits: number; model: string; aiJobId: string }> {
   const provider = await aiProvider(meta.companyId);
   await assertSpend(meta, provider);
-  const clean = stripPiiDeep(vars);
+  const clean = stripPiiDeep(sanitizeDeep(vars));
   const aiJobId = await startJob(
     meta,
     { prompt: promptRef(prompt), vars: clean as Record<string, unknown> },
@@ -173,8 +209,9 @@ export async function runStructured<V, O>(
   );
   try {
     const res = await provider.structured(prompt, clean);
-    const credits = await finishJob(meta, aiJobId, res, res.output as Record<string, unknown>);
-    return { output: res.output, credits, model: res.model, aiJobId };
+    const output = sanitizeDeep(res.output);
+    const credits = await finishJob(meta, aiJobId, res, output as Record<string, unknown>);
+    return { output, credits, model: res.model, aiJobId };
   } catch (err) {
     await failJob(meta.companyId, aiJobId, err);
     log.warn("structured call failed", { prompt: prompt.id, error: (err as Error).message });
@@ -186,8 +223,8 @@ export async function runStructured<V, O>(
 export function scrubAssistantRun(run: AssistantRun): AssistantRun {
   return {
     ...run,
-    message: stripPii(run.message),
-    history: run.history.map((h) => ({ ...h, text: stripPii(h.text) })),
+    message: stripPii(sanitizeText(run.message)),
+    history: run.history.map((h) => ({ ...h, text: stripPii(sanitizeText(h.text)) })),
     tools: isolateToolResults(run.tools),
   };
 }
@@ -229,7 +266,9 @@ export async function* runAssistant(
       step = await gen.next();
     }
     settled = true;
-    const credits = await finishJob(meta, aiJobId, step.value, { text: text.slice(0, 4000) });
+    const credits = await finishJob(meta, aiJobId, step.value, {
+      text: sanitizeText(text.slice(0, 4000)),
+    });
     const result = { credits, model: step.value.model, aiJobId };
     onSettle?.(result);
     return result;
@@ -246,7 +285,7 @@ export async function* runAssistant(
         meta,
         aiJobId,
         { usage: usageSoFar, model, stopReason: "aborted" },
-        { text: text.slice(0, 4000) },
+        { text: sanitizeText(text.slice(0, 4000)) },
       );
       onSettle?.({ credits, model, aiJobId });
     }
