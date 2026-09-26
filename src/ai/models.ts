@@ -6,13 +6,7 @@
 
 export type Effort = "low" | "medium" | "high";
 
-export type AiRoute =
-  | "listing_copy"
-  | "tags"
-  | "sku_suggestion"
-  | "personalization_check"
-  | "trademark_judge"
-  | "assistant";
+export type AiRoute = "listing_copy" | "trademark_judge" | "assistant";
 
 export type RouteConfig = {
   model: string;
@@ -24,9 +18,6 @@ export const DEFAULT_MODEL = "claude-opus-5";
 
 export const ROUTES: Record<AiRoute, RouteConfig> = {
   listing_copy: { model: DEFAULT_MODEL, effort: "medium", maxTokens: 16_000 },
-  tags: { model: DEFAULT_MODEL, effort: "low", maxTokens: 4_000 },
-  sku_suggestion: { model: DEFAULT_MODEL, effort: "low", maxTokens: 4_000 },
-  personalization_check: { model: DEFAULT_MODEL, effort: "low", maxTokens: 4_000 },
   trademark_judge: { model: DEFAULT_MODEL, effort: "low", maxTokens: 4_000 },
   assistant: { model: DEFAULT_MODEL, effort: "high", maxTokens: 32_000 },
 };

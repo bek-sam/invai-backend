@@ -46,7 +46,15 @@ export type AssistantRun = {
 export interface AiProvider {
   name: "anthropic" | "mock";
   structured<V, O>(prompt: PromptDef<V, O>, vars: V): Promise<StructuredResult<O>>;
-  assistant(run: AssistantRun): AsyncGenerator<AssistantStreamEvent, AssistantFinal>;
+  /**
+   * `onUsage` is called with the running token total after each completed turn (before the final
+   * one), so a caller that tears this generator down early (its own caller disconnected) can still
+   * charge for what was actually billed instead of nothing.
+   */
+  assistant(
+    run: AssistantRun,
+    onUsage?: (usage: TokenUsage) => void,
+  ): AsyncGenerator<AssistantStreamEvent, AssistantFinal>;
 }
 
 /** The model declined (stop_reason `refusal`, after the server-side fallback also declined). */

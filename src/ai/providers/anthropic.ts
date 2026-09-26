@@ -70,7 +70,10 @@ async function structured<V, O>(prompt: PromptDef<V, O>, vars: V): Promise<Struc
   };
 }
 
-async function* assistant(run: AssistantRun): AsyncGenerator<AssistantStreamEvent, AssistantFinal> {
+async function* assistant(
+  run: AssistantRun,
+  onUsage?: (usage: TokenUsage) => void,
+): AsyncGenerator<AssistantStreamEvent, AssistantFinal> {
   const route = ROUTES.assistant;
   const pending: AssistantStreamEvent[] = [];
   const tools = run.tools.map((t) =>
@@ -121,6 +124,7 @@ async function* assistant(run: AssistantRun): AsyncGenerator<AssistantStreamEven
     total.tokensOut += u.tokensOut;
     total.cacheReadTokens += u.cacheReadTokens;
     last = { model: message.model, stopReason: message.stop_reason };
+    onUsage?.({ ...total });
     checkStop(message.stop_reason, message.stop_details);
   }
   while (pending.length) yield pending.shift() as AssistantStreamEvent;

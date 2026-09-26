@@ -2,10 +2,23 @@ import { ORPCError } from "@orpc/server";
 import { eq } from "drizzle-orm";
 import { beforeAll, describe, expect, it } from "vitest";
 import { assertCredits } from "../../ai/credits";
+import { aiProvider } from "../../ai/gateway";
 import { withSystem, withTenant } from "../../db/client";
-import { designs, listingDrafts, usage } from "../../db/schema";
+import {
+  blankVariants,
+  channelConnections,
+  companies,
+  designs,
+  listingDrafts,
+  products,
+  usage,
+} from "../../db/schema";
+import { env } from "../../env";
+import { parseCsvObjects } from "../../lib/csv";
+import { getObject } from "../../lib/s3";
 import { createCompany, createUser, tenantContext } from "../../test/fixtures";
 import { periodOf } from "../billing/service";
+import { clearSampleWorkspaceCache } from "../tenancy/demo-flag";
 import * as svc from "./service";
 import { combineRisk, matchRisk } from "./trademark";
 
@@ -175,5 +188,185 @@ describe("ai module", () => {
     const conv = await withTenant(companyId, (tx) => svc.getConversation(tx, ctx, convId));
     expect(conv.messages.map((m) => m.role)).toEqual(["user", "assistant"]);
     expect(conv.messages[1]?.text).toMatch(/TikTok/);
+  });
+
+  describe("exportCsv (T-6-4 AC2): one row per variant, real SKUs", () => {
+    let productId: string;
+    const skus = ["SKU-BLK-S", "SKU-BLK-M", "SKU-WHT-S", "SKU-WHT-M"];
+
+    beforeAll(async () => {
+      await withSystem(async (tx) => {
+        const [p] = await tx
+          .insert(products)
+          .values({
+            companyId,
+            designId,
+            brand: "Gildan",
+            styleCode: "G64000",
+            name: "Cactus Tee",
+            allowedColorCodes: ["BLK", "WHT"],
+            allowedSizeCodes: ["S", "M"],
+          })
+          .returning();
+        productId = p?.id as string;
+        await tx.insert(blankVariants).values([
+          {
+            companyId,
+            brand: "Gildan",
+            style: "64000",
+            styleCode: "G64000",
+            color: "Black",
+            colorCode: "BLK",
+            size: "Small",
+            sizeCode: "S",
+            sku: skus[0] as string,
+          },
+          {
+            companyId,
+            brand: "Gildan",
+            style: "64000",
+            styleCode: "G64000",
+            color: "Black",
+            colorCode: "BLK",
+            size: "Medium",
+            sizeCode: "M",
+            sku: skus[1] as string,
+          },
+          {
+            companyId,
+            brand: "Gildan",
+            style: "64000",
+            styleCode: "G64000",
+            color: "White",
+            colorCode: "WHT",
+            size: "Small",
+            sizeCode: "S",
+            sku: skus[2] as string,
+          },
+          {
+            companyId,
+            brand: "Gildan",
+            style: "64000",
+            styleCode: "G64000",
+            color: "White",
+            colorCode: "WHT",
+            size: "Medium",
+            sizeCode: "M",
+            sku: skus[3] as string,
+          },
+          // Not in the product's allowed colors/sizes: must not show up in an export.
+          {
+            companyId,
+            brand: "Gildan",
+            style: "64000",
+            styleCode: "G64000",
+            color: "Black",
+            colorCode: "BLK",
+            size: "XL",
+            sizeCode: "XL",
+            sku: "SKU-BLK-XL",
+          },
+        ]);
+      });
+    });
+
+    async function approvedDraft(channel: "etsy" | "shopify") {
+      const enq: string[] = [];
+      svc.setGenerationEnqueuer(async (input) => {
+        enq.push(...input.draftIds);
+      });
+      const { jobId, drafts } = await withTenant(companyId, (tx) =>
+        svc.createDrafts(tx, ctx, { designId, productId, channels: [channel] }),
+      );
+      await svc.runGenerationJob({ companyId, jobId, draftIds: enq, userId: ctx.userId });
+      const draft = await withTenant(companyId, (tx) =>
+        svc.getDraft(tx, ctx, drafts[0]?.id as string),
+      );
+      return withTenant(companyId, (tx) => svc.approveDraft(tx, ctx, draft.id, true));
+    }
+
+    it("exports one CSV row per variant with real SKUs (Etsy)", async () => {
+      const draft = await approvedDraft("etsy");
+      const { key } = await withTenant(companyId, (tx) =>
+        svc.exportListingsCsv(tx, ctx, { draftIds: [draft.id], channel: "etsy" }),
+      );
+      const csv = (await getObject(key)).toString("utf8");
+      const { rows } = parseCsvObjects(csv);
+      expect(rows).toHaveLength(4);
+      expect(rows.map((r) => r.sku).sort()).toEqual([...skus].sort());
+      expect(rows.every((r) => !(r.sku ?? "").startsWith("DRAFT-"))).toBe(true);
+    });
+
+    it("exports a Shopify product CSV: one Handle per draft, one row per variant", async () => {
+      const draft = await approvedDraft("shopify");
+      const { key } = await withTenant(companyId, (tx) =>
+        svc.exportListingsCsv(tx, ctx, { draftIds: [draft.id], channel: "shopify" }),
+      );
+      const csv = (await getObject(key)).toString("utf8");
+      const { rows } = parseCsvObjects(csv);
+      expect(rows).toHaveLength(4);
+      expect(new Set(rows.map((r) => r.Handle)).size).toBe(1);
+      expect(rows.map((r) => r["Variant SKU"]).sort()).toEqual([...skus].sort());
+      // Only the first row of the handle carries the shared listing fields.
+      expect(rows[0]?.Title).toBeTruthy();
+      expect(rows[1]?.Title).toBe("");
+    });
+
+    it("rejects a channel that doesn't match the draft's own channel", async () => {
+      const draft = await approvedDraft("etsy");
+      await expect(
+        withTenant(companyId, (tx) =>
+          svc.exportListingsCsv(tx, ctx, { draftIds: [draft.id], channel: "shopify" }),
+        ),
+      ).rejects.toMatchObject({ code: "CHANNEL_MISMATCH" });
+    });
+
+    it("publishDraft's CSV fallback (B-101) uses real SKUs, not a DRAFT- placeholder", async () => {
+      const draft = await approvedDraft("etsy");
+      const [conn] = await withSystem((tx) =>
+        tx
+          .insert(channelConnections)
+          .values({ companyId, channel: "etsy", name: "Etsy CSV", mode: "csv", provider: "mock" })
+          .returning(),
+      );
+      const status = await withTenant(companyId, (tx) =>
+        svc.publishDraft(tx, ctx, draft.id, conn?.id as string),
+      );
+      expect(status.status).toBe("approved");
+      expect(status.pendingApproval).toBe(true);
+      const [row] = await withSystem((tx) =>
+        tx.select().from(listingDrafts).where(eq(listingDrafts.id, draft.id)),
+      );
+      const key = ((row?.publishedUrl as string) ?? "").replace(/^s3:/, "");
+      const csv = (await getObject(key)).toString("utf8");
+      const { rows } = parseCsvObjects(csv);
+      expect(rows).toHaveLength(4);
+      expect(rows.every((r) => !(r.sku ?? "").includes("DRAFT-"))).toBe(true);
+      expect(rows.map((r) => r.sku).sort()).toEqual([...skus].sort());
+    });
+  });
+
+  describe("AC7: a sample workspace never reaches the real model", () => {
+    it("forces the mock provider even when a real ANTHROPIC_API_KEY is configured", async () => {
+      const flags = env.mocks as unknown as { ai: boolean };
+      const saved = flags.ai;
+      flags.ai = false; // simulate ANTHROPIC_API_KEY being set
+      try {
+        const sampleCo = await createCompany();
+        const owner = await createUser(sampleCo.id, "owner");
+        await withSystem((tx) =>
+          tx
+            .update(companies)
+            .set({ demoOwnerUserId: owner.id })
+            .where(eq(companies.id, sampleCo.id)),
+        );
+        clearSampleWorkspaceCache();
+        expect((await aiProvider(sampleCo.id)).name).toBe("mock");
+        expect((await aiProvider(companyId)).name).toBe("anthropic");
+      } finally {
+        flags.ai = saved;
+        clearSampleWorkspaceCache();
+      }
+    });
   });
 });

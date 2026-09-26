@@ -33,7 +33,6 @@ import {
   listingDrafts,
   products,
 } from "../../db/schema";
-import { getChannelAdapter } from "../../integrations/channels";
 import { audit } from "../../lib/audit";
 import { toCsv } from "../../lib/csv";
 import { badRequest, conflict, invalidTransition, notFound } from "../../lib/errors";
@@ -646,16 +645,36 @@ export async function rejectDraft(tx: Tx, ctx: Ctx, id: string, reason?: string)
 
 /* ---------------------------------- publish ---------------------------------- */
 
-/** Bulk-upload CSV rows (Etsy / Amazon flat-file style columns; generic for the rest). */
-export function exportCsv(channel: Channel, c: ListingContent, sku: string): string {
-  const price = c.price != null ? (c.price / 100).toFixed(2) : "";
-  const description = [c.description, ...c.disclosures].join("\n\n");
+/** Slug for a Shopify `Handle` column: lowercase, ascii, hyphenated, never empty. */
+function slugify(s: string): string {
+  const slug = s
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[̀-ͯ]/g, "")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return slug || "listing";
+}
+
+/**
+ * Bulk-upload CSV rows: one row per **variant** (not per draft), each with a real blank-variant
+ * SKU. Rows that share the same `content` object (by reference — every variant row for one draft
+ * is built from the same draft) are one listing on multi-row channels (Etsy/Amazon: one row IS one
+ * listing, so no grouping is needed there; Shopify: many rows share one `Handle`).
+ */
+export function exportCsv(
+  channel: Channel,
+  rows: { content: ListingContent; sku: string }[],
+): string {
+  const price = (c: ListingContent) => (c.price != null ? (c.price / 100).toFixed(2) : "");
+  const description = (c: ListingContent) => [c.description, ...c.disclosures].join("\n\n");
+
   if (channel === "etsy") {
-    return toCsv([
-      {
+    return toCsv(
+      rows.map(({ content: c, sku }) => ({
         title: c.title,
-        description,
-        price,
+        description: description(c),
+        price: price(c),
         quantity: 999,
         sku,
         tags: c.tags.join(","),
@@ -664,49 +683,176 @@ export function exportCsv(channel: Channel, c: ListingContent, sku: string): str
         is_made_to_order: "true",
         when_made: "made_to_order",
         production_partner: "DTF transfer printer",
-      },
-    ]);
+      })),
+    );
   }
   if (channel === "amazon") {
-    const bullets = Object.fromEntries(
-      Array.from({ length: 5 }, (_, i) => [`bullet_point${i + 1}`, c.bullets[i] ?? ""]),
+    return toCsv(
+      rows.map(({ content: c, sku }) => {
+        const bullets = Object.fromEntries(
+          Array.from({ length: 5 }, (_, i) => [`bullet_point${i + 1}`, c.bullets[i] ?? ""]),
+        );
+        return {
+          feed_product_type: "SHIRT",
+          item_sku: sku,
+          item_name: c.title,
+          product_description: description(c),
+          ...bullets,
+          generic_keywords: c.tags.join(" "),
+          standard_price: price(c),
+          quantity: 999,
+        };
+      }),
     );
-    return toCsv([
-      {
-        feed_product_type: "SHIRT",
-        item_sku: sku,
-        item_name: c.title,
-        product_description: description,
-        ...bullets,
-        generic_keywords: c.tags.join(" "),
-        standard_price: price,
-        quantity: 999,
-      },
-    ]);
   }
-  return toCsv([
-    {
+  if (channel === "shopify") {
+    // Shopify's product CSV: one `Handle` per draft (product), one row per variant under it.
+    // Only the first row of each handle carries the shared listing fields; later rows leave them
+    // blank (toCsv fills missing columns as "") the way Shopify's own exports do.
+    const out: Record<string, string | number>[] = [];
+    let prevContent: ListingContent | null = null;
+    let handle = "";
+    let n = 0;
+    for (const { content: c, sku } of rows) {
+      if (c !== prevContent) {
+        prevContent = c;
+        n += 1;
+        handle = `${slugify(c.title)}-${n}`;
+        out.push({
+          Handle: handle,
+          Title: c.title,
+          "Body (HTML)": description(c),
+          Vendor: "",
+          Tags: c.tags.join(", "),
+          Published: "TRUE",
+          "Option1 Name": "Size",
+          "Option1 Value": "",
+          "Variant SKU": sku,
+          "Variant Price": price(c),
+          "Variant Inventory Qty": 999,
+          "Variant Inventory Policy": "deny",
+          "Variant Fulfillment Service": "manual",
+          "Image Src": "",
+        });
+      } else {
+        out.push({
+          Handle: handle,
+          "Variant SKU": sku,
+          "Variant Price": price(c),
+          "Variant Inventory Qty": 999,
+        });
+      }
+    }
+    return toCsv(out);
+  }
+  return toCsv(
+    rows.map(({ content: c, sku }) => ({
       title: c.title,
-      description,
-      price,
+      description: description(c),
+      price: price(c),
       sku,
       tags: c.tags.join(","),
       bullets: c.bullets.join(" | "),
-    },
-  ]);
+    })),
+  );
 }
 
-type MaybeUpsert = {
-  upsertListing?: (
-    conn: unknown,
-    listing: {
-      draftId: string;
-      content: ListingContent;
-      designId: string;
-      productId: string | null;
-    },
-  ) => Promise<{ listingId: string; url?: string | null }>;
-};
+/** The product a draft's SKUs come from: the draft's own `productId`, or the design's active one. */
+async function resolveProduct(tx: Tx, companyId: string, row: DraftRow) {
+  if (row.productId) {
+    const [p] = await tx
+      .select()
+      .from(products)
+      .where(and(eq(products.companyId, companyId), eq(products.id, row.productId)));
+    return p ?? null;
+  }
+  const [p] = await tx
+    .select()
+    .from(products)
+    .where(
+      and(
+        eq(products.companyId, companyId),
+        eq(products.designId, row.designId),
+        eq(products.status, "active"),
+      ),
+    )
+    .orderBy(asc(products.createdAt))
+    .limit(1);
+  return p ?? null;
+}
+
+/** One export/CSV row per real blank-variant SKU that this draft's product covers. */
+async function variantRowsForDraft(
+  tx: Tx,
+  ctx: Pick<Ctx, "companyId">,
+  row: DraftRow,
+): Promise<{ content: ListingContent; sku: string }[]> {
+  const product = await resolveProduct(tx, ctx.companyId, row);
+  if (!product) throw badRequest(`Draft ${row.id} has no product to resolve blank SKUs from`);
+  const variants = await tx
+    .select({
+      colorCode: blankVariants.colorCode,
+      sizeCode: blankVariants.sizeCode,
+      sku: blankVariants.sku,
+    })
+    .from(blankVariants)
+    .where(
+      and(
+        eq(blankVariants.companyId, ctx.companyId),
+        eq(blankVariants.styleCode, product.styleCode),
+      ),
+    );
+  const allowedColor = new Set(product.allowedColorCodes);
+  const allowedSize = new Set(product.allowedSizeCodes);
+  const matched = variants.filter(
+    (v) =>
+      (!allowedColor.size || allowedColor.has(v.colorCode)) &&
+      (!allowedSize.size || allowedSize.has(v.sizeCode)),
+  );
+  if (!matched.length)
+    throw badRequest(`No blank variants match ${product.name} for draft ${row.id}`);
+  return matched.map((v) => ({ content: row.content, sku: v.sku }));
+}
+
+/** `ai.listings.exportCsv`: one CSV row per variant across every draft, all for one channel. */
+export async function exportListingsCsv(
+  tx: Tx,
+  ctx: Ctx,
+  input: { draftIds: string[]; channel: Channel },
+): Promise<{ key: string }> {
+  const found = await tx
+    .select()
+    .from(listingDrafts)
+    .where(
+      and(eq(listingDrafts.companyId, ctx.companyId), inArray(listingDrafts.id, input.draftIds)),
+    );
+  const byId = new Map(found.map((r) => [r.id, r]));
+  const ordered: DraftRow[] = [];
+  for (const id of input.draftIds) {
+    const row = byId.get(id);
+    if (!row) throw notFound("listing draft", id);
+    if (row.channel !== input.channel)
+      throw new ORPCError("CHANNEL_MISMATCH", {
+        status: 400,
+        message: "A draft's channel does not match the export channel",
+      });
+    ordered.push(row);
+  }
+  const rows: { content: ListingContent; sku: string }[] = [];
+  for (const row of ordered) rows.push(...(await variantRowsForDraft(tx, ctx, row)));
+  const key = objectKey(ctx.companyId, "listing-export", "csv");
+  await putObject(key, exportCsv(input.channel, rows), "text/csv");
+  await audit(tx, {
+    companyId: ctx.companyId,
+    actor: ctx.actor,
+    action: "listing_draft.export_csv",
+    entityType: "listing_draft",
+    entityId: ordered[0]?.id ?? "",
+    summary: `Exported ${input.channel} CSV for ${ordered.length} draft${ordered.length === 1 ? "" : "s"} (${rows.length} SKU rows)`,
+    data: { draftIds: input.draftIds },
+  });
+  return { key };
+}
 
 export async function publishDraft(
   tx: Tx,
@@ -729,71 +875,15 @@ export async function publishDraft(
   if (conn.channel !== row.channel && conn.channel !== "csv")
     throw badRequest(`Connection is ${conn.channel}; this draft is for ${row.channel}`);
 
-  const adapter = (await getChannelAdapter(
-    conn.channel,
-    conn.provider,
-    conn,
-  )) as unknown as MaybeUpsert & {
-    pendingApproval?: boolean;
-  };
-  if (typeof adapter.upsertListing === "function" && conn.mode === "api") {
-    try {
-      const res = await adapter.upsertListing(
-        {
-          id: conn.id,
-          companyId: conn.companyId,
-          channel: conn.channel,
-          name: conn.name,
-          mode: conn.mode,
-          provider: conn.provider,
-          externalShopId: conn.externalShopId,
-          cursor: conn.cursor,
-          credentials: conn.credentials ? JSON.parse(conn.credentials) : null,
-        },
-        { draftId: id, content: row.content, designId: row.designId, productId: row.productId },
-      );
-      await tx
-        .update(listingDrafts)
-        .set({
-          status: "published",
-          connectionId,
-          publishedListingId: res.listingId,
-          publishedUrl: res.url ?? null,
-          error: null,
-        })
-        .where(eq(listingDrafts.id, id));
-      await emit(tx, ctx.companyId, "listing_draft.published", {
-        draftId: id,
-        listingId: res.listingId,
-      });
-      await audit(tx, {
-        companyId: ctx.companyId,
-        actor: ctx.actor,
-        action: "listing_draft.publish",
-        entityType: "listing_draft",
-        entityId: id,
-        summary: `Published to ${conn.name}`,
-      });
-      return publishStatus(tx, ctx, id);
-    } catch (err) {
-      const message = (err as Error).message;
-      await tx
-        .update(listingDrafts)
-        .set({ status: "failed", connectionId, error: message })
-        .where(eq(listingDrafts.id, id));
-      await emit(tx, ctx.companyId, "listing_draft.failed", { draftId: id, error: message });
-      return publishStatus(tx, ctx, id);
-    }
-  }
-
-  // No listing API for this channel yet: produce a bulk-upload CSV; the draft stays approved.
+  // No channel has a live listing-publish API today (see wave 6 plan review): every channel
+  // produces a bulk-upload CSV instead, and the draft stays approved so it can be exported again.
   const key = objectKey(
     ctx.companyId,
     "listing-export",
     "csv",
     id as ReturnType<typeof crypto.randomUUID>,
   );
-  await putObject(key, exportCsv(row.channel, row.content, `DRAFT-${id.slice(0, 8)}`), "text/csv");
+  await putObject(key, exportCsv(row.channel, await variantRowsForDraft(tx, ctx, row)), "text/csv");
   await tx
     .update(listingDrafts)
     .set({ status: "approved", connectionId, publishedUrl: `${EXPORT_PREFIX}${key}`, error: null })
@@ -910,23 +1000,36 @@ export async function* ask(
   let text = "";
   const toolCalls: { name: string; input: Record<string, unknown>; summary?: string }[] = [];
   let credits = 0;
+  let failed = false;
+  // `settled` mirrors gateway.ts's `runAssistant`: false only means this generator itself was torn
+  // down mid-stream (the HTTP client disconnected) rather than finishing or erroring normally. The
+  // consumption loop below is manual (`.next()`), so closing `gen` on that path is on us — it is
+  // what lets runAssistant's own `finally` run and actually charge for tokens Anthropic already
+  // billed instead of leaving them free and the ai_jobs row stuck "running".
+  let settled = false;
+  const gen = runAssistant(
+    {
+      companyId: ctx.companyId,
+      userId,
+      kind: "assistant",
+      creditKind: "assistant",
+      entity: { type: "assistant_message", id: messageId },
+    },
+    {
+      system: ASSISTANT_PROMPT.system,
+      history: setup.history,
+      message: input.message,
+      tools: assistantTools(ctx),
+      now: new Date(),
+    },
+    // Fires with the real charged credits however runAssistant ends, including the disconnect
+    // path below (see the comment on runAssistant itself for why this isn't read off its return
+    // value instead).
+    (result) => {
+      credits = result.credits;
+    },
+  );
   try {
-    const gen = runAssistant(
-      {
-        companyId: ctx.companyId,
-        userId,
-        kind: "assistant",
-        creditKind: "assistant",
-        entity: { type: "assistant_message", id: messageId },
-      },
-      {
-        system: ASSISTANT_PROMPT.system,
-        history: setup.history,
-        message: input.message,
-        tools: assistantTools(ctx),
-        now: new Date(),
-      },
-    );
     let step = await gen.next();
     while (!step.done) {
       const e = step.value;
@@ -949,8 +1052,10 @@ export async function* ask(
       }
       step = await gen.next();
     }
-    credits = step.value.credits;
+    settled = true;
   } catch (err) {
+    settled = true;
+    failed = true;
     const code =
       err instanceof ORPCError && err.code === "CREDITS_EXHAUSTED"
         ? "credits_exhausted"
@@ -959,17 +1064,29 @@ export async function* ask(
           : "internal";
     log.warn("assistant failed", { error: (err as Error).message });
     yield { type: "error", message: (err as Error).message, code };
+  } finally {
+    if (!settled) {
+      // Close the inner generator so its own `finally` runs: that's what actually finishes the
+      // ai_jobs row and charges credits, and calls the `onSettle` callback above with the real
+      // number before this `await` resolves.
+      await gen.return({ credits: 0, model: "", aiJobId: "" }).catch(() => undefined);
+    }
+    await withTenant(ctx.companyId, async (tx) => {
+      if (failed && !text && !toolCalls.length) {
+        // Nothing came of this turn: don't leave a blank assistant message in the transcript.
+        await tx.delete(assistantMessages).where(eq(assistantMessages.id, messageId));
+      } else {
+        await tx
+          .update(assistantMessages)
+          .set({ text, toolCalls: { calls: toolCalls }, creditsUsed: credits })
+          .where(eq(assistantMessages.id, messageId));
+      }
+      await tx
+        .update(assistantConversations)
+        .set({ updatedAt: new Date() })
+        .where(eq(assistantConversations.id, conversationId));
+    });
   }
-  await withTenant(ctx.companyId, async (tx) => {
-    await tx
-      .update(assistantMessages)
-      .set({ text, toolCalls: { calls: toolCalls }, creditsUsed: credits })
-      .where(eq(assistantMessages.id, messageId));
-    await tx
-      .update(assistantConversations)
-      .set({ updatedAt: new Date() })
-      .where(eq(assistantConversations.id, conversationId));
-  });
   yield { type: "done", conversationId, messageId, creditsUsed: credits };
 }
 

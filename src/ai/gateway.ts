@@ -4,8 +4,9 @@ import { aiJobs } from "../db/schema";
 import { env } from "../env";
 import { upstream } from "../lib/errors";
 import { logger } from "../lib/log";
+import { isSampleWorkspace } from "../modules/tenancy/demo-flag";
 import { assertCredits, type CreditKind, chargeCredits } from "./credits";
-import { tokensToCostCents, tokensToCredits } from "./models";
+import { MOCK_MODEL, tokensToCostCents, tokensToCredits } from "./models";
 import { stripPii, stripPiiDeep } from "./pii";
 import { type PromptDef, promptRef } from "./prompts";
 import { anthropicProvider } from "./providers/anthropic";
@@ -30,8 +31,15 @@ const log = logger("ai.gateway");
 
 export type AiJobKind = (typeof aiJobs.$inferInsert)["kind"];
 
-export function aiProvider(): AiProvider {
-  return env.mocks.ai ? mockProvider : anthropicProvider;
+/**
+ * A sample workspace (T-6-5's `isSampleWorkspace`) never reaches the real model, even when
+ * `ANTHROPIC_API_KEY` is set: it always gets the mock provider, so it can never spend the
+ * platform's Anthropic key. See `finishJob` for why the cost check also no longer trusts
+ * `env.mocks.ai` alone.
+ */
+export async function aiProvider(companyId: string): Promise<AiProvider> {
+  if (env.mocks.ai) return mockProvider;
+  return (await isSampleWorkspace(companyId)) ? mockProvider : anthropicProvider;
 }
 
 type CallMeta = {
@@ -96,7 +104,9 @@ async function finishJob(
         tokensIn: result.usage.tokensIn,
         tokensOut: result.usage.tokensOut,
         cacheReadTokens: result.usage.cacheReadTokens,
-        costCents: env.mocks.ai ? 0 : tokensToCostCents(result.usage),
+        // A sample workspace's calls also come back with `model === MOCK_MODEL` (aiProvider()
+        // above), so this stays 0 for them regardless of env.mocks.ai.
+        costCents: result.model === MOCK_MODEL ? 0 : tokensToCostCents(result.usage),
         credits,
         stopReason: result.stopReason,
         finishedAt: new Date(),
@@ -125,7 +135,7 @@ export async function runStructured<V, O>(
   prompt: PromptDef<V, O>,
   vars: V,
 ): Promise<{ output: O; credits: number; model: string; aiJobId: string }> {
-  const provider = aiProvider();
+  const provider = await aiProvider(meta.companyId);
   const clean = stripPiiDeep(vars);
   const aiJobId = await startJob(
     meta,
@@ -155,28 +165,60 @@ export function scrubAssistantRun(run: AssistantRun): AssistantRun {
 /**
  * The tool-using assistant, streamed. Yields text deltas and tool events; returns usage and the
  * credits charged. Throws CREDITS_EXHAUSTED before any model call when the balance is empty.
+ *
+ * `onSettle` fires exactly once, with the real charged credits, however this generator ends:
+ * normal completion, a failure, or being torn down early by `.return()` (the caller's own caller
+ * — ultimately the HTTP client — disconnected). A manual `while (!step.done)` loop over a nested
+ * generator does not close it the way `for await` would, so the disconnect path below closes the
+ * provider's generator itself and still finishes (and charges for) the ai_jobs row, instead of
+ * leaving it stuck "running" with tokens Anthropic already billed left uncredited. `onSettle`
+ * (rather than this generator's own return value) is how that real number reaches a caller that
+ * only sees the placeholder it passed to `.return()` — a generator cannot rewrite its own
+ * `.return()` value from a `finally` without also risking swallowing a real thrown error.
  */
 export async function* runAssistant(
   meta: CallMeta,
   run: AssistantRun,
+  onSettle?: (result: { credits: number; model: string; aiJobId: string }) => void,
 ): AsyncGenerator<AssistantStreamEvent, { credits: number; model: string; aiJobId: string }> {
-  const provider = aiProvider();
+  const provider = await aiProvider(meta.companyId);
   const clean = scrubAssistantRun(run);
   const aiJobId = await startJob(meta, { message: clean.message.slice(0, 500) }, provider);
   let text = "";
+  let usageSoFar: AssistantFinal["usage"] = { tokensIn: 0, tokensOut: 0, cacheReadTokens: 0 };
+  const gen = provider.assistant(clean, (u) => {
+    usageSoFar = u;
+  });
+  let settled = false;
   try {
-    const gen = provider.assistant(clean);
     let step = await gen.next();
     while (!step.done) {
       if (step.value.type === "text") text += step.value.text;
       yield step.value;
       step = await gen.next();
     }
+    settled = true;
     const credits = await finishJob(meta, aiJobId, step.value, { text: text.slice(0, 4000) });
-    return { credits, model: step.value.model, aiJobId };
+    const result = { credits, model: step.value.model, aiJobId };
+    onSettle?.(result);
+    return result;
   } catch (err) {
+    settled = true;
     await failJob(meta.companyId, aiJobId, err);
     throw err;
+  } finally {
+    if (!settled) {
+      const dummy: AssistantFinal = { usage: usageSoFar, model: "", stopReason: null };
+      await gen.return(dummy).catch(() => undefined);
+      const model = provider.name === "mock" ? MOCK_MODEL : provider.name;
+      const credits = await finishJob(
+        meta,
+        aiJobId,
+        { usage: usageSoFar, model, stopReason: "aborted" },
+        { text: text.slice(0, 4000) },
+      );
+      onSettle?.({ credits, model, aiJobId });
+    }
   }
 }
 

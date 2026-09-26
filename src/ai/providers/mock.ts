@@ -233,6 +233,7 @@ function* chunks(text: string): Generator<string> {
 
 async function* mockAssistant(
   run: AssistantRun,
+  onUsage?: (usage: TokenUsage) => void,
 ): AsyncGenerator<AssistantStreamEvent, AssistantFinal> {
   const planned = planAssistantCalls(run.message, run.now);
   const answers: string[] = [];
@@ -246,6 +247,9 @@ async function* mockAssistant(
     results.push(out.data);
     yield { type: "tool_result", name: tool.name, summary: out.summary };
     answers.push(out.answer);
+    // A running estimate (no model call, so this is the same deterministic formula as the final
+    // usage below), so a caller torn down mid-loop can still charge for the answer built so far.
+    onUsage?.(usageOf(run.system, run.message, { results, answers }));
   }
   const text = answers.length
     ? `${answers.join("\n\n")}\n\n_(Demo mode: answer composed from your live shop data without a model call.)_`
