@@ -4,6 +4,7 @@ import { aiJobs } from "../db/schema";
 import { env } from "../env";
 import { upstream } from "../lib/errors";
 import { logger } from "../lib/log";
+import { sanitizeDeep, sanitizeText } from "../lib/text-safety";
 import { isSampleWorkspace } from "../modules/tenancy/demo-flag";
 import { assertSpendAvailable, recordSpend } from "./breaker";
 import { assertCredits, type CreditKind, chargeCredits } from "./credits";
@@ -87,37 +88,14 @@ async function failJob(companyId: string, aiJobId: string, err: unknown) {
   ).catch((e) => log.error("could not mark ai job failed", { error: (e as Error).message }));
 }
 
-/**
- * C0 control characters other than tab, newline and carriage return, plus DEL. NUL in particular
- * can't be stored: Postgres text and jsonb reject it (22P05), so a stray NUL in a design name or a
- * pasted personalization would crash the ai_jobs insert. None of them carry meaning for the model.
+/*
+ * NUL/control-character/lone-surrogate stripping used to live here alone. T-8-6 moved the regex
+ * and `sanitizeText`/`sanitizeDeep` into `../lib/text-safety` so the oRPC input boundary and the
+ * webhook/CSV order-import pipeline can reuse the exact same logic instead of growing their own
+ * copies; both are re-exported here so every existing `from "./gateway"` import keeps working.
+ * The gateway still applies them to AI vars and assistant input/output (defense in depth, OI-5).
  */
-// biome-ignore lint/suspicious/noControlCharactersInRegex: matching control characters is the point
-const UNSTORABLE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g;
-
-/** A surrogate half without its partner: jsonb rejects the `\ud800` escape JSON.stringify emits. */
-const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
-
-/** One string made safe for Postgres text/jsonb and the model: controls dropped, lone surrogates → U+FFFD. */
-export function sanitizeText(text: string): string {
-  return text.replace(UNSTORABLE, "").replace(LONE_SURROGATE, "\uFFFD");
-}
-
-/**
- * The gateway-boundary sanitizer: every string in `value` (object keys too) through
- * `sanitizeText`. Applied to vars and assistant input before they are stored or sent, and to
- * model output before it is stored or returned.
- */
-export function sanitizeDeep<T>(value: T): T {
-  if (typeof value === "string") return sanitizeText(value) as T;
-  if (Array.isArray(value)) return value.map((v) => sanitizeDeep(v)) as T;
-  if (value && typeof value === "object" && Object.getPrototypeOf(value) === Object.prototype) {
-    return Object.fromEntries(
-      Object.entries(value).map(([k, v]) => [sanitizeText(k), sanitizeDeep(v)]),
-    ) as T;
-  }
-  return value;
-}
+export { sanitizeDeep, sanitizeText };
 
 function toApiError(err: unknown): unknown {
   if (err instanceof AiRefusalError) return upstream("Claude", err.message);

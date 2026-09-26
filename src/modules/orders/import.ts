@@ -15,6 +15,7 @@ import type { ChannelHold, ChannelLineCancel } from "../../integrations/channels
 import { audit } from "../../lib/audit";
 import { emit } from "../../lib/outbox";
 import { publish } from "../../lib/realtime";
+import { sanitizeDeep } from "../../lib/text-safety";
 import { loadMatcher, type Matcher, recordRuleUse } from "../channels/sku";
 import { withFlags } from "./flags";
 import { mapItems } from "./mapping";
@@ -133,7 +134,11 @@ export async function importNormalizedOrders(
       });
       continue;
     }
-    const n = parsed.data;
+    // Shared import pipeline for CSV, API poll and webhooks (see the module comment above): none
+    // of that text comes through an oRPC input, so it never sees `orpc.ts`'s sanitizer. Same
+    // helper, applied once here, right after validation and before the first raw insert/update of
+    // this order's text (T-8-6; a NUL byte in `buyerNote` used to crash the `orders` insert).
+    const n = sanitizeDeep(parsed.data);
     const [existing] = await tx
       .select()
       .from(orders)

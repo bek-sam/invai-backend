@@ -138,6 +138,23 @@ describe("Shopify order webhooks import paid orders only", () => {
     const [o] = await findOrder(companyId, id);
     expect(o?.status).toBe("cancelled");
   });
+
+  // T-8-6 (follow-up to T-8-2 r3 / OI-5): a NUL byte reaching `orders.buyerNote` from a webhook
+  // payload used to crash the insert the same way a CSV row or an oRPC input did. This goes
+  // through the real webhook path (signature check, adapter parse, importNormalizedOrders), not
+  // just the shared helper in isolation.
+  it("a NUL byte in the order's note doesn't crash the webhook import", async () => {
+    const id = orderId();
+    const d = shopifyDelivery(
+      shop,
+      "orders/create",
+      restOrder(id, "paid", { note: "Gift wrap please\u0000!!" }),
+    );
+    const res = await deliver(d);
+    expect(res).toMatchObject({ handled: true, kind: "order_upsert" });
+    const [o] = await findOrder(companyId, id);
+    expect(o?.buyerNote).toBe("Gift wrap please!!");
+  });
 });
 
 describe("Shopify webhook subscriptions and disconnect", () => {

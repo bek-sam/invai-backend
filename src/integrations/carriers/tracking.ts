@@ -6,6 +6,8 @@
  * (created by the same user within 3 months) instead of a duplicate.
  */
 
+import { sanitizeText } from "../../lib/text-safety";
+
 export const TRACKER_STATUSES = [
   "unknown",
   "pre_transit",
@@ -91,7 +93,9 @@ export function normalizeEasypostTracker(t: EpTracker): TrackerUpdate | null {
     trackingCode: t.tracking_code,
     carrierShipmentId: t.shipment_id ?? null,
     status,
-    statusDetail: t.status_detail ?? null,
+    // Carrier webhook text, written to `shipments.statusDetail` (text) below the sanitized oRPC
+    // input boundary in orpc.ts (T-8-6): sanitize it here, the one place it's normalized.
+    statusDetail: t.status_detail ? sanitizeText(t.status_detail) : null,
     occurredAt: latest ?? validDate(t.updated_at) ?? new Date(),
     deliveredAt: status === "delivered" ? (delivered ?? latest ?? validDate(t.updated_at)) : null,
   };

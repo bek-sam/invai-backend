@@ -2,6 +2,7 @@ import { contract, type ProcedureMeta } from "@invai/contracts";
 import { type AnyContractRouter, isContractProcedure } from "@orpc/contract";
 import { implement, type Router } from "@orpc/server";
 import { emailNotVerified, forbidden, notImplemented, unauthorized } from "../lib/errors";
+import { sanitizeDeep } from "../lib/text-safety";
 import { type Context, type TenantContext, tenantOf } from "./context";
 
 /*
@@ -32,6 +33,39 @@ export const EMAIL_VERIFIED_PROCEDURES: ReadonlySet<string> = new Set([
   "billing.checkout",
   "billing.portal",
 ]);
+
+/**
+ * NUL-safe input at the API boundary (T-8-6, follow-up to T-8-2 r3 / OI-5): a raw NUL byte (or
+ * other C0 control character, or a lone UTF-16 surrogate) in any caller-supplied string crashes
+ * the first Postgres text/jsonb write it reaches (22P05/22021), wherever that happens to be.
+ * Fixing call sites one at a time doesn't close the class, so this sanitizes every string field
+ * of every procedure's input, once, here.
+ *
+ * Why a middleware and not a shared schema helper in contracts: every procedure's `.input()` in
+ * `@invai/contracts` is `z.object(...)` (or a `z.union` of them) — there is no bare-string or
+ * bare-array input anywhere in the contract. That means the *validated* input handed to this
+ * middleware is always a plain object, so one middleware can sanitize it in place instead of
+ * wrapping every `z.string()` call in every schema file with a `SanitizedString` helper (dozens
+ * of call sites across `contracts/src/schemas/*.ts`, for the same outcome).
+ *
+ * `next()` in oRPC only lets a middleware replace `context`, not `input` (see `MiddlewareNextFn`
+ * in `@orpc/server`): there's no way to swap the top-level input object for a sanitized copy. So
+ * this mutates the validated input's own enumerable properties instead of reassigning it — since
+ * every middleware after this one, and the handler, close over the same object reference, they
+ * see the sanitized values. `sanitizeDeep` (shared with the AI gateway and the order-import
+ * pipeline, `../lib/text-safety`) already builds that sanitized tree immutably; `Object.assign`
+ * just copies its top-level keys onto the object already flowing through the chain.
+ *
+ * Attached first (before `guard`), so permission/auth checks and every handler see clean input.
+ * The AI gateway's `sanitizeDeep`/`sanitizeText` (T-8-2) and `ask()`'s sanitizing stay as defense
+ * in depth for AI-specific text that's stored or sent to the model beyond the raw request input.
+ */
+const sanitizeInput = os.middleware(async ({ next }, input: unknown) => {
+  if (input && typeof input === "object") {
+    Object.assign(input as Record<string, unknown>, sanitizeDeep(input));
+  }
+  return next();
+});
 
 const guard = os.middleware(async ({ context, next, procedure, path }) => {
   const meta = procedure["~orpc"].meta as ProcedureMeta;
@@ -64,8 +98,8 @@ const guard = os.middleware(async ({ context, next, procedure, path }) => {
   return next();
 });
 
-/** Guarded builder without a tenant requirement. */
-export const pub = os.use(guard);
+/** Guarded builder without a tenant requirement. Sanitizes input before the permission guard. */
+export const pub = os.use(sanitizeInput).use(guard);
 
 /** Guarded builder that adds `context.tenant: TenantContext`. */
 export const authed = pub.use(async ({ context, next }) => {

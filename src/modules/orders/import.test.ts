@@ -256,6 +256,30 @@ describe("CSV import pipeline", () => {
     expect(pii?.buyer_pii.street1).toBe("99 New St");
   });
 
+  // T-8-6 (follow-up to T-8-2 r3 / OI-5): a NUL byte in a channel's order text used to crash the
+  // `orders` insert (Postgres 22021 on `orders.buyerNote`, a plain text column written straight
+  // from the CSV row). `importNormalizedOrders` is the pipeline CSV, API poll and webhooks all
+  // share, so fixing it here covers all three sources at once.
+  it("a NUL byte in a CSV row's buyer note doesn't crash the orders insert", async () => {
+    const conn = await withTenant(companyId, (tx) => getConnectionRow(tx, etsyConnId));
+    const first = parseOrdersCsv("etsy", fixture("etsy-sold-order-items.csv"))
+      .orders[0] as NormalizedOrder;
+    const withNul: NormalizedOrder = {
+      ...first,
+      channelOrderId: "3310000098",
+      orderNo: "3310000098",
+      buyerNote: "Please gift-wrap\u0000 this one!",
+    };
+    const res = await withTenant(companyId, (tx) =>
+      importNormalizedOrders(tx, ctx, conn, [withNul], { source: "csv" }),
+    );
+    expect(res).toMatchObject({ imported: 1, errors: [] });
+    const [order] = await withTenant(companyId, (tx) =>
+      tx.select().from(orders).where(eq(orders.channelOrderId, "3310000098")),
+    );
+    expect(order?.buyerNote).toBe("Please gift-wrap this one!");
+  });
+
   it("maps an unknown SKU once, learns the rule and maps its siblings", async () => {
     const conn = await withTenant(companyId, (tx) => getConnectionRow(tx, etsyConnId));
     const sibling: NormalizedOrder = {
