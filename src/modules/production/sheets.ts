@@ -1105,6 +1105,12 @@ export async function markSheetPrinting(
  * `printing` -> `printed`. Units then flow to the floor exactly as a vendor-printed sheet does:
  * `printed -> received` is already a valid transition, so the shop marks the same sheet
  * received (markSheetReceived) once the transfers are cut and ready for pick, no branch needed.
+ *
+ * This is the in-house-only counterpart to the vendor path's `printed` (reached through the
+ * vendor status webhook, `sendSheetToVendor`'s `transitionSheet(..., "printed")`, never through
+ * here). `SHEET_TRANSITIONS` alone allows `sent`/`acknowledged` -> `printed` too (that's the
+ * vendor path), so this procedure must refuse those explicitly or a shop user could force a
+ * vendor sheet straight to `printed` with no vendor confirmation.
  */
 export async function markSheetPrinted(
   tx: Tx,
@@ -1112,6 +1118,8 @@ export async function markSheetPrinted(
   id: string,
 ): Promise<GangSheetDetail> {
   const sheet = await lockSheet(tx, id);
+  if (sheet.status !== "printing" || !(await companyPrintsInHouse(tx, ctx.companyId)))
+    throw invalidTransition("sheet", sheet.id, sheet.status, "printed");
   await transitionSheet(tx, ctx.companyId, ctx.actor, sheet, "printed");
   return getSheet(tx, ctx, id);
 }

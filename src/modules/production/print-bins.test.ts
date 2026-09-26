@@ -29,7 +29,10 @@ async function setPrintsInHouse(companyId: string, value: boolean) {
   );
 }
 
-async function makeSheet(companyId: string, status: "building" | "ready" = "ready") {
+async function makeSheet(
+  companyId: string,
+  status: "building" | "ready" | "printing" | "sent" | "acknowledged" = "ready",
+) {
   return withSystem(async (tx) => {
     const [batch] = await tx
       .insert(gangSheetBatches)
@@ -76,6 +79,31 @@ describe("markSheetPrinting / markSheetPrinted (in-house path)", () => {
     const sheet = await makeSheet(shop.id, "building");
     await expect(
       withTenant(shop.id, (tx) => markSheetPrinting(tx, ctx, sheet.id)),
+    ).rejects.toMatchObject({ code: "INVALID_TRANSITION" });
+  });
+
+  it("refuses to mark a vendor-path (sent) sheet printed, even though SHEET_TRANSITIONS allows sent -> printed", async () => {
+    const shop = await createCompany();
+    // printsInHouse is false: a vendor-only shop.
+    const ctx = tenantContext(shop.id, null, "owner");
+    const sheet = await makeSheet(shop.id, "sent");
+    await expect(
+      withTenant(shop.id, (tx) => markSheetPrinted(tx, ctx, sheet.id)),
+    ).rejects.toMatchObject({ code: "INVALID_TRANSITION" });
+    const [row] = await withSystem((tx) =>
+      tx.select().from(gangSheets).where(eq(gangSheets.id, sheet.id)),
+    );
+    expect(row?.status).toBe("sent");
+    expect(row?.printedAt).toBeNull();
+  });
+
+  it("refuses markSheetPrinted on an acknowledged vendor sheet even when the company prints in-house", async () => {
+    const shop = await createCompany();
+    await setPrintsInHouse(shop.id, true);
+    const ctx = tenantContext(shop.id, null, "owner");
+    const sheet = await makeSheet(shop.id, "acknowledged");
+    await expect(
+      withTenant(shop.id, (tx) => markSheetPrinted(tx, ctx, sheet.id)),
     ).rejects.toMatchObject({ code: "INVALID_TRANSITION" });
   });
 });
