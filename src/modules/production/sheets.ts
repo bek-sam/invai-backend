@@ -61,6 +61,8 @@ type TransferRow = typeof transfers.$inferSelect;
 type ExclusionReason = (typeof BATCH_EXCLUSION_REASONS)[number];
 
 export const LABEL_HEIGHT_IN = 0.42;
+/** Top-edge sheet-id header band (B-79); nesting starts placements below it, not just margin_in. */
+export const HEADER_HEIGHT_IN = 0.45;
 
 /* --------------------------------- specs ---------------------------------- */
 
@@ -119,7 +121,7 @@ const STATES_NEEDING_SHEET = ["ready", "on_sheet", "transfer_in"] as const;
 /** Does a w x h design (plus its label strip) fit the spec's printable width in some rotation? */
 export function fitsSpec(w: number, h: number, spec: SheetSpec) {
   const usable = spec.widthIn - 2 * spec.marginIn;
-  const maxLen = spec.maxLengthIn - 2 * spec.marginIn;
+  const maxLen = spec.maxLengthIn - 2 * spec.marginIn - HEADER_HEIGHT_IN;
   return (
     (w <= usable && h + LABEL_HEIGHT_IN <= maxLen) || (h <= usable && w + LABEL_HEIGHT_IN <= maxLen)
   );
@@ -271,6 +273,7 @@ function nestRequest(items: Candidate[], spec: SheetSpec) {
     max_length_in: spec.maxLengthIn,
     allow_rotation: true,
     label_height_in: LABEL_HEIGHT_IN,
+    header_height_in: HEADER_HEIGHT_IN,
   };
 }
 
@@ -287,7 +290,7 @@ function roughEstimate(items: Candidate[], spec: SheetSpec) {
     (s, c) => s + (c.widthIn + spec.spacingIn) * (c.heightIn + LABEL_HEIGHT_IN + spec.spacingIn),
     0,
   );
-  const length = area / usable / 0.8 + 2 * spec.marginIn;
+  const length = area / usable / 0.8 + 2 * spec.marginIn + HEADER_HEIGHT_IN;
   const sheets = Math.max(items.length ? 1 : 0, Math.ceil(length / spec.maxLengthIn));
   const designArea = items.reduce((s, c) => s + c.widthIn * c.heightIn, 0);
   return {
@@ -592,6 +595,7 @@ export async function composeSheet(
       preview_key: previewKey,
       label_gap_in: spec.labelGapIn,
       filename_hint: filenameHint,
+      header_height_in: HEADER_HEIGHT_IN,
     });
   } catch (err) {
     error =
@@ -845,6 +849,7 @@ export async function runRegenerateSheet(companyId: string, sheetId: string, job
       max_length_in: prep.vendor.spec.maxLengthIn,
       allow_rotation: true,
       label_height_in: LABEL_HEIGHT_IN,
+      header_height_in: HEADER_HEIGHT_IN,
     });
     const [first, ...rest] = nest.sheets;
     await withTenant(companyId, async (tx) => {

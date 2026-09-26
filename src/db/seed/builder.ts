@@ -8,7 +8,7 @@ import { recordListingsForCompany } from "../../modules/channels/sku";
 import { shelfFor } from "../../modules/inventory/shelves";
 import { transitionItem } from "../../modules/orders/state-machine";
 import { renderValues } from "../../modules/personalization/service";
-import { LABEL_HEIGHT_IN } from "../../modules/production/sheets";
+import { HEADER_HEIGHT_IN, LABEL_HEIGHT_IN } from "../../modules/production/sheets";
 import { issueStationToken, setPin } from "../../modules/tenancy/floor-auth";
 import type { Tx } from "../client";
 import type { Address } from "../schema";
@@ -1039,7 +1039,7 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
       const { marginIn, spacingIn, widthIn: filmIn } = DEFAULT_SHEET_SPEC;
       const layout: { xIn: number; yIn: number }[] = [];
       let x = marginIn;
-      let y = marginIn;
+      let y = marginIn + HEADER_HEIGHT_IN; // top-edge header band; nesting starts below it
       let rowH = 0;
       let printArea = 0;
       for (const c of chunk) {
