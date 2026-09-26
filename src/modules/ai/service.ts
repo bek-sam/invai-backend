@@ -12,7 +12,7 @@ import { ORPCError } from "@orpc/server";
 import { and, asc, desc, eq, gte, ilike, inArray, lte, or, type SQL, sql } from "drizzle-orm";
 import type { z } from "zod";
 import { assertCredits, creditBalance } from "../../ai/credits";
-import { runAssistant, runStructured } from "../../ai/gateway";
+import { runAssistant, runStructured, sanitizeDeep, sanitizeText } from "../../ai/gateway";
 import { ASSISTANT_PROMPT, type ListingCopy, listingCopyPrompt } from "../../ai/prompts";
 import {
   describeIssues,
@@ -1042,6 +1042,8 @@ export async function* ask(
 ): AsyncGenerator<AssistantEvent> {
   if (!ctx.userId) throw badRequest("The assistant needs a signed-in user");
   const userId = ctx.userId;
+  // Postgres text rejects NUL (22021): sanitize before the conversation rows are written.
+  const message = sanitizeText(input.message);
   const setup = await withTenant(ctx.companyId, async (tx) => {
     await assertCredits(tx, ctx.companyId, 1);
     let conversationId = input.conversationId;
@@ -1059,7 +1061,7 @@ export async function* ask(
     } else {
       const [c] = await tx
         .insert(assistantConversations)
-        .values({ companyId: ctx.companyId, userId, title: input.message.slice(0, 80) })
+        .values({ companyId: ctx.companyId, userId, title: message.slice(0, 80) })
         .returning({ id: assistantConversations.id });
       conversationId = c?.id as string;
     }
@@ -1073,7 +1075,7 @@ export async function* ask(
       companyId: ctx.companyId,
       conversationId,
       role: "user",
-      text: input.message,
+      text: message,
     });
     const [assistantMsg] = await tx
       .insert(assistantMessages)
@@ -1105,7 +1107,7 @@ export async function* ask(
     {
       system: ASSISTANT_PROMPT.system,
       history: setup.history,
-      message: input.message,
+      message,
       tools: assistantTools(ctx),
       now: new Date(),
     },
@@ -1167,7 +1169,11 @@ export async function* ask(
       } else {
         await tx
           .update(assistantMessages)
-          .set({ text, toolCalls: { calls: toolCalls }, creditsUsed: credits })
+          .set({
+            text: sanitizeText(text),
+            toolCalls: sanitizeDeep({ calls: toolCalls }),
+            creditsUsed: credits,
+          })
           .where(eq(assistantMessages.id, messageId));
       }
       await tx

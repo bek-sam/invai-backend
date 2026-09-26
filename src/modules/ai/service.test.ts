@@ -198,6 +198,16 @@ describe("ai module", () => {
     expect(conv.messages[1]?.text).toMatch(/TikTok/);
   });
 
+  it("stores a chat message containing NUL without a 500 (T-8-2 r2)", async () => {
+    const events = [];
+    const message = "what was my TikTok\u0000 margin this week?\u0000";
+    for await (const e of svc.ask(ctx, { message })) events.push(e);
+    expect(events.at(-1)?.type).toBe("done");
+    const convId = events[0]?.type === "start" ? events[0].conversationId : "";
+    const conv = await withTenant(companyId, (tx) => svc.getConversation(tx, ctx, convId));
+    expect(conv.messages[0]?.text).toBe("what was my TikTok margin this week?");
+  });
+
   describe("exportCsv (T-6-4 AC2): one row per variant, real SKUs", () => {
     let productId: string;
     const skus = ["SKU-BLK-S", "SKU-BLK-M", "SKU-WHT-S", "SKU-WHT-M"];
