@@ -584,6 +584,7 @@ export async function composeSheet(
       out_key: pngKey,
       ...(pdfKey ? { pdf_key: pdfKey } : {}),
       preview_key: previewKey,
+      label_gap_in: spec.labelGapIn,
     });
   } catch (err) {
     error =

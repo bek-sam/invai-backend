@@ -30,6 +30,8 @@ export type SheetSpec = {
   pricePerInch: number;
   spacingIn: number;
   marginIn: number;
+  /** Clear film between a design and its label (contracts `SheetSpec.labelGapIn`, B-79). */
+  labelGapIn: number;
   colorProfile: string | null;
   notes: string | null;
 };
@@ -42,6 +44,7 @@ export const DEFAULT_SHEET_SPEC: SheetSpec = {
   pricePerInch: 30,
   spacingIn: 0.25,
   marginIn: 0.25,
+  labelGapIn: 0.125,
   colorProfile: null,
   notes: null,
 };
