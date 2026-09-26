@@ -99,13 +99,6 @@ export const productionRouter = authed.production.router({
   scan: authed.production.scan.handler(({ input, context: { tenant } }) =>
     withTenant(tenant.companyId, (tx) => svc.scan(tx, tenant, input)),
   ),
-  // Each replayed scan commits on its own, so one bad scan can't undo the others.
-  scanBatch: authed.production.scanBatch.handler(async ({ input, context: { tenant } }) => {
-    const results = [];
-    for (const s of input.scans)
-      results.push(await withTenant(tenant.companyId, (tx) => svc.scan(tx, tenant, s)));
-    return { results };
-  }),
   qc: authed.production.qc.handler(({ input, context: { tenant } }) =>
     withTenant(tenant.companyId, (tx) => svc.qc(tx, tenant, input)),
   ),

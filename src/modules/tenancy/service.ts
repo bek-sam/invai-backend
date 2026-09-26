@@ -48,6 +48,7 @@ function toOrg(row: typeof companies.$inferSelect): Org {
     timezone: row.timezone,
     plan: row.type === "vendor" ? null : (row.plan ?? "trial"),
     demo: row.demo,
+    demoOwned: row.demoOwnerUserId !== null,
     printsInHouse: row.settings?.printsInHouse === true,
     productionPartner: row.settings?.productionPartner ?? null,
     createdAt: row.createdAt.toISOString(),
