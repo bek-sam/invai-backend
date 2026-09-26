@@ -1,6 +1,7 @@
 import {
   CreateBucketCommand,
   DeleteObjectCommand,
+  DeleteObjectsCommand,
   GetObjectCommand,
   HeadBucketCommand,
   HeadObjectCommand,
@@ -180,4 +181,41 @@ export async function listKeysOlderThan(prefix: string, before: Date): Promise<s
     token = res.IsTruncated ? res.NextContinuationToken : undefined;
   } while (token);
   return out;
+}
+
+/** Every object under `prefix` with its size (paginated listing). */
+export async function listObjects(prefix: string): Promise<{ key: string; size: number }[]> {
+  const out: { key: string; size: number }[] = [];
+  let token: string | undefined;
+  do {
+    const res = await s3.send(
+      new ListObjectsV2Command({ Bucket: bucket, Prefix: prefix, ContinuationToken: token }),
+    );
+    for (const o of res.Contents ?? []) if (o.Key) out.push({ key: o.Key, size: o.Size ?? 0 });
+    token = res.IsTruncated ? res.NextContinuationToken : undefined;
+  } while (token);
+  return out;
+}
+
+/**
+ * Delete every object under a company's prefix (`{companyId}/`), 1,000 keys per request, and
+ * return how many were deleted. Refuses anything but one whole company prefix, so a bad argument
+ * can never empty the bucket. Safe to repeat: a second run finds nothing to delete.
+ */
+export async function deletePrefix(prefix: string): Promise<number> {
+  if (!/^[0-9a-f-]{36}\/$/.test(prefix)) throw new Error(`refusing to delete prefix ${prefix}`);
+  let deleted = 0;
+  for (;;) {
+    const res = await s3.send(
+      new ListObjectsV2Command({ Bucket: bucket, Prefix: prefix, MaxKeys: 1000 }),
+    );
+    const keys = (res.Contents ?? []).flatMap((o) => (o.Key ? [{ Key: o.Key }] : []));
+    if (keys.length === 0) return deleted;
+    const del = await s3.send(
+      new DeleteObjectsCommand({ Bucket: bucket, Delete: { Objects: keys, Quiet: true } }),
+    );
+    if (del.Errors?.length)
+      throw new Error(`could not delete ${del.Errors.length} object(s) under ${prefix}`);
+    deleted += keys.length;
+  }
 }

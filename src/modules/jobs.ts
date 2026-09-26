@@ -17,3 +17,4 @@ import "./ai/jobs";
 import "./billing/jobs";
 import "./tenancy/jobs";
 import "./today/jobs";
+import "./privacy/jobs";

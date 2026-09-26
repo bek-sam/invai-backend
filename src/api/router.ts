@@ -7,6 +7,7 @@ import { financeRouter } from "../modules/finance/router";
 import { inventoryRouter } from "../modules/inventory/router";
 import { orderItemsRouter, ordersRouter } from "../modules/orders/router";
 import { personalizationRouter } from "../modules/personalization/router";
+import { privacyRouter } from "../modules/privacy/router";
 import { productionRouter } from "../modules/production/router";
 import { shippingRouter } from "../modules/shipping/router";
 import {
@@ -53,6 +54,7 @@ export const router = os.router({
   finance: financeRouter,
   ai: aiRouter,
   billing: billingRouter,
+  privacy: privacyRouter,
 });
 
 export type Router = typeof router;

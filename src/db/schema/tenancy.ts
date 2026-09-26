@@ -73,6 +73,13 @@ export const companies = pgTable("companies", {
     .unique()
     .references(() => users.id, { onDelete: "cascade" }),
   settings: jsonObject<CompanySettings>(),
+  /**
+   * Soft delete (privacy.deleteRequest, B-23): set when the owner asks to delete the company; the
+   * hard purge runs 30 days later unless cancelled first. Null for every live company.
+   */
+  deletedAt: timestamp({ withTimezone: true }),
+  /** Set when the hard purge ran: the row stays as an anonymized tombstone for the audit trail. */
+  purgedAt: timestamp({ withTimezone: true }),
   ...timestamps,
 });
 
@@ -440,6 +447,7 @@ export const JOB_KINDS = [
   "listing_drafts",
   "profit_recompute",
   "sync",
+  "tenant_export",
 ] as const;
 export const JOB_STATUSES = ["queued", "running", "done", "failed"] as const;
 
