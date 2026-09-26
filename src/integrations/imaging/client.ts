@@ -254,6 +254,7 @@ export function createImagingClient(
       preview_width_px?: number;
       label_gap_in?: number;
       filename_hint?: string;
+      sheet_id?: string;
       header_height_in?: number;
     }) => call("/compose", input, ComposeResult, { timeoutMs: 600_000 }),
 

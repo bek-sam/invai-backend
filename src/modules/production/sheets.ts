@@ -595,6 +595,7 @@ export async function composeSheet(
       preview_key: previewKey,
       label_gap_in: spec.labelGapIn,
       filename_hint: filenameHint,
+      sheet_id: sheet.id,
       header_height_in: HEADER_HEIGHT_IN,
     });
   } catch (err) {
