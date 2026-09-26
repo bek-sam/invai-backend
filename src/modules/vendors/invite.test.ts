@@ -166,3 +166,64 @@ describe("vendor invitations need the vendor's acceptance", () => {
     expect(conns).toHaveLength(0);
   });
 });
+
+// B-80: app/pdf.py no longer relies on /UserUnit for pages over 200in, so a vendor spec asking
+// for a longer PDF must be rejected at save, not discovered later at compose time.
+describe("vendor sheet specs: PDF is capped at 200in (B-80)", () => {
+  it("rejects a PDF spec over 200in at invite, before any org or invite email exists", async () => {
+    const shopId = (await createCompany()).id;
+    const shop = tenantContext(shopId, (await createUser(shopId, "owner")).id, "owner");
+    const email = `toolong-${Date.now()}@test.local`;
+    await expect(
+      inviteVendor(shop, {
+        name: "Overlong DTF",
+        email,
+        spec: { format: "pdf", maxLengthIn: 240 },
+        isDefault: false,
+        turnaroundDays: 2,
+      }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    expect(mail.sent.find((m) => m.to === email)).toBeUndefined();
+    expect(await db.select().from(invitations).where(eq(invitations.email, email))).toHaveLength(0);
+    expect(
+      await withSystem((tx) =>
+        tx
+          .select()
+          .from(vendorConnections)
+          .where(and(eq(vendorConnections.companyId, shopId), eq(vendorConnections.email, email))),
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("accepts a PDF spec at exactly 200in", async () => {
+    const shopId = (await createCompany()).id;
+    const shop = tenantContext(shopId, (await createUser(shopId, "owner")).id, "owner");
+    const email = `exactly200-${Date.now()}@test.local`;
+    const conn = await inviteVendor(shop, {
+      name: "Exactly 200 DTF",
+      email,
+      spec: { format: "pdf", maxLengthIn: 200 },
+      isDefault: false,
+      turnaroundDays: 2,
+    });
+    expect(conn.spec.maxLengthIn).toBe(200);
+  });
+
+  it("rejects switching an existing connection's spec to a PDF over 200in on update", async () => {
+    const shopId = (await createCompany()).id;
+    const shop = tenantContext(shopId, (await createUser(shopId, "owner")).id, "owner");
+    const email = `switch-${Date.now()}@test.local`;
+    const conn = await inviteVendor(shop, {
+      name: "Switching DTF",
+      email,
+      spec: { format: "png", maxLengthIn: 240 },
+      isDefault: false,
+      turnaroundDays: 2,
+    });
+    await expect(
+      withTenant(shopId, (tx) =>
+        updateConnection(tx, shop, { id: conn.id, spec: { format: "pdf" } }),
+      ),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+  });
+});

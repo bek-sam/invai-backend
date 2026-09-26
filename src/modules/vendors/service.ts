@@ -2,6 +2,7 @@ import {
   DEFAULT_SHEET_SPEC,
   type GangSheet,
   type SheetState,
+  sheetSpecPdfCapError,
   type VendorConnection,
   type VendorInboxSheet,
   type VendorInviteInput as VendorInviteInputSchema,
@@ -150,6 +151,10 @@ const slugify = (s: string) =>
  *      UPSTREAM_FAILED, so the shop never sees "invited" for a vendor who got nothing.
  */
 export async function inviteVendor(ctx: TenantContext, input: VendorInviteInput) {
+  // B-80: reject an over-length PDF spec before any org/invite side effect runs.
+  const inviteSpecError = sheetSpecPdfCapError({ ...DEFAULT_SHEET_SPEC, ...input.spec });
+  if (inviteSpecError) throw badRequest(inviteSpecError);
+
   const email = input.email.trim().toLowerCase();
   const assertNotConnected = async (tx: Tx) => {
     const [dup] = await tx
@@ -300,6 +305,8 @@ export async function updateConnection(
   const spec = { ...DEFAULT_SHEET_SPEC, ...row.spec, ...(input.spec ?? {}) };
   if (spec.maxLengthIn <= 2 * spec.marginIn || spec.widthIn <= 2 * spec.marginIn)
     throw badRequest("Sheet size is smaller than its margins");
+  const updateSpecError = sheetSpecPdfCapError(spec); // B-80
+  if (updateSpecError) throw badRequest(updateSpecError);
   await tx
     .update(vendorConnections)
     .set({
