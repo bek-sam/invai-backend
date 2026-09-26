@@ -142,7 +142,29 @@ export type ComposeResult = z.infer<typeof ComposeResult>;
 
 export type ImagingClient = ReturnType<typeof createImagingClient>;
 
-export function createImagingClient(baseUrl = env.IMAGING_URL, timeoutMs = 120_000) {
+/** Imaging answers 429 + Retry-After when its heavy-job slots are full (T-9-5, B-19). */
+export const IMAGING_BUSY_RETRIES = 5;
+const MAX_RETRY_WAIT_MS = 30_000;
+const DEFAULT_RETRY_WAIT_MS = 2_000;
+
+/** Retry-After as delay-seconds or an HTTP date, clamped to 0.1–30 s. */
+export function retryAfterMs(header: string | null, now = Date.now()): number {
+  let ms = DEFAULT_RETRY_WAIT_MS;
+  if (header?.trim()) {
+    const secs = Number(header);
+    const date = Date.parse(header);
+    if (Number.isFinite(secs)) ms = secs * 1000;
+    else if (Number.isFinite(date)) ms = date - now;
+  }
+  return Math.min(MAX_RETRY_WAIT_MS, Math.max(100, ms));
+}
+
+export function createImagingClient(
+  baseUrl = env.IMAGING_URL,
+  timeoutMs = 120_000,
+  secret = env.IMAGING_SHARED_SECRET,
+  sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
+) {
   async function call<T>(
     endpoint: string,
     body: unknown,
@@ -150,14 +172,26 @@ export function createImagingClient(baseUrl = env.IMAGING_URL, timeoutMs = 120_0
     init: { method?: "GET" | "POST"; timeoutMs?: number } = {},
   ): Promise<T> {
     const method = init.method ?? "POST";
-    const res = await fetch(`${baseUrl}${endpoint}`, {
-      method,
-      headers: method === "POST" ? { "content-type": "application/json" } : undefined,
-      body: method === "POST" ? JSON.stringify(body) : undefined,
-      signal: AbortSignal.timeout(init.timeoutMs ?? timeoutMs),
-    }).catch((err) => {
-      throw new ImagingError(endpoint, 0, err instanceof Error ? err.message : String(err));
-    });
+    const headers: Record<string, string> = {};
+    if (method === "POST") headers["content-type"] = "application/json";
+    if (secret) headers["x-imaging-secret"] = secret;
+    let res: Response;
+    // A 429 is sent before imaging does any work, so retrying it is always safe.
+    for (let attempt = 0; ; attempt++) {
+      res = await fetch(`${baseUrl}${endpoint}`, {
+        method,
+        headers,
+        body: method === "POST" ? JSON.stringify(body) : undefined,
+        signal: AbortSignal.timeout(init.timeoutMs ?? timeoutMs),
+      }).catch((err) => {
+        throw new ImagingError(endpoint, 0, err instanceof Error ? err.message : String(err));
+      });
+      if (res.status !== 429 || attempt >= IMAGING_BUSY_RETRIES) break;
+      const waitMs = retryAfterMs(res.headers.get("retry-after"));
+      log.warn("imaging busy, retrying", { endpoint, attempt: attempt + 1, waitMs });
+      await res.body?.cancel();
+      await sleep(waitMs);
+    }
     const text = await res.text();
     if (!res.ok) {
       let detail = text;
@@ -206,6 +240,7 @@ export function createImagingClient(baseUrl = env.IMAGING_URL, timeoutMs = 120_0
       max_length_in?: number;
       allow_rotation?: boolean;
       label_height_in?: number;
+      header_height_in?: number;
     }) => call("/nest", input, NestResult),
 
     compose: (input: {
@@ -219,6 +254,7 @@ export function createImagingClient(baseUrl = env.IMAGING_URL, timeoutMs = 120_0
       preview_width_px?: number;
       label_gap_in?: number;
       filename_hint?: string;
+      header_height_in?: number;
     }) => call("/compose", input, ComposeResult, { timeoutMs: 600_000 }),
 
     mockup: (input: {

@@ -49,6 +49,8 @@ const raw = createEnv({
     S3_PUBLIC_ENDPOINT: z.url().optional(),
 
     IMAGING_URL: z.url(),
+    /** Sent to imaging as `X-Imaging-Secret` (T-9-5); imaging requires 32+ chars in production. */
+    IMAGING_SHARED_SECRET: secret(z.string()),
 
     BETTER_AUTH_SECRET: z.string().min(32),
     BETTER_AUTH_URL: z.url(),
@@ -114,6 +116,7 @@ export const PRODUCTION_KEYS = [
   "SHOPIFY_API_SECRET",
   "SMTP_URL",
   "MAIL_FROM",
+  "IMAGING_SHARED_SECRET",
 ] as const;
 
 export function missingProductionKeys(
@@ -161,6 +164,12 @@ export const env = {
   /** Undefined only in production with ALLOW_MOCKS=true; the mailer then logs instead of sending. */
   SMTP_URL: raw.SMTP_URL ?? (isProd ? undefined : "smtp://localhost:1025"),
   MAIL_FROM: raw.MAIL_FROM ?? (isProd ? undefined : "InvAI <sheets@invai.local>"),
+  /**
+   * Imaging's public dev default (invai-imaging `DEV_SHARED_SECRET`). Never used in production:
+   * there a missing secret sends no header, and imaging (which refuses the dev secret) answers 401.
+   */
+  IMAGING_SHARED_SECRET:
+    raw.IMAGING_SHARED_SECRET ?? (isProd ? undefined : "invai-imaging-dev-secret"),
   isDev: raw.NODE_ENV === "development",
   isTest,
   isProd,
