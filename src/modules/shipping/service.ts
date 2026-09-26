@@ -1,5 +1,6 @@
 import type {
   BatchBuyResult as BatchBuyResultSchema,
+  Channel,
   RatesInput as RatesInputSchema,
   RatesResult as RatesResultSchema,
   Shipment,
@@ -8,7 +9,21 @@ import type {
   ShipQueueEntry,
   TrackingPushStatus as TrackingPushStatusSchema,
 } from "@invai/contracts";
-import { and, asc, desc, eq, gte, ilike, inArray, lte, or, type SQL, sql } from "drizzle-orm";
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  gte,
+  ilike,
+  inArray,
+  isNotNull,
+  lte,
+  ne,
+  or,
+  type SQL,
+  sql,
+} from "drizzle-orm";
 import { PDFDocument } from "pdf-lib";
 import type { z } from "zod";
 import type { TenantContext } from "../../api/context";
@@ -34,6 +49,11 @@ import {
   type PurchasedLabel,
   type VoidResult,
 } from "../../integrations/carriers";
+import {
+  buildTrackingExport,
+  isTrackingExportChannel,
+  type TrackingExportRow,
+} from "../../integrations/channels/exports/tracking";
 import { type Actor, audit } from "../../lib/audit";
 import { badRequest, conflict, notFound, ORPCError, upstream } from "../../lib/errors";
 import { logger } from "../../lib/log";
@@ -314,6 +334,7 @@ function toShipment(
     labeledAt: row.labeledAt?.toISOString() ?? null,
     deliveredAt: row.deliveredAt?.toISOString() ?? null,
     voidedAt: row.voidedAt?.toISOString() ?? null,
+    exportedAt: row.exportedAt?.toISOString() ?? null,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
   };
@@ -1770,3 +1791,110 @@ export async function markDelivered(
 
 export const isMockCarrier = async (companyId: string) =>
   (await carrierAdapter({ companyId })).provider === "mock";
+
+/* -------------------------------- tracking export -------------------------------- */
+
+const NOT_CSV_CHANNEL = () =>
+  new ORPCError("NOT_CSV_CHANNEL", { status: 400, message: "This channel is not CSV-only" });
+
+/**
+ * One file of tracking for a CSV-only channel (T-7-1, B-68): every `manual`-push shipment
+ * labeled since `since` (or since this channel's last export, taken as the newest `exportedAt`
+ * already on a shipment for it) up to `until`. Marks those shipments `exportedAt`; re-running
+ * with the same or an earlier `since` re-includes and re-marks them (re-export is always
+ * possible, per the wave 7 stub).
+ */
+export async function exportTracking(
+  tx: Tx,
+  ctx: TenantContext,
+  input: { channel: Channel; since: string | null; until?: string },
+): Promise<{ key: string; count: number }> {
+  if (!isTrackingExportChannel(input.channel)) throw NOT_CSV_CHANNEL();
+  const until = input.until ? new Date(input.until) : null;
+  let cutoff = input.since ? new Date(input.since) : null;
+  if (!cutoff) {
+    const [row] = await tx
+      .select({ max: sql<Date | string | null>`max(${shipments.exportedAt})` })
+      .from(shipments)
+      .innerJoin(orders, eq(orders.id, shipments.orderId))
+      .where(and(eq(shipments.companyId, ctx.companyId), eq(orders.channel, input.channel)));
+    cutoff = row?.max ? new Date(row.max) : null;
+  }
+  // The wave stub's query names a `trackingPushStatus = 'manual'` filter, but that value
+  // doesn't exist on this column (TRACKING_PUSH_STATUSES has no "manual" -- a CSV-only
+  // channel's manual push result is recorded as `not_required`, same as "push is turned off").
+  // `orders.channel` already restricts this to the 4 pendingApproval channels, where a real
+  // `pushed` status is architecturally impossible, so the real filter is just "labeled, has a
+  // tracking code, not voided, and not mid-push".
+  const conds = [
+    eq(shipments.companyId, ctx.companyId),
+    eq(orders.channel, input.channel),
+    isNotNull(shipments.labeledAt),
+    isNotNull(shipments.trackingCode),
+    ne(shipments.status, "voided"),
+    ne(shipments.trackingPushStatus, "pushing"),
+  ];
+  if (cutoff) conds.push(gte(shipments.labeledAt, cutoff));
+  if (until) conds.push(lte(shipments.labeledAt, until));
+
+  const rows = await tx
+    .select({
+      id: shipments.id,
+      channelOrderId: orders.channelOrderId,
+      orderNo: orders.orderNo,
+      carrier: shipments.carrier,
+      service: shipments.service,
+      trackingCode: shipments.trackingCode,
+      trackingUrl: shipments.trackingUrl,
+      labeledAt: shipments.labeledAt,
+      orderItemIds: shipments.orderItemIds,
+    })
+    .from(shipments)
+    .innerJoin(orders, eq(orders.id, shipments.orderId))
+    .where(and(...conds))
+    .orderBy(asc(shipments.labeledAt));
+
+  const allItemIds = rows.flatMap((r) => r.orderItemIds);
+  const lineById = new Map(
+    allItemIds.length
+      ? (
+          await tx
+            .select({ id: orderItems.id, channelLineId: orderItems.channelLineId })
+            .from(orderItems)
+            .where(inArray(orderItems.id, allItemIds))
+        ).map((i) => [i.id, i.channelLineId] as const)
+      : [],
+  );
+
+  const exportRows: TrackingExportRow[] = rows.map((r) => {
+    const counts = new Map<string, number>();
+    for (const itemId of r.orderItemIds) {
+      const lineId = lineById.get(itemId) || r.channelOrderId;
+      counts.set(lineId, (counts.get(lineId) ?? 0) + 1);
+    }
+    return {
+      channelOrderId: r.channelOrderId,
+      orderNo: r.orderNo,
+      carrier: r.carrier ?? "mock",
+      service: r.service,
+      trackingCode: r.trackingCode ?? "",
+      trackingUrl: r.trackingUrl,
+      labeledAt: r.labeledAt as Date,
+      lines: [...counts].map(([channelLineId, quantity]) => ({ channelLineId, quantity })),
+    };
+  });
+
+  const file = buildTrackingExport(input.channel, exportRows);
+  const key = objectKey(ctx.companyId, "label", file.ext);
+  await putObject(key, file.body, file.contentType);
+
+  const ids = rows.map((r) => r.id);
+  if (ids.length)
+    await tx
+      .update(shipments)
+      .set({ exportedAt: sql`now()` })
+      .where(and(eq(shipments.companyId, ctx.companyId), inArray(shipments.id, ids)));
+
+  log.info("tracking exported", { channel: input.channel, count: ids.length, key });
+  return { key, count: ids.length };
+}

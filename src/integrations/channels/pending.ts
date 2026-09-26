@@ -37,7 +37,7 @@ export function pendingApprovalAdapter(
       return {
         status: "manual",
         externalId: null,
-        message: `Upload tracking ${push.trackingCode} (${push.carrier}) for ${label} order ${push.channelOrderId} manually (${docs.tracking})`,
+        message: `Upload tracking ${push.trackingCode} (${push.carrier}) for ${label} order ${push.channelOrderId} manually: use "Export tracking for ${label}" on the Shipping page, or go to ${docs.tracking}`,
       };
     },
     async setAvailability() {

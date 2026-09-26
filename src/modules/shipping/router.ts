@@ -1,6 +1,5 @@
 import { authed } from "../../api/orpc";
 import { afterCommit, withTenant } from "../../db/client";
-import { notImplemented } from "../../lib/errors";
 import { startBatchBuy } from "./batch";
 import { pushTrackingJob } from "./jobs";
 import * as svc from "./service";
@@ -61,7 +60,7 @@ export const shippingRouter = authed.shipping.router({
     svc.voidShipment(tenant, input),
   ),
   // T-7-1 (wave 7 stub 1): CSV tracking export for pendingApproval-adapter channels.
-  exportTracking: authed.shipping.exportTracking.handler(() => {
-    throw notImplemented("shipping.exportTracking");
-  }),
+  exportTracking: authed.shipping.exportTracking.handler(({ input, context: { tenant } }) =>
+    withTenant(tenant.companyId, (tx) => svc.exportTracking(tx, tenant, input)),
+  ),
 });
