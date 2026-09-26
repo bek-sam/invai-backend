@@ -116,3 +116,6 @@ jobs:
           echo "MinIO did not start" && docker logs minio && exit 1
       - run: pnpm run --if-present db:migrate
       - run: pnpm run --if-present test
+      # No ANTHROPIC_API_KEY here, so env.mocks.ai is true and this runs against the mock provider
+      # (plumbing check only — see evals/run.ts and invai-docs/decisions/0007-ai-model-policy.md).
+      - run: pnpm run --if-present evals

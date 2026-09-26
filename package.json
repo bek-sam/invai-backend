@@ -19,7 +19,8 @@
     "db:seed": "tsx src/db/seed/index.ts",
     "db:studio": "drizzle-kit studio",
     "test": "vitest run --passWithNoTests",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "evals": "tsx evals/run.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.128.0",

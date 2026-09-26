@@ -48,6 +48,19 @@ mock provider automatically when its env var is unset (`env.mocks.*` in `src/env
 `invai-docs/architecture.md` for the full design. Outgoing mail goes to Mailpit
 (`SMTP_URL`/`MAIL_FROM` default to it outside production; UI on http://localhost:8025).
 
+## AI evals
+
+`pnpm evals` (or `pnpm evals listing_copy trademark_judge` for a subset) runs the eval sets in
+`evals/<route>/cases.jsonl` through the real gateway (`src/ai/gateway.ts`) against a throwaway
+tenant, and prints pass rate, cost and latency per route (`evals/run.ts`; case format and required
+coverage in `.claude/skills/ai-feature-with-evals/eval-template.md`). With no `ANTHROPIC_API_KEY`
+(CI, or a local run without one) every call goes to the mock provider automatically, so the run
+checks the plumbing (schema-valid output, correct cardinality, the gateway/validator wiring) rather
+than model quality — a fixed mock can't demonstrate that either way. With a key it calls the real
+model and scores each case against its `expect`. `evals/baseline.json` is a checked-in mock-mode
+run to diff future runs against. See decision `0007-ai-model-policy.md`: no prompt or model change
+ships without an eval diff.
+
 ## Production build and required keys
 
 ```
