@@ -6,12 +6,14 @@ import {
   closeQueues,
   getJob,
   listJobs,
+  processJob,
   QUEUE_CONCURRENCY,
   QUEUE_NAMES,
   redis,
 } from "../lib/queues";
 import { onJobFailed } from "./job-failures";
 import { startOutboxRelay } from "./outbox-relay";
+import "./sweeps";
 
 const log = logger("worker");
 
@@ -24,12 +26,8 @@ const log = logger("worker");
 const workers = QUEUE_NAMES.map((queue) => {
   const worker = new Worker(
     queue,
-    async (job) => {
-      const def = getJob(job.name);
-      if (!def) throw new Error(`no handler registered for job ${job.name} on queue ${queue}`);
-      const input = def.input.parse(job.data);
-      return def.handler(input, job);
-    },
+    // Dispatch by name; input that fails the job's schema fails it for good (no retries).
+    processJob,
     { connection: redis, concurrency: QUEUE_CONCURRENCY[queue] },
   );
   worker.on("failed", (job, err) => {
