@@ -1,6 +1,7 @@
 import { REALTIME_SSE_PATH } from "@invai/contracts";
 import { OpenAPIHandler } from "@orpc/openapi/fetch";
 import { RPCHandler } from "@orpc/server/fetch";
+import { ResponseHeadersPlugin } from "@orpc/server/plugins";
 import type { StandardHandleResult } from "@orpc/server/standard";
 import { experimental_ZodSmartCoercionPlugin } from "@orpc/zod/zod4";
 import { sql } from "drizzle-orm";
@@ -36,12 +37,17 @@ const logUnexpected = async (options: { next: () => Promise<StandardHandleResult
   }
 };
 
-/** Apps talk RPC at /rpc; the same procedures are exposed as REST under /api/v1 (OpenAPI routes). */
-const rpc = new RPCHandler(router, { interceptors: [logUnexpected] });
+/** Apps talk RPC at /rpc; the same procedures are exposed as REST under /api/v1 (OpenAPI routes).
+ * `ResponseHeadersPlugin` injects `context.resHeaders`, so a middleware (the rate limiter's
+ * `Retry-After`, orpc.ts) can set a response header even on the request that it throws for. */
+const rpc = new RPCHandler(router, {
+  interceptors: [logUnexpected],
+  plugins: [new ResponseHeadersPlugin()],
+});
 const rest = new OpenAPIHandler(router, {
   interceptors: [logUnexpected],
   // Query strings arrive as strings; coerce them to the contract's number/boolean/date types.
-  plugins: [new experimental_ZodSmartCoercionPlugin()],
+  plugins: [new experimental_ZodSmartCoercionPlugin(), new ResponseHeadersPlugin()],
 });
 
 export const app = new Hono();

@@ -1,6 +1,7 @@
 import { Worker } from "bullmq";
 import "../modules/jobs";
 import { closeDb } from "../db/client";
+import { companyIdFromData, withFairness } from "../lib/fairness";
 import { errorData, logger } from "../lib/log";
 import {
   closeQueues,
@@ -22,13 +23,17 @@ const log = logger("worker");
  * One BullMQ Worker per queue. Jobs are dispatched by name to the definition registered with
  * `defineJob()` (src/lib/queues.ts). `src/modules/jobs.ts` imports every module's jobs.ts so the
  * registry is complete before the workers start. The outbox relay runs in this process too.
+ *
+ * `withFairness` (T-12-3, B-20) wraps the dispatch with the per-`{queue, companyId}` semaphore:
+ * a job over its tenant's concurrency cap re-delays itself instead of running or failing.
  */
+const fairProcessJob = withFairness(companyIdFromData, processJob);
 
 const workers = QUEUE_NAMES.map((queue) => {
   const worker = new Worker(
     queue,
     // Dispatch by name; input that fails the job's schema fails it for good (no retries).
-    processJob,
+    fairProcessJob,
     { connection: redis, concurrency: QUEUE_CONCURRENCY[queue] },
   );
   worker.on("failed", (job, err) => {

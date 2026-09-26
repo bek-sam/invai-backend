@@ -35,6 +35,7 @@ import {
   verifyEmailLink,
 } from "./lib/auth-mail";
 import { logger } from "./lib/log";
+import { betterAuthConsume } from "./lib/ratelimit";
 import { invitePreview } from "./modules/tenancy/invites";
 import { onOrganizationCreated } from "./modules/today/org-hooks";
 
@@ -214,10 +215,18 @@ export const authOptions = {
   // Per-IP limits on the auth endpoints (Better Auth only enables them in production by default).
   // Better Auth's own rules also apply: /two-factor/* 3 per 10 s, plus a per-challenge limit of 5
   // codes and a 15-minute account lock after 10 wrong codes.
+  //
+  // `customStorage` (T-2-3 follow-up, T-12-3 item 2): Better Auth's default `storage: "memory"`
+  // is a plain in-process Map, so two API processes each allow the full quota -- the count never
+  // leaves whichever process handled the request. `betterAuthConsume` (lib/ratelimit.ts) runs the
+  // same fixed-window check Better Auth's own storages use, but as one Redis EVAL shared by every
+  // process against the same Valkey. This only moves the rate limiter; sessions/verification stay
+  // on the Postgres adapter (no `secondaryStorage` set here).
   rateLimit: {
     enabled: !env.isTest,
     window: 60,
     max: 100,
+    customStorage: { consume: betterAuthConsume },
     customRules: {
       "/sign-in/email": { window: 60, max: 20 }, // per IP; a shop office shares one IP
       "/sign-up/email": { window: 60, max: 5 },

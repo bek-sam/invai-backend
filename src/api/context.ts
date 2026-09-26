@@ -38,6 +38,10 @@ export type Context = {
   memberships: Membership[];
   /** The Better Auth session id for user sessions (used by me.switchOrg). */
   authSessionId: string | null;
+  /** Set by `ResponseHeadersPlugin` (api/app.ts): headers a middleware wants on the HTTP response
+   * even when it throws (e.g. `Retry-After` on RATE_LIMITED). Absent outside a real request (tests
+   * calling a procedure directly with `call()`). */
+  resHeaders?: Headers;
 };
 
 /** What every authenticated handler works with. See `authed` in src/api/orpc.ts. */

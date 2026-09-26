@@ -1,7 +1,14 @@
 import { contract, type ProcedureMeta } from "@invai/contracts";
 import { type AnyContractRouter, isContractProcedure } from "@orpc/contract";
 import { implement, type Router } from "@orpc/server";
-import { emailNotVerified, forbidden, notImplemented, unauthorized } from "../lib/errors";
+import {
+  emailNotVerified,
+  forbidden,
+  notImplemented,
+  rateLimited,
+  unauthorized,
+} from "../lib/errors";
+import { checkRateLimit, type RateBucket } from "../lib/ratelimit";
 import { sanitizeDeep } from "../lib/text-safety";
 import { type Context, type TenantContext, tenantOf } from "./context";
 
@@ -98,8 +105,45 @@ const guard = os.middleware(async ({ context, next, procedure, path }) => {
   return next();
 });
 
+/**
+ * Per-company API rate limits (T-12-3, B-20): a Valkey token bucket keyed by `company_id`, not
+ * IP (see `lib/ratelimit.ts`). Runs after `guard` so a request that would 401/403 anyway doesn't
+ * spend a token. Skipped when there's no company yet (public procedures, or a station/floor
+ * request whose token didn't resolve) -- nothing to key the bucket on.
+ *
+ * Bucket: `ai.*` procedures get the `ai` bucket (the AI gateway's own per-company spend breaker
+ * covers cost; this covers request volume); `auth: "station"` procedures (floor PIN login, the
+ * PIN-screen staff list) get `auth`; everything else is `reads` for GET, `writes` otherwise.
+ * `RATE_LIMITED`'s `retryAfterSec` becomes both the error's `data` (already in COMMON_ERRORS) and
+ * an HTTP `Retry-After` header, via `context.resHeaders` (`ResponseHeadersPlugin`, api/app.ts) --
+ * that plugin merges headers set on `context.resHeaders` into the response even when the
+ * middleware that set them goes on to throw.
+ */
+function bucketFor(
+  path: readonly string[],
+  meta: ProcedureMeta,
+  method: string | undefined,
+): RateBucket {
+  if (path[0] === "ai") return "ai";
+  if (meta.auth === "station") return "auth";
+  return method === "GET" ? "reads" : "writes";
+}
+
+const rateLimit = os.middleware(async ({ context, next, procedure, path }) => {
+  if (!context.companyId) return next();
+  const meta = procedure["~orpc"].meta as ProcedureMeta;
+  const method = (procedure["~orpc"].route as { method?: string } | undefined)?.method;
+  const bucket = bucketFor(path, meta, method);
+  const { allowed, retryAfterSec } = await checkRateLimit(bucket, context.companyId);
+  if (!allowed) {
+    context.resHeaders?.set("Retry-After", String(retryAfterSec));
+    throw rateLimited(retryAfterSec);
+  }
+  return next();
+});
+
 /** Guarded builder without a tenant requirement. Sanitizes input before the permission guard. */
-export const pub = os.use(sanitizeInput).use(guard);
+export const pub = os.use(sanitizeInput).use(guard).use(rateLimit);
 
 /** Guarded builder that adds `context.tenant: TenantContext`. */
 export const authed = pub.use(async ({ context, next }) => {

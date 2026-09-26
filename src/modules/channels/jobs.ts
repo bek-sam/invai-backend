@@ -32,6 +32,22 @@ export const syncConnectionJob = defineJob({
 
 export const POLL_EVERY_MS = 10 * 60_000;
 
+/**
+ * Stable per-connection delay in [0, spreadMs) (T-12-3, B-20): every poll tick used to enqueue
+ * every connection's sync job at once, so a shop with many connections hit the sync queue (and
+ * whatever it calls) in one spike every 10 minutes. A deterministic hash of the connection id
+ * spreads them across the window instead -- the same connection always lands at the same offset
+ * (stable, not random per run), so two ticks don't line different connections up together either.
+ */
+export function pollJitterMs(connectionId: string, spreadMs = POLL_EVERY_MS): number {
+  let h = 2166136261; // FNV-1a offset basis
+  for (let i = 0; i < connectionId.length; i++) {
+    h ^= connectionId.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0) % spreadMs;
+}
+
 /** Every 10 minutes: one sync job per API connection with auto-import on. */
 export const pollChannelsJob = defineJob({
   queue: "sync",
@@ -48,7 +64,7 @@ export const pollChannelsJob = defineJob({
     for (const c of conns) {
       await syncConnectionJob.enqueue(
         { companyId: c.companyId, connectionId: c.id, jobId: null },
-        { jobId: `poll-${c.id}-${bucket}` },
+        { jobId: `poll-${c.id}-${bucket}`, delay: pollJitterMs(c.id) },
       );
     }
     return { connections: conns.length, tokens };
