@@ -13,6 +13,7 @@ vi.mock("../integrations/vendors/mailer", async (orig) => ({
   sendMail: vi.fn(async () => ({ messageId: "<test>" })),
 }));
 
+const { CONTRACT_VERSION } = await import("@invai/contracts");
 const { app } = await import("./app");
 const { anonymousContext, permissionsFor } = await import("./context");
 type Context = import("./context").Context;
@@ -107,6 +108,8 @@ describe("EMAIL_NOT_VERIFIED gate", () => {
     const floor = (emailVerified: boolean) =>
       session({
         sessionKind: "floor",
+        // A floor tablet sends its contract version (T-13-1), or the guard answers CLIENT_TOO_OLD.
+        headers: new Headers({ "x-contract-version": CONTRACT_VERSION }),
         role: "packer",
         permissions: permissionsFor("packer"),
         emailVerified,

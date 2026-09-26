@@ -76,7 +76,13 @@ app.use(
   cors({
     origin: [env.WEB_ORIGIN, env.FLOOR_ORIGIN],
     credentials: true,
-    allowHeaders: ["Content-Type", "Authorization", "X-Station-Token", "Last-Event-ID"],
+    allowHeaders: [
+      "Content-Type",
+      "Authorization",
+      "X-Station-Token",
+      "X-Contract-Version",
+      "Last-Event-ID",
+    ],
     exposeHeaders: ["Content-Length"],
   }),
 );

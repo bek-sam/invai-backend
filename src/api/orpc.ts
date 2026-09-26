@@ -1,7 +1,14 @@
-import { contract, type ProcedureMeta } from "@invai/contracts";
+import {
+  CONTRACT_VERSION_HEADER,
+  contract,
+  isContractVersionAtLeast,
+  type ProcedureMeta,
+} from "@invai/contracts";
 import { type AnyContractRouter, isContractProcedure } from "@orpc/contract";
 import { implement, type Router } from "@orpc/server";
+import { env } from "../env";
 import {
+  clientTooOld,
   emailNotVerified,
   forbidden,
   notImplemented,
@@ -74,6 +81,25 @@ const sanitizeInput = os.middleware(async ({ next }, input: unknown) => {
   return next();
 });
 
+/**
+ * Floor API version handshake (T-13-1, B-82, ADR 0012). A floor tablet sends `X-Contract-Version`
+ * on every call; below `MIN_FLOOR_CONTRACT_VERSION` (or with no header) its `floor`/`station`
+ * calls get `CLIENT_TOO_OLD` (426) so an old tablet can't write old shapes after a deploy.
+ * `station` covers `floor.login`/`floor.staff`, so the tablet hears it at first contact.
+ * A web user session calling an `auth: "floor"` procedure is exempt: the gate is for tablets.
+ * Runs after the auth-mode check, so an anonymous call to a floor procedure is still a 401.
+ */
+export function enforceFloorContractVersion(
+  mode: NonNullable<ProcedureMeta["auth"]>,
+  context: Pick<Context, "headers" | "sessionKind">,
+  minVersion: string = env.MIN_FLOOR_CONTRACT_VERSION,
+): void {
+  if (mode !== "floor" && mode !== "station") return;
+  if (context.sessionKind === "user") return;
+  const current = context.headers.get(CONTRACT_VERSION_HEADER)?.trim() || null;
+  if (!isContractVersionAtLeast(current, minVersion)) throw clientTooOld(minVersion, current);
+}
+
 const guard = os.middleware(async ({ context, next, procedure, path }) => {
   const meta = procedure["~orpc"].meta as ProcedureMeta;
   const mode = meta.auth ?? "user";
@@ -95,6 +121,8 @@ const guard = os.middleware(async ({ context, next, procedure, path }) => {
       }
       break;
   }
+
+  enforceFloorContractVersion(mode, context);
 
   if (meta.permission !== "none" && !context.permissions.has(meta.permission)) {
     throw forbidden(meta.permission, `Missing permission ${meta.permission} for ${path.join(".")}`);

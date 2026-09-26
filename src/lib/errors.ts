@@ -70,6 +70,18 @@ export function rateLimited(retryAfterSec: number) {
   });
 }
 
+/**
+ * A floor tablet on a contract version below `MIN_FLOOR_CONTRACT_VERSION`, or with no
+ * `X-Contract-Version` header (HTTP 426, T-13-1, ADR 0012). The floor shows "Update needed".
+ */
+export function clientTooOld(minVersion: string, current: string | null) {
+  return new ORPCError("CLIENT_TOO_OLD", {
+    status: 426,
+    message: "This app is out of date. Update it to continue",
+    data: { minVersion, current },
+  });
+}
+
 /** An external service (imaging, carrier, channel, model) failed (HTTP 502). */
 export function upstream(service: string, detail: string | null = null) {
   return new ORPCError("UPSTREAM_FAILED", {

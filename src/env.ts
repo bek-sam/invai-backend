@@ -1,4 +1,5 @@
 import { existsSync } from "node:fs";
+import { CONTRACT_VERSION } from "@invai/contracts";
 import { createEnv } from "@t3-oss/env-core";
 import { z } from "zod";
 
@@ -59,6 +60,15 @@ const raw = createEnv({
     /** Signs floor session tokens and station/PIN hashes. Falls back to BETTER_AUTH_SECRET. */
     FLOOR_TOKEN_SECRET: z.string().min(32).optional(),
     FLOOR_SESSION_TTL_HOURS: z.coerce.number().default(12),
+    /**
+     * Oldest `X-Contract-Version` a floor tablet may call with (T-13-1, ADR 0012). Defaults to the
+     * contracts version this backend was built with; ops set it lower to hold old tablets inside
+     * the grace window without a contracts release.
+     */
+    MIN_FLOOR_CONTRACT_VERSION: z
+      .string()
+      .regex(/^\d+\.\d+\.\d+$/, "expected x.y.z")
+      .default(CONTRACT_VERSION),
 
     /** `<keyId>:<base64 32 bytes>[,<keyId>:<base64>]`; the first key encrypts, all keys decrypt. */
     FIELD_ENCRYPTION_KEY: z.string().min(40),
