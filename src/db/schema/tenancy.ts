@@ -359,6 +359,8 @@ export const outboxEvents = pgTable(
   },
   (t) => [
     index("outbox_events_pending_idx").on(t.createdAt).where(sql`dispatched_at is null`),
+    // The 7-day purge of dispatched rows (worker/outbox-relay.ts `purgeDispatchedOutbox`).
+    index("outbox_events_dispatched_idx").on(t.dispatchedAt).where(sql`dispatched_at is not null`),
     tenantPolicy("outbox_events"),
   ],
 ).enableRLS();

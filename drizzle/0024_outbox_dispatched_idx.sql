@@ -1,0 +1,2 @@
+ALTER TABLE "vendor_connections" ALTER COLUMN "spec" SET DEFAULT '{"widthIn":22,"maxLengthIn":240,"format":"png","dpi":300,"pricePerInch":30,"spacingIn":0.25,"marginIn":0.25,"labelGapIn":0.125,"colorProfile":null,"notes":null}'::jsonb;--> statement-breakpoint
+CREATE INDEX "outbox_events_dispatched_idx" ON "outbox_events" USING btree ("dispatched_at") WHERE dispatched_at is not null;
