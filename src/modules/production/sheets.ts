@@ -60,7 +60,7 @@ type SheetRow = typeof gangSheets.$inferSelect;
 type TransferRow = typeof transfers.$inferSelect;
 type ExclusionReason = (typeof BATCH_EXCLUSION_REASONS)[number];
 
-export const LABEL_HEIGHT_IN = 0.35;
+export const LABEL_HEIGHT_IN = 0.42;
 
 /* --------------------------------- specs ---------------------------------- */
 

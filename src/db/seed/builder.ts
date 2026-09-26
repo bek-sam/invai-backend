@@ -8,6 +8,7 @@ import { recordListingsForCompany } from "../../modules/channels/sku";
 import { shelfFor } from "../../modules/inventory/shelves";
 import { transitionItem } from "../../modules/orders/state-machine";
 import { renderValues } from "../../modules/personalization/service";
+import { LABEL_HEIGHT_IN } from "../../modules/production/sheets";
 import { issueStationToken, setPin } from "../../modules/tenancy/floor-auth";
 import type { Tx } from "../client";
 import type { Address } from "../schema";
@@ -1043,7 +1044,7 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
       let printArea = 0;
       for (const c of chunk) {
         if (x > marginIn && x + c.widthIn > filmIn - marginIn) {
-          y += rowH + 0.35 + spacingIn;
+          y += rowH + LABEL_HEIGHT_IN + spacingIn;
           x = marginIn;
           rowH = 0;
         }
@@ -1052,7 +1053,7 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
         rowH = Math.max(rowH, c.heightIn);
         printArea += c.widthIn * c.heightIn;
       }
-      const lengthIn = Math.round((y + rowH + 0.35 + marginIn) * 100) / 100;
+      const lengthIn = Math.round((y + rowH + LABEL_HEIGHT_IN + marginIn) * 100) / 100;
       const builtAt = new Date(first.placedAt.getTime() + 8 * HOUR);
       const [batch] = await tx
         .insert(gangSheetBatches)
