@@ -244,6 +244,30 @@ describe("privacy: tenant export", () => {
     await runJobInline(tenantExportJob, { companyId: a.id, jobId: next.id });
   });
 
+  it("a files.read user without org.export can't download an export", async () => {
+    const job = await call(
+      router.privacy.exportTrigger,
+      {},
+      { context: as(a.id, a.ownerId, "owner") },
+    );
+    await runJobInline(tenantExportJob, { companyId: a.id, jobId: job.id });
+    const input = { fileKey: exportKey(a.id, job.id), disposition: "attachment" as const };
+    for (const role of ["presser", "office", "designer", "admin"] as const) {
+      const userId = (await createUser(a.id, role)).id;
+      const ctx = as(a.id, userId, role);
+      expect(ctx.permissions.has("files.read"), role).toBe(true);
+      await expect(
+        call(router.files.downloadUrl, input, { context: ctx }),
+        role,
+      ).rejects.toMatchObject({
+        code: "NOT_FOUND",
+      });
+    }
+    await expect(
+      call(router.files.downloadUrl, input, { context: as(a.id, a.ownerId, "owner") }),
+    ).resolves.toMatchObject({ fileKey: input.fileKey });
+  });
+
   it("is the owner's alone: admin gets FORBIDDEN", async () => {
     const adminId = (await createUser(a.id, "admin")).id;
     const admin = as(a.id, adminId, "admin");

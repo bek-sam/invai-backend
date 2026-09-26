@@ -138,6 +138,8 @@ const KIND_PERMISSIONS: Record<string, Permission[] | null> = {
   raw: null,
   csv: ["channels.import", "catalog.manage", "finance.manage"],
   label: ["shipping.read"],
+  // Whole-company exports (privacy.exportTrigger) hold everything, buyer PII included: owner only.
+  "tenant-export": ["org.export"],
 };
 
 function canReadKind(ctx: TenantContext, kind: string): boolean {
