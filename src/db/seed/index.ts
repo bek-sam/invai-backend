@@ -72,6 +72,9 @@ async function main() {
       plan: "growth",
       timezone: "America/Phoenix",
       demo: true,
+      // Etsy's validator requires one (production_partner_required, T-8-1); Desert Bloom's real
+      // DTF vendor (seeded just below) is the natural value, not a made-up name.
+      settings: { productionPartner: { name: "Sun City DTF", etsyPartnerId: null } },
     })
     .returning();
   const [vendorOrg] = await systemDb
