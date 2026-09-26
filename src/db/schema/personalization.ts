@@ -15,13 +15,18 @@ import { companyId } from "./tenancy";
 /** Contracts `TemplateSlot` (camelCase); translated to imaging's snake_case at render time. */
 export type TemplateSlot = {
   name: string;
-  kind: "text";
+  kind: "text" | "photo";
   xIn: number;
   yIn: number;
   wIn: number;
   hIn: number;
-  fontFamily: string;
+  fontFamily: "Inter" | "Inter Bold" | "Inter Black" | "Oswald" | "Pacifico" | "Bebas Neue";
   fontSizePt: number;
+  minFontSizePt: number | null;
+  maxLines: number | null;
+  strokeWidthPt: number;
+  strokeColor: string | null;
+  fit: "fit" | "fill";
   color: string;
   align: "left" | "center" | "right";
   maxChars: number | null;

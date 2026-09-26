@@ -41,13 +41,18 @@ const KeyResult = z.object({ key: z.string() });
 
 export const TemplateSlot = z.object({
   name: z.string(),
-  kind: z.literal("text"),
+  kind: z.enum(["text", "photo"]),
   x_in: z.number(),
   y_in: z.number(),
   w_in: z.number(),
   h_in: z.number(),
   font_family: z.string(),
   font_size_pt: z.number(),
+  min_font_size_pt: z.number().nullable().optional(),
+  max_lines: z.number().int().nullable().optional(),
+  stroke_width_pt: z.number().optional(),
+  stroke_color: z.string().nullable().optional(),
+  fit: z.enum(["fit", "fill"]).optional(),
   color: z.string(),
   align: z.enum(["left", "center", "right"]),
   max_chars: z.number().optional(),
@@ -66,7 +71,14 @@ const RenderResult = z.object({
   flags: z.array(
     z.object({
       slot: z.string(),
-      code: z.enum(["overflow", "empty", "too_long", "suspicious_chars"]),
+      code: z.enum([
+        "overflow",
+        "empty",
+        "too_long",
+        "suspicious_chars",
+        "missing_glyphs",
+        "low_res_photo",
+      ]),
       message: z.string(),
     }),
   ),

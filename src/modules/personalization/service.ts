@@ -269,6 +269,9 @@ export function localFlags(slots: TemplateSlot[], values: Record<string, string>
         });
       continue;
     }
+    // A photo slot's value is a storage key, not buyer text; the date/year heuristics below
+    // only make sense for text slots.
+    if (s.kind === "photo") continue;
     if (/date/.test(label)) {
       const ok = DATE_RE.some((re) => re.test(v));
       const m = /^(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})$/.exec(v);
@@ -319,13 +322,18 @@ function renderTemplatePayload(
     ...(t.backgroundKey ? { background_key: t.backgroundKey } : {}),
     slots: t.slots.map((s) => ({
       name: s.name,
-      kind: "text" as const,
+      kind: s.kind,
       x_in: s.xIn,
       y_in: s.yIn,
       w_in: s.wIn,
       h_in: s.hIn,
       font_family: s.fontFamily,
       font_size_pt: s.fontSizePt,
+      min_font_size_pt: s.minFontSizePt,
+      max_lines: s.maxLines,
+      stroke_width_pt: s.strokeWidthPt,
+      stroke_color: s.strokeColor,
+      fit: s.fit,
       color: s.color,
       align: s.align,
       ...(s.maxChars ? { max_chars: s.maxChars } : {}),
