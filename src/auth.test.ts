@@ -512,6 +512,10 @@ describe("two-step sign-in (TOTP)", () => {
   });
 });
 
+// Unique per run: the limiter's counters live in the shared Valkey for 15 minutes, so fixed IPs
+// make a second run inside that window start already limited.
+const RL_RUN = Math.floor(Math.random() * 250) + 1;
+
 describe("auth rate limits", () => {
   // Rate limits are off in tests (sign-ups would trip them); this instance turns them on.
   const limited = betterAuth({
@@ -535,13 +539,15 @@ describe("auth rate limits", () => {
     const statuses = [];
     for (let i = 0; i < 6; i++) {
       statuses.push(
-        (await hit("/request-password-reset", { email: uniqEmail("rl") }, "203.0.113.7")).status,
+        (await hit("/request-password-reset", { email: uniqEmail("rl") }, `203.0.${RL_RUN}.7`))
+          .status,
       );
     }
     expect(statuses).toEqual([200, 200, 200, 200, 200, 429]);
     // Another IP is unaffected.
     expect(
-      (await hit("/request-password-reset", { email: uniqEmail("rl") }, "203.0.113.8")).status,
+      (await hit("/request-password-reset", { email: uniqEmail("rl") }, `203.0.${RL_RUN}.8`))
+        .status,
     ).toBe(200);
   });
 
@@ -553,7 +559,7 @@ describe("auth rate limits", () => {
           await hit(
             "/reset-password",
             { token: "nope", newPassword: "whatever 123" },
-            "203.0.113.9",
+            `203.0.${RL_RUN}.9`,
           )
         ).status,
       );
