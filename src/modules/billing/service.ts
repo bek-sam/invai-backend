@@ -34,7 +34,12 @@ const log = logger("billing");
 
 type PlanRow = typeof plans.$inferSelect;
 
-/** The v1 price list. Scale is custom (no order cap). Synced into the global `plans` table. */
+/**
+ * The v1 price list. Scale is custom (no order cap). Synced into the global `plans` table.
+ * `labelFeeCents` on the paid plans is the $0.10/label default from the concept doc — see OI-1
+ * (open): the owner still has to pick between that flat rate, keeping a low fee as a growth
+ * lever, or a pricing-experiment readout. Trial stays free (0) either way.
+ */
 export const PLAN_CATALOG: (typeof plans.$inferInsert)[] = [
   {
     key: "trial",
@@ -52,7 +57,7 @@ export const PLAN_CATALOG: (typeof plans.$inferInsert)[] = [
     priceMonthlyCents: 14900,
     ordersPerMonth: 3000,
     aiCreditsPerMonth: 500,
-    labelFeeCents: 5,
+    labelFeeCents: 10, // see OI-1
     maxUsers: 5,
     maxConnections: 4,
   },
@@ -62,7 +67,7 @@ export const PLAN_CATALOG: (typeof plans.$inferInsert)[] = [
     priceMonthlyCents: 34900,
     ordersPerMonth: 10000,
     aiCreditsPerMonth: 2000,
-    labelFeeCents: 4,
+    labelFeeCents: 10, // see OI-1
     maxUsers: 15,
     maxConnections: 8,
   },
@@ -72,7 +77,7 @@ export const PLAN_CATALOG: (typeof plans.$inferInsert)[] = [
     priceMonthlyCents: 69900,
     ordersPerMonth: 30000,
     aiCreditsPerMonth: 6000,
-    labelFeeCents: 3,
+    labelFeeCents: 10, // see OI-1
     maxUsers: 40,
     maxConnections: 16,
   },
@@ -82,7 +87,7 @@ export const PLAN_CATALOG: (typeof plans.$inferInsert)[] = [
     priceMonthlyCents: 0,
     ordersPerMonth: null,
     aiCreditsPerMonth: 20000,
-    labelFeeCents: 2,
+    labelFeeCents: 10, // see OI-1
     maxUsers: null,
     maxConnections: null,
   },

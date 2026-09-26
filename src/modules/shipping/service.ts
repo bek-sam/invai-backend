@@ -61,7 +61,7 @@ import { emit } from "../../lib/outbox";
 import { keyset, type PageInput } from "../../lib/pagination";
 import { publish } from "../../lib/realtime";
 import { getObject, objectKey, presignGet, putObject } from "../../lib/s3";
-import { assertPaidActionAllowed } from "../billing/service";
+import { assertPaidActionAllowed, getPlan } from "../billing/service";
 import { pushTrackingForShipment } from "../channels/service";
 import { transitionItem } from "../orders/state-machine";
 import { createJobRow, updateJobRow } from "../production/service";
@@ -86,8 +86,6 @@ type TrackingPushStatus = z.infer<typeof TrackingPushStatusSchema>;
 type SettingsInput = z.infer<typeof ShippingSettingsInputSchema>;
 type Strategy = "cheapest" | "fastest" | "cheapest_on_time";
 
-/** Platform per-label fee (billing), in cents. */
-export const LABEL_FEE_CENTS = 4;
 /** Quotes older than this must be fetched again before buying. */
 const RATE_TTL_MS = 24 * 3600_000;
 /** Days after delivery before buyer PII is purged. */
@@ -884,6 +882,8 @@ async function recordLabel(
 ) {
   const [order] = await tx.select().from(orders).where(eq(orders.id, s.orderId)).limit(1);
   if (!order) throw notFound("order", s.orderId);
+  // Same fee the plan bills for and the profit calc reads back off this row (AC3).
+  const labelFeeCents = (await getPlan(tx, ctx.companyId)).labelFee;
   const pack = (await orderPacks(tx, [order.id])).get(order.id);
   const itemIds = pack?.itemIds ?? s.orderItemIds;
   const settings = await settingsRow(tx, ctx);
@@ -909,7 +909,7 @@ async function recordLabel(
       labelKey: label.labelKey,
       format: "pdf",
       postageCents: label.postageCents,
-      labelFeeCents: LABEL_FEE_CENTS,
+      labelFeeCents,
       carrierLabelId: label.carrierLabelId,
     })
     .onConflictDoNothing();
@@ -926,7 +926,7 @@ async function recordLabel(
       labelKey: label.labelKey,
       labelFormat: "pdf",
       postageCents: label.postageCents,
-      labelFeeCents: LABEL_FEE_CENTS,
+      labelFeeCents,
       selectedRateId: quote.rateId,
       carrierLabelId: label.carrierLabelId,
       orderItemIds: itemIds,
