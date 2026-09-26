@@ -1,4 +1,5 @@
 import type { TrademarkCheck } from "@invai/contracts";
+import { ORPCError } from "@orpc/server";
 import { sql } from "drizzle-orm";
 import { runStructured } from "../../ai/gateway";
 import { trademarkJudgePrompt } from "../../ai/prompts";
@@ -180,6 +181,30 @@ export async function checkTrademarks(
     ocrText: opts.ocrText ?? null,
     checkedAt: new Date().toISOString(),
   };
+}
+
+/**
+ * Wave 8 Contract stubs / A enforcement (T-8-4): re-checked live in `approveDraft`, `publishDraft`
+ * and `exportListingsCsv` against the draft's **current** `trademark` field — never a value cached
+ * at approval time. `riskScore >= 60` always throws, with no override (the old `acknowledgeRisk`
+ * bypass in `approveDraft` is gone). `25 <= riskScore < 60` throws unless a review is on record.
+ */
+export function assertTrademarkGate(tm: TrademarkCheck | null, reviewed: boolean): void {
+  if (!tm) return;
+  if (tm.riskLevel === "high") {
+    throw new ORPCError("HIGH_TRADEMARK_RISK", {
+      status: 409,
+      message: "High trademark risk; this listing cannot be approved, published or exported",
+      data: tm,
+    });
+  }
+  if (tm.riskLevel === "medium" && !reviewed) {
+    throw new ORPCError("TRADEMARK_REVIEW_REQUIRED", {
+      status: 409,
+      message: "Medium trademark risk; a compliance review is required first",
+      data: { riskScore: tm.riskScore },
+    });
+  }
 }
 
 function explain(matches: TmMatch[], level: string, judged: boolean): string {

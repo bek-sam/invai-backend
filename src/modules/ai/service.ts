@@ -43,7 +43,7 @@ import { keyset, type PageInput } from "../../lib/pagination";
 import { publish } from "../../lib/realtime";
 import { objectKey, presignGet, putObject } from "../../lib/s3";
 import { assistantTools } from "./assistant-tools";
-import { checkTrademarks, type TmInput } from "./trademark";
+import { assertTrademarkGate, checkTrademarks, type TmInput } from "./trademark";
 
 const log = logger("ai");
 
@@ -610,7 +610,7 @@ async function getDraftFromRow(tx: Tx, row: DraftRow) {
   return d as ListingDraft;
 }
 
-export async function approveDraft(tx: Tx, ctx: Ctx, id: string, acknowledgeRisk: boolean) {
+export async function approveDraft(tx: Tx, ctx: Ctx, id: string) {
   const row = await loadDraft(tx, ctx, id, true);
   if (row.status !== "needs_review")
     throw invalidTransition("listing_draft", id, row.status, "approved");
@@ -621,13 +621,10 @@ export async function approveDraft(tx: Tx, ctx: Ctx, id: string, acknowledgeRisk
       message: "Draft violates channel rules",
       data: validation,
     });
+  // T-8-4: re-checks the draft's *current* trademark field live, every call. No override — the
+  // former `acknowledgeRisk` bypass is gone.
   const tm = row.trademark as TrademarkCheck | null;
-  if (tm?.riskLevel === "high" && !acknowledgeRisk)
-    throw new ORPCError("HIGH_TRADEMARK_RISK", {
-      status: 409,
-      message: "High trademark risk; pass acknowledgeRisk to approve anyway",
-      data: tm,
-    });
+  assertTrademarkGate(tm, !!row.trademarkReviewedBy);
   const [updated] = await tx
     .update(listingDrafts)
     .set({ status: "approved", approvedBy: ctx.userId, approvedAt: new Date(), validation })
@@ -639,8 +636,8 @@ export async function approveDraft(tx: Tx, ctx: Ctx, id: string, acknowledgeRisk
     action: "listing_draft.approve",
     entityType: "listing_draft",
     entityId: id,
-    summary: `Approved ${row.channel} listing${tm?.riskLevel === "high" ? " (trademark risk acknowledged)" : ""}`,
-    data: { riskScore: tm?.riskScore ?? null, acknowledgeRisk },
+    summary: `Approved ${row.channel} listing`,
+    data: { riskScore: tm?.riskScore ?? null },
   });
   if (ctx.userId)
     await emit(tx, ctx.companyId, "listing_draft.approved", { draftId: id, userId: ctx.userId });
@@ -669,6 +666,51 @@ export async function rejectDraft(tx: Tx, ctx: Ctx, id: string, reason?: string)
     entityType: "listing_draft",
     entityId: id,
     summary: reason ? `Rejected: ${reason}` : "Rejected",
+  });
+  return getDraftFromRow(tx, updated as DraftRow);
+}
+
+/**
+ * `ai.listings.recordTrademarkReview`: a compliance sign-off on a medium-risk draft
+ * (25 <= riskScore < 60), required by `assertTrademarkGate` before approve/publish/export.
+ * 409s outside that band — including once the risk score has moved (edited content, or a mark
+ * added since) rather than trusting a stale review.
+ */
+export async function recordTrademarkReview(tx: Tx, ctx: Ctx, id: string, note: string) {
+  const row = await loadDraft(tx, ctx, id, true);
+  const tm = row.trademark as TrademarkCheck | null;
+  if (tm?.riskLevel !== "medium")
+    throw new ORPCError("TRADEMARK_REVIEW_NOT_APPLICABLE", {
+      status: 409,
+      message: "Trademark review only applies to medium-risk drafts (25 <= riskScore < 60)",
+      data:
+        tm ??
+        ({
+          riskScore: 0,
+          riskLevel: "low",
+          matches: [],
+          explanation: "No trademark check has run on this draft yet.",
+          ocrText: null,
+          checkedAt: new Date().toISOString(),
+        } satisfies TrademarkCheck),
+    });
+  const [updated] = await tx
+    .update(listingDrafts)
+    .set({
+      trademarkReviewedBy: ctx.userId,
+      trademarkReviewedAt: new Date(),
+      trademarkReviewNote: note,
+    })
+    .where(eq(listingDrafts.id, id))
+    .returning();
+  await audit(tx, {
+    companyId: ctx.companyId,
+    actor: ctx.actor,
+    action: "listing_draft.trademark_review",
+    entityType: "listing_draft",
+    entityId: id,
+    summary: `Trademark review recorded (risk ${tm.riskScore})`,
+    data: { riskScore: tm.riskScore, note },
   });
   return getDraftFromRow(tx, updated as DraftRow);
 }
@@ -911,6 +953,8 @@ export async function exportListingsCsv(
         status: 400,
         message: "A draft's channel does not match the export channel",
       });
+    // T-8-4: re-checked live per draft, against its current trademark field.
+    assertTrademarkGate(row.trademark as TrademarkCheck | null, !!row.trademarkReviewedBy);
     ordered.push(row);
   }
   const etsyPartnerId =
@@ -944,6 +988,8 @@ export async function publishDraft(
     throw invalidTransition("listing_draft", id, row.status, "publishing");
   if (row.status === "failed" && !row.approvedAt)
     throw conflict("Draft must be approved by a person before publishing");
+  // T-8-4: re-checked live against the current trademark field, not the value cached at approval.
+  assertTrademarkGate(row.trademark as TrademarkCheck | null, !!row.trademarkReviewedBy);
   const [conn] = await tx
     .select()
     .from(channelConnections)

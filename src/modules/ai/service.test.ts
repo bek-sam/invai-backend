@@ -137,20 +137,30 @@ describe("ai module", () => {
       svc.updateDraft(tx, ctx, etsy.id, { title: "x".repeat(150) }),
     );
     await expect(
-      withTenant(companyId, (tx) => svc.approveDraft(tx, ctx, etsy.id, false)),
+      withTenant(companyId, (tx) => svc.approveDraft(tx, ctx, etsy.id)),
     ).rejects.toMatchObject({
       code: "VALIDATION_FAILED",
     });
-    // A trademark in the title requires acknowledging the risk.
+    // A trademark in the title blocks approval unconditionally (T-8-4 AC1): no acknowledgeRisk
+    // override exists any more.
     await withTenant(companyId, (tx) =>
       svc.updateDraft(tx, ctx, etsy.id, { title: "Just Do It Nike Cactus Shirt" }),
     );
     await expect(
-      withTenant(companyId, (tx) => svc.approveDraft(tx, ctx, etsy.id, false)),
+      withTenant(companyId, (tx) => svc.approveDraft(tx, ctx, etsy.id)),
     ).rejects.toMatchObject({
       code: "HIGH_TRADEMARK_RISK",
     });
-    const approved = await withTenant(companyId, (tx) => svc.approveDraft(tx, ctx, etsy.id, true));
+    await expect(
+      withTenant(companyId, (tx) => svc.approveDraft(tx, ctx, etsy.id)),
+    ).rejects.toMatchObject({
+      code: "HIGH_TRADEMARK_RISK",
+    });
+    // Only editing the trademarked text away clears the gate.
+    await withTenant(companyId, (tx) =>
+      svc.updateDraft(tx, ctx, etsy.id, { title: "Desert Sunset Cactus Tee" }),
+    );
+    const approved = await withTenant(companyId, (tx) => svc.approveDraft(tx, ctx, etsy.id));
     expect(approved.status).toBe("approved");
 
     const credits = await withTenant(companyId, (tx) => svc.balance(tx, ctx));
@@ -300,7 +310,7 @@ describe("ai module", () => {
       const draft = await withTenant(companyId, (tx) =>
         svc.getDraft(tx, ctx, drafts[0]?.id as string),
       );
-      return withTenant(companyId, (tx) => svc.approveDraft(tx, ctx, draft.id, true));
+      return withTenant(companyId, (tx) => svc.approveDraft(tx, ctx, draft.id));
     }
 
     it("exports one CSV row per variant with real SKUs (Etsy)", async () => {
@@ -415,6 +425,132 @@ describe("ai module", () => {
             .where(eq(companies.id, companyId)),
         );
       }
+    });
+  });
+
+  describe("trademark gate (T-8-4, AC1/AC2/AC3/AC4)", () => {
+    /** A needs_review draft with its `trademark` field forced to an exact score/level, so the
+     * gate itself is under test rather than the trigram scoring (already covered above). */
+    async function draftAt(riskScore: number, riskLevel: "low" | "medium" | "high") {
+      const enq: string[] = [];
+      svc.setGenerationEnqueuer(async (input) => {
+        enq.push(...input.draftIds);
+      });
+      const { jobId, drafts } = await withTenant(companyId, (tx) =>
+        svc.createDrafts(tx, ctx, { designId, channels: ["etsy"] }),
+      );
+      await svc.runGenerationJob({ companyId, jobId, draftIds: enq, userId: ctx.userId });
+      const id = drafts[0]?.id as string;
+      await withSystem((tx) =>
+        tx
+          .update(listingDrafts)
+          .set({
+            trademark: {
+              riskScore,
+              riskLevel,
+              matches: [],
+              explanation: "forced for the gate test",
+              ocrText: null,
+              checkedAt: new Date().toISOString(),
+            },
+          })
+          .where(eq(listingDrafts.id, id)),
+      );
+      return id;
+    }
+
+    it("< 25 publishes clean", async () => {
+      const id = await draftAt(10, "low");
+      const approved = await withTenant(companyId, (tx) => svc.approveDraft(tx, ctx, id));
+      expect(approved.status).toBe("approved");
+    });
+
+    it("25-59 blocks until recordTrademarkReview, then publishes", async () => {
+      const id = await draftAt(40, "medium");
+      await expect(
+        withTenant(companyId, (tx) => svc.approveDraft(tx, ctx, id)),
+      ).rejects.toMatchObject({ code: "TRADEMARK_REVIEW_REQUIRED", data: { riskScore: 40 } });
+      // Recording a review only applies to a medium-risk draft.
+      const other = await draftAt(10, "low");
+      await expect(
+        withTenant(companyId, (tx) => svc.recordTrademarkReview(tx, ctx, other, "not medium")),
+      ).rejects.toMatchObject({ code: "TRADEMARK_REVIEW_NOT_APPLICABLE" });
+      const reviewed = await withTenant(companyId, (tx) =>
+        svc.recordTrademarkReview(
+          tx,
+          ctx,
+          id,
+          "Reviewed against the class-25 index; not a conflict",
+        ),
+      );
+      expect(reviewed.trademarkReview?.reviewedBy).toBe(ctx.userId);
+      expect(reviewed.trademarkReview?.note).toMatch(/not a conflict/);
+      const approved = await withTenant(companyId, (tx) => svc.approveDraft(tx, ctx, id));
+      expect(approved.status).toBe("approved");
+    });
+
+    it(">= 60 blocks even after a review is recorded", async () => {
+      const id = await draftAt(80, "high");
+      await expect(
+        withTenant(companyId, (tx) => svc.recordTrademarkReview(tx, ctx, id, "trying anyway")),
+      ).rejects.toMatchObject({ code: "TRADEMARK_REVIEW_NOT_APPLICABLE" });
+      // Even a review recorded directly (e.g. stale from before the risk moved) never overrides.
+      await withSystem((tx) =>
+        tx
+          .update(listingDrafts)
+          .set({
+            trademarkReviewedBy: ctx.userId,
+            trademarkReviewedAt: new Date(),
+            trademarkReviewNote: "stale review",
+          })
+          .where(eq(listingDrafts.id, id)),
+      );
+      await expect(
+        withTenant(companyId, (tx) => svc.approveDraft(tx, ctx, id)),
+      ).rejects.toMatchObject({ code: "HIGH_TRADEMARK_RISK" });
+    });
+
+    it("re-checks the current trademark field live at publish/export, not the value cached at approval", async () => {
+      const id = await draftAt(10, "low");
+      const approved = await withTenant(companyId, (tx) => svc.approveDraft(tx, ctx, id));
+      expect(approved.status).toBe("approved");
+      // The risk moves after approval (e.g. a mark added to the index since); publish/export must
+      // re-read the draft's current field rather than trust what approve saw.
+      await withSystem((tx) =>
+        tx
+          .update(listingDrafts)
+          .set({
+            trademark: {
+              riskScore: 90,
+              riskLevel: "high",
+              matches: [],
+              explanation: "risk moved after approval",
+              ocrText: null,
+              checkedAt: new Date().toISOString(),
+            },
+          })
+          .where(eq(listingDrafts.id, id)),
+      );
+      const [conn] = await withSystem((tx) =>
+        tx
+          .insert(channelConnections)
+          .values({
+            companyId,
+            channel: "etsy",
+            name: "Etsy CSV (gate test)",
+            mode: "csv",
+            provider: "mock",
+          })
+          .returning(),
+      );
+      await expect(
+        withTenant(companyId, (tx) => svc.publishDraft(tx, ctx, id, conn?.id as string)),
+      ).rejects.toMatchObject({ code: "HIGH_TRADEMARK_RISK" });
+      await expect(
+        withTenant(companyId, (tx) =>
+          svc.exportListingsCsv(tx, ctx, { draftIds: [id], channel: "etsy" }),
+        ),
+      ).rejects.toMatchObject({ code: "HIGH_TRADEMARK_RISK" });
     });
   });
 

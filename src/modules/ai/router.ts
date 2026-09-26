@@ -1,6 +1,5 @@
 import { authed } from "../../api/orpc";
 import { withTenant } from "../../db/client";
-import { notImplemented } from "../../lib/errors";
 import "./jobs";
 import * as svc from "./service";
 
@@ -18,18 +17,22 @@ export const aiRouter = authed.ai.router({
     update: authed.ai.listings.update.handler(({ input, context: { tenant } }) =>
       withTenant(tenant.companyId, (tx) => svc.updateDraft(tx, tenant, input.id, input.content)),
     ),
+    // `acknowledgeRisk` is deprecated (kept in the contract input only so old clients still
+    // typecheck): the trademark gate re-checks the draft's current `trademark` field live and has
+    // no override, so the flag is ignored here (T-8-4).
     approve: authed.ai.listings.approve.handler(({ input, context: { tenant } }) =>
-      withTenant(tenant.companyId, (tx) =>
-        svc.approveDraft(tx, tenant, input.id, input.acknowledgeRisk),
-      ),
+      withTenant(tenant.companyId, (tx) => svc.approveDraft(tx, tenant, input.id)),
     ),
     reject: authed.ai.listings.reject.handler(({ input, context: { tenant } }) =>
       withTenant(tenant.companyId, (tx) => svc.rejectDraft(tx, tenant, input.id, input.reason)),
     ),
     // T-8-4 (wave 8): compliance sign-off on a medium-risk draft.
-    recordTrademarkReview: authed.ai.listings.recordTrademarkReview.handler(() => {
-      throw notImplemented("ai.listings.recordTrademarkReview");
-    }),
+    recordTrademarkReview: authed.ai.listings.recordTrademarkReview.handler(
+      ({ input, context: { tenant } }) =>
+        withTenant(tenant.companyId, (tx) =>
+          svc.recordTrademarkReview(tx, tenant, input.id, input.note),
+        ),
+    ),
     publish: authed.ai.listings.publish.handler(({ input, context: { tenant } }) =>
       withTenant(tenant.companyId, (tx) =>
         svc.publishDraft(tx, tenant, input.id, input.connectionId),
