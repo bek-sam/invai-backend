@@ -77,20 +77,24 @@ app.use(
 
 // Public and unauthenticated: dependency status only. Which providers run on mocks is logged at
 // startup (server.ts) and never exposed here.
+const checkDb = () =>
+  db
+    .execute(sql`select 1`)
+    .then(() => true)
+    .catch(() => false);
+const checkRedis = () =>
+  redis
+    .ping()
+    .then((r) => r === "PONG")
+    .catch(() => false);
+
 app.get("/health", async (c) => {
-  const checks = await Promise.all([
-    db
-      .execute(sql`select 1`)
-      .then(() => true)
-      .catch(() => false),
-    redis
-      .ping()
-      .then((r) => r === "PONG")
-      .catch(() => false),
+  const [dbOk, redisOk, imagingOk, s3Ok] = await Promise.all([
+    checkDb(),
+    checkRedis(),
     imaging.isUp(),
     s3Healthy(),
   ]);
-  const [dbOk, redisOk, imagingOk, s3Ok] = checks;
   const ok = dbOk && redisOk;
   return c.json(
     {
@@ -103,6 +107,20 @@ app.get("/health", async (c) => {
     },
     ok ? 200 : 503,
   );
+});
+
+// Liveness (T-12-2, B-16): the process is up and can answer HTTP, full stop. No DB/Redis/imaging/S3
+// calls, so a dependency outage never fails this -- an orchestrator must not restart a healthy
+// process just because its database is down (that would make an outage worse, not better).
+app.get("/livez", (c) => c.json({ ok: true }));
+
+// Readiness: same DB/Redis checks as /health, without imaging/S3 (those degrade a feature, not
+// whether this instance should receive traffic). 503 takes an instance out of a load balancer's
+// rotation without restarting it.
+app.get("/readyz", async (c) => {
+  const [dbOk, redisOk] = await Promise.all([checkDb(), checkRedis()]);
+  const ok = dbOk && redisOk;
+  return c.json({ ok, db: dbOk, redis: redisOk }, ok ? 200 : 503);
 });
 
 // Internal-only DLQ/redrive routes (X-Internal-Token; 404 otherwise). See internal.ts.

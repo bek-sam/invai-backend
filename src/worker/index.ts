@@ -11,6 +11,7 @@ import {
   QUEUE_NAMES,
   redis,
 } from "../lib/queues";
+import { withShutdownCap } from "../lib/shutdown-timeout";
 import { onJobFailed } from "./job-failures";
 import { startOutboxRelay } from "./outbox-relay";
 import "./sweeps";
@@ -53,10 +54,32 @@ log.info("worker started", {
   jobs: listJobs().map((j) => j.name),
 });
 
+/**
+ * Graceful SIGTERM/SIGINT (T-12-2, B-16). `worker.close()` (no `force` arg) waits for each
+ * worker's active job to finish before resolving -- it does not cap how long that takes. Race it
+ * against SHUTDOWN_CAP_MS so a job stuck past a deploy's real stop-timeout budget can't hang the
+ * process forever: below the cap the job keeps running untouched; at the cap this force-exits
+ * with jobs still active rather than waiting longer.
+ */
+const SHUTDOWN_CAP_MS = 20_000;
+
 async function shutdown(signal: string) {
-  log.info("shutting down", { signal });
+  log.info("shutting down", { signal, capMs: SHUTDOWN_CAP_MS });
   stopRelay();
-  await Promise.all(workers.map((w) => w.close()));
+
+  const closing = Promise.all(workers.map((w) => w.close())).catch((err) =>
+    log.error("worker close failed", errorData(err)),
+  );
+  const closedInTime = await withShutdownCap(closing, SHUTDOWN_CAP_MS);
+
+  if (!closedInTime) {
+    log.warn("shutdown cap elapsed; forcing exit with a job still active", {
+      signal,
+      capMs: SHUTDOWN_CAP_MS,
+    });
+    process.exit(1);
+  }
+
   await closeQueues();
   await closeDb();
   process.exit(0);

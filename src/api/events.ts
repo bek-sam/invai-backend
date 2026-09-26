@@ -3,6 +3,7 @@ import { streamSSE } from "hono/streaming";
 import { logger } from "../lib/log";
 import { type RealtimeEnvelope, type RealtimeMessage, replay, subscribe } from "../lib/realtime";
 import { buildContext } from "./context";
+import { shuttingDown } from "./shutdown";
 
 const log = logger("sse");
 
@@ -58,7 +59,18 @@ events.get("/", async (c) => {
 
     while (!stream.aborted) {
       await stream.writeSSE({ event: "ping", data: String(Date.now()) });
-      await stream.sleep(25_000);
+      // T-12-2 (B-16): on SIGTERM, don't hold this connection open for the server's whole drain
+      // window. Wake up as soon as shutdown begins (instead of only at the next 25s ping) so the
+      // client gets a retry hint and reconnects to a fresh instance instead of timing out.
+      const woke = await Promise.race([
+        stream.sleep(25_000).then(() => "timer" as const),
+        shuttingDown.then(() => "shutdown" as const),
+      ]);
+      if (woke === "shutdown") {
+        await stream.writeSSE({ event: "shutdown", data: "", retry: 1000 });
+        unsubscribe();
+        break;
+      }
     }
   });
 });

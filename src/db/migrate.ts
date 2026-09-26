@@ -6,6 +6,14 @@ import { ensureReferenceData } from "./reference";
 
 const MIGRATIONS_FOLDER = fileURLToPath(new URL("../../drizzle", import.meta.url));
 
+/**
+ * Fixed, known `pg_advisory_lock` key for `runMigrations` (T-12-2, B-16 follow-up; T-1-5 review:
+ * concurrent migrates on a fresh DB race on `CREATE EXTENSION`). The value is arbitrary but must
+ * stay stable: any two `runMigrations` calls against the same database, ever, need to contend on
+ * this same key to serialize.
+ */
+const MIGRATION_LOCK_KEY = 468_241;
+
 /** Required extensions; `vector` is optional until the pgvector image is in place. */
 const EXTENSIONS: { name: string; required: boolean }[] = [
   { name: "pg_trgm", required: true },
@@ -22,20 +30,30 @@ const EXTENSIONS: { name: string; required: boolean }[] = [
  */
 export async function runMigrations(migrationDatabaseUrl: string, opts: { quiet?: boolean } = {}) {
   const log = opts.quiet ? () => {} : (msg: string) => console.log(`[migrate] ${msg}`);
+  // max: 1 so every query below -- the lock, the extensions, the migration and the reference
+  // data -- runs on the one physical connection that holds the session-level advisory lock.
   const pool = new Pool({ connectionString: migrationDatabaseUrl, max: 1 });
   try {
-    for (const ext of EXTENSIONS) {
-      try {
-        await pool.query(`CREATE EXTENSION IF NOT EXISTS "${ext.name}"`);
-      } catch (err) {
-        if (ext.required) throw err;
-        log(`optional extension ${ext.name} unavailable: ${(err as Error).message}`);
+    // Serializes concurrent `runMigrations` calls against the same database (a second `pnpm
+    // db:migrate`, or two app instances booting at once). Waits, rather than erroring, and is
+    // released below even on failure so a crashed migration doesn't wedge the database.
+    await pool.query("select pg_advisory_lock($1)", [MIGRATION_LOCK_KEY]);
+    try {
+      for (const ext of EXTENSIONS) {
+        try {
+          await pool.query(`CREATE EXTENSION IF NOT EXISTS "${ext.name}"`);
+        } catch (err) {
+          if (ext.required) throw err;
+          log(`optional extension ${ext.name} unavailable: ${(err as Error).message}`);
+        }
       }
+      const db = drizzle(pool, { casing: "snake_case" });
+      await migrate(db, { migrationsFolder: MIGRATIONS_FOLDER });
+      await ensureReferenceData(db);
+      log(`up to date (${new URL(migrationDatabaseUrl).pathname.slice(1)})`);
+    } finally {
+      await pool.query("select pg_advisory_unlock($1)", [MIGRATION_LOCK_KEY]);
     }
-    const db = drizzle(pool, { casing: "snake_case" });
-    await migrate(db, { migrationsFolder: MIGRATIONS_FOLDER });
-    await ensureReferenceData(db);
-    log(`up to date (${new URL(migrationDatabaseUrl).pathname.slice(1)})`);
   } finally {
     await pool.end();
   }
