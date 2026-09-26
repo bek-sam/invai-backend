@@ -35,6 +35,9 @@ export const financeRouter = authed.finance.router({
     record: authed.finance.refunds.record.handler(({ input, context: { tenant } }) =>
       withTenant(tenant.companyId, (tx) => refunds.recordRefund(tx, tenant, input)),
     ),
+    void: authed.finance.refunds.void.handler(({ input, context: { tenant } }) =>
+      withTenant(tenant.companyId, (tx) => refunds.voidRefund(tx, tenant, input)),
+    ),
     list: authed.finance.refunds.list.handler(({ input, context: { tenant } }) =>
       withTenant(tenant.companyId, (tx) => refunds.listRefunds(tx, input.orderId)),
     ),

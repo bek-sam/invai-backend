@@ -1,5 +1,5 @@
 import type { Channel, RefundEvent } from "@invai/contracts";
-import { and, asc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, sql } from "drizzle-orm";
 import type { TenantContext } from "../../api/context";
 import type { Tx } from "../../db/client";
 import { blankVariants, orderItems, orders, profitLines, refundEvents } from "../../db/schema";
@@ -33,6 +33,8 @@ export function toRefundEvent(r: RefundRow): RefundEvent {
     feeRecoveredCents: r.feeRecoveredCents,
     refundedAt: r.refundedAt.toISOString(),
     note: r.note,
+    voidedAt: r.voidedAt?.toISOString() ?? null,
+    voidReason: r.voidReason,
   };
 }
 
@@ -125,18 +127,45 @@ export async function recordRefund(
   },
 ): Promise<RefundEvent> {
   if (input.amountCents <= 0) throw badRequest("A refund amount must be more than zero");
+  // Row lock: two refunds recorded at once can't both pass the cap below.
   const [order] = await tx
-    .select({ id: orders.id, channel: orders.channel })
+    .select({
+      id: orders.id,
+      channel: orders.channel,
+      totalCents: orders.totalCents,
+      taxCents: orders.taxCents,
+    })
     .from(orders)
-    .where(eq(orders.id, input.orderId));
+    .where(eq(orders.id, input.orderId))
+    .for("update");
   if (!order) throw notFound("order", input.orderId);
   const units = await orderUnits(tx, order.id);
   let scope = units.filter((u) => !u.isReprint && !u.cancelled);
+  const live = (await listRefunds(tx, order.id)).items.filter((r) => !r.voidedAt);
+  // What's left to refund: the order's sale (before tax) less live refunds and the units
+  // cancelled before shipping (profit already books those as refunded).
+  const cancelled = units
+    .filter((u) => u.cancelled && !u.isReprint)
+    .reduce((a, u) => a + u.saleCents, 0);
+  let remaining =
+    Math.max(0, order.totalCents - order.taxCents) -
+    cancelled -
+    live.reduce((a, r) => a + r.amountCents, 0);
   if (input.orderItemId) {
     const unit = units.find((u) => u.id === input.orderItemId);
     if (!unit) throw new ORPCError("INVALID_ORDER_ITEM", { status: 400 });
     scope = [unit];
+    const onItem = live
+      .filter((r) => r.orderItemId === unit.id)
+      .reduce((a, r) => a + r.amountCents, 0);
+    remaining = Math.min(remaining, (unit.cancelled ? 0 : unit.saleCents) - onItem);
   }
+  if (input.amountCents > remaining)
+    throw new ORPCError("REFUND_EXCEEDS_ORDER", {
+      status: 400,
+      message: "The refund is more than what is left to refund on this order",
+      data: { remainingCents: Math.max(0, remaining) },
+    });
   const table = await feeTable(tx, ctx.companyId, order.channel);
   const [row] = await tx
     .insert(refundEvents)
@@ -164,6 +193,42 @@ export async function recordRefund(
     data: { refundId: row.id, orderItemId: input.orderItemId, amountCents: input.amountCents },
   });
   return toRefundEvent(row);
+}
+
+/**
+ * Void a manual refund entered by mistake. The row stays (dated, with the reason and who did
+ * it) but no longer counts: profit and the order's remaining-to-refund both skip voided rows.
+ */
+export async function voidRefund(
+  tx: Tx,
+  ctx: Ctx,
+  input: { id: string; reason: string },
+): Promise<RefundEvent> {
+  const [row] = await tx
+    .select()
+    .from(refundEvents)
+    .where(eq(refundEvents.id, input.id))
+    .for("update");
+  if (!row) throw notFound("refund", input.id);
+  if (row.source !== "manual") throw new ORPCError("REFUND_NOT_MANUAL", { status: 400 });
+  if (row.voidedAt) throw new ORPCError("REFUND_ALREADY_VOIDED", { status: 409 });
+  const now = new Date();
+  const [updated] = await tx
+    .update(refundEvents)
+    .set({ voidedAt: now, voidReason: input.reason, voidedBy: ctx.userId, updatedAt: now })
+    .where(and(eq(refundEvents.id, row.id), isNull(refundEvents.voidedAt)))
+    .returning();
+  if (!updated) throw new ORPCError("REFUND_ALREADY_VOIDED", { status: 409 });
+  await audit(tx, {
+    companyId: ctx.companyId,
+    actor: ctx.actor,
+    action: "refund.void",
+    entityType: "order",
+    entityId: row.orderId,
+    summary: `Refund ${(row.amountCents / 100).toFixed(2)} voided: ${input.reason}`,
+    data: { refundId: row.id, amountCents: row.amountCents, reason: input.reason },
+  });
+  return toRefundEvent(updated);
 }
 
 /**

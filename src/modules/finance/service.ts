@@ -9,7 +9,20 @@ import {
   type OrderProfit,
   type ProfitSummary,
 } from "@invai/contracts";
-import { and, asc, eq, gte, inArray, isNotNull, lt, lte, ne, type SQL, sql } from "drizzle-orm";
+import {
+  and,
+  asc,
+  eq,
+  gte,
+  inArray,
+  isNotNull,
+  isNull,
+  lt,
+  lte,
+  ne,
+  type SQL,
+  sql,
+} from "drizzle-orm";
 import type { z } from "zod";
 import type { TenantContext } from "../../api/context";
 import { afterCommit, type Tx } from "../../db/client";
@@ -1003,6 +1016,7 @@ async function refundGroups(tx: Tx, companyId: string, input: ProfitInput, tz: s
     .where(
       and(
         eq(r.companyId, companyId),
+        isNull(r.voidedAt),
         gte(r.refundedAt, new Date(input.period.from)),
         lt(r.refundedAt, new Date(input.period.to)),
         input.channel ? eq(r.channel, input.channel) : undefined,
@@ -1157,7 +1171,7 @@ export async function orderProfit(
   });
 
   // T-7-2: refunds after shipment (the ledger), on their item's line; order-level ones on totals.
-  const { items: refundRows } = await listRefunds(tx, orderId);
+  const refundRows = (await listRefunds(tx, orderId)).items.filter((r) => !r.voidedAt);
   const refundOf = (itemId: string | null) =>
     refundRows
       .filter((r) => r.orderItemId === itemId)

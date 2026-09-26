@@ -1,7 +1,7 @@
 import { eq } from "drizzle-orm";
 import { beforeAll, describe, expect, it } from "vitest";
 import { withSystem, withTenant } from "../../db/client";
-import { orderItems, orders } from "../../db/schema";
+import { auditLog, orderItems, orders } from "../../db/schema";
 import {
   createCompany,
   createConnection,
@@ -9,7 +9,7 @@ import {
   createUser,
   tenantContext,
 } from "../../test/fixtures";
-import { ingestChannelRefunds, listRefunds, recordRefund } from "./refunds";
+import { ingestChannelRefunds, listRefunds, recordRefund, voidRefund } from "./refunds";
 import * as svc from "./service";
 
 const DAY = 86400_000;
@@ -89,6 +89,116 @@ describe("finance refunds (T-7-2)", () => {
       svc.getProfit(tx, ctx, { dimension: "day", period: period(7, 0) }),
     );
     expect(days.totals.refunds).toBe(2500);
+  });
+
+  it("caps manual refunds at what is left on the order and on the item", async () => {
+    const { order, items } = await shippedOrder("amazon", 2); // 2 x $25, no tax
+    const rec = (amountCents: number, orderItemId: string | null = null) =>
+      withTenant(companyId, (tx) =>
+        recordRefund(tx, ctx, {
+          orderId: order.id,
+          orderItemId,
+          amountCents,
+          refundedAt: new Date().toISOString(),
+          note: null,
+        }),
+      );
+    // $999 typed instead of $9.99 on a $50 order.
+    await expect(rec(99_900)).rejects.toMatchObject({
+      code: "REFUND_EXCEEDS_ORDER",
+      data: { remainingCents: 5000 },
+    });
+    // One unit can't take more than it sold for.
+    await expect(rec(2501, items[0]?.id)).rejects.toMatchObject({
+      code: "REFUND_EXCEEDS_ORDER",
+      data: { remainingCents: 2500 },
+    });
+    await rec(3000);
+    // Cumulative: $30 already refunded, $20 left.
+    await expect(rec(2001)).rejects.toMatchObject({ data: { remainingCents: 2000 } });
+    await rec(2000);
+    await expect(rec(1)).rejects.toMatchObject({ data: { remainingCents: 0 } });
+    // A unit cancelled before shipping is already refunded: it lowers what's left.
+    const other = await shippedOrder("amazon", 2);
+    await withSystem((tx) =>
+      tx
+        .update(orderItems)
+        .set({ state: "cancelled" })
+        .where(eq(orderItems.id, other.items[0]?.id as string)),
+    );
+    await expect(
+      withTenant(companyId, (tx) =>
+        recordRefund(tx, ctx, {
+          orderId: other.order.id,
+          orderItemId: null,
+          amountCents: 2600,
+          refundedAt: new Date().toISOString(),
+          note: null,
+        }),
+      ),
+    ).rejects.toMatchObject({ data: { remainingCents: 2500 } });
+  });
+
+  it("voids a manual refund: audited, dated, and out of profit", async () => {
+    const { order } = await shippedOrder("amazon", 2);
+    const ev = await withTenant(companyId, (tx) =>
+      recordRefund(tx, ctx, {
+        orderId: order.id,
+        orderItemId: null,
+        amountCents: 5000,
+        refundedAt: new Date().toISOString(),
+        note: "typo",
+      }),
+    );
+    const before = await withTenant(companyId, (tx) => svc.orderProfit(tx, ctx, order.id));
+    expect(before.refunds).toBe(5000);
+    const voided = await withTenant(companyId, (tx) =>
+      voidRefund(tx, ctx, { id: ev.id, reason: "Entered the wrong order" }),
+    );
+    expect(voided.voidedAt).not.toBeNull();
+    expect(voided.voidReason).toBe("Entered the wrong order");
+    const after = await withTenant(companyId, (tx) => svc.orderProfit(tx, ctx, order.id));
+    expect(after.refunds).toBe(0);
+    expect(after.channelFees).toBe(before.channelFees + ev.feeRecoveredCents);
+    expect(after.feeBreakdown.some((f) => f.label === "Fee returned on refunds")).toBe(false);
+    const byOrder = await withTenant(companyId, (tx) =>
+      svc.getProfit(tx, ctx, { dimension: "order", period: period(7, 0) }),
+    );
+    expect(byOrder.rows.find((r) => r.key === order.id)?.refunds).toBe(0);
+    // Still listed (with the void), and the full amount is refundable again.
+    const list = await withTenant(companyId, (tx) => listRefunds(tx, order.id));
+    expect(list.items[0]?.voidedAt).toBe(voided.voidedAt);
+    const audit = await withSystem((tx) =>
+      tx.select().from(auditLog).where(eq(auditLog.entityId, order.id)),
+    );
+    expect(audit.map((a) => a.action)).toEqual(
+      expect.arrayContaining(["refund.record", "refund.void"]),
+    );
+    await expect(
+      withTenant(companyId, (tx) => voidRefund(tx, ctx, { id: ev.id, reason: "again" })),
+    ).rejects.toMatchObject({ code: "REFUND_ALREADY_VOIDED" });
+  });
+
+  it("won't void a channel refund", async () => {
+    const { order } = await shippedOrder("shopify", 2);
+    const [o] = await withSystem((tx) => tx.select().from(orders).where(eq(orders.id, order.id)));
+    await withTenant(companyId, (tx) =>
+      ingestChannelRefunds(tx, companyId, "shopify", "shopify", [
+        {
+          channelOrderId: o?.channelOrderId as string,
+          channelRefundId: "void-test:L1",
+          channelLineId: "L1",
+          quantity: 1,
+          amountCents: 1000,
+          refundedAt: new Date().toISOString(),
+          note: null,
+        },
+      ]),
+    );
+    const [ev] = (await withTenant(companyId, (tx) => listRefunds(tx, order.id))).items;
+    await expect(
+      withTenant(companyId, (tx) => voidRefund(tx, ctx, { id: ev?.id as string, reason: "x" })),
+    ).rejects.toMatchObject({ code: "REFUND_NOT_MANUAL" });
   });
 
   it("rejects an item from another order", async () => {

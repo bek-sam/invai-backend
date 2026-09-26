@@ -85,6 +85,10 @@ export const refundEvents = pgTable(
     channelRefundId: text(),
     refundedAt: timestamp({ withTimezone: true }).notNull(),
     note: text(),
+    /** A manual refund voided as a mistake (finance.refunds.void): excluded from profit. */
+    voidedAt: timestamp({ withTimezone: true }),
+    voidReason: text(),
+    voidedBy: uuid(),
     ...timestamps,
   },
   (t) => [
