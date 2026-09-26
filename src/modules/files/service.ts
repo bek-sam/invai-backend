@@ -119,7 +119,13 @@ export async function downloadUrl(
   if (owned && !canReadKind(ctx, input.fileKey.split("/")[1] ?? "")) throw notFound("file");
   const head = await headObject(input.fileKey);
   if (!head.exists) throw notFound("file");
-  const name = input.disposition === "attachment" ? input.fileKey.split("/").pop() : undefined;
+  // SVG is XML with executable <script>: never served inline (T-12-5), regardless of what the
+  // caller asked for -- forcing attachment stops a browser from rendering it as a document.
+  const forceAttachment = head.contentType === "image/svg+xml";
+  const name =
+    input.disposition === "attachment" || forceAttachment
+      ? input.fileKey.split("/").pop()
+      : undefined;
   return {
     fileKey: input.fileKey,
     url: await presignGet(input.fileKey, DOWNLOAD_TTL, name),

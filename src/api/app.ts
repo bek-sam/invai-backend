@@ -53,6 +53,8 @@ const rest = new OpenAPIHandler(router, {
 export const app = new Hono();
 
 // API responses are JSON/SSE only, so the strictest CSP applies; HSTS only matters behind TLS.
+// Permissions-Policy denies every browser feature outright: nothing here is rendered as HTML,
+// so there is no legitimate caller for camera/mic/geolocation/payment on this origin (T-12-5).
 app.use(
   "*",
   secureHeaders({
@@ -61,6 +63,7 @@ app.use(
     crossOriginResourcePolicy: "same-site",
     xFrameOptions: "DENY",
     referrerPolicy: "no-referrer",
+    permissionsPolicy: { camera: [], microphone: [], geolocation: [], payment: [] },
   }),
 );
 

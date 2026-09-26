@@ -108,6 +108,19 @@ describe("files", () => {
     expect((await get(office, label)).fileKey).toBe(label);
   });
 
+  it("an SVG is always forced to download, even when inline was requested (T-12-5)", async () => {
+    const svg = await putObject(
+      objectKey(companyId, "design", "svg"),
+      "<svg xmlns='http://www.w3.org/2000/svg'><script>alert(1)</script></svg>",
+      "image/svg+xml",
+    );
+    const res = await withTenant(companyId, (tx) =>
+      downloadUrl(tx, office, { fileKey: svg, disposition: "inline" }),
+    );
+    const disposition = new URL(res.url).searchParams.get("response-content-disposition");
+    expect(disposition).toMatch(/^attachment;/);
+  });
+
   it("isSafeKey accepts generated keys only", () => {
     expect(isSafeKey(objectKey(companyId, "template_background", "png"))).toBe(true);
     for (const bad of ["a/../b", "a/./b", "a//b", "/a/b", "a/b/", "a/.hidden", "a\\b", ""])

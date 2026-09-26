@@ -32,6 +32,15 @@ describe("HTTP surface", () => {
     expect(res.headers.get("x-content-type-options")).toBe("nosniff");
     expect(res.headers.get("x-frame-options")).toBe("DENY");
     expect(res.headers.get("content-security-policy")).toContain("default-src 'none'");
+    expect(res.headers.get("referrer-policy")).toBe("no-referrer");
+    expect(res.headers.get("permissions-policy")).toBe(
+      "camera=(), microphone=(), geolocation=(), payment=()",
+    );
+    if (env.isProd) {
+      expect(res.headers.get("strict-transport-security")).toBe(
+        "max-age=31536000; includeSubDomains",
+      );
+    }
     expect(res.headers.get("access-control-allow-origin")).toBe(env.WEB_ORIGIN);
     expect(res.headers.get("access-control-allow-credentials")).toBe("true");
     const floor = await app.request("/health", { headers: { origin: env.FLOOR_ORIGIN } });
