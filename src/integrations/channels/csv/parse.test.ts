@@ -116,6 +116,47 @@ describe("marketplace CSV formats", () => {
     expect(out.orders.find((o) => o.channelOrderId === "4792210001236")?.isRush).toBe(true);
   });
 
+  it("walmart: a cancelled line cancels only that line (T-7-4)", () => {
+    const [header, l1, l2, ...rest] = fixture("walmart-orders.csv").split("\n");
+    const cancelledL2 = (l2 as string).replace(",Acknowledged,", ",Cancelled,");
+    const out = parseOrdersCsv("walmart", [header, l1, cancelledL2, ...rest].join("\n"));
+    const po = out.orders.find((o) => o.channelOrderId === "4792210001234");
+    expect(po?.items.map((i) => i.channelLineId)).toEqual(["4792210001234-1"]);
+    expect(out.cancelledLines).toEqual([
+      { channelOrderId: "4792210001234", channelLineId: "4792210001234-2" },
+    ]);
+    expect(out.cancelledChannelOrderIds).toEqual(["4792210001235"]);
+    // Every line cancelled: the whole PO is cancelled, no line cancels.
+    const both = [header, (l1 as string).replace(",Acknowledged,", ",Cancelled,"), cancelledL2];
+    const all = parseOrdersCsv("walmart", both.join("\n"));
+    expect(all.orders).toHaveLength(0);
+    expect(all.cancelledChannelOrderIds).toEqual(["4792210001234"]);
+    expect(all.cancelledLines).toEqual([]);
+  });
+
+  it("tiktok On hold and amazon buyer-requested cancellation become holds (T-7-4)", () => {
+    const tt = fixture("tiktok-orders.csv").replace(
+      "576912345678901002,To ship",
+      "576912345678901002,On hold",
+    );
+    const out = parseOrdersCsv("tiktok", tt);
+    expect(out.orders.map((o) => o.channelOrderId)).toContain("576912345678901002");
+    expect(out.holds).toEqual([
+      { channelOrderId: "576912345678901002", signal: "channel_on_hold" },
+    ]);
+    const [h, first, ...more] = fixture("amazon-unshipped-orders.txt").split("\n");
+    const amazon = [
+      `${h}\tis-buyer-requested-cancellation`,
+      `${first}\ttrue`,
+      ...more.filter(Boolean).map((l) => `${l}\tfalse`),
+    ].join("\n");
+    const az = parseOrdersCsv("amazon", amazon);
+    expect(az.holds).toEqual([
+      { channelOrderId: "113-4521987-1234501", signal: "buyer_cancel_request" },
+    ]);
+    expect(parseOrdersCsv("tiktok", fixture("tiktok-orders.csv")).holds).toEqual([]);
+  });
+
   it("shopify: order columns from the first row, cancelled orders separated", () => {
     const out = parseOrdersCsv("shopify", fixture("shopify-orders-export.csv"));
     expect(out.orders).toHaveLength(2);

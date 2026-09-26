@@ -185,6 +185,7 @@ describe("staleness (B-12)", () => {
       { ...base, buyerNote: "gift wrap", sourceUpdatedAt: "2026-11-24T19:00:00.000Z" },
     ]);
     expect(newer).toMatchObject({ updated: 1, stale: 0 });
+    expect((await orderRow(id))?.channelUpdatedAt?.toISOString()).toBe("2026-11-24T19:00:00.000Z");
     // A later floor action moves orders.updated_at past the channel's clock; a channel edit made
     // before that action but delivered after it still applies.
     await withTenant(companyId, (tx) =>
@@ -373,6 +374,30 @@ describe("per-line cancel and line edits (B-12)", () => {
     // The channel removes that unit too: the shop's cancel already covers it.
     await run([order([{ id: "a", sku: "DB001-G64000-BLK-M", qty: 1 }])]);
     expect((await unitsOf(id)).map((x) => x.state)).toEqual(["ready", "cancelled"]);
+  });
+});
+
+describe("channel line cancels (Walmart CSV)", () => {
+  it("cancels only the listed line's units and flags pressed ones", async () => {
+    seq++;
+    const n = order([
+      { id: "a", sku: "DB001-G64000-BLK-M", qty: 2 },
+      { id: "b", sku: "DB019-G64000-BLK-L", qty: 1 },
+    ]);
+    const id = (await run([n], "csv")).orderIds[0] as string;
+    const u = await unitsOf(id);
+    await setState([u[0]?.id as string], "pressed");
+    const cancel = { channelOrderId: n.channelOrderId, channelLineId: "a" };
+    const res = await run([], "csv", conn, { source: "csv", cancelledLines: [cancel] });
+    expect(res.cancelled).toBe(1);
+    const after = await unitsOf(id);
+    expect(after.map((x) => x.state)).toEqual(["pressed", "cancelled", "ready"]);
+    expect(after[0]?.flags.map((f) => f.code)).toContain("channel_edit_after_press");
+    expect((await orderRow(id))?.cancelReason).toBeNull();
+    // Idempotent.
+    expect(
+      (await run([], "csv", conn, { source: "csv", cancelledLines: [cancel] })).cancelled,
+    ).toBe(0);
   });
 });
 

@@ -67,10 +67,26 @@ export type ChannelRefund = {
   note: string | null;
 };
 
+/**
+ * T-7-4 (B-12): the channel says an order must wait before production: the buyer asked to cancel
+ * (Amazon `is-buyer-requested-cancellation`), or the channel holds it (TikTok "On hold").
+ */
+export type ChannelHold = {
+  channelOrderId: string;
+  signal: "buyer_cancel_request" | "channel_on_hold";
+};
+
+/** T-7-4 (B-12): one line the channel cancelled while the rest of the order stands (Walmart). */
+export type ChannelLineCancel = { channelOrderId: string; channelLineId: string };
+
 export type FetchOrdersResult = {
   orders: NormalizedOrder[];
   /** Orders the channel reports as cancelled since the last cursor. */
   cancelledChannelOrderIds: string[];
+  /** Orders to hold (T-7-4); absent = the adapter reads no such signal. */
+  holds?: ChannelHold[];
+  /** Single lines cancelled (T-7-4); absent = the adapter reads none. */
+  cancelledLines?: ChannelLineCancel[];
   nextCursor: string | null;
   /** Refunds on the fetched orders (T-7-2); absent = the adapter doesn't read refunds. */
   refunds?: ChannelRefund[];

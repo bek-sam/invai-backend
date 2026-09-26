@@ -1,6 +1,6 @@
 import type { Channel, CsvFormat, NormalizedOrder, PersonalizationAnswer } from "@invai/contracts";
 import { parseCsv } from "../../../lib/csv";
-import type { ChannelRefund } from "../types";
+import type { ChannelHold, ChannelLineCancel, ChannelRefund } from "../types";
 
 /*
  * Marketplace CSV exports -> NormalizedOrder. One parser per export format, using each
@@ -22,6 +22,10 @@ export type ParsedCsv = {
   /** T-7-2: refunds the export lists (Shopify "Refunded Amount", TikTok "Order Refund Amount",
    * generic `refund_amount`), one order-level refund per order, before tax. */
   refunds?: ChannelRefund[];
+  /** T-7-4: orders to hold (TikTok "On hold", Amazon buyer-requested cancellation). */
+  holds?: ChannelHold[];
+  /** T-7-4: single lines the export lists as cancelled while the order stands (Walmart). */
+  cancelledLines?: ChannelLineCancel[];
 };
 
 export class CsvFormatError extends Error {}
@@ -221,11 +225,17 @@ function newCollector() {
   const drafts = new Map<string, Draft>();
   const errors: CsvRowError[] = [];
   const cancelled = new Set<string>();
+  const holds = new Map<string, ChannelHold>();
+  const cancelledLines: ChannelLineCancel[] = [];
   const refundTotals = new Map<string, { cents: number; at: string | null; taxInside: boolean }>();
   return {
     drafts,
     errors,
     cancelled,
+    cancelledLines,
+    hold(channelOrderId: string, signal: ChannelHold["signal"]) {
+      holds.set(`${channelOrderId}|${signal}`, { channelOrderId, signal });
+    },
     fail(row: Row, message: string) {
       errors.push({ row: row.line, message });
     },
@@ -279,7 +289,19 @@ function newCollector() {
             });
         }
       }
-      return { orders, orderRows, cancelledChannelOrderIds: [...cancelled], errors, refunds };
+      // A line cancel whose order has no line left cancels the whole order instead.
+      const live = new Set(orders.map((o) => o.channelOrderId));
+      for (const l of cancelledLines)
+        if (!live.has(l.channelOrderId)) cancelled.add(l.channelOrderId);
+      return {
+        orders,
+        orderRows,
+        cancelledChannelOrderIds: [...cancelled],
+        errors,
+        refunds,
+        holds: [...holds.values()].filter((h) => live.has(h.channelOrderId)),
+        cancelledLines: cancelledLines.filter((l) => live.has(l.channelOrderId)),
+      };
     },
   };
 }
@@ -480,6 +502,12 @@ function parseAmazon(text: string): ParsedCsv {
     const placedAt = requireDate(c, row, row.get("purchase-date"), "purchase-date");
     const qty = checkQty(c, row, row.get("quantity-to-ship", "quantity-purchased"));
     if (!placedAt || qty === null) continue;
+    if (
+      /^(true|yes|y)$/i.test(
+        row.get("is-buyer-requested-cancellation", "is-buyer-requested-cancel"),
+      )
+    )
+      c.hold(orderId, "buyer_cancel_request");
     const shipBy = parseDate(row.get("promise-date", "latest-ship-date", "ship-by-date"));
     const itemPrice = money(row.get("item-price"));
     const serviceLevel = row.get("ship-service-level");
@@ -586,6 +614,7 @@ function parseTiktok(text: string): ParsedCsv {
       c.cancelled.add(orderId);
       continue;
     }
+    if (/on.?hold/.test(status)) c.hold(orderId, "channel_on_hold");
     const placedAt = requireDate(c, row, row.get("Paid Time", "Created Time"), "Created Time");
     const qty = checkQty(c, row, row.get("Quantity"));
     if (!placedAt || qty === null) continue;
@@ -670,7 +699,11 @@ function parseWalmart(text: string): ParsedCsv {
       continue;
     }
     if (/cancel/i.test(row.get("Status"))) {
-      c.cancelled.add(po);
+      // Only this line (T-7-4); `finish` cancels the PO when no line is left.
+      c.cancelledLines.push({
+        channelOrderId: po,
+        channelLineId: `${po}-${row.get("Line#", "Line Number") || row.line}`,
+      });
       continue;
     }
     const placedAt = requireDate(c, row, row.get("Order Date"), "Order Date");

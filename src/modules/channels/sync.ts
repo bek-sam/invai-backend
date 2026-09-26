@@ -311,15 +311,21 @@ async function runCsvImport(
     const [run] = await tx.select().from(importRuns).where(eq(importRuns.id, runId)).for("update");
     if (!run) throw notFound("import", runId);
     if (run.status !== "running") return { done: run, jobRow: undefined, cancelled: 0 };
-    const cancelled = parsed.cancelledChannelOrderIds.length
-      ? (
-          await importNormalizedOrders(tx, ctx, conn, [], {
-            source: "csv",
-            importRunId: runId,
-            cancelledChannelOrderIds: parsed.cancelledChannelOrderIds,
-          })
-        ).cancelled
-      : 0;
+    // T-7-4: line cancels and holds (TikTok "On hold", buyer cancel requests) after the orders.
+    const cancelled =
+      parsed.cancelledChannelOrderIds.length ||
+      parsed.cancelledLines?.length ||
+      parsed.holds?.length
+        ? (
+            await importNormalizedOrders(tx, ctx, conn, [], {
+              source: "csv",
+              importRunId: runId,
+              cancelledChannelOrderIds: parsed.cancelledChannelOrderIds,
+              cancelledLines: parsed.cancelledLines,
+              holds: parsed.holds,
+            })
+          ).cancelled
+        : 0;
     const errors = [...run.errors].sort((a, b) => a.row - b.row);
     const [done] = await tx
       .update(importRuns)
@@ -550,6 +556,8 @@ export async function syncConnection(
       const out = await importNormalizedOrders(tx, ctx, conn, fetched.orders, {
         source: "api",
         cancelledChannelOrderIds: fetched.cancelledChannelOrderIds,
+        cancelledLines: fetched.cancelledLines,
+        holds: fetched.holds,
       });
       // T-7-2: refunds after the sale (dated ledger, upserted by channel refund id).
       if (fetched.refunds?.length)

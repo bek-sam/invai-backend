@@ -1,5 +1,5 @@
 import { type NormalizedOrder, NormalizedOrder as NormalizedOrderSchema } from "@invai/contracts";
-import { and, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import type { TenantContext } from "../../api/context";
 import { afterCommit, type Tx } from "../../db/client";
 import {
@@ -11,6 +11,7 @@ import {
   orderItemTransitions,
   orders,
 } from "../../db/schema";
+import type { ChannelHold, ChannelLineCancel } from "../../integrations/channels/types";
 import { audit } from "../../lib/audit";
 import { emit } from "../../lib/outbox";
 import { publish } from "../../lib/realtime";
@@ -29,7 +30,7 @@ import { transitionItem } from "./state-machine";
  *   ready / needs_mapping / needs_artwork -> reserve blanks -> outbox + realtime.
  * Re-importing the same order updates what changed (address, totals, note, ship-by, lines) and
  * skips it otherwise, so a CSV can be uploaded twice and a webhook can race the poller. A payload
- * whose channel timestamp is older than the last one applied is ignored (T-7-4, B-12).
+ * whose channel timestamp is older than `orders.channel_updated_at` is ignored (T-7-4, B-12).
  */
 
 type ConnectionRow = typeof channelConnections.$inferSelect;
@@ -61,17 +62,12 @@ type Options = {
   cancelledChannelOrderIds?: string[];
   /** Orders the channel says must not go to production yet (T-7-4, B-12). */
   holds?: ChannelHold[];
+  /** Single lines the channel cancelled (Walmart CSV line status). */
+  cancelledLines?: ChannelLineCancel[];
 };
 
-/**
- * A channel signal that the order must wait (T-7-4, B-12): the buyer asked the channel to cancel
- * (answer it before printing), or the channel itself holds the order (TikTok ON_HOLD). Each
- * signal holds an order once; a hold the shop released stays released.
- */
-export type ChannelHold = {
-  channelOrderId: string;
-  signal: "buyer_cancel_request" | "channel_on_hold";
-};
+// Each hold signal holds an order once; a hold the shop released stays released.
+export type { ChannelHold, ChannelLineCancel };
 
 /** What an import run needs to build and route units. */
 type Run = {
@@ -161,7 +157,6 @@ export async function importNormalizedOrders(
           entityType: "order",
           entityId: existing.id,
           summary: `Updated from ${opts.source === "csv" ? "CSV import" : "channel sync"}: ${changed.join(", ")}`,
-          data: { sourceUpdatedAt: n.sourceUpdatedAt },
         });
         await emit(tx, ctx.companyId, "order.updated", { orderId: existing.id });
       } else result.skipped++;
@@ -176,6 +171,9 @@ export async function importNormalizedOrders(
 
   for (const channelOrderId of opts.cancelledChannelOrderIds ?? []) {
     if (await cancelFromChannel(tx, ctx, channel, channelOrderId)) result.cancelled++;
+  }
+  for (const line of opts.cancelledLines ?? []) {
+    if (await cancelLineFromChannel(tx, ctx, channel, line)) result.cancelled++;
   }
   for (const hold of opts.holds ?? []) {
     if (await holdFromChannel(tx, ctx, channel, hold)) result.held++;
@@ -217,6 +215,7 @@ async function createOrder(
       shipBy,
       isRush: n.isRush,
       hasPersonalization,
+      channelUpdatedAt: n.sourceUpdatedAt ? new Date(n.sourceUpdatedAt) : null,
       shippingMethod: n.shippingMethod,
       buyerNote: n.buyerNote,
       buyerRef: buyerRefOf(ctx.companyId, n.buyerName),
@@ -270,7 +269,6 @@ async function createOrder(
     data: {
       source: opts.source,
       importRunId: opts.importRunId,
-      sourceUpdatedAt: n.sourceUpdatedAt,
     },
   });
   const unmatched = await routeUnits(tx, ctx, connection, itemRows, opts.matcher);
@@ -373,29 +371,6 @@ function piiValues(companyId: string, orderId: string, n: NormalizedOrder) {
 const SHIPPED = new Set(["shipped", "delivered", "cancelled"]);
 
 /**
- * The newest channel timestamp already applied to this order (T-7-4, B-12), from the import and
- * sync audit rows. `orders.updated_at` itself moves on every floor scan (the cached status), so
- * comparing against it would drop a real channel edit that arrives after a scan.
- */
-async function appliedSourceUpdatedAt(tx: Tx, ctx: TenantContext, orderId: string) {
-  const [row] = await tx
-    .select({ at: sql<string | null>`${auditLog.data}->>'sourceUpdatedAt'` })
-    .from(auditLog)
-    .where(
-      and(
-        eq(auditLog.companyId, ctx.companyId),
-        eq(auditLog.entityType, "order"),
-        eq(auditLog.entityId, orderId),
-        inArray(auditLog.action, ["order.imported", "order.synced"]),
-        sql`${auditLog.data}->>'sourceUpdatedAt' is not null`,
-      ),
-    )
-    .orderBy(desc(sql`(${auditLog.data}->>'sourceUpdatedAt')::timestamptz`))
-    .limit(1);
-  return row?.at ? new Date(row.at) : null;
-}
-
-/**
  * Apply channel-side changes to an existing order; returns what changed (null = unchanged,
  * "stale" = the payload is older than one already applied and was ignored).
  */
@@ -407,10 +382,11 @@ async function updateExisting(
   n: NormalizedOrder,
   run: Run,
 ): Promise<string[] | null | "stale"> {
-  if (n.sourceUpdatedAt) {
-    const applied = await appliedSourceUpdatedAt(tx, ctx, o.id);
-    if (applied && new Date(n.sourceUpdatedAt).getTime() < applied.getTime()) return "stale";
-  }
+  // Staleness (B-12): against the newest channel timestamp applied, not `updated_at`, which moves
+  // on every floor scan (the cached status) and would drop a real edit that arrives after one.
+  const sourceAt = n.sourceUpdatedAt ? new Date(n.sourceUpdatedAt) : null;
+  if (sourceAt && o.channelUpdatedAt && sourceAt.getTime() < o.channelUpdatedAt.getTime())
+    return "stale";
   const changed: string[] = [];
   const set: Partial<typeof orders.$inferInsert> = {};
   const totals = {
@@ -465,6 +441,9 @@ async function updateExisting(
   }
   if (!SHIPPED.has(o.status))
     changed.push(...(await applyLineEdits(tx, ctx, connection, { ...o, ...set }, n, run)));
+  // Advance the watermark even when nothing changed, so an older payload is caught after it.
+  if (sourceAt && (!o.channelUpdatedAt || sourceAt.getTime() > o.channelUpdatedAt.getTime()))
+    await tx.update(orders).set({ channelUpdatedAt: sourceAt }).where(eq(orders.id, o.id));
   return changed.length ? changed : null;
 }
 
@@ -828,6 +807,43 @@ async function flagPressed(
     any = true;
   }
   return any;
+}
+
+/** The channel cancelled one line: cancel its open units, flag pressed ones (idempotent). */
+export async function cancelLineFromChannel(
+  tx: Tx,
+  ctx: TenantContext,
+  channel: OrderRow["channel"],
+  line: ChannelLineCancel,
+): Promise<boolean> {
+  const [o] = await tx
+    .select()
+    .from(orders)
+    .where(and(eq(orders.channel, channel), eq(orders.channelOrderId, line.channelOrderId)))
+    .limit(1);
+  if (!o || SHIPPED.has(o.status)) return false;
+  const units = await tx
+    .select()
+    .from(orderItems)
+    .where(
+      and(
+        eq(orderItems.orderId, o.id),
+        eq(orderItems.channelLineId, line.channelLineId),
+        eq(orderItems.isReprint, false),
+      ),
+    );
+  const active = units.filter((u) => u.state !== "cancelled");
+  const flags: { item: ItemRow; message: string; fingerprint: string }[] = [];
+  const took = cancelCheapest(active, active.length, flags, "line cancelled");
+  if (took.length)
+    await cancelOrder(tx, ctx, {
+      id: o.id,
+      reason: "channel_cancelled",
+      note: "Line cancelled on the channel",
+      orderItemIds: took.map((u) => u.id),
+    });
+  const flagged = await flagPressed(tx, ctx, flags);
+  return took.length > 0 || flagged;
 }
 
 /**

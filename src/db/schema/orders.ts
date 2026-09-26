@@ -107,6 +107,9 @@ export const orders = pgTable(
     binId: uuid(),
     /** S3 key of the raw channel payload (encrypted archive, 30-day lifecycle). */
     rawPayloadKey: text(),
+    /** The channel's own "last modified" time of the newest payload applied (T-7-4, B-12): an
+     * older payload is ignored. Null = none applied yet, or the channel sends none (CSV). */
+    channelUpdatedAt: timestamp({ withTimezone: true }),
     importRunId: uuid(),
     shippedAt: timestamp({ withTimezone: true }),
     deliveredAt: timestamp({ withTimezone: true }),

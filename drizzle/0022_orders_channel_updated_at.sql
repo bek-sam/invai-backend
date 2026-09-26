@@ -1,0 +1,1 @@
+ALTER TABLE "orders" ADD COLUMN "channel_updated_at" timestamp with time zone;
