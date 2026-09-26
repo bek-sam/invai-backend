@@ -5,6 +5,7 @@ import { env } from "../env";
 import { upstream } from "../lib/errors";
 import { logger } from "../lib/log";
 import { isSampleWorkspace } from "../modules/tenancy/demo-flag";
+import { assertSpendAvailable, recordSpend } from "./breaker";
 import { assertCredits, type CreditKind, chargeCredits } from "./credits";
 import { MOCK_MODEL, tokensToCostCents, tokensToCredits } from "./models";
 import { stripPii, stripPiiDeep } from "./pii";
@@ -18,6 +19,7 @@ import {
   type AssistantFinal,
   type AssistantRun,
   type AssistantStreamEvent,
+  type AssistantTool,
 } from "./providers/types";
 
 /**
@@ -94,6 +96,9 @@ async function finishJob(
   output: Record<string, unknown>,
 ) {
   const credits = tokensToCredits(result.usage);
+  // A sample workspace's calls also come back with `model === MOCK_MODEL` (aiProvider() above),
+  // so this stays 0 for them regardless of env.mocks.ai, and the spend counters never move.
+  const costCents = result.model === MOCK_MODEL ? 0 : tokensToCostCents(result.usage);
   await withTenant(meta.companyId, async (tx) => {
     await tx
       .update(aiJobs)
@@ -104,9 +109,7 @@ async function finishJob(
         tokensIn: result.usage.tokensIn,
         tokensOut: result.usage.tokensOut,
         cacheReadTokens: result.usage.cacheReadTokens,
-        // A sample workspace's calls also come back with `model === MOCK_MODEL` (aiProvider()
-        // above), so this stays 0 for them regardless of env.mocks.ai.
-        costCents: result.model === MOCK_MODEL ? 0 : tokensToCostCents(result.usage),
+        costCents,
         credits,
         stopReason: result.stopReason,
         finishedAt: new Date(),
@@ -123,7 +126,32 @@ async function finishJob(
       userId: meta.userId,
     });
   });
+  // After the commit: a Valkey side effect never runs inside the DB transaction.
+  await recordSpend(meta.companyId, costCents);
   return credits;
+}
+
+/**
+ * The spend breaker (breaker.ts) runs before every real provider call. The mock never spends, so
+ * a keyless environment or a sample workspace never reads the counters.
+ */
+async function assertSpend(meta: CallMeta, provider: AiProvider) {
+  if (provider.name !== "mock") await assertSpendAvailable(meta.companyId);
+}
+
+/**
+ * Assistant tool results are untrusted data (design names, labels, anything a shop typed). Each
+ * result goes to the model as a JSON envelope labelled with its source, which the assistant's
+ * system prompt (DATA_RULE) says to treat as data only. Applied here, once, for every tool.
+ */
+export function isolateToolResults(tools: AssistantTool[]): AssistantTool[] {
+  return tools.map((t) => ({
+    ...t,
+    run: async (input) => {
+      const out = await t.run(input);
+      return { ...out, data: { source: `tool_result:${t.name}`, data: out.data } };
+    },
+  }));
 }
 
 /**
@@ -136,6 +164,7 @@ export async function runStructured<V, O>(
   vars: V,
 ): Promise<{ output: O; credits: number; model: string; aiJobId: string }> {
   const provider = await aiProvider(meta.companyId);
+  await assertSpend(meta, provider);
   const clean = stripPiiDeep(vars);
   const aiJobId = await startJob(
     meta,
@@ -159,6 +188,7 @@ export function scrubAssistantRun(run: AssistantRun): AssistantRun {
     ...run,
     message: stripPii(run.message),
     history: run.history.map((h) => ({ ...h, text: stripPii(h.text) })),
+    tools: isolateToolResults(run.tools),
   };
 }
 
@@ -182,6 +212,7 @@ export async function* runAssistant(
   onSettle?: (result: { credits: number; model: string; aiJobId: string }) => void,
 ): AsyncGenerator<AssistantStreamEvent, { credits: number; model: string; aiJobId: string }> {
   const provider = await aiProvider(meta.companyId);
+  await assertSpend(meta, provider);
   const clean = scrubAssistantRun(run);
   const aiJobId = await startJob(meta, { message: clean.message.slice(0, 500) }, provider);
   let text = "";

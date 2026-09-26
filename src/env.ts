@@ -62,6 +62,9 @@ const raw = createEnv({
     FIELD_ENCRYPTION_KEY: z.string().min(40),
 
     ANTHROPIC_API_KEY: secret(z.string()),
+    /** Daily (UTC) real-model AI spend caps in cents (src/ai/breaker.ts); 0 turns a scope off. */
+    AI_DAILY_PLATFORM_CAP_CENTS: z.coerce.number().int().min(0).default(50_000),
+    AI_DAILY_TENANT_CAP_CENTS: z.coerce.number().int().min(0).default(5_000),
     EASYPOST_API_KEY: secret(z.string()),
     /** EasyPost webhook HMAC secret (`X-Hmac-Signature`); unset uses the mock dev secret. */
     EASYPOST_WEBHOOK_SECRET: secret(z.string()),
