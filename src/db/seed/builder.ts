@@ -11,7 +11,7 @@ import { renderValues } from "../../modules/personalization/service";
 import { HEADER_HEIGHT_IN, LABEL_HEIGHT_IN } from "../../modules/production/sheets";
 import { issueStationToken, setPin } from "../../modules/tenancy/floor-auth";
 import type { Tx } from "../client";
-import type { Address } from "../schema";
+import type { Address, SheetSpec } from "../schema";
 import {
   adSpend,
   alerts,
@@ -147,6 +147,67 @@ export type ShopSeedResult = {
 
 /** The full Desert Bloom volumes. A demo uses a smaller slice of the same shape. */
 export const FULL_VOLUME = { historicalOrders: 300, dueSoonOrders: 60, adSpendDays: 30 };
+
+type NestItemLike = { id: string; widthIn: number; heightIn: number };
+type SheetPlan<T> = {
+  lengthIn: number;
+  utilization: number;
+  placements: { item: T; xIn: number; yIn: number; rotated: boolean }[];
+};
+
+/**
+ * Fallback only (T-13-5, B-111): imaging's real `/nest` (with rotation) is what the product
+ * actually builds gang sheets with, so seeded sheets go through it too — this first-fit-decreasing
+ * shelf pack (sort widest first, place each item in the first already-open row it fits before
+ * opening a new one, so a later narrower item can backfill a wide item's leftover width) only
+ * runs if imaging is unreachable, so the seed can still finish. It never rotates.
+ */
+function ffdPack<T extends NestItemLike>(items: T[], spec: SheetSpec): SheetPlan<T> {
+  const { marginIn, spacingIn, widthIn: filmIn } = spec;
+  const usableIn = filmIn - 2 * marginIn;
+  const order = items
+    .map((_, i) => i)
+    .sort((a, b) => (items[b]?.widthIn ?? 0) - (items[a]?.widthIn ?? 0));
+  type Row = { usedIn: number; heightIn: number; items: number[] };
+  const rows: Row[] = [];
+  for (const idx of order) {
+    const it = items[idx] as T;
+    const row = rows.find((r) => r.usedIn + spacingIn + it.widthIn <= usableIn);
+    if (row) {
+      row.usedIn += spacingIn + it.widthIn;
+      row.heightIn = Math.max(row.heightIn, it.heightIn);
+      row.items.push(idx);
+    } else {
+      rows.push({ usedIn: it.widthIn, heightIn: it.heightIn, items: [idx] });
+    }
+  }
+  const xy: { xIn: number; yIn: number }[] = new Array(items.length);
+  let y = marginIn + HEADER_HEIGHT_IN;
+  let printArea = 0;
+  for (let r = 0; r < rows.length; r++) {
+    const row = rows[r] as Row;
+    let x = marginIn;
+    for (const idx of row.items) {
+      const it = items[idx] as T;
+      xy[idx] = { xIn: Math.round(x * 100) / 100, yIn: Math.round(y * 100) / 100 };
+      x += it.widthIn + spacingIn;
+      printArea += it.widthIn * it.heightIn;
+    }
+    if (r < rows.length - 1) y += row.heightIn + LABEL_HEIGHT_IN + spacingIn;
+  }
+  const lastH = rows.length > 0 ? (rows[rows.length - 1] as Row).heightIn : 0;
+  const lengthIn = Math.round((y + lastH + LABEL_HEIGHT_IN + marginIn) * 100) / 100;
+  return {
+    lengthIn,
+    utilization: lengthIn > 0 ? Math.round((printArea / (filmIn * lengthIn)) * 100) / 100 : 0,
+    placements: items.map((it, idx) => ({
+      item: it,
+      xIn: xy[idx]?.xIn ?? marginIn,
+      yIn: xy[idx]?.yIn ?? 0,
+      rotated: false,
+    })),
+  };
+}
 
 export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResult> {
   const { companyId: shopId, random, run, profile, people, vendor } = opts;
@@ -1027,12 +1088,12 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
     if (!vendor) throw new Error("vendor");
     const sorted = [...productionItems].sort((a, b) => a.placedAt.getTime() - b.placedAt.getTime());
     const PER_SHEET = 24;
-    let sheetNo = 0;
+    let physicalSheetNo = 0;
+    let fellBackTo = 0;
     for (let s = 0; s < sorted.length; s += PER_SHEET) {
       const chunk = sorted.slice(s, s + PER_SHEET);
       const first = chunk[0];
       if (!first) continue;
-      sheetNo++;
       const day = first.placedAt.toISOString().slice(0, 10);
       const states = new Set(chunk.map((c) => c.state));
       const status = states.has("on_sheet")
@@ -1040,47 +1101,51 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
           ? "sent"
           : "printed"
         : "received";
-      // Shelf-pack the 22 in film with real first-fit-decreasing (T-13-5, B-111): sort widest
-      // first, then place each item in the FIRST already-open row it fits in (not only the row
-      // most recently opened) before starting a new one. A width-only sort with a single open
-      // row still strands a lone wide item (e.g. a 6-unit "back" bulk order) — nothing narrower
-      // gets a chance to backfill its leftover width until every row is considered. `layout`
-      // stays indexed by `chunk`'s original (placedAt) order since the transfers/placements
-      // loops below are built from `chunk[k]`/`layout[k]`.
-      const { marginIn, spacingIn, widthIn: filmIn } = DEFAULT_SHEET_SPEC;
-      const usableIn = filmIn - 2 * marginIn;
-      const packOrder = chunk
-        .map((_, i) => i)
-        .sort((a, b) => (chunk[b]?.widthIn ?? 0) - (chunk[a]?.widthIn ?? 0));
-      type Row = { usedIn: number; heightIn: number; items: number[] };
-      const rows: Row[] = [];
-      for (const idx of packOrder) {
-        const c = chunk[idx] as (typeof chunk)[number];
-        const row = rows.find((r) => r.usedIn + spacingIn + c.widthIn <= usableIn);
-        if (row) {
-          row.usedIn += spacingIn + c.widthIn;
-          row.heightIn = Math.max(row.heightIn, c.heightIn);
-          row.items.push(idx);
-        } else {
-          rows.push({ usedIn: c.widthIn, heightIn: c.heightIn, items: [idx] });
-        }
+      // Real nesting (T-13-5, B-111): the product builds gang sheets through imaging's `/nest`
+      // (real 2D nesting, with rotation), and the seed's demo numbers need to reflect that same
+      // algorithm rather than a bespoke seed-only packer. Imaging is required for the seed, so
+      // this should always succeed; the FFD shelf pack below is a fallback for when it isn't
+      // reachable, so the seed can still finish (logged as a warning, since it changes the
+      // reported efficiency).
+      let plans: SheetPlan<(typeof chunk)[number]>[];
+      try {
+        const byId = new Map(chunk.map((c) => [c.id, c]));
+        const nest = await imaging.nest({
+          items: chunk.map((c) => ({ id: c.id, width_in: c.widthIn, height_in: c.heightIn })),
+          sheet_width_in: DEFAULT_SHEET_SPEC.widthIn,
+          spacing_in: DEFAULT_SHEET_SPEC.spacingIn,
+          margin_in: DEFAULT_SHEET_SPEC.marginIn,
+          max_length_in: DEFAULT_SHEET_SPEC.maxLengthIn,
+          allow_rotation: true,
+          label_height_in: LABEL_HEIGHT_IN,
+          header_height_in: HEADER_HEIGHT_IN,
+        });
+        plans = nest.sheets
+          .map((ns) => ({
+            lengthIn: Math.round(ns.length_in * 100) / 100,
+            utilization: Math.round(ns.utilization * 100) / 100,
+            placements: ns.placements
+              .filter((p) => byId.has(p.id))
+              .map((p) => ({
+                item: byId.get(p.id) as (typeof chunk)[number],
+                xIn: p.x_in,
+                yIn: p.y_in,
+                rotated: p.rotated,
+              })),
+          }))
+          .filter((p) => p.placements.length > 0);
+        const placed = plans.reduce((n, p) => n + p.placements.length, 0);
+        if (!plans.length) throw new Error("nest returned no sheets");
+        if (placed < chunk.length)
+          log.warn("seed: /nest left items unplaced", { day, placed, of: chunk.length });
+      } catch (err) {
+        fellBackTo++;
+        log.warn("seed: imaging /nest unreachable, falling back to FFD shelf pack", {
+          day,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        plans = [ffdPack(chunk, DEFAULT_SHEET_SPEC)];
       }
-      const layout: { xIn: number; yIn: number }[] = new Array(chunk.length);
-      let y = marginIn + HEADER_HEIGHT_IN; // top-edge header band; nesting starts below it
-      let printArea = 0;
-      for (let r = 0; r < rows.length; r++) {
-        const row = rows[r] as Row;
-        let x = marginIn;
-        for (const idx of row.items) {
-          const c = chunk[idx] as (typeof chunk)[number];
-          layout[idx] = { xIn: Math.round(x * 100) / 100, yIn: Math.round(y * 100) / 100 };
-          x += c.widthIn + spacingIn;
-          printArea += c.widthIn * c.heightIn;
-        }
-        if (r < rows.length - 1) y += row.heightIn + LABEL_HEIGHT_IN + spacingIn;
-      }
-      const rowH = rows.length > 0 ? (rows[rows.length - 1] as Row).heightIn : 0;
-      const lengthIn = Math.round((y + rowH + LABEL_HEIGHT_IN + marginIn) * 100) / 100;
       const builtAt = new Date(first.placedAt.getTime() + 8 * HOUR);
       const [batch] = await tx
         .insert(gangSheetBatches)
@@ -1091,144 +1156,154 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
           dueBefore: new Date(first.placedAt.getTime() + 2 * DAY),
           vendorConnectionId: vendor.id,
           itemCount: chunk.length,
-          sheetCount: 1,
+          sheetCount: plans.length,
           createdBy: ownerId,
           createdAt: builtAt,
           updatedAt: builtAt,
         })
         .returning();
       if (!batch) throw new Error("batch");
-      const [sheet] = await tx
-        .insert(gangSheets)
-        .values({
-          companyId: shopId,
-          batchId: batch.id,
-          sheetNo: 1,
-          name: `${day} #${sheetNo}`,
-          vendorConnectionId: vendor.id,
-          widthIn: 22,
-          lengthIn,
-          utilization: Math.round((printArea / (22 * lengthIn)) * 100) / 100,
-          status,
-          transferCount: chunk.length,
-          reprintCount: chunk.filter((c) => c.isReprint).length,
-          costCents: Math.round(lengthIn * DEFAULT_SHEET_SPEC.pricePerInch),
-          // Open sheets get real files (composed below); historical ones keep no file.
-          pngKey: status === "received" ? null : `${shopId}/sheet/seed/${day}-${sheetNo}.png`,
-          previewKey: status === "received" ? null : `${shopId}/preview/seed/${day}-${sheetNo}.png`,
-          sentAt: new Date(builtAt.getTime() + HOUR),
-          acknowledgedAt: status === "sent" ? null : new Date(builtAt.getTime() + 3 * HOUR),
-          printedAt: status === "sent" ? null : new Date(builtAt.getTime() + 20 * HOUR),
-          shippedAt: status === "received" ? new Date(builtAt.getTime() + 26 * HOUR) : null,
-          receivedAt: status === "received" ? new Date(builtAt.getTime() + 44 * HOUR) : null,
-          trackingCarrier: status === "received" ? "ups" : null,
-          trackingCode:
-            status === "received" ? `1Z999AA1${String(10000000 + sheetNo * 4321)}` : null,
-          createdAt: builtAt,
-          updatedAt: builtAt,
-        })
-        .returning();
-      if (!sheet) throw new Error("sheet");
-      if (sheet.pngKey && sheet.previewKey)
-        sheetComposes.push({
-          sheetId: sheet.id,
-          widthIn: 22,
-          lengthIn,
-          pngKey: sheet.pngKey,
-          previewKey: sheet.previewKey,
-          placements: chunk.map((c, k) => ({
-            transfer_id: "",
-            file_key: c.fileKey,
-            x_in: layout[k]?.xIn ?? marginIn,
-            y_in: layout[k]?.yIn ?? 0,
-            width_in: c.widthIn,
-            height_in: c.heightIn,
-            rotated: false,
-            label: {
-              order_no: c.orderNo,
-              item_no: `${k + 1}`,
-              size: c.size,
-              color: c.color,
-              design: c.designName,
-              reprint: c.isReprint,
-            },
-          })),
-        });
-      if (vendor.vendorCompanyId)
-        await tx.insert(vendorAccess).values({
-          companyId: shopId,
-          vendorCompanyId: vendor.vendorCompanyId,
-          gangSheetId: sheet.id,
-          grantedBy: ownerId,
-          grantedAt: sheet.sentAt ?? builtAt,
-        });
-      for (let k = 0; k < chunk.length; k++) {
-        const item = chunk[k] as (typeof chunk)[number];
-        const [transfer] = await tx
-          .insert(transfers)
+      for (let pi = 0; pi < plans.length; pi++) {
+        const plan = plans[pi] as SheetPlan<(typeof chunk)[number]>;
+        const placements = plan.placements;
+        physicalSheetNo++;
+        const [sheet] = await tx
+          .insert(gangSheets)
           .values({
             companyId: shopId,
-            gangSheetId: sheet.id,
-            orderItemId: item.id,
-            xIn: layout[k]?.xIn ?? DEFAULT_SHEET_SPEC.marginIn,
-            yIn: layout[k]?.yIn ?? 0,
-            widthIn: item.widthIn,
-            heightIn: item.heightIn,
-            rotated: false,
-            label: {
-              order_no: item.orderNo,
-              item_no: `${k + 1}`,
-              size: item.size,
-              color: item.color,
-              design: item.designName,
-              reprint: item.isReprint,
-            },
-            status:
-              item.state === "on_sheet"
-                ? "placed"
-                : item.state === "transfer_in"
-                  ? "received"
-                  : "pressed",
-            isReprint: item.isReprint,
-            pressedAt: ["pressed", "packed", "shipped", "delivered"].includes(item.state)
-              ? new Date(builtAt.getTime() + 50 * HOUR)
-              : null,
+            batchId: batch.id,
+            sheetNo: pi + 1,
+            name: `${day} #${physicalSheetNo}`,
+            vendorConnectionId: vendor.id,
+            widthIn: DEFAULT_SHEET_SPEC.widthIn,
+            lengthIn: plan.lengthIn,
+            utilization: plan.utilization,
+            status,
+            transferCount: placements.length,
+            reprintCount: placements.filter((p) => p.item.isReprint).length,
+            costCents: Math.round(plan.lengthIn * DEFAULT_SHEET_SPEC.pricePerInch),
+            // Open sheets get real files (composed below); historical ones keep no file.
+            pngKey:
+              status === "received" ? null : `${shopId}/sheet/seed/${day}-${physicalSheetNo}.png`,
+            previewKey:
+              status === "received" ? null : `${shopId}/preview/seed/${day}-${physicalSheetNo}.png`,
+            sentAt: new Date(builtAt.getTime() + HOUR),
+            acknowledgedAt: status === "sent" ? null : new Date(builtAt.getTime() + 3 * HOUR),
+            printedAt: status === "sent" ? null : new Date(builtAt.getTime() + 20 * HOUR),
+            shippedAt: status === "received" ? new Date(builtAt.getTime() + 26 * HOUR) : null,
+            receivedAt: status === "received" ? new Date(builtAt.getTime() + 44 * HOUR) : null,
+            trackingCarrier: status === "received" ? "ups" : null,
+            trackingCode:
+              status === "received" ? `1Z999AA1${String(10000000 + physicalSheetNo * 4321)}` : null,
             createdAt: builtAt,
             updatedAt: builtAt,
           })
-          .returning({ id: transfers.id });
-        if (!transfer) throw new Error("transfer");
-        const compose = sheetComposes.find((c) => c.sheetId === sheet.id);
-        const placement = compose?.placements[k];
-        if (placement) placement.transfer_id = transfer.id;
-        await tx
-          .update(orderItems)
-          .set({ transferId: transfer.id, gangSheetId: sheet.id })
-          .where(eq(orderItems.id, item.id));
-        if (
-          ["pressed", "packed", "shipped", "delivered"].includes(item.state) &&
-          item.placedAt.getTime() > now - 4 * DAY
-        ) {
-          await tx.insert(scans).values({
-            companyId: shopId,
-            clientScanId: crypto.randomUUID(),
-            stationId: stationIds["Press 1"] ?? null,
-            station: "press",
-            action: "press",
-            userId: pressActor.userId,
-            transferCode: `T:${transfer.id}`,
-            blankCode: `B:${item.blankVariantId}`,
-            transferId: transfer.id,
-            orderItemId: item.id,
-            ok: true,
-            mismatch: null,
-            result: { ok: true, message: "Match" },
-            scannedAt: new Date(builtAt.getTime() + 50 * HOUR),
+          .returning();
+        if (!sheet) throw new Error("sheet");
+        if (sheet.pngKey && sheet.previewKey)
+          sheetComposes.push({
+            sheetId: sheet.id,
+            widthIn: DEFAULT_SHEET_SPEC.widthIn,
+            lengthIn: plan.lengthIn,
+            pngKey: sheet.pngKey,
+            previewKey: sheet.previewKey,
+            placements: placements.map((p, k) => ({
+              transfer_id: "",
+              file_key: p.item.fileKey,
+              x_in: p.xIn,
+              y_in: p.yIn,
+              width_in: p.rotated ? p.item.heightIn : p.item.widthIn,
+              height_in: p.rotated ? p.item.widthIn : p.item.heightIn,
+              rotated: p.rotated,
+              label: {
+                order_no: p.item.orderNo,
+                item_no: `${k + 1}`,
+                size: p.item.size,
+                color: p.item.color,
+                design: p.item.designName,
+                reprint: p.item.isReprint,
+              },
+            })),
           });
+        if (vendor.vendorCompanyId)
+          await tx.insert(vendorAccess).values({
+            companyId: shopId,
+            vendorCompanyId: vendor.vendorCompanyId,
+            gangSheetId: sheet.id,
+            grantedBy: ownerId,
+            grantedAt: sheet.sentAt ?? builtAt,
+          });
+        for (let k = 0; k < placements.length; k++) {
+          const p = placements[k] as (typeof placements)[number];
+          const item = p.item;
+          const [transfer] = await tx
+            .insert(transfers)
+            .values({
+              companyId: shopId,
+              gangSheetId: sheet.id,
+              orderItemId: item.id,
+              xIn: p.xIn,
+              yIn: p.yIn,
+              widthIn: p.rotated ? item.heightIn : item.widthIn,
+              heightIn: p.rotated ? item.widthIn : item.heightIn,
+              rotated: p.rotated,
+              label: {
+                order_no: item.orderNo,
+                item_no: `${k + 1}`,
+                size: item.size,
+                color: item.color,
+                design: item.designName,
+                reprint: item.isReprint,
+              },
+              status:
+                item.state === "on_sheet"
+                  ? "placed"
+                  : item.state === "transfer_in"
+                    ? "received"
+                    : "pressed",
+              isReprint: item.isReprint,
+              pressedAt: ["pressed", "packed", "shipped", "delivered"].includes(item.state)
+                ? new Date(builtAt.getTime() + 50 * HOUR)
+                : null,
+              createdAt: builtAt,
+              updatedAt: builtAt,
+            })
+            .returning({ id: transfers.id });
+          if (!transfer) throw new Error("transfer");
+          const compose = sheetComposes.find((c) => c.sheetId === sheet.id);
+          const placement = compose?.placements[k];
+          if (placement) placement.transfer_id = transfer.id;
+          await tx
+            .update(orderItems)
+            .set({ transferId: transfer.id, gangSheetId: sheet.id })
+            .where(eq(orderItems.id, item.id));
+          if (
+            ["pressed", "packed", "shipped", "delivered"].includes(item.state) &&
+            item.placedAt.getTime() > now - 4 * DAY
+          ) {
+            await tx.insert(scans).values({
+              companyId: shopId,
+              clientScanId: crypto.randomUUID(),
+              stationId: stationIds["Press 1"] ?? null,
+              station: "press",
+              action: "press",
+              userId: pressActor.userId,
+              transferCode: `T:${transfer.id}`,
+              blankCode: `B:${item.blankVariantId}`,
+              transferId: transfer.id,
+              orderItemId: item.id,
+              ok: true,
+              mismatch: null,
+              result: { ok: true, message: "Match" },
+              scannedAt: new Date(builtAt.getTime() + 50 * HOUR),
+            });
+          }
         }
       }
     }
-    return sheetNo;
+    if (fellBackTo > 0)
+      log.warn("seed: sheets built with the FFD fallback", { chunks: fellBackTo });
+    return physicalSheetNo;
   });
   // Real PNG + preview for the sheets a vendor can still open (the historical ones have none).
   let composed = 0;
