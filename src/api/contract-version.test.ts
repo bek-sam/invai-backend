@@ -1,6 +1,7 @@
-import { CONTRACT_VERSION } from "@invai/contracts";
+import { CONTRACT_VERSION, FLOOR_COMPAT_BASELINE } from "@invai/contracts";
 import { call } from "@orpc/server";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
+import { env } from "../env";
 import { createCompany, createUser } from "../test/fixtures";
 import { app } from "./app";
 import { anonymousContext, type Context, permissionsFor } from "./context";
@@ -63,6 +64,40 @@ describe("enforceFloorContractVersion", () => {
   });
 });
 
+describe("default minimum (FLOOR_COMPAT_BASELINE)", () => {
+  it("defaults to the floor baseline, not CONTRACT_VERSION", () => {
+    if (!process.env.MIN_FLOOR_CONTRACT_VERSION) {
+      expect(env.MIN_FLOOR_CONTRACT_VERSION).toBe(FLOOR_COMPAT_BASELINE);
+    }
+  });
+
+  it("a contracts version bump alone doesn't refuse current tablets", async () => {
+    // Simulate a later backend build on contracts 9.9.0 with no floor-facing break: the
+    // baseline doesn't move, so a tablet still on today's version keeps working.
+    vi.resetModules();
+    vi.doMock("@invai/contracts", async (orig) => ({
+      ...(await orig<typeof import("@invai/contracts")>()),
+      CONTRACT_VERSION: "9.9.0",
+    }));
+    try {
+      const bumped = await import("../env");
+      const { enforceFloorContractVersion: enforce } = await import("./orpc");
+      if (!process.env.MIN_FLOOR_CONTRACT_VERSION) {
+        expect(bumped.env.MIN_FLOOR_CONTRACT_VERSION).toBe(FLOOR_COMPAT_BASELINE);
+      }
+      const tablet = {
+        headers: new Headers({ "x-contract-version": CONTRACT_VERSION }),
+        sessionKind: "floor" as const,
+      };
+      expect(() => enforce("floor", tablet)).not.toThrow();
+      expect(() => enforce("station", tablet)).not.toThrow();
+    } finally {
+      vi.doUnmock("@invai/contracts");
+      vi.resetModules();
+    }
+  });
+});
+
 describe("guard: floor contract version", () => {
   let companyId: string;
   let userId: string;
@@ -89,7 +124,7 @@ describe("guard: floor contract version", () => {
     });
     expect(old).toEqual({
       code: "CLIENT_TOO_OLD",
-      data: { minVersion: CONTRACT_VERSION, current: "0.0.1" },
+      data: { minVersion: FLOOR_COMPAT_BASELINE, current: "0.0.1" },
     });
     expect(
       (await errorOf("production.queue", floorSession(null), { station: "press", limit: 5 })).code,
@@ -115,7 +150,7 @@ describe("guard: floor contract version", () => {
     expect(old.status).toBe(426);
     const body = (await old.json()) as { json: { code: string; data: unknown } };
     expect(body.json.code).toBe("CLIENT_TOO_OLD");
-    expect(body.json.data).toEqual({ minVersion: CONTRACT_VERSION, current: "0.1.0" });
+    expect(body.json.data).toEqual({ minVersion: FLOOR_COMPAT_BASELINE, current: "0.1.0" });
     expect((await post({})).status).toBe(426);
     // A current tablet reaches the handler, which then wants a station token.
     const current = await post({ "x-contract-version": CONTRACT_VERSION });
