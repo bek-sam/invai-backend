@@ -1,5 +1,7 @@
+import { SHEET_STATES } from "@invai/contracts";
 import { eq } from "drizzle-orm";
 import { beforeAll, describe, expect, it, vi } from "vitest";
+import { z } from "zod";
 import { withSystem, withTenant } from "../../db/client";
 import { gangSheetBatches, gangSheets, vendorAccess, vendorConnections } from "../../db/schema";
 import { DEFAULT_SHEET_SPEC } from "../../db/schema/vendors";
@@ -86,6 +88,13 @@ describe("vendors: delivery and the vendor portal", () => {
     expect(inbox.items.map((s) => s.id)).toEqual([sheetId]);
     expect(inbox.items[0]?.shop.name).toBe("Shop A");
     expect(inbox.counts.sent).toBe(1);
+    // counts is an exhaustive Record<SheetState, number> (contract: z.record(z.enum(SHEET_STATES),
+    // ...)) -- a missing key (e.g. `printing`, dropped once from a hand-listed array) fails this
+    // parse the same way it fails at the oRPC output-validation layer (a 500 for every caller).
+    expect(() =>
+      z.record(z.enum(SHEET_STATES), z.number().int().nonnegative()).parse(inbox.counts),
+    ).not.toThrow();
+    expect(Object.keys(inbox.counts).sort()).toEqual([...SHEET_STATES].sort());
     const other = await svc.vendorInbox(otherVendorCtx, { limit: 10 });
     expect(other.items).toHaveLength(0);
     await expect(svc.vendorSheet(otherVendorCtx, sheetId)).rejects.toMatchObject({

@@ -1,6 +1,7 @@
 import {
   DEFAULT_SHEET_SPEC,
   type GangSheet,
+  SHEET_STATES,
   type SheetState,
   sheetSpecPdfCapError,
   type VendorConnection,
@@ -530,20 +531,10 @@ export async function vendorInbox(ctx: TenantContext, input: InboxInput) {
       .from(gangSheets)
       .where(and(...base))
       .groupBy(gangSheets.status);
+    // Derived from SHEET_STATES (not hand-listed) so a future state can't silently drop out of
+    // this exhaustive Record and fail output validation, as `printing` (T-6-2) just did.
     const counts = Object.fromEntries(
-      (
-        [
-          "building",
-          "ready",
-          "sent",
-          "acknowledged",
-          "printed",
-          "shipped",
-          "received",
-          "failed",
-          "cancelled",
-        ] as const
-      ).map((s) => [s, countRows.find((c) => c.status === s)?.n ?? 0]),
+      SHEET_STATES.map((s) => [s, countRows.find((c) => c.status === s)?.n ?? 0]),
     ) as Record<SheetState, number>;
     const result = page.result(
       rows.map((r) => ({ ...r, createdAt: r.sheet.createdAt, id: r.sheet.id })),
