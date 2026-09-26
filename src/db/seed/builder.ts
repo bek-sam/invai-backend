@@ -40,6 +40,7 @@ import {
   suppliers,
   transfers,
   usage,
+  users,
   vendorAccess,
   vendorConnections,
 } from "../schema";
@@ -123,8 +124,11 @@ export type ShopSeedOptions = {
   profile: ShopProfile;
   /** Who did what on the timeline (the same user may fill every slot). */
   people: { owner: string; office: string; presser: string; packer: string; receiver: string };
-  /** Floor PINs to set (the full seed's staff); none for a demo. */
-  pins: { userId: string; pin: string }[];
+  /**
+   * Floor PINs to set (the full seed's staff); none for a demo. `locale` sets the user's
+   * `locale` column (e.g. Spanish-speaking floor staff), defaulting to "en" when omitted.
+   */
+  pins: { userId: string; pin: string; locale?: "en" | "es" }[];
   /** Issue a station token for "Press 1" (the full seed prints it for the floor app). */
   issueStationToken: boolean;
   /** The DTF vendor: a portal vendor org, or null for email delivery. */
@@ -173,6 +177,7 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
       .returning();
     for (const p of opts.pins) {
       await setPin(tx, { companyId: shopId, userId: p.userId, pin: p.pin, actorUserId: ownerId });
+      if (p.locale) await tx.update(users).set({ locale: p.locale }).where(eq(users.id, p.userId));
     }
     const press1 = stationRows.find((s) => s.name === "Press 1");
     if (!press1) throw new Error("station");
@@ -1035,24 +1040,46 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
           ? "sent"
           : "printed"
         : "received";
-      // Greedy rows across the 22 in film, each as tall as its tallest design plus label and spacing.
+      // Shelf-pack the 22 in film with real first-fit-decreasing (T-13-5, B-111): sort widest
+      // first, then place each item in the FIRST already-open row it fits in (not only the row
+      // most recently opened) before starting a new one. A width-only sort with a single open
+      // row still strands a lone wide item (e.g. a 6-unit "back" bulk order) — nothing narrower
+      // gets a chance to backfill its leftover width until every row is considered. `layout`
+      // stays indexed by `chunk`'s original (placedAt) order since the transfers/placements
+      // loops below are built from `chunk[k]`/`layout[k]`.
       const { marginIn, spacingIn, widthIn: filmIn } = DEFAULT_SHEET_SPEC;
-      const layout: { xIn: number; yIn: number }[] = [];
-      let x = marginIn;
-      let y = marginIn + HEADER_HEIGHT_IN; // top-edge header band; nesting starts below it
-      let rowH = 0;
-      let printArea = 0;
-      for (const c of chunk) {
-        if (x > marginIn && x + c.widthIn > filmIn - marginIn) {
-          y += rowH + LABEL_HEIGHT_IN + spacingIn;
-          x = marginIn;
-          rowH = 0;
+      const usableIn = filmIn - 2 * marginIn;
+      const packOrder = chunk
+        .map((_, i) => i)
+        .sort((a, b) => (chunk[b]?.widthIn ?? 0) - (chunk[a]?.widthIn ?? 0));
+      type Row = { usedIn: number; heightIn: number; items: number[] };
+      const rows: Row[] = [];
+      for (const idx of packOrder) {
+        const c = chunk[idx] as (typeof chunk)[number];
+        const row = rows.find((r) => r.usedIn + spacingIn + c.widthIn <= usableIn);
+        if (row) {
+          row.usedIn += spacingIn + c.widthIn;
+          row.heightIn = Math.max(row.heightIn, c.heightIn);
+          row.items.push(idx);
+        } else {
+          rows.push({ usedIn: c.widthIn, heightIn: c.heightIn, items: [idx] });
         }
-        layout.push({ xIn: Math.round(x * 100) / 100, yIn: Math.round(y * 100) / 100 });
-        x += c.widthIn + spacingIn;
-        rowH = Math.max(rowH, c.heightIn);
-        printArea += c.widthIn * c.heightIn;
       }
+      const layout: { xIn: number; yIn: number }[] = new Array(chunk.length);
+      let y = marginIn + HEADER_HEIGHT_IN; // top-edge header band; nesting starts below it
+      let printArea = 0;
+      for (let r = 0; r < rows.length; r++) {
+        const row = rows[r] as Row;
+        let x = marginIn;
+        for (const idx of row.items) {
+          const c = chunk[idx] as (typeof chunk)[number];
+          layout[idx] = { xIn: Math.round(x * 100) / 100, yIn: Math.round(y * 100) / 100 };
+          x += c.widthIn + spacingIn;
+          printArea += c.widthIn * c.heightIn;
+        }
+        if (r < rows.length - 1) y += row.heightIn + LABEL_HEIGHT_IN + spacingIn;
+      }
+      const rowH = rows.length > 0 ? (rows[rows.length - 1] as Row).heightIn : 0;
       const lengthIn = Math.round((y + rowH + LABEL_HEIGHT_IN + marginIn) * 100) / 100;
       const builtAt = new Date(first.placedAt.getTime() + 8 * HOUR);
       const [batch] = await tx

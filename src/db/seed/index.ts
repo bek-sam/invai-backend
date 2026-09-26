@@ -23,7 +23,7 @@ const PASSWORD = "demo1234!";
 const random = rng(20260924);
 const DAY = 86_400_000;
 
-type SeedUser = { email: string; name: string; role: Role; pin: string };
+type SeedUser = { email: string; name: string; role: Role; pin: string; locale?: "en" | "es" };
 
 const SHOP_USERS: SeedUser[] = [
   { email: "owner@desertbloom.test", name: "Riley Owner", role: "owner", pin: "1111" },
@@ -33,7 +33,14 @@ const SHOP_USERS: SeedUser[] = [
   { email: "presser@desertbloom.test", name: "Pat Presser", role: "presser", pin: "1155" },
   { email: "packer@desertbloom.test", name: "Paula Packer", role: "packer", pin: "1166" },
   { email: "receiver@desertbloom.test", name: "Ray Receiver", role: "receiver", pin: "1177" },
-  { email: "luis@desertbloom.test", name: "Luis Presser", role: "presser", pin: "1188" },
+  // Spanish-speaking floor staff (T-13-5, B-111): locale: "es" so their floor UI comes up in Spanish.
+  {
+    email: "luis@desertbloom.test",
+    name: "Luis Presser",
+    role: "presser",
+    pin: "1188",
+    locale: "es",
+  },
 ];
 
 async function signUp(email: string, name: string): Promise<string> {
@@ -129,7 +136,11 @@ async function main() {
       packer: userIds.get("packer@desertbloom.test") as string,
       receiver: userIds.get("receiver@desertbloom.test") as string,
     },
-    pins: SHOP_USERS.map((u) => ({ userId: userIds.get(u.email) as string, pin: u.pin })),
+    pins: SHOP_USERS.map((u) => ({
+      userId: userIds.get(u.email) as string,
+      pin: u.pin,
+      locale: u.locale,
+    })),
     issueStationToken: true,
     vendor: {
       vendorCompanyId: vendorOrg.id,
