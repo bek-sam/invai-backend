@@ -18,6 +18,7 @@ import {
   ilike,
   inArray,
   isNotNull,
+  isNull,
   lte,
   ne,
   or,
@@ -1798,11 +1799,23 @@ const NOT_CSV_CHANNEL = () =>
   new ORPCError("NOT_CSV_CHANNEL", { status: 400, message: "This channel is not CSV-only" });
 
 /**
- * One file of tracking for a CSV-only channel (T-7-1, B-68): every `manual`-push shipment
- * labeled since `since` (or since this channel's last export, taken as the newest `exportedAt`
- * already on a shipment for it) up to `until`. Marks those shipments `exportedAt`; re-running
- * with the same or an earlier `since` re-includes and re-marks them (re-export is always
- * possible, per the wave 7 stub).
+ * One file of tracking for a CSV-only channel (T-7-1, B-68): every `manual`-push shipment not
+ * yet in an export (`exportedAt IS NULL`, "since the last export"), or -- when `since` is given
+ * -- labeled in that explicit range instead, regardless of whether it was exported before.
+ * Marks the included shipments `exportedAt`.
+ *
+ * This reads `exportedAt IS NULL` rather than the wave stub's literal
+ * `labeledAt >= (since ?? lastExportedAt)`: computing "the channel's last export" as
+ * `max(exportedAt)` and comparing it against `labeledAt` mixes the value written by the
+ * database's own `now()` with one written earlier from the same request by the same clock, and
+ * *that* comparison is what broke idempotency in review round 1 (a repeat export with
+ * `since: null` re-included the shipment it had itself just marked, because millisecond-precision
+ * loss going through a JS `Date` on the round trip could put the read-back `exportedAt` a few ms
+ * *before* the `labeledAt` it was compared against, even on one machine with one clock). Testing
+ * a boolean the export itself sets needs no clock, on either side, ever: once a shipment's
+ * `exportedAt` is non-null, no default-run query can select it again, by construction. An
+ * explicit `since`/`until` (a chosen range) still works the same as before and remains how a
+ * shop deliberately re-exports a range it already exported.
  */
 export async function exportTracking(
   tx: Tx,
@@ -1810,16 +1823,8 @@ export async function exportTracking(
   input: { channel: Channel; since: string | null; until?: string },
 ): Promise<{ key: string; count: number }> {
   if (!isTrackingExportChannel(input.channel)) throw NOT_CSV_CHANNEL();
+  const since = input.since ? new Date(input.since) : null;
   const until = input.until ? new Date(input.until) : null;
-  let cutoff = input.since ? new Date(input.since) : null;
-  if (!cutoff) {
-    const [row] = await tx
-      .select({ max: sql<Date | string | null>`max(${shipments.exportedAt})` })
-      .from(shipments)
-      .innerJoin(orders, eq(orders.id, shipments.orderId))
-      .where(and(eq(shipments.companyId, ctx.companyId), eq(orders.channel, input.channel)));
-    cutoff = row?.max ? new Date(row.max) : null;
-  }
   // The wave stub's query names a `trackingPushStatus = 'manual'` filter, but that value
   // doesn't exist on this column (TRACKING_PUSH_STATUSES has no "manual" -- a CSV-only
   // channel's manual push result is recorded as `not_required`, same as "push is turned off").
@@ -1834,7 +1839,7 @@ export async function exportTracking(
     ne(shipments.status, "voided"),
     ne(shipments.trackingPushStatus, "pushing"),
   ];
-  if (cutoff) conds.push(gte(shipments.labeledAt, cutoff));
+  conds.push(since ? gte(shipments.labeledAt, since) : isNull(shipments.exportedAt));
   if (until) conds.push(lte(shipments.labeledAt, until));
 
   const rows = await tx

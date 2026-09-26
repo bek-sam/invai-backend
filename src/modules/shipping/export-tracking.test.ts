@@ -91,7 +91,7 @@ describe("shipping.exportTracking", () => {
     expect(row?.exportedAt).toBeTruthy();
   });
 
-  it("re-export with since=null uses the channel's last export as the cutoff (nothing new), but an explicit earlier since re-includes it", async () => {
+  it("re-export with since=null is idempotent (exportedAt IS NULL, no clock comparison), but an explicit earlier since re-includes it", async () => {
     const { shop, ctx, conn } = await setup("etsy");
     const { order, items } = await createOrder(shop.id, conn.id, { channel: "etsy" });
     await labelShipment(
@@ -105,10 +105,14 @@ describe("shipping.exportTracking", () => {
     );
     expect(first.count).toBe(1);
 
-    const again = await withTenant(shop.id, (tx) =>
-      svc.exportTracking(tx, ctx, { channel: "etsy", since: null }),
-    );
-    expect(again.count).toBe(0);
+    // Back-to-back repeats (the double-click / retry case review round 1 caught): always 0,
+    // with no `sleep` and no dependency on the DB and app clocks agreeing.
+    for (let i = 0; i < 3; i++) {
+      const again = await withTenant(shop.id, (tx) =>
+        svc.exportTracking(tx, ctx, { channel: "etsy", since: null }),
+      );
+      expect(again.count).toBe(0);
+    }
 
     const replay = await withTenant(shop.id, (tx) =>
       svc.exportTracking(tx, ctx, {
