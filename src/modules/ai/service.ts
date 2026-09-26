@@ -28,6 +28,7 @@ import {
   assistantMessages,
   blankVariants,
   channelConnections,
+  companies,
   designs,
   jobs,
   listingDrafts,
@@ -342,10 +343,29 @@ async function generationContext(tx: Tx, row: DraftRow) {
     product?.prices.find((p) => p.channel === row.channel)?.price ??
     product?.prices[0]?.price ??
     null;
-  return { design, product: product ?? null, blank, price };
+  return {
+    design,
+    product: product ?? null,
+    blank,
+    price,
+    productionPartner: await productionPartner(tx, row.companyId),
+  };
 }
 
-function toContent(copy: ListingCopy, price: number | null): ListingContent {
+/** `companies.settings.productionPartner`, or null. Never model-generated (wave.md Contract stubs / C). */
+async function productionPartner(tx: Tx, companyId: string) {
+  const [row] = await tx
+    .select({ settings: companies.settings })
+    .from(companies)
+    .where(eq(companies.id, companyId));
+  return row?.settings?.productionPartner ?? null;
+}
+
+function toContent(
+  copy: ListingCopy,
+  price: number | null,
+  productionPartner: { name: string; etsyPartnerId: string | null } | null,
+): ListingContent {
   return {
     title: copy.title,
     description: copy.description,
@@ -354,8 +374,7 @@ function toContent(copy: ListingCopy, price: number | null): ListingContent {
     attributes: Object.fromEntries(copy.attributes.map((a) => [a.key, a.value])),
     price,
     disclosures: [],
-    // TODO(T-8-1): fill from the company's productionPartner setting, never model-generated.
-    productionPartner: null,
+    productionPartner: productionPartner?.name ?? null,
   };
 }
 
@@ -437,7 +456,7 @@ export async function generateDraft(companyId: string, draftId: string, userId: 
     let first = await runStructured(meta, listingCopyPrompt, vars);
     let credits = first.credits;
     let content = withDisclosures(
-      normalizeListing(row.channel, toContent(first.output, gen.price)),
+      normalizeListing(row.channel, toContent(first.output, gen.price, gen.productionPartner)),
     );
     let validation = validateListing(row.channel, content);
     if (!validation.ok) {
@@ -447,7 +466,9 @@ export async function generateDraft(companyId: string, draftId: string, userId: 
       });
       credits += retry.credits;
       first = retry;
-      content = withDisclosures(normalizeListing(row.channel, toContent(retry.output, gen.price)));
+      content = withDisclosures(
+        normalizeListing(row.channel, toContent(retry.output, gen.price, gen.productionPartner)),
+      );
       validation = validateListing(row.channel, content);
     }
     const trademark = await withTenant(companyId, (tx) =>
@@ -671,7 +692,19 @@ function slugify(s: string): string {
  * is built from the same draft) are one listing on multi-row channels (Etsy/Amazon: one row IS one
  * listing, so no grouping is needed there; Shopify: many rows share one `Handle`).
  */
-export type ExportRow = { content: ListingContent; sku: string; color: string; size: string };
+/**
+ * `etsyPartnerId` is the company's `settings.productionPartner.etsyPartnerId` (from
+ * `getShopProductionPartners`; blank until the Etsy adapter is authorized — no live ids yet).
+ * Same value for every row of one export; carried per-row (not per-content) so `exportCsv` stays
+ * a pure function of its rows.
+ */
+export type ExportRow = {
+  content: ListingContent;
+  sku: string;
+  color: string;
+  size: string;
+  etsyPartnerId?: string | null;
+};
 
 export function exportCsv(channel: Channel, rows: ExportRow[]): string {
   const price = (c: ListingContent) => (c.price != null ? (c.price / 100).toFixed(2) : "");
@@ -679,7 +712,7 @@ export function exportCsv(channel: Channel, rows: ExportRow[]): string {
 
   if (channel === "etsy") {
     return toCsv(
-      rows.map(({ content: c, sku }) => ({
+      rows.map(({ content: c, sku, etsyPartnerId }) => ({
         title: c.title,
         description: description(c),
         price: price(c),
@@ -690,7 +723,10 @@ export function exportCsv(channel: Channel, rows: ExportRow[]): string {
         who_made: "i_did",
         is_made_to_order: "true",
         when_made: "made_to_order",
-        production_partner: "DTF transfer printer",
+        // Etsy's structured field is production_partner_ids (getShopProductionPartners); a
+        // sentence in the description does not replace it (wave.md Contract stubs / C).
+        production_partner: c.productionPartner ?? "",
+        production_partner_ids: etsyPartnerId ?? "",
       })),
     );
   }
@@ -813,6 +849,7 @@ async function variantRowsForDraft(
   tx: Tx,
   ctx: Pick<Ctx, "companyId">,
   row: DraftRow,
+  etsyPartnerId: string | null = null,
 ): Promise<ExportRow[]> {
   const product = await resolveProduct(tx, ctx.companyId, row);
   if (!product) throw badRequest(`Draft ${row.id} has no product to resolve blank SKUs from`);
@@ -843,7 +880,13 @@ async function variantRowsForDraft(
   );
   if (!matched.length)
     throw badRequest(`No blank variants match ${product.name} for draft ${row.id}`);
-  return matched.map((v) => ({ content: row.content, sku: v.sku, color: v.color, size: v.size }));
+  return matched.map((v) => ({
+    content: row.content,
+    sku: v.sku,
+    color: v.color,
+    size: v.size,
+    etsyPartnerId,
+  }));
 }
 
 /** `ai.listings.exportCsv`: one CSV row per variant across every draft, all for one channel. */
@@ -870,8 +913,12 @@ export async function exportListingsCsv(
       });
     ordered.push(row);
   }
+  const etsyPartnerId =
+    input.channel === "etsy"
+      ? ((await productionPartner(tx, ctx.companyId))?.etsyPartnerId ?? null)
+      : null;
   const rows: ExportRow[] = [];
-  for (const row of ordered) rows.push(...(await variantRowsForDraft(tx, ctx, row)));
+  for (const row of ordered) rows.push(...(await variantRowsForDraft(tx, ctx, row, etsyPartnerId)));
   const key = objectKey(ctx.companyId, "listing-export", "csv");
   await putObject(key, exportCsv(input.channel, rows), "text/csv");
   await audit(tx, {
@@ -915,7 +962,15 @@ export async function publishDraft(
     "csv",
     id as ReturnType<typeof crypto.randomUUID>,
   );
-  await putObject(key, exportCsv(row.channel, await variantRowsForDraft(tx, ctx, row)), "text/csv");
+  const etsyPartnerId =
+    row.channel === "etsy"
+      ? ((await productionPartner(tx, ctx.companyId))?.etsyPartnerId ?? null)
+      : null;
+  await putObject(
+    key,
+    exportCsv(row.channel, await variantRowsForDraft(tx, ctx, row, etsyPartnerId)),
+    "text/csv",
+  );
   await tx
     .update(listingDrafts)
     .set({ status: "approved", connectionId, publishedUrl: `${EXPORT_PREFIX}${key}`, error: null })
@@ -1091,9 +1146,11 @@ export async function* ask(
     const code =
       err instanceof ORPCError && err.code === "CREDITS_EXHAUSTED"
         ? "credits_exhausted"
-        : (err as Error).message.includes("declined")
-          ? "refusal"
-          : "internal";
+        : err instanceof ORPCError && err.code === "AI_SPEND_CAP_REACHED"
+          ? "spend_cap"
+          : (err as Error).message.includes("declined")
+            ? "refusal"
+            : "internal";
     log.warn("assistant failed", { error: (err as Error).message });
     yield { type: "error", message: (err as Error).message, code };
   } finally {

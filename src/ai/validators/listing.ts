@@ -31,9 +31,76 @@ const ETSY_TAG_RE = /^[\p{L}\p{N} '-]+$/u;
 /** Characters Etsy rejects in titles. */
 const ETSY_TITLE_BAD = /[$^`]/;
 
-export const AI_DISCLOSURE = "Listing copy drafted with AI assistance and reviewed by our team.";
-export const PARTNER_DISCLOSURE =
-  "Made to order: designed by us, printed as a DTF transfer by our production partner and pressed in our studio.";
+/**
+ * Etsy has no documented numeric cap on all-caps words in titles — its own guidance just says
+ * ALL CAPS "looks spammy" (Seller Handbook "New Guidance for Listing Titles",
+ * https://www.etsy.com/seller-handbook/article/1399426136697, Wayback snapshot 2025-12-02,
+ * http://web.archive.org/web/20251202163448/) [U]. InvAI enforces Etsy's guidance literally — no
+ * all-caps words at all — but exempts short (<=3 letter) words so real acronyms and sizes (XL,
+ * DTF, US) never trip it.
+ */
+const ETSY_ALL_CAPS_MAX = 0;
+
+/** Words of 4+ letters that are entirely uppercase (after stripping non-letters). */
+function allCapsWords(title: string): string[] {
+  return title
+    .split(/\s+/)
+    .filter((w) => {
+      const letters = w.replace(/[^\p{L}]/gu, "");
+      return letters.length >= 4 && letters === letters.toUpperCase() && /\p{Lu}/u.test(letters);
+    })
+    .map((w) => w.replace(/[^\p{L}]/gu, ""));
+}
+
+/**
+ * Etsy's own title guidance: "Try not to repeat words" / avoid "unnecessary repeated words or
+ * phrases" (same Seller Handbook source as ETSY_ALL_CAPS_MAX above). Returns the first 3-word
+ * phrase (case-insensitive, punctuation-insensitive) that recurs anywhere in the title, or null.
+ * A longer repeated run (4+ words) always contains a repeated 3-word window, so checking 3-grams
+ * catches every "3-or-more-word phrase repeated verbatim" case.
+ */
+function repeatedPhrase(title: string): string | null {
+  const words = title
+    .toLowerCase()
+    .split(/\s+/)
+    .map((w) => w.replace(/[^\p{L}\p{N}]/gu, ""))
+    .filter(Boolean);
+  const seen = new Set<string>();
+  for (let i = 0; i + 3 <= words.length; i++) {
+    const phrase = words.slice(i, i + 3).join(" ");
+    if (seen.has(phrase)) return phrase;
+    seen.add(phrase);
+  }
+  return null;
+}
+
+/** `en / es`, the bilingual convention this validator's issue messages use (agent-brief: en+es). */
+function bi(en: string, es: string): string {
+  return `${en} / ${es}`;
+}
+
+/*
+ * Etsy Creativity Standards: "Sellers must disclose within their listing description if an item
+ * is created with the use of AI." https://www.etsy.com/legal/creativity (etsy.com returns 403 to
+ * automated fetches; confirmed from the Wayback snapshot taken 2026-08-28,
+ * http://web.archive.org/web/20260828105429/https://www.etsy.com/legal/creativity).
+ * The rule targets the item/design, not AI-written listing copy (T-8-1 card), so this discloses
+ * the *design* and never claims AI made the finished physical product — production (the DTF print
+ * and press) is ours, disclosed separately by PARTNER_DISCLOSURE below.
+ */
+export const AI_DISCLOSURE = bi(
+  "This design was created with the use of AI, based on our own prompts, then produced by us as a made-to-order DTF print.",
+  "Este diseño se creó con el uso de IA, a partir de nuestras propias indicaciones, y luego lo producimos como una transferencia DTF por encargo.",
+);
+/**
+ * Etsy Creativity Standards, "designed by a seller": "Sellers must disclose that an item is made
+ * by a production partner, and provide accurate information about where the item will ship from."
+ * Same source/snapshot as AI_DISCLOSURE above.
+ */
+export const PARTNER_DISCLOSURE = bi(
+  "Made to order: designed by us, printed as a DTF transfer by our production partner and pressed in our studio.",
+  "Hecho por encargo: diseñado por nosotros, impreso como transferencia DTF por nuestro socio de producción y prensado en nuestro taller.",
+);
 
 export function validateListing(
   channel: Channel,
@@ -46,21 +113,58 @@ export function validateListing(
 
   if (content.title !== undefined) {
     const title = content.title.trim();
-    if (!title) errors.push(issue("title", "title_required", "Title is required"));
+    if (!title)
+      errors.push(
+        issue("title", "title_required", bi("Title is required", "El título es obligatorio")),
+      );
     if (title.length > rules.titleMax)
       errors.push(
         issue(
           "title",
           `title_max_${rules.titleMax}`,
-          `Title is ${title.length} characters; ${CHANNEL_RULES[channel].label} allows ${rules.titleMax}`,
+          bi(
+            `Title is ${title.length} characters; ${CHANNEL_RULES[channel].label} allows ${rules.titleMax}`,
+            `El título tiene ${title.length} caracteres; ${CHANNEL_RULES[channel].label} permite ${rules.titleMax}`,
+          ),
         ),
       );
     if (channel === "etsy" && ETSY_TITLE_BAD.test(title))
-      errors.push(issue("title", "title_invalid_chars", "Etsy titles cannot contain $, ^ or `"));
-    if (title && title === title.toUpperCase() && /[A-Z]{4,}/.test(title))
-      warnings.push(
-        issue("title", "title_all_caps", "All-caps titles read as spam; use title case"),
+      errors.push(
+        issue(
+          "title",
+          "title_invalid_chars",
+          bi(
+            "Etsy titles cannot contain $, ^ or `",
+            "Los títulos de Etsy no pueden contener $, ^ ni `",
+          ),
+        ),
       );
+    if (channel === "etsy" && title) {
+      const caps = allCapsWords(title);
+      if (caps.length > ETSY_ALL_CAPS_MAX)
+        errors.push(
+          issue(
+            "title",
+            "title_all_caps",
+            bi(
+              `All-caps word${caps.length === 1 ? "" : "s"} "${caps.join('", "')}" read as spam; use title case`,
+              `La${caps.length === 1 ? "" : "s"} palabra${caps.length === 1 ? "" : "s"} en mayúsculas "${caps.join('", "')}" se leen como spam; usa mayúsculas y minúsculas normales`,
+            ),
+          ),
+        );
+      const phrase = repeatedPhrase(title);
+      if (phrase)
+        errors.push(
+          issue(
+            "title",
+            "title_repeated_phrase",
+            bi(
+              `The phrase "${phrase}" repeats in the title`,
+              `La frase "${phrase}" se repite en el título`,
+            ),
+          ),
+        );
+    }
   }
 
   if (content.description !== undefined) {
@@ -181,6 +285,23 @@ export function validateListing(
           "disclosures",
           "disclosure_required",
           `${CHANNEL_RULES[channel].label} requires AI and production-partner disclosures`,
+        ),
+      );
+  }
+
+  // Etsy `production_partner_ids`: required for a POD/DTF shop (wave.md Contract stubs / C).
+  // Never model-generated — filled in at generation time from companies.settings.productionPartner
+  // and only checked here, so a shop with no production partner configured can't publish to Etsy.
+  if (channel === "etsy" && content.productionPartner !== undefined) {
+    if (content.productionPartner === null)
+      errors.push(
+        issue(
+          "productionPartner",
+          "production_partner_required",
+          bi(
+            "Add a production partner in Settings before publishing to Etsy",
+            "Agrega un socio de producción en Configuración antes de publicar en Etsy",
+          ),
         ),
       );
   }

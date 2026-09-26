@@ -74,6 +74,14 @@ describe("ai module", () => {
     companyId = (await createCompany()).id;
     const owner = await createUser(companyId, "owner");
     ctx = tenantContext(companyId, owner.id, "owner");
+    // Etsy's validator requires a production partner (production_partner_required, T-8-1 AC2); a
+    // real shop configures one from Settings before it can generate/approve an Etsy listing.
+    await withSystem((tx) =>
+      tx
+        .update(companies)
+        .set({ settings: { productionPartner: { name: "Cactus Print Co", etsyPartnerId: null } } })
+        .where(eq(companies.id, companyId)),
+    );
     const [d] = await withSystem((tx) =>
       tx
         .insert(designs)
@@ -295,6 +303,10 @@ describe("ai module", () => {
       expect(rows).toHaveLength(4);
       expect(rows.map((r) => r.sku).sort()).toEqual([...skus].sort());
       expect(rows.every((r) => !(r.sku ?? "").startsWith("DRAFT-"))).toBe(true);
+      // production_partner_ids (T-8-1 AC2): name from the company setting, id blank until the
+      // Etsy adapter is authorized.
+      expect(rows.every((r) => r.production_partner === "Cactus Print Co")).toBe(true);
+      expect(rows.every((r) => r.production_partner_ids === "")).toBe(true);
     });
 
     it("exports a Shopify product CSV: one Handle per draft, one row per variant, real option values", async () => {
@@ -364,6 +376,35 @@ describe("ai module", () => {
       expect(rows).toHaveLength(4);
       expect(rows.every((r) => !(r.sku ?? "").includes("DRAFT-"))).toBe(true);
       expect(rows.map((r) => r.sku).sort()).toEqual([...skus].sort());
+    });
+
+    it("production_partner_ids carries the Etsy partner id once one is set (T-8-1 AC2)", async () => {
+      await withSystem((tx) =>
+        tx
+          .update(companies)
+          .set({
+            settings: { productionPartner: { name: "Cactus Print Co", etsyPartnerId: "12345" } },
+          })
+          .where(eq(companies.id, companyId)),
+      );
+      try {
+        const draft = await approvedDraft("etsy");
+        const { key } = await withTenant(companyId, (tx) =>
+          svc.exportListingsCsv(tx, ctx, { draftIds: [draft.id], channel: "etsy" }),
+        );
+        const csv = (await getObject(key)).toString("utf8");
+        const { rows } = parseCsvObjects(csv);
+        expect(rows.every((r) => r.production_partner_ids === "12345")).toBe(true);
+      } finally {
+        await withSystem((tx) =>
+          tx
+            .update(companies)
+            .set({
+              settings: { productionPartner: { name: "Cactus Print Co", etsyPartnerId: null } },
+            })
+            .where(eq(companies.id, companyId)),
+        );
+      }
     });
   });
 

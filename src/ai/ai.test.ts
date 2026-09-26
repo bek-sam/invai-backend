@@ -47,7 +47,7 @@ const base: ListingContent = {
   attributes: {},
   price: 2800,
   disclosures: ["AI disclosure"],
-  productionPartner: null,
+  productionPartner: "Cactus Print Co",
 };
 
 describe("channel validators", () => {
@@ -77,6 +77,28 @@ describe("channel validators", () => {
     expect(r.errors.map((e) => e.rule)).toEqual(["disclosure_required"]);
     expect(r.warnings.map((w) => w.rule)).toContain("tags_unused");
     expect(validateListing("etsy", base).ok).toBe(true);
+  });
+
+  it("requires a production partner on Etsy (T-8-1 AC2), a draft missing it fails", () => {
+    const r = validateListing("etsy", { ...base, productionPartner: null });
+    expect(r.errors.map((e) => e.rule)).toEqual(["production_partner_required"]);
+    expect(r.ok).toBe(false);
+    // Other channels never gate on it.
+    expect(validateListing("amazon", { ...base, productionPartner: null }).ok).toBe(true);
+  });
+
+  it("flags an all-caps word and a repeated 3-word phrase in an Etsy title (T-8-1 AC3)", () => {
+    const caps = validateListing("etsy", { ...base, title: "AWESOME Cactus Shirt" });
+    expect(caps.errors.map((e) => e.rule)).toContain("title_all_caps");
+
+    const repeated = validateListing("etsy", {
+      ...base,
+      title: "Funny Cactus Shirt for Dog Moms Funny Cactus Shirt",
+    });
+    expect(repeated.errors.map((e) => e.rule)).toContain("title_repeated_phrase");
+
+    // Short acronyms/sizes don't count as all-caps, and a clean title has neither error.
+    expect(validateListing("etsy", { ...base, title: "DTF Cactus Shirt, Size XL" }).ok).toBe(true);
   });
 
   it("checks Amazon bullets and ignores tags", () => {
@@ -139,7 +161,9 @@ describe("mock provider", () => {
           attributes: {},
           price: 2800,
           disclosures: [],
-          productionPartner: null,
+          // Only Etsy's validator requires it (production_partner_required, T-8-1); a POD/DTF shop
+          // must have one configured to publish there.
+          productionPartner: channel === "etsy" ? "Cactus Print Co" : null,
         }),
       );
       const r = validateListing(channel, content);
