@@ -733,7 +733,13 @@ function publishOrder(tx: Tx, companyId: string, orderId: string) {
 export async function holdOrder(
   tx: Tx,
   ctx: TenantContext,
-  input: { id: string; reason: NonNullable<OrderRow["holdReason"]>; note: string | null },
+  input: {
+    id: string;
+    reason: NonNullable<OrderRow["holdReason"]>;
+    note: string | null;
+    /** The channel signal behind an automatic hold (T-7-4); kept on the transitions. */
+    channelSignal?: string;
+  },
 ) {
   const order = await getOrderRow(tx, input.id);
   const items = (await orderItemRows(tx, input.id)).filter((i) => PRE_SHIPPED.has(i.state));
@@ -750,7 +756,10 @@ export async function holdOrder(
     await transitionItem(tx, i.id, "on_hold", {
       actor: ctx.actor,
       reason: input.reason,
-      data: { note: input.note },
+      data: {
+        note: input.note,
+        ...(input.channelSignal ? { channelSignal: input.channelSignal } : {}),
+      },
     });
   await tx
     .update(orders)
@@ -1018,6 +1027,7 @@ const FLAG_SEVERITY: Record<string, ItemFlag["severity"]> = {
   address_invalid: "error",
   reprint: "info",
   manual_review: "warn",
+  channel_edit_after_press: "warn",
 };
 
 export async function setItemFlag(

@@ -898,15 +898,13 @@ async function handleWebhook(
           source: "webhook",
         });
         orderIds = orderIds.concat(res.orderIds);
-        if (event.kind === "order_upsert") {
+        // T-7-4 (B-12): a delivery older than what was applied is ignored, payload archive too.
+        const fresh = res.orderIds.filter((id) => !res.staleOrderIds.includes(id));
+        if (event.kind === "order_upsert" && fresh.length) {
           // Encrypted raw payload archive (purged with the buyer PII).
           const rawKey = objectKey(conn.companyId, "raw", "json");
           await putObject(rawKey, encryptField(body), "application/octet-stream");
-          if (res.orderIds.length)
-            await tx
-              .update(orders)
-              .set({ rawPayloadKey: rawKey })
-              .where(inArray(orders.id, res.orderIds));
+          await tx.update(orders).set({ rawPayloadKey: rawKey }).where(inArray(orders.id, fresh));
         }
         if (res.imported)
           afterCommit(tx, async () => {
