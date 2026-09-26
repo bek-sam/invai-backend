@@ -1,11 +1,13 @@
 import { z } from "zod";
+import { BULK_PRIORITY } from "../../lib/fairness";
 import { logger } from "../../lib/log";
 import { defineJob } from "../../lib/queues";
 import { runGenerationJob, setGenerationEnqueuer } from "./service";
 
 const log = logger("ai.jobs");
 
-/** Writes the listing drafts of one `listing_drafts` job (ai queue, metered per company). */
+/** Writes the listing drafts of one `listing_drafts` job (ai queue, metered per company). Batch
+ * work over `draftIds` (T-12-3, B-20): bulk priority, same as csv_import and the reports queue. */
 export const generateListingDrafts = defineJob({
   queue: "ai",
   name: "ai.generateListingDrafts",
@@ -16,7 +18,7 @@ export const generateListingDrafts = defineJob({
     userId: z.uuid().nullable(),
   }),
   jobId: (i) => `listing-drafts-${i.jobId}`,
-  options: { attempts: 2 },
+  options: { attempts: 2, priority: BULK_PRIORITY },
   handler: (input) => runGenerationJob(input),
 });
 

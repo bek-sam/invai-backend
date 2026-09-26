@@ -59,10 +59,25 @@ export const DEFAULT_JOB_OPTIONS: JobsOptions = {
   removeOnFail: { age: 7 * 24 * 3600 },
 };
 
+/**
+ * The `reports` queue is entirely periodic sweeps and report generation (T-12-3, B-20): nothing
+ * on it is a user waiting on a response, so every job there defaults to bulk priority (kept equal
+ * to `lib/fairness.ts`'s `BULK_PRIORITY`; duplicated here rather than imported, to avoid a
+ * `fairness.ts` <-> `queues.ts` import cycle). A job that sets its own `priority` (`defineJob`'s
+ * `options`, or at `enqueue()`) still overrides this default via the per-call options merge below.
+ */
+const REPORTS_BULK_PRIORITY = 10;
+
 export const queues = Object.fromEntries(
   QUEUE_NAMES.map((name) => [
     name,
-    new Queue(name, { connection: redis, defaultJobOptions: DEFAULT_JOB_OPTIONS }),
+    new Queue(name, {
+      connection: redis,
+      defaultJobOptions:
+        name === "reports"
+          ? { ...DEFAULT_JOB_OPTIONS, priority: REPORTS_BULK_PRIORITY }
+          : DEFAULT_JOB_OPTIONS,
+    }),
   ]),
 ) as Record<QueueName, Queue>;
 
