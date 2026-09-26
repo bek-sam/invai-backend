@@ -297,7 +297,7 @@ describe("ai module", () => {
       expect(rows.every((r) => !(r.sku ?? "").startsWith("DRAFT-"))).toBe(true);
     });
 
-    it("exports a Shopify product CSV: one Handle per draft, one row per variant", async () => {
+    it("exports a Shopify product CSV: one Handle per draft, one row per variant, real option values", async () => {
       const draft = await approvedDraft("shopify");
       const { key } = await withTenant(companyId, (tx) =>
         svc.exportListingsCsv(tx, ctx, { draftIds: [draft.id], channel: "shopify" }),
@@ -310,6 +310,27 @@ describe("ai module", () => {
       // Only the first row of the handle carries the shared listing fields.
       expect(rows[0]?.Title).toBeTruthy();
       expect(rows[1]?.Title).toBe("");
+      // Every row names its options, and carries this variant's own color/size — not blank, and
+      // not the same value repeated for every variant (the bug the r1 review caught).
+      const bySku: Record<string, { color: string; size: string }> = {
+        "SKU-BLK-S": { color: "Black", size: "Small" },
+        "SKU-BLK-M": { color: "Black", size: "Medium" },
+        "SKU-WHT-S": { color: "White", size: "Small" },
+        "SKU-WHT-M": { color: "White", size: "Medium" },
+      };
+      for (const r of rows) {
+        expect(r["Option1 Name"]).toBe("Color");
+        expect(r["Option2 Name"]).toBe("Size");
+        const expected = bySku[r["Variant SKU"] as string];
+        expect(r["Option1 Value"]).toBe(expected?.color);
+        expect(r["Option2 Value"]).toBe(expected?.size);
+      }
+      // Each Handle + option-value combination is unique (no two rows collide in Shopify's own
+      // importer).
+      const combos = new Set(
+        rows.map((r) => `${r.Handle}|${r["Option1 Value"]}|${r["Option2 Value"]}`),
+      );
+      expect(combos.size).toBe(rows.length);
     });
 
     it("rejects a channel that doesn't match the draft's own channel", async () => {

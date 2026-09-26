@@ -662,10 +662,9 @@ function slugify(s: string): string {
  * is built from the same draft) are one listing on multi-row channels (Etsy/Amazon: one row IS one
  * listing, so no grouping is needed there; Shopify: many rows share one `Handle`).
  */
-export function exportCsv(
-  channel: Channel,
-  rows: { content: ListingContent; sku: string }[],
-): string {
+export type ExportRow = { content: ListingContent; sku: string; color: string; size: string };
+
+export function exportCsv(channel: Channel, rows: ExportRow[]): string {
   const price = (c: ListingContent) => (c.price != null ? (c.price / 100).toFixed(2) : "");
   const description = (c: ListingContent) => [c.description, ...c.disclosures].join("\n\n");
 
@@ -707,17 +706,30 @@ export function exportCsv(
   }
   if (channel === "shopify") {
     // Shopify's product CSV: one `Handle` per draft (product), one row per variant under it.
-    // Only the first row of each handle carries the shared listing fields; later rows leave them
-    // blank (toCsv fills missing columns as "") the way Shopify's own exports do.
+    // Every row repeats "Option1/2 Name" and carries that row's own "Option1/2 Value" (Shopify's
+    // importer keys a variant off Handle + its option values, not off the SKU); only the first
+    // row of each handle also carries the shared listing fields (title, body, tags, ...) — later
+    // rows leave those blank (toCsv fills missing columns as "") the way Shopify's own exports do.
     const out: Record<string, string | number>[] = [];
     let prevContent: ListingContent | null = null;
     let handle = "";
     let n = 0;
-    for (const { content: c, sku } of rows) {
+    let seen = new Set<string>();
+    for (const { content: c, sku, color, size } of rows) {
       if (c !== prevContent) {
         prevContent = c;
         n += 1;
         handle = `${slugify(c.title)}-${n}`;
+        seen = new Set();
+      }
+      // Defensive: two rows with the same Handle + option values would collide in Shopify's own
+      // importer (it can't tell the variants apart); this should never happen given the unique
+      // (company, style, color, size) index on blank_variants, but skip rather than export it.
+      const optionKey = `${color}\u0000${size}`;
+      if (seen.has(optionKey)) continue;
+      seen.add(optionKey);
+      const isFirstOfHandle = seen.size === 1;
+      if (isFirstOfHandle) {
         out.push({
           Handle: handle,
           Title: c.title,
@@ -725,8 +737,10 @@ export function exportCsv(
           Vendor: "",
           Tags: c.tags.join(", "),
           Published: "TRUE",
-          "Option1 Name": "Size",
-          "Option1 Value": "",
+          "Option1 Name": "Color",
+          "Option1 Value": color,
+          "Option2 Name": "Size",
+          "Option2 Value": size,
           "Variant SKU": sku,
           "Variant Price": price(c),
           "Variant Inventory Qty": 999,
@@ -737,6 +751,10 @@ export function exportCsv(
       } else {
         out.push({
           Handle: handle,
+          "Option1 Name": "Color",
+          "Option1 Value": color,
+          "Option2 Name": "Size",
+          "Option2 Value": size,
           "Variant SKU": sku,
           "Variant Price": price(c),
           "Variant Inventory Qty": 999,
@@ -786,13 +804,18 @@ async function variantRowsForDraft(
   tx: Tx,
   ctx: Pick<Ctx, "companyId">,
   row: DraftRow,
-): Promise<{ content: ListingContent; sku: string }[]> {
+): Promise<ExportRow[]> {
   const product = await resolveProduct(tx, ctx.companyId, row);
   if (!product) throw badRequest(`Draft ${row.id} has no product to resolve blank SKUs from`);
   const variants = await tx
     .select({
       colorCode: blankVariants.colorCode,
       sizeCode: blankVariants.sizeCode,
+      // Display names (e.g. "Black", "Small"), not the internal codes: these become the
+      // Shopify Option1/2 Value a buyer sees, and the column the Etsy/Amazon/generic branches
+      // ignore.
+      color: blankVariants.color,
+      size: blankVariants.size,
       sku: blankVariants.sku,
     })
     .from(blankVariants)
@@ -811,7 +834,7 @@ async function variantRowsForDraft(
   );
   if (!matched.length)
     throw badRequest(`No blank variants match ${product.name} for draft ${row.id}`);
-  return matched.map((v) => ({ content: row.content, sku: v.sku }));
+  return matched.map((v) => ({ content: row.content, sku: v.sku, color: v.color, size: v.size }));
 }
 
 /** `ai.listings.exportCsv`: one CSV row per variant across every draft, all for one channel. */
@@ -838,7 +861,7 @@ export async function exportListingsCsv(
       });
     ordered.push(row);
   }
-  const rows: { content: ListingContent; sku: string }[] = [];
+  const rows: ExportRow[] = [];
   for (const row of ordered) rows.push(...(await variantRowsForDraft(tx, ctx, row)));
   const key = objectKey(ctx.companyId, "listing-export", "csv");
   await putObject(key, exportCsv(input.channel, rows), "text/csv");
