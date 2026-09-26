@@ -246,88 +246,76 @@ describe("Shopify OAuth state", () => {
   };
   const domain = () => `t12-${uniq()}.myshopify.com`;
 
-  it(
-    "expires after 10 minutes",
-    async () => {
-      expect(OAUTH_STATE_TTL_MS).toBeLessThanOrEqual(10 * 60_000);
-      const shop = domain();
-      const p = await start(shop);
-      await withSystem((tx) =>
-        tx
-          .update(channelConnections)
-          .set({ updatedAt: new Date(Date.now() - OAUTH_STATE_TTL_MS - 60_000) })
-          .where(eq(channelConnections.id, p.connectionId)),
-      );
-      await expect(
-        completeShopifyOAuth({ shop, state: p.state, code: "mock" }),
-      ).rejects.toMatchObject({ code: "BAD_REQUEST", message: expect.stringMatching(/expired/) });
-      // Starting again issues a fresh link that works.
-      const again = await start(shop);
-      await expect(
-        completeShopifyOAuth({ shop, state: again.state, code: "mock" }),
-      ).resolves.toMatchObject({ connectionId: again.connectionId });
-    },
-    60_000,
-  );
+  it("expires after 10 minutes", async () => {
+    expect(OAUTH_STATE_TTL_MS).toBeLessThanOrEqual(10 * 60_000);
+    const shop = domain();
+    const p = await start(shop);
+    await withSystem((tx) =>
+      tx
+        .update(channelConnections)
+        .set({ updatedAt: new Date(Date.now() - OAUTH_STATE_TTL_MS - 60_000) })
+        .where(eq(channelConnections.id, p.connectionId)),
+    );
+    await expect(
+      completeShopifyOAuth({ shop, state: p.state, code: "mock" }),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST", message: expect.stringMatching(/expired/) });
+    // Starting again issues a fresh link that works.
+    const again = await start(shop);
+    await expect(
+      completeShopifyOAuth({ shop, state: again.state, code: "mock" }),
+    ).resolves.toMatchObject({ connectionId: again.connectionId });
+  }, 60_000);
 
-  it(
-    "can be used only once, even by two callbacks racing",
-    async () => {
-      const shop = domain();
-      const p = await start(shop);
-      // Two real, concurrent transactions contend for the same row's `for update` lock. Postgres
-      // serializes them correctly regardless of how long either one takes to run (retry-once below
-      // only guards against the shared DB's connection pool being briefly saturated by other
-      // agents' suites, which can surface as a connection-acquire error on both sides rather than
-      // the expected single-winner outcome -- that's an infra hiccup, not evidence the lock is
-      // wrong, so it's worth one retry before failing the test).
-      const race = () =>
-        Promise.allSettled([
-          completeShopifyOAuth({ shop, state: p.state, code: "mock" }),
-          completeShopifyOAuth({ shop, state: p.state, code: "mock" }),
-        ]);
-      let results = await race();
-      let fulfilled = results.filter((r) => r.status === "fulfilled");
-      // Only retry the zero-winners case (both sides hit a transient infra error, e.g. the shared
-      // pool was briefly out of connections) -- two winners would mean the row lock itself failed,
-      // which must fail the test, not be retried away.
-      if (fulfilled.length === 0) {
-        results = await race();
-        fulfilled = results.filter((r) => r.status === "fulfilled");
-      }
-      expect(fulfilled).toHaveLength(1);
-      await expect(completeShopifyOAuth({ shop, state: p.state, code: "mock" })).rejects.toThrow();
-    },
-    60_000,
-  );
+  it("can be used only once, even by two callbacks racing", async () => {
+    const shop = domain();
+    const p = await start(shop);
+    // Two real, concurrent transactions contend for the same row's `for update` lock. Postgres
+    // serializes them correctly regardless of how long either one takes to run (retry-once below
+    // only guards against the shared DB's connection pool being briefly saturated by other
+    // agents' suites, which can surface as a connection-acquire error on both sides rather than
+    // the expected single-winner outcome -- that's an infra hiccup, not evidence the lock is
+    // wrong, so it's worth one retry before failing the test).
+    const race = () =>
+      Promise.allSettled([
+        completeShopifyOAuth({ shop, state: p.state, code: "mock" }),
+        completeShopifyOAuth({ shop, state: p.state, code: "mock" }),
+      ]);
+    let results = await race();
+    let fulfilled = results.filter((r) => r.status === "fulfilled");
+    // Only retry the zero-winners case (both sides hit a transient infra error, e.g. the shared
+    // pool was briefly out of connections) -- two winners would mean the row lock itself failed,
+    // which must fail the test, not be retried away.
+    if (fulfilled.length === 0) {
+      results = await race();
+      fulfilled = results.filter((r) => r.status === "fulfilled");
+    }
+    expect(fulfilled).toHaveLength(1);
+    await expect(completeShopifyOAuth({ shop, state: p.state, code: "mock" })).rejects.toThrow();
+  }, 60_000);
 
-  it(
-    "a failed completion burns the state too",
-    async () => {
-      const shop = domain();
-      const p = await start(shop);
-      // Another company holds the store: this completion fails after the state is consumed.
-      const other = (await createCompany()).id;
-      await withSystem((tx) =>
-        tx.insert(channelConnections).values({
-          companyId: other,
-          channel: "shopify",
-          name: "holder",
-          status: "connected",
-          mode: "api",
-          externalShopId: shop,
-        }),
-      );
-      await expect(
-        completeShopifyOAuth({ shop, state: p.state, code: "mock" }),
-      ).rejects.toMatchObject({ code: "CONFLICT" });
-      await withSystem((tx) =>
-        tx.delete(channelConnections).where(eq(channelConnections.companyId, other)),
-      );
-      await expect(
-        completeShopifyOAuth({ shop, state: p.state, code: "mock" }),
-      ).rejects.toMatchObject({ code: "NOT_FOUND" });
-    },
-    60_000,
-  );
+  it("a failed completion burns the state too", async () => {
+    const shop = domain();
+    const p = await start(shop);
+    // Another company holds the store: this completion fails after the state is consumed.
+    const other = (await createCompany()).id;
+    await withSystem((tx) =>
+      tx.insert(channelConnections).values({
+        companyId: other,
+        channel: "shopify",
+        name: "holder",
+        status: "connected",
+        mode: "api",
+        externalShopId: shop,
+      }),
+    );
+    await expect(
+      completeShopifyOAuth({ shop, state: p.state, code: "mock" }),
+    ).rejects.toMatchObject({ code: "CONFLICT" });
+    await withSystem((tx) =>
+      tx.delete(channelConnections).where(eq(channelConnections.companyId, other)),
+    );
+    await expect(
+      completeShopifyOAuth({ shop, state: p.state, code: "mock" }),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+  }, 60_000);
 });

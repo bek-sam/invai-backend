@@ -105,6 +105,10 @@ describe("imaging contract drift (T-13-3, B-104)", () => {
       ComposePlacement,
       pydantic("ComposePlacementModel"),
     );
-    assertNoDrift("ComposePlacement.label/LabelModel", ComposePlacement.shape.label, pydantic("LabelModel"));
+    assertNoDrift(
+      "ComposePlacement.label/LabelModel",
+      ComposePlacement.shape.label,
+      pydantic("LabelModel"),
+    );
   });
 });
