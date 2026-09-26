@@ -206,6 +206,7 @@ export function createImagingClient(baseUrl = env.IMAGING_URL, timeoutMs = 120_0
       preview_key: string;
       preview_width_px?: number;
       label_gap_in?: number;
+      filename_hint?: string;
     }) => call("/compose", input, ComposeResult, { timeoutMs: 600_000 }),
 
     mockup: (input: {

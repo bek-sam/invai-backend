@@ -567,6 +567,12 @@ export async function composeSheet(
     for (const key of new Set(files.values())) {
       if (!(await headObject(key)).exists) throw new Error(`print file missing in storage: ${key}`);
     }
+    // AC2 (B-79): the sheet id and order numbers, so CADlink or a human can look the job up by
+    // name or by scanning the header code imaging draws for this (not the opaque S3 key).
+    const orderNos = [
+      ...new Set(rows.map((r) => r.label?.order_no).filter((v): v is string => !!v)),
+    ];
+    const filenameHint = [sheet.name, ...orderNos].join(" ").slice(0, 150);
     await imaging.compose({
       width_in: sheet.widthIn,
       length_in: sheet.lengthIn,
@@ -585,6 +591,7 @@ export async function composeSheet(
       ...(pdfKey ? { pdf_key: pdfKey } : {}),
       preview_key: previewKey,
       label_gap_in: spec.labelGapIn,
+      filename_hint: filenameHint,
     });
   } catch (err) {
     error =
