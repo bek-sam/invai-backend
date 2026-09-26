@@ -591,4 +591,80 @@ describe("stuck intent sweep", () => {
     expect((await row(r.shipmentId)).status).toBe("labeled");
     expect(await redis.get(`stuck-intent:buy:${r.shipmentId}`)).toBeNull();
   });
+
+  // T-12-1: every intent kind reaches alertStuck after its retry budget, not only buys.
+  const stuckAlert = async (kind: string, shipmentId: string) =>
+    (
+      await withTenant(companyId, (tx) =>
+        tx
+          .select()
+          .from(alerts)
+          .where(
+            and(
+              eq(alerts.companyId, companyId),
+              eq(alerts.dedupeKey, `stuck-intent-${kind}-${shipmentId}`),
+            ),
+          ),
+      )
+    )[0];
+
+  it(`a stuck void alerts after ${STUCK_ALERT_AFTER} failed retries`, async () => {
+    const { shipment } = await labeled("etsy");
+    await withSystem((tx) =>
+      tx
+        .update(shipments)
+        .set({ status: "voiding", voidAttemptedAt: null })
+        .where(eq(shipments.id, shipment.id)),
+    );
+    carrier.failLookup = true;
+    const results: string[] = [];
+    try {
+      for (let i = 0; i < STUCK_ALERT_AFTER; i++) {
+        await age(shipment.id);
+        results.push(await retryStuckIntent(companyId, shipment.id, "void"));
+      }
+    } finally {
+      carrier.failLookup = false;
+    }
+    expect(results).toEqual(["failed", "failed", "alerted"]);
+    expect(await stuckAlert("void", shipment.id)).toMatchObject({
+      entityId: shipment.id,
+      title: "A label void needs a look",
+    });
+    await redis.del(`stuck-intent:void:${shipment.id}`);
+  });
+
+  it(`a stuck push alerts after ${STUCK_ALERT_AFTER} failed retries`, async () => {
+    const { shipment } = await labeled("shopify");
+    await withSystem((tx) =>
+      tx
+        .update(shipments)
+        .set({ trackingPushStatus: "pushing", pushAttemptedAt: new Date() })
+        .where(eq(shipments.id, shipment.id)),
+    );
+    shopifyFails = true;
+    const enqueue = vi.spyOn(pushTrackingJob, "enqueue").mockResolvedValue({} as never);
+    const results: string[] = [];
+    try {
+      for (let i = 0; i < STUCK_ALERT_AFTER; i++) {
+        await withSystem((tx) =>
+          tx
+            .update(shipments)
+            .set({ trackingPushStatus: "pushing" })
+            .where(eq(shipments.id, shipment.id)),
+        );
+        await age(shipment.id);
+        results.push(await retryStuckIntent(companyId, shipment.id, "push"));
+      }
+    } finally {
+      shopifyFails = false;
+      enqueue.mockRestore();
+    }
+    expect(results).toEqual(["failed", "failed", "alerted"]);
+    expect(await stuckAlert("push", shipment.id)).toMatchObject({
+      entityId: shipment.id,
+      title: "Tracking wasn't sent to the channel",
+    });
+    await redis.del(`stuck-intent:push:${shipment.id}`);
+  });
 });

@@ -1,6 +1,13 @@
-import { type Job, type JobsOptions, Queue } from "bullmq";
+import {
+  type BackoffOptions,
+  type Job,
+  type JobsOptions,
+  type JobType,
+  Queue,
+  UnrecoverableError,
+} from "bullmq";
 import { Redis } from "ioredis";
-import type { z } from "zod";
+import { z } from "zod";
 import { env } from "../env";
 import { logger } from "./log";
 
@@ -21,9 +28,33 @@ export const QUEUE_CONCURRENCY: Record<QueueName, number> = {
   reports: 1,
 };
 
-const DEFAULT_JOB_OPTIONS: JobsOptions = {
+/**
+ * Share of each retry delay that is randomized (BullMQ `jitter`): a delay of D lands anywhere in
+ * [D * (1 - JITTER), D], so jobs that failed together (a provider blip) don't retry in lockstep.
+ */
+export const BACKOFF_JITTER = 0.5;
+
+export const DEFAULT_BACKOFF = {
+  type: "exponential",
+  delay: 2_000,
+  jitter: BACKOFF_JITTER,
+} as const satisfies BackoffOptions;
+
+/**
+ * Every job type retries with jitter (B-17). A job's own `backoff` (in `defineJob` options or at
+ * enqueue) keeps its type and delay but gains the default jitter unless it sets one itself.
+ */
+export function withJitter(
+  backoff: JobsOptions["backoff"] | undefined,
+): JobsOptions["backoff"] | undefined {
+  if (backoff === undefined) return undefined;
+  if (typeof backoff === "number") return { type: "fixed", delay: backoff, jitter: BACKOFF_JITTER };
+  return backoff.jitter === undefined ? { ...backoff, jitter: BACKOFF_JITTER } : backoff;
+}
+
+export const DEFAULT_JOB_OPTIONS: JobsOptions = {
   attempts: 5,
-  backoff: { type: "exponential", delay: 2_000 },
+  backoff: DEFAULT_BACKOFF,
   removeOnComplete: { age: 24 * 3600, count: 5_000 },
   removeOnFail: { age: 7 * 24 * 3600 },
 };
@@ -85,9 +116,11 @@ export function defineJob<I>(def: JobDefinition<I>): DefinedJob<I> {
     enqueue: (input, options) => {
       const data = def.input.parse(input);
       const jobId = options?.jobId ?? def.jobId?.(data);
+      const backoff = withJitter(options?.backoff ?? def.options?.backoff);
       return queues[def.queue].add(def.name, data, {
         ...def.options,
         ...options,
+        ...(backoff ? { backoff } : {}),
         jobId: jobId ? safeJobId(jobId) : undefined,
       }) as Promise<Job<I>>;
     },
@@ -122,6 +155,59 @@ export async function runJobInline<I>(
   } as Job<I>);
 }
 
+/* ---- Permanent failures ----------------------------------------------------------------- */
+
+/**
+ * Stop retrying: BullMQ fails the job at once (one attempt, not five) and it lands in the failed
+ * set, where `/internal/dlq` lists and redrives it. Throw it for failures a retry can't fix:
+ * Zod-invalid input, a provider's 4xx validation answer, a missing entity, revoked OAuth, a plan
+ * limit. Record the reason on the entity first so a person can see it. Transient failures (5xx,
+ * timeouts, 429, imaging down) throw a normal Error and retry with backoff.
+ *
+ *   if (res.status >= 400 && isPermanentHttpStatus(res.status))
+ *     permanentFailure(`carrier rejected the address (${res.status})`);
+ */
+export function permanentFailure(reason: string): never {
+  throw new UnrecoverableError(reason);
+}
+
+/** A 4xx a retry can't fix. 408 (timeout), 409 (conflict), 425 and 429 (rate limit) are transient. */
+export function isPermanentHttpStatus(status: number): boolean {
+  return status >= 400 && status < 500 && ![408, 409, 425, 429].includes(status);
+}
+
+/**
+ * The worker parses job data with this: input that fails the job's schema can never succeed on a
+ * retry, so it fails the job permanently instead of burning five attempts.
+ */
+export function parseJobInput<I>(def: Pick<JobDefinition<I>, "name" | "input">, data: unknown): I {
+  const parsed = def.input.safeParse(data);
+  if (parsed.success) return parsed.data;
+  return permanentFailure(
+    `invalid input for ${def.name}: ${z.prettifyError(parsed.error).slice(0, 500)}`,
+  );
+}
+
+/**
+ * The worker's processor: dispatch by job name to its `defineJob` definition, parse the input
+ * (invalid input fails for good, see `parseJobInput`) and run the handler. A name with no handler
+ * stays a normal (retried) error: during a rolling deploy an older worker may not know it yet.
+ */
+export async function processJob(job: Job): Promise<unknown> {
+  const def = getJob(job.name);
+  if (!def) throw new Error(`no handler registered for job ${job.name} on queue ${job.queueName}`);
+  return def.handler(parseJobInput(def, job.data), job);
+}
+
+/** BullMQ states in which a job may still run (used to tell a live job from an abandoned row). */
+export const LIVE_JOB_STATES = [
+  "active",
+  "waiting",
+  "waiting-children",
+  "delayed",
+  "prioritized",
+] as const satisfies readonly JobType[];
+
 /** Backoff for jobs a person may be waiting on: exponential with jitter (research 11 G9). */
 export const RETRY_BACKOFF = { type: "exponential", delay: 5_000, jitter: 0.5 } as const;
 
@@ -152,8 +238,10 @@ type Subscription = {
 const subscriptions = new Map<string, Subscription[]>();
 
 /**
- * Subscribe a job to an outbox event. The relay enqueues one job per subscription with
- * jobId `${eventId}:${jobName}`, so a re-relayed event cannot run a handler twice.
+ * Subscribe a job to an outbox event. The relay enqueues one job per subscription. A job with its
+ * own `jobId` keeps it, so two events that map to the same input collapse into one pending job;
+ * otherwise (or once that id's job has finished) the id is `${eventId}:${jobName}`, so a
+ * re-relayed event does not enqueue the handler twice. See `worker/outbox-relay.ts`.
  * `map` turns the event into job input; return null to ignore the event.
  */
 export function onEvent<I>(

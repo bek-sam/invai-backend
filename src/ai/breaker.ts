@@ -16,8 +16,8 @@ import { raiseAlert } from "../modules/today/service";
  *
  * The per-tenant credit ledger (credits.ts) is still the primary per-tenant limit; this breaker
  * is the backstop against a runaway loop or a leaked key. If Valkey does not answer within
- * CHECK_TIMEOUT_MS the check fails open (logged): the credit check has already run, and BullMQ is
- * down with Valkey anyway.
+ * CHECK_TIMEOUT_MS the check fails open (logged, and a critical `ai_breaker_fail_open` alert on the
+ * calling company, T-12-1): the credit check has already run, and BullMQ is down with Valkey anyway.
  */
 
 const log = logger("ai.breaker");
@@ -78,6 +78,7 @@ export async function assertSpendAvailable(
     );
   } catch (err) {
     log.error("spend check skipped: valkey unavailable", { error: (err as Error).message });
+    await alertFailOpen(companyId, now, (err as Error).message);
     return;
   }
   const tenantSpent = Number(values[0] ?? 0);
@@ -88,6 +89,39 @@ export async function assertSpendAvailable(
   if (caps.platform > 0 && platformSpent >= caps.platform) {
     await capReached(companyId, "platform", caps.platform, platformSpent, now);
   }
+}
+
+/** Per-process throttle so an outage writes one alert per company per window, not one per call. */
+const FAIL_OPEN_ALERT_EVERY_MS = 10 * 60_000;
+const failOpenAlertedAt = new Map<string, number>();
+
+/**
+ * The breaker let a call through without checking spend. Valkey is down, so the dedupe lives in
+ * Postgres (one alert per company per UTC hour) plus an in-process throttle. Never throws.
+ */
+async function alertFailOpen(companyId: string, now: Date, reason: string) {
+  const last = failOpenAlertedAt.get(companyId) ?? 0;
+  if (now.getTime() - last < FAIL_OPEN_ALERT_EVERY_MS && now.getTime() >= last) return;
+  failOpenAlertedAt.set(companyId, now.getTime());
+  const hour = now.toISOString().slice(0, 13);
+  await withTenant(companyId, (tx) =>
+    raiseAlert(tx, companyId, {
+      kind: "ai_breaker_fail_open",
+      severity: "critical",
+      title: "AI spend check was skipped",
+      message:
+        "InvAI couldn't reach its spend counter, so AI calls ran without the daily spend check. Your AI credits still apply.",
+      dedupeKey: `ai_breaker_fail_open:${hour}`,
+      data: { hour, reason: reason.slice(0, 200) },
+    }),
+  ).catch((e) =>
+    log.error("could not raise ai_breaker_fail_open alert", { error: (e as Error).message }),
+  );
+}
+
+/** Test hook: forget the fail-open throttle. */
+export function resetFailOpenThrottle() {
+  failOpenAlertedAt.clear();
 }
 
 async function capReached(

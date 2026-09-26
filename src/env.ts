@@ -64,6 +64,12 @@ const raw = createEnv({
     FIELD_ENCRYPTION_KEY: z.string().min(40),
 
     ANTHROPIC_API_KEY: secret(z.string()),
+    /**
+     * Operator token for the internal DLQ/redrive routes (`X-Internal-Token`, api/internal.ts).
+     * Never shipped to a browser. Unset turns the routes off (every call 404s); set it wherever an
+     * operator needs to list or redrive failed jobs.
+     */
+    INTERNAL_ADMIN_TOKEN: secret(z.string().min(32)),
     /** Daily (UTC) real-model AI spend caps in cents (src/ai/breaker.ts); 0 turns a scope off. */
     AI_DAILY_PLATFORM_CAP_CENTS: z.coerce.number().int().min(0).default(50_000),
     AI_DAILY_TENANT_CAP_CENTS: z.coerce.number().int().min(0).default(5_000),

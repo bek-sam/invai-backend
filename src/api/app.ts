@@ -18,6 +18,7 @@ import { redis } from "../lib/queues";
 import { s3Healthy } from "../lib/s3";
 import { buildContext } from "./context";
 import { events } from "./events";
+import { internal } from "./internal";
 import { router } from "./router";
 import { webhooks } from "./webhooks";
 import { carrierWebhooks } from "./webhooks-carriers";
@@ -103,6 +104,9 @@ app.get("/health", async (c) => {
     ok ? 200 : 503,
   );
 });
+
+// Internal-only DLQ/redrive routes (X-Internal-Token; 404 otherwise). See internal.ts.
+app.route("/internal", internal);
 
 app.on(["GET", "POST"], "/api/auth/*", (c) => auth.handler(c.req.raw));
 

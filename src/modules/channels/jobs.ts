@@ -1,8 +1,12 @@
+import { and, eq, isNull, lt } from "drizzle-orm";
 import { z } from "zod";
+import { withSystem, withTenant } from "../../db/client";
+import { webhookDeliveries } from "../../db/schema";
 import { env } from "../../env";
 import { errorData, logger } from "../../lib/log";
-import { defineJob, queues } from "../../lib/queues";
+import { defineJob, LIVE_JOB_STATES, queues, safeJobId } from "../../lib/queues";
 import { warnOverduePrivacyRequests } from "../privacy/service";
+import { raiseAlert } from "../today/service";
 import { checkWebhookSubscriptions, refreshExpiringTokens } from "./service";
 import {
   pollableConnections,
@@ -78,12 +82,101 @@ export const etsyWebhookJob = defineJob({
     processWebhook("etsy", headers, body, receivedAt),
 });
 
-/** Daily: drop webhook delivery records past their retention (7 days). */
+/** A delivery still `received` this long after it arrived lost its job (T-12-1). */
+export const WEBHOOK_STUCK_MS = 60 * 60_000;
+export const WEBHOOK_STUCK_SWEEP_EVERY_MS = 15 * 60_000;
+export const STUCK_WEBHOOK_DETAIL = "stuck at received: its processing job was lost";
+
+/**
+ * Flags deliveries left at `received` past WEBHOOK_STUCK_MS whose job is no longer live (the
+ * enqueue failed and the process crashed before forgetting the record, or the job was removed).
+ * Each row is flagged once: `detail` is set, so the next sweep skips it. The row keeps its status
+ * (a late job still finishes it normally). Rows only learn their company when processed, so the
+ * usual case is an operator signal (error log); a row that already knows its company also raises
+ * a `sync_broken` alert for that shop.
+ */
+export async function flagStuckWebhookDeliveries(now = new Date()) {
+  const cutoff = new Date(now.getTime() - WEBHOOK_STUCK_MS);
+  const stuck = await withSystem((tx) =>
+    tx
+      .select()
+      .from(webhookDeliveries)
+      .where(
+        and(
+          eq(webhookDeliveries.status, "received"),
+          lt(webhookDeliveries.receivedAt, cutoff),
+          isNull(webhookDeliveries.detail),
+        ),
+      )
+      .limit(200),
+  );
+  let flagged = 0;
+  let alerted = 0;
+  for (const row of stuck) {
+    const job = await queues.sync.getJob(safeJobId(`webhook-${row.channel}-${row.deliveryId}`));
+    const state = job ? await job.getState() : null;
+    if (state && (LIVE_JOB_STATES as readonly string[]).includes(state)) continue;
+    const [marked] = await withSystem((tx) =>
+      tx
+        .update(webhookDeliveries)
+        .set({ detail: STUCK_WEBHOOK_DETAIL })
+        .where(
+          and(
+            eq(webhookDeliveries.id, row.id),
+            eq(webhookDeliveries.status, "received"),
+            isNull(webhookDeliveries.detail),
+          ),
+        )
+        .returning({ id: webhookDeliveries.id }),
+    );
+    if (!marked) continue;
+    flagged++;
+    log.error("webhook delivery stuck at received", {
+      companyId: row.companyId,
+      channel: row.channel,
+      deliveryId: row.deliveryId,
+      receivedAt: row.receivedAt.toISOString(),
+    });
+    const companyId = row.companyId;
+    if (companyId) {
+      await withTenant(companyId, (tx) =>
+        raiseAlert(tx, companyId, {
+          kind: "sync_broken",
+          severity: "warning",
+          title: "A store update wasn't processed",
+          message:
+            "An order update from your store arrived but wasn't processed. Run a sync on the connection to pick it up.",
+          dedupeKey: `webhook_stuck:${row.id}`,
+          data: { channel: row.channel, deliveryId: row.deliveryId },
+        }),
+      );
+      alerted++;
+    }
+  }
+  return { flagged, alerted };
+}
+
+/** Every 15 minutes: flag deliveries stuck at `received`. */
+export const stuckWebhookDeliveriesJob = defineJob({
+  queue: "sync",
+  name: "channels.webhookDeliveries.stuck",
+  input: z.object({}).passthrough(),
+  options: { attempts: 1 },
+  handler: async () => flagStuckWebhookDeliveries(),
+});
+
+/**
+ * Daily: drop webhook delivery records past their retention (7 days). Stuck ones are flagged
+ * first, so none is purged before it was reported.
+ */
 export const purgeWebhookDeliveriesJob = defineJob({
   queue: "sync",
   name: "channels.webhookDeliveries.purge",
   input: z.object({}).passthrough(),
-  handler: async () => purgeWebhookDeliveries(),
+  handler: async () => ({
+    stuck: await flagStuckWebhookDeliveries(),
+    ...(await purgeWebhookDeliveries()),
+  }),
 });
 
 /**
@@ -111,6 +204,11 @@ export async function schedulePolling() {
     "channels-webhook-deliveries-purge",
     { pattern: "45 4 * * *", tz: "UTC" },
     { name: purgeWebhookDeliveriesJob.name, data: {} },
+  );
+  await queues.sync.upsertJobScheduler(
+    "channels-webhook-deliveries-stuck",
+    { every: WEBHOOK_STUCK_SWEEP_EVERY_MS },
+    { name: stuckWebhookDeliveriesJob.name, data: {} },
   );
   await queues.sync.upsertJobScheduler(
     "channels-webhook-subscriptions-check",
