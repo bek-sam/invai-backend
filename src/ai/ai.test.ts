@@ -15,6 +15,7 @@ const base: ListingContent = {
   attributes: {},
   price: 2800,
   disclosures: ["AI disclosure"],
+  productionPartner: null,
 };
 
 describe("channel validators", () => {
@@ -106,6 +107,7 @@ describe("mock provider", () => {
           attributes: {},
           price: 2800,
           disclosures: [],
+          productionPartner: null,
         }),
       );
       const r = validateListing(channel, content);

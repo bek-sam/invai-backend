@@ -1,5 +1,6 @@
 import { authed } from "../../api/orpc";
 import { withTenant } from "../../db/client";
+import { notImplemented } from "../../lib/errors";
 import "./jobs";
 import * as svc from "./service";
 
@@ -25,6 +26,10 @@ export const aiRouter = authed.ai.router({
     reject: authed.ai.listings.reject.handler(({ input, context: { tenant } }) =>
       withTenant(tenant.companyId, (tx) => svc.rejectDraft(tx, tenant, input.id, input.reason)),
     ),
+    // T-8-4 (wave 8): compliance sign-off on a medium-risk draft.
+    recordTrademarkReview: authed.ai.listings.recordTrademarkReview.handler(() => {
+      throw notImplemented("ai.listings.recordTrademarkReview");
+    }),
     publish: authed.ai.listings.publish.handler(({ input, context: { tenant } }) =>
       withTenant(tenant.companyId, (tx) =>
         svc.publishDraft(tx, tenant, input.id, input.connectionId),

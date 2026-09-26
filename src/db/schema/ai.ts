@@ -10,7 +10,7 @@ import {
 } from "drizzle-orm/pg-core";
 import { enumText, id, jsonObject, publicReadPolicy, tenantPolicy, timestamps } from "./_shared";
 import { CHANNELS } from "./channels";
-import { companyId } from "./tenancy";
+import { companyId, users } from "./tenancy";
 
 export const AI_JOB_KINDS = [
   "listing_draft",
@@ -76,6 +76,8 @@ export type ListingContent = {
   attributes: Record<string, string>;
   price: number | null;
   disclosures: string[];
+  /** Filled in at generation time from the company's `productionPartner` setting; never model-generated. */
+  productionPartner: string | null;
 };
 
 /** AI listing copy waiting for human approval. Nothing goes live without `approved`. */
@@ -98,10 +100,15 @@ export const listingDrafts = pgTable(
       attributes: {},
       price: null,
       disclosures: [],
+      productionPartner: null,
     }),
     /** Contracts ValidationResult / TrademarkCheck, null until computed. */
     validation: jsonb().$type<Record<string, unknown>>(),
     trademark: jsonb().$type<Record<string, unknown>>(),
+    /** Compliance sign-off for a medium-risk draft (contracts TrademarkReview). All null until reviewed. */
+    trademarkReviewedBy: uuid().references(() => users.id),
+    trademarkReviewedAt: timestamp({ withTimezone: true }),
+    trademarkReviewNote: text(),
     mockupKeys: text().array().notNull().default([]),
     model: text(),
     creditsUsed: integer().notNull().default(0),

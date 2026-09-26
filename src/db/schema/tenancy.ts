@@ -88,6 +88,8 @@ export type CompanySettings = {
   demoRetiredAt?: string;
   /** The shop prints its own DTF sheets instead of sending them to a vendor. */
   printsInHouse?: boolean;
+  /** The outside shop that presses/ships for this org, if any (Etsy production-partner disclosure). */
+  productionPartner?: { name: string; etsyPartnerId: string | null } | null;
 };
 
 export const sessions = pgTable(

@@ -4,7 +4,7 @@ import { AUDIT_ACTIONS, FLOOR_ROLES, ROLE_PERMISSIONS } from "@invai/contracts";
 import { and, asc, count, desc, eq, gte, inArray, lte, type SQL, sql } from "drizzle-orm";
 import type { Context, TenantContext } from "../../api/context";
 import { db, type Tx, withTenant } from "../../db/client";
-import type { Address, Role, StationKind } from "../../db/schema";
+import type { Address, CompanySettings, Role, StationKind } from "../../db/schema";
 import {
   auditLog,
   companies,
@@ -49,6 +49,7 @@ function toOrg(row: typeof companies.$inferSelect): Org {
     plan: row.type === "vendor" ? null : (row.plan ?? "trial"),
     demo: row.demo,
     printsInHouse: row.settings?.printsInHouse === true,
+    productionPartner: row.settings?.productionPartner ?? null,
     createdAt: row.createdAt.toISOString(),
   };
 }
@@ -118,18 +119,27 @@ export async function me(tx: Tx, ctx: Context & { tenant: TenantContext }): Prom
 export async function updateOrg(
   tx: Tx,
   ctx: TenantContext,
-  input: { name?: string; timezone?: string; printsInHouse?: boolean },
+  input: {
+    name?: string;
+    timezone?: string;
+    printsInHouse?: boolean;
+    productionPartner?: { name: string; etsyPartnerId: string | null } | null;
+  },
 ): Promise<Org> {
+  const settingsPatch: Partial<CompanySettings> = {};
+  if (input.printsInHouse !== undefined) settingsPatch.printsInHouse = input.printsInHouse;
+  if (input.productionPartner !== undefined)
+    settingsPatch.productionPartner = input.productionPartner;
   const [row] = await db
     .update(companies)
     .set({
       name: input.name,
       timezone: input.timezone,
       // jsonb merge so other settings keys are never clobbered.
-      ...(input.printsInHouse === undefined
+      ...(Object.keys(settingsPatch).length === 0
         ? {}
         : {
-            settings: sql`coalesce(${companies.settings}, '{}'::jsonb) || ${JSON.stringify({ printsInHouse: input.printsInHouse })}::jsonb`,
+            settings: sql`coalesce(${companies.settings}, '{}'::jsonb) || ${JSON.stringify(settingsPatch)}::jsonb`,
           }),
     })
     .where(eq(companies.id, ctx.companyId))

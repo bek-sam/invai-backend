@@ -81,6 +81,13 @@ async function toDraft(row: DraftRow, designName: string): Promise<ListingDraft>
     content: row.content,
     validation: (row.validation as ValidationResult | null) ?? null,
     trademark: (row.trademark as TrademarkCheck | null) ?? null,
+    trademarkReview: row.trademarkReviewedBy
+      ? {
+          reviewedBy: row.trademarkReviewedBy,
+          reviewedAt: (row.trademarkReviewedAt as Date).toISOString(),
+          note: row.trademarkReviewNote ?? "",
+        }
+      : null,
     mockupKeys: row.mockupKeys,
     model: row.model,
     creditsUsed: row.creditsUsed,
@@ -347,6 +354,8 @@ function toContent(copy: ListingCopy, price: number | null): ListingContent {
     attributes: Object.fromEntries(copy.attributes.map((a) => [a.key, a.value])),
     price,
     disclosures: [],
+    // TODO(T-8-1): fill from the company's productionPartner setting, never model-generated.
+    productionPartner: null,
   };
 }
 
