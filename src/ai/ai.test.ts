@@ -1,6 +1,15 @@
 import { type ListingContent, ValidationResult } from "@invai/contracts";
 import { describe, expect, it } from "vitest";
-import { tokensToCredits } from "./models";
+import { z } from "zod";
+import {
+  DEFAULT_MODEL,
+  HAIKU_MODEL,
+  MOCK_MODEL,
+  MODEL_PRICES,
+  SONNET_MODEL,
+  tokensToCostCents,
+  tokensToCredits,
+} from "./models";
 import { resolvePeriod } from "./periods";
 import { stripPii } from "./pii";
 import { ListingCopy, listingCopyPrompt } from "./prompts";
@@ -151,5 +160,81 @@ describe("gateway helpers", () => {
   it("resolves relative periods", () => {
     const p = resolvePeriod("last 7 days", new Date("2026-09-24T12:00:00Z"));
     expect(p.from.toISOString()).toBe("2026-09-18T00:00:00.000Z");
+  });
+});
+
+/* ------------------- T-8-3: AI cost table and mock hardening ------------------- */
+
+describe("AI cost table and mock hardening (T-8-3)", () => {
+  describe("tokensToCostCents", () => {
+    const oneMillionEach = {
+      tokensIn: 1_000_000,
+      tokensOut: 1_000_000,
+      cacheReadTokens: 1_000_000,
+    };
+
+    it("has a price for every model this codebase can route to", () => {
+      for (const id of [DEFAULT_MODEL, SONNET_MODEL, HAIKU_MODEL])
+        expect(MODEL_PRICES[id]).toBeTruthy();
+    });
+
+    it("pins Opus 5 (default model, default call shape): $5 in + $25 out + $0.50 cache read per MTok", () => {
+      // Same call shape gateway.ts uses today (usage only, no model arg) — must keep pricing at Opus 5.
+      expect(tokensToCostCents(oneMillionEach)).toBe(3_050);
+      expect(tokensToCostCents(oneMillionEach, DEFAULT_MODEL)).toBe(3_050);
+    });
+
+    it("pins Sonnet 5: $2 in + $10 out + $0.20 cache read per MTok", () => {
+      expect(tokensToCostCents(oneMillionEach, SONNET_MODEL)).toBe(1_220);
+    });
+
+    it("pins Haiku 4.5: $1 in + $5 out + $0.10 cache read per MTok", () => {
+      expect(tokensToCostCents(oneMillionEach, HAIKU_MODEL)).toBe(610);
+    });
+
+    it("prices a 5-minute cache write at 1.25x the model's input rate", () => {
+      const write = { tokensIn: 0, tokensOut: 0, cacheReadTokens: 0, cacheWriteTokens: 1_000_000 };
+      expect(tokensToCostCents(write, DEFAULT_MODEL)).toBe(625);
+      expect(tokensToCostCents(write, SONNET_MODEL)).toBe(250);
+      expect(tokensToCostCents(write, HAIKU_MODEL)).toBe(125);
+    });
+
+    it("prices a 1-hour cache write at 2x the model's input rate", () => {
+      const write = { tokensIn: 0, tokensOut: 0, cacheReadTokens: 0, cacheWriteTokens: 1_000_000 };
+      expect(tokensToCostCents(write, DEFAULT_MODEL, { cacheTtl: "1h" })).toBe(1_000);
+    });
+
+    it("halves input, output and cache read for a batch call", () => {
+      expect(tokensToCostCents(oneMillionEach, DEFAULT_MODEL, { batch: true })).toBe(1_525);
+      expect(tokensToCostCents(oneMillionEach, SONNET_MODEL, { batch: true })).toBe(610);
+    });
+
+    it("falls back to Opus 5 pricing for an id the table doesn't recognize, instead of throwing", () => {
+      expect(() => tokensToCostCents(oneMillionEach, "claude-nonexistent-9")).not.toThrow();
+      expect(tokensToCostCents(oneMillionEach, "claude-nonexistent-9")).toBe(
+        tokensToCostCents(oneMillionEach, DEFAULT_MODEL),
+      );
+    });
+  });
+
+  describe("mock provider hardening", () => {
+    it("returns a schema-valid default instead of throwing on a prompt id with no fixture", async () => {
+      const unknownPrompt = {
+        id: "totally_unknown_prompt_xyz",
+        version: 1,
+        route: "listing_copy" as const,
+        system: "s",
+        user: () => "u",
+        schema: z.object({
+          ok: z.boolean(),
+          tags: z.array(z.string()),
+          note: z.string().nullable(),
+          rank: z.enum(["low", "high"]),
+        }),
+      };
+      const result = await mockProvider.structured(unknownPrompt, {});
+      expect(result.output).toEqual({ ok: false, tags: [], note: null, rank: "low" });
+      expect(result.model).toBe(MOCK_MODEL);
+    });
   });
 });

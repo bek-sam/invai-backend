@@ -1,4 +1,6 @@
 import { CHANNEL_RULES, type Channel } from "@invai/contracts";
+import type { z } from "zod";
+import { logger } from "../../lib/log";
 import { MOCK_MODEL } from "../models";
 import { resolvePeriod } from "../periods";
 import type {
@@ -22,6 +24,8 @@ import type {
  * from the design name, tags and blank; the assistant really calls the company-scoped tools and
  * writes its answer from their results, streamed as text deltas.
  */
+
+const log = logger("ai:mock");
 
 const estimateTokens = (s: string) => Math.ceil(s.length / 4);
 
@@ -166,6 +170,49 @@ export function mockListingCopy(v: ListingVars): ListingCopy {
   return { title, description, tags, bullets, attributes };
 }
 
+/**
+ * Best-effort schema-valid placeholder for a prompt this mock has no hand-written fixture for
+ * (a new route added after this file, or a typo'd `prompt.id`). Walks the zod shape and picks a
+ * plausible value per node type; `mockProvider.structured` still runs the real `schema.parse` on
+ * the result, so a shape this can't handle surfaces as a normal parse error, not a silent lie.
+ */
+function defaultForSchema(schema: z.ZodType): unknown {
+  const def = (schema as unknown as { _def: { type: string; [k: string]: unknown } })._def;
+  switch (def.type) {
+    case "object": {
+      const shape = (schema as z.ZodObject).shape;
+      const out: Record<string, unknown> = {};
+      for (const [key, field] of Object.entries(shape))
+        out[key] = defaultForSchema(field as z.ZodType);
+      return out;
+    }
+    case "array":
+      return [];
+    case "record":
+      return {};
+    case "string":
+      return "";
+    case "number":
+      return 0;
+    case "boolean":
+      return false;
+    case "literal":
+      return (def.values as unknown[])[0];
+    case "enum":
+      return Object.values(def.entries as Record<string, unknown>)[0];
+    case "nullable":
+      return null;
+    case "optional":
+      return undefined;
+    case "default":
+      return def.defaultValue;
+    case "null":
+      return null;
+    default:
+      return def.innerType ? defaultForSchema(def.innerType as z.ZodType) : null;
+  }
+}
+
 function usageOf(system: string, user: string, output: unknown): TokenUsage {
   return {
     tokensIn: estimateTokens(system) + estimateTokens(user),
@@ -273,7 +320,12 @@ export const mockProvider: AiProvider = {
           reason: "Mock provider: flagged for human review.",
         })),
       } satisfies TrademarkJudgement;
-    } else throw new Error(`mock provider has no fixture for prompt ${prompt.id}`);
+    } else {
+      // Unknown prompt id (a new route, or a typo): don't 500 the request — warn and hand back a
+      // schema-valid placeholder so callers exercise the real path end to end (B-45 hardening).
+      log.warn("no fixture for prompt; returning a schema-valid default", { promptId: prompt.id });
+      output = defaultForSchema(prompt.schema);
+    }
     const parsed = prompt.schema.parse(output);
     return {
       output: parsed,

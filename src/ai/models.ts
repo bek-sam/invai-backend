@@ -47,12 +47,97 @@ export function tokensToCredits(u: {
   return Math.max(1, Math.ceil(billable / 1000));
 }
 
-/** List price per million tokens for cost traces (Opus 5: $5 in / $25 out, cache read $0.50). */
-export function tokensToCostCents(u: {
-  tokensIn: number;
-  tokensOut: number;
-  cacheReadTokens: number;
-}) {
-  const dollars = (u.tokensIn * 5 + u.tokensOut * 25 + u.cacheReadTokens * 0.5) / 1_000_000;
-  return Math.round(dollars * 100);
+/* --------------------------------- price table --------------------------------- */
+
+export const SONNET_MODEL = "claude-sonnet-5";
+export const HAIKU_MODEL = "claude-haiku-4-5";
+
+/** Cents per million tokens, list price. */
+export type ModelPriceCents = {
+  inputPerMTok: number;
+  outputPerMTok: number;
+  /** Cache write, standard 5-minute TTL (`cache_control: { type: "ephemeral" }` with no `ttl`). */
+  cacheWrite5mPerMTok: number;
+  /** Cache write, 1-hour TTL (`ttl: "1h"`). Not currently requested by any provider call. */
+  cacheWrite1hPerMTok: number;
+  cacheReadPerMTok: number;
+  /** Message Batches API: 50% off the standard input/output rate. */
+  batchInputPerMTok: number;
+  batchOutputPerMTok: number;
+};
+
+/**
+ * List prices for every model this codebase can route to (Opus, Sonnet, Haiku — B-45). No price
+ * is hard-coded outside this table: `tokensToCostCents` below only reads from it.
+ *
+ * Source: Anthropic's Claude API pricing, via the `claude-api` skill's "Current Models" reference
+ * (skill cache date 2026-06-24; checked against docs.claude.com/en/docs/about-claude/pricing on
+ * 2026-09-26). Cache write = 1.25x input (5m TTL) / 2x input (1h TTL); cache read = 0.1x input;
+ * batch = 50% off input and output — Anthropic's standard multipliers, applied to each model's
+ * base rate below. Re-check this table (and the date in this comment) whenever a model is added
+ * or repriced.
+ */
+export const MODEL_PRICES: Record<string, ModelPriceCents> = {
+  [DEFAULT_MODEL]: {
+    // Opus 5: $5.00 / $25.00 per MTok in/out.
+    inputPerMTok: 500,
+    outputPerMTok: 2_500,
+    cacheWrite5mPerMTok: 625,
+    cacheWrite1hPerMTok: 1_000,
+    cacheReadPerMTok: 50,
+    batchInputPerMTok: 250,
+    batchOutputPerMTok: 1_250,
+  },
+  [SONNET_MODEL]: {
+    // Sonnet 5: $2.00 / $10.00 per MTok in/out.
+    inputPerMTok: 200,
+    outputPerMTok: 1_000,
+    cacheWrite5mPerMTok: 250,
+    cacheWrite1hPerMTok: 400,
+    cacheReadPerMTok: 20,
+    batchInputPerMTok: 100,
+    batchOutputPerMTok: 500,
+  },
+  [HAIKU_MODEL]: {
+    // Haiku 4.5: $1.00 / $5.00 per MTok in/out.
+    inputPerMTok: 100,
+    outputPerMTok: 500,
+    cacheWrite5mPerMTok: 125,
+    cacheWrite1hPerMTok: 200,
+    cacheReadPerMTok: 10,
+    batchInputPerMTok: 50,
+    batchOutputPerMTok: 250,
+  },
+};
+
+/**
+ * List-price cost of a call, in cents, read from `MODEL_PRICES`. `model` defaults to
+ * `DEFAULT_MODEL` (every route currently uses it) and falls back to it for an id the table
+ * doesn't recognize, so a mis-tagged job traces at Opus 5 prices rather than throwing.
+ */
+export function tokensToCostCents(
+  u: {
+    tokensIn: number;
+    tokensOut: number;
+    cacheReadTokens: number;
+    /** Tokens written to the cache this call (0 when nothing new was cached). */
+    cacheWriteTokens?: number;
+  },
+  model: string = DEFAULT_MODEL,
+  opts: { batch?: boolean; cacheTtl?: "5m" | "1h" } = {},
+): number {
+  const price = MODEL_PRICES[model] ?? MODEL_PRICES[DEFAULT_MODEL];
+  if (!price) throw new Error("MODEL_PRICES is missing DEFAULT_MODEL");
+  const batchDiscount = opts.batch ? 0.5 : 1;
+  const cacheWriteRate =
+    (opts.cacheTtl === "1h" ? price.cacheWrite1hPerMTok : price.cacheWrite5mPerMTok) *
+    batchDiscount;
+  // MODEL_PRICES rates are already cents per million tokens, so this division yields cents.
+  const cents =
+    (u.tokensIn * (opts.batch ? price.batchInputPerMTok : price.inputPerMTok) +
+      u.tokensOut * (opts.batch ? price.batchOutputPerMTok : price.outputPerMTok) +
+      u.cacheReadTokens * price.cacheReadPerMTok * batchDiscount +
+      (u.cacheWriteTokens ?? 0) * cacheWriteRate) /
+    1_000_000;
+  return Math.round(cents);
 }
