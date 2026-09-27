@@ -1249,7 +1249,13 @@ async function recsFor(
   return all
     .filter((r) => rules.includes(r.rule) && r.band !== "low")
     .filter((r) => {
-      if (subject.niche) return (r.params.niche ?? r.target.niche) === subject.niche;
+      if (subject.niche) {
+        if ((r.params.niche ?? r.target.niche) === subject.niche) return true;
+        // R1 is per design (no niche on it): it answers a niche question when its peak month is
+        // one of the niche's peak months ("get ready for Halloween" → the October peaks).
+        const peaks = market.NICHES.find((n) => n.key === subject.niche)?.peakMonths ?? [];
+        return r.rule === "R1" && r.params.peakMonth != null && peaks.includes(r.params.peakMonth);
+      }
       if (subject.designIds)
         return r.target.designId != null && subject.designIds.includes(r.target.designId);
       return true;

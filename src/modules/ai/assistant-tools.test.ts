@@ -1204,9 +1204,36 @@ describe("market tools (T-18-4)", () => {
       },
       yearsUsed: 10,
     }));
+    const octoberR1 = rec("R1", {
+      action: "list_and_stock",
+      target: {
+        designId: a.designIds[0] ?? null,
+        designName: "Spooky Pumpkin Ghost",
+        niche: null,
+        channel: null,
+      },
+      params: {
+        designName: "Spooky Pumpkin Ghost",
+        channels: ["amazon"],
+        blankName: "Gildan 64000 Black M",
+        peakMonth: 10,
+      },
+      mock: false,
+      sources: [prov("census", false)],
+    });
+    const decemberR1 = rec("R1", {
+      params: { peakMonth: 12 },
+      target: { designId: null, designName: "Elf", niche: null, channel: null },
+    });
+    m.listRecommendations.mockResolvedValue([octoberR1, decemberR1]);
     const out = await run(a.ctx, "get_seasonality", { niche: "Halloween" });
     expect(m.getSeasonalitySignal.mock.calls[0]?.[2]).toEqual({ niche: "halloween" });
-    expect(out.answer).toBe(
+    expect(out.meta?.recommendations?.map((r) => r.id)).toEqual([octoberR1.id]);
+    m.listRecommendations.mockResolvedValue([]);
+    expect(out.answer).toContain(
+      "List Spooky Pumpkin Ghost on Amazon and stock Gildan 64000 Black M before October.",
+    );
+    expect(out.answer.split("\n")[0]).toBe(
       "**Halloween**: peaks in October (All US clothing stores, not specific to your niche; US Census retail trade, as of 2026-09-20; Medium confidence: test it). Act by 2026-09-07: 6 weeks to the peak, your lead time is 4 weeks. Act now.",
     );
     const unknown = await run(a.ctx, "get_seasonality", { niche: "Sunset Palms" });
