@@ -1,3 +1,4 @@
+import type { RecommendationRef, SignalSourceRef } from "@invai/contracts";
 import type { z } from "zod";
 import type { PromptDef } from "../prompts";
 
@@ -25,12 +26,30 @@ export type ToolOutput = {
   summary: string;
   /** A plain-language sentence the mock provider can use in its answer. */
   answer: string;
+  /** Wave 18 market tools: provenance and recommendations for the `tool_result` event. */
+  meta?: ToolMeta;
+  /**
+   * Terms the answer must not repeat (a trademark-screened niche the user named). Read by the
+   * gateway's answer check and stripped before the result reaches the model or the web.
+   */
+  forbiddenTerms?: string[];
+};
+
+/**
+ * What a market tool result carries to the web besides its summary (contract
+ * `AssistantEvent.tool_result`): the mock flag and sources for the "Sample data" badge, and the
+ * recommendations it showed (at most 3), each of which gets a vote card.
+ */
+export type ToolMeta = {
+  mock?: boolean;
+  sources?: SignalSourceRef[];
+  recommendations?: RecommendationRef[];
 };
 
 export type AssistantStreamEvent =
   | { type: "text"; text: string }
   | { type: "tool_call"; name: string; input: Record<string, unknown> }
-  | { type: "tool_result"; name: string; summary: string };
+  | { type: "tool_result"; name: string; summary: string; meta?: ToolMeta };
 
 export type AssistantFinal = { usage: TokenUsage; model: string; stopReason: string | null };
 

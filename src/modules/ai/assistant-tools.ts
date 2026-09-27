@@ -1,6 +1,23 @@
-import { CHANNEL_RULES, CHANNELS, type Channel } from "@invai/contracts";
+import {
+  CHANNEL_RULES,
+  CHANNELS,
+  type Channel,
+  type MarketRecommendation,
+  type SignalSourceRef,
+} from "@invai/contracts";
+import { ORPCError } from "@orpc/server";
 import { and, eq, gte, inArray, isNotNull, isNull, lt, ne, sql } from "drizzle-orm";
 import { z } from "zod";
+import {
+  BAND_COPY,
+  channelLabel,
+  fill,
+  MARKET_COPY,
+  money,
+  monthName,
+  RULE_ACTION,
+  sourceLine,
+} from "../../ai/market-copy";
 import type { AssistantTool, ToolOutput } from "../../ai/providers/types";
 import type { TenantContext } from "../../api/context";
 import { type Tx, withTenant } from "../../db/client";
@@ -18,8 +35,13 @@ import {
   refundEvents,
   reprints,
 } from "../../db/schema";
+import { logger } from "../../lib/log";
 import { getProfit, localDay } from "../finance/service";
 import { listStock } from "../inventory/service";
+import * as market from "../market/service";
+import { screenMarketTerms } from "./niche";
+
+const log = logger("ai.assistant-tools");
 
 /*
  * The assistant's read-only, company-scoped tools. Each tool opens its own withTenant transaction
@@ -1009,5 +1031,683 @@ export function assistantTools(ctx: TenantContext): AssistantTool[] {
           };
         }),
     ),
+    // Wave 18 market tools (T-18-4).
+    ...marketTools(ctx),
   ];
+}
+
+/* ------------------------------ market tools (T-18-4) ------------------------------ */
+
+/*
+ * Wave 18 (spec market-signals "Assistant tools"). Read-only: each tool reads stored signals and
+ * recommendations through the market service (T-18-3) inside the caller's `withTenant`; nothing
+ * here calls a provider or writes a row (the one write, "shown", is `recordRecommendationsShown`,
+ * called once per turn by `ask`). Data is whitelisted field by field, so nothing beyond the
+ * contract's aggregate fields (no seller names, no listing titles) can reach the model. Money is
+ * cents in `data`, formatted in `answer`; `answer` is the fixed, code-written text in the user's
+ * language, which the gateway's answer check falls back to.
+ */
+
+/** Recommendations one market tool may show (contract `tool_result.recommendations` max 3). */
+export const MARKET_REC_MAX = 3;
+/** Designs a shop-wide market answer looks at when no design or niche is named. */
+const MARKET_TOP_DESIGNS = 8;
+/** Candidate prices `simulate_price` accepts (spec). */
+export const SIMULATE_MAX_PRICES = 8;
+
+const Lang = z
+  .enum(["en", "es"])
+  .optional()
+  .describe('"es" when the user writes Spanish, else "en"');
+const Subject = {
+  designId: z
+    .uuid()
+    .optional()
+    .describe("One of the shop's design ids, from an earlier tool result"),
+  niche: z
+    .string()
+    .max(80)
+    .optional()
+    .describe("A niche key or name (teacher, dog-mom, halloween) when the user names a niche"),
+};
+
+type DesignRef = { id: string; name: string };
+type Target = { label: string; input: market.Subject; design: DesignRef | null };
+type NicheResolution =
+  | { kind: "key"; key: string; label: string }
+  | { kind: "dropped"; term: string }
+  | { kind: "unknown" };
+
+const fold = (s: string) =>
+  s
+    .normalize("NFD")
+    .replace(/\p{M}/gu, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+
+/** Taxonomy key, or the trademark screen's verdict for a term that isn't one. */
+async function resolveNiche(companyId: string, raw: string, lang: Lang2): Promise<NicheResolution> {
+  const f = fold(raw)
+    .replace(/\bniche\b|\bnicho\b/g, "")
+    .trim();
+  const hit = market.NICHES.find(
+    (n) => fold(n.key) === f || fold(n.labelEn) === f || fold(n.labelEs) === f,
+  );
+  if (hit) return { kind: "key", key: hit.key, label: lang === "es" ? hit.labelEs : hit.labelEn };
+  const { droppedCount } = await screenMarketTerms(companyId, [raw]);
+  return droppedCount > 0 ? { kind: "dropped", term: raw } : { kind: "unknown" };
+}
+type Lang2 = "en" | "es";
+
+/** The shop's best-selling designs over 90 days (own catalog rows only), with their top channel. */
+async function topDesigns(tx: Tx, companyId: string, limit: number, channel?: Channel) {
+  const since = new Date(Date.now() - 90 * 86_400_000);
+  const sold = await tx
+    .select({
+      designId: sql<string>`${profitLines.designId}::text`,
+      channel: profitLines.channel,
+      units: sql<number>`count(*)::int`,
+    })
+    .from(profitLines)
+    .where(
+      and(
+        eq(profitLines.companyId, companyId),
+        gte(profitLines.placedAt, since),
+        isNotNull(profitLines.designId),
+        eq(profitLines.isReprint, false),
+        channel ? eq(profitLines.channel, channel) : undefined,
+      ),
+    )
+    .groupBy(profitLines.designId, profitLines.channel);
+  const byDesign = new Map<string, { units: number; channel: Channel; best: number }>();
+  for (const r of sold) {
+    const cur = byDesign.get(r.designId) ?? { units: 0, channel: r.channel as Channel, best: 0 };
+    cur.units += r.units;
+    if (r.units > cur.best) Object.assign(cur, { channel: r.channel, best: r.units });
+    byDesign.set(r.designId, cur);
+  }
+  const ranked = [...byDesign.entries()].sort((a, b) => b[1].units - a[1].units).slice(0, limit);
+  const ids = ranked.map(([id]) => id);
+  const rows = ids.length
+    ? await tx
+        .select({ id: sql<string>`${designs.id}::text`, name: designs.name })
+        .from(designs)
+        .where(and(eq(designs.companyId, companyId), inArray(designs.id, ids)))
+    : await tx
+        .select({ id: sql<string>`${designs.id}::text`, name: designs.name })
+        .from(designs)
+        .where(and(eq(designs.companyId, companyId), eq(designs.status, "active")))
+        .orderBy(sql`${designs.createdAt} desc`)
+        .limit(limit);
+  const order = (id: string) => (ids.includes(id) ? ids.indexOf(id) : ids.length);
+  return rows
+    .sort((a, b) => order(a.id) - order(b.id))
+    .map((d) => ({ ...d, channel: byDesign.get(d.id)?.channel ?? null }));
+}
+
+async function designById(tx: Tx, companyId: string, id: string): Promise<DesignRef | null> {
+  const [d] = await tx
+    .select({ id: sql<string>`${designs.id}::text`, name: designs.name })
+    .from(designs)
+    .where(and(eq(designs.companyId, companyId), eq(designs.id, id)));
+  return d ?? null;
+}
+
+const sourceRef = (p: { source: SignalSourceRef["source"]; asOf: string; mock: boolean }) => ({
+  source: p.source,
+  asOf: p.asOf,
+  mock: p.mock,
+});
+
+function uniqueSources(list: SignalSourceRef[]): SignalSourceRef[] {
+  const seen = new Set<string>();
+  return list
+    .filter((s) => {
+      const k = `${s.source}|${s.asOf}|${s.mock}`;
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    })
+    .slice(0, MAX_ROWS);
+}
+
+const signedRatio = (v: number | null) =>
+  v == null ? null : `${v >= 0 ? "+" : ""}${(v * 100).toFixed(1)}%`;
+
+const TREND_WORD: Record<string, Record<Lang2, string>> = {
+  rising: { en: "rising", es: "subiendo" },
+  falling: { en: "falling", es: "bajando" },
+  flat: { en: "flat", es: "estable" },
+  insufficient: { en: "not enough data", es: "no hay suficientes datos" },
+};
+const INSUFFICIENT: Record<string, Record<Lang2, string>> = {
+  too_few_points: {
+    en: "fewer than 13 weekly points",
+    es: "menos de 13 semanas de datos",
+  },
+  mostly_zero: { en: "no sales in most weeks", es: "sin ventas en la mayoría de las semanas" },
+  no_source: { en: "no data source yet", es: "todavía no hay fuente de datos" },
+};
+const UNAVAILABLE: Record<string, Record<Lang2, string>> = {
+  no_compliant_source: {
+    en: "There's no approved price source for {{channel}} yet.",
+    es: "Todavía no hay una fuente de precios aprobada para {{channel}}.",
+  },
+  not_connected: {
+    en: "{{channel}} isn't connected, so I can't compare prices there.",
+    es: "{{channel}} no está conectado, así que no puedo comparar precios ahí.",
+  },
+  too_few_comparables: {
+    en: "I need at least 8 comparable listings on {{channel}} to place your price, and there are fewer.",
+    es: "Necesito por lo menos 8 publicaciones comparables en {{channel}} para ubicar tu precio, y hay menos.",
+  },
+};
+
+/** One recommendation as the model and the fallback see it: the fixed action text, band, sample note. */
+function recLine(r: MarketRecommendation, lang: Lang2) {
+  const p = r.params;
+  const niche = p.niche ?? r.target.niche;
+  const nicheLabelText = niche ? market.nicheLabel(niche, lang) : "";
+  const action = fill(RULE_ACTION[r.rule][lang], {
+    design: p.designName ?? r.target.designName ?? "",
+    channels: (p.channels ?? []).map(channelLabel).join(", "),
+    blank: p.blankName ?? (lang === "es" ? "la prenda" : "the blank"),
+    peak: p.peakMonth ? monthName(p.peakMonth, lang) : "",
+    price: money(p.testPriceMinCents ?? p.testPriceMaxCents ?? p.currentPriceCents ?? 0),
+    channel: channelLabel(p.channel ?? r.target.channel ?? ""),
+    floor: money(p.floorPriceCents ?? 0),
+    niche: nicheLabelText,
+  });
+  const evidence = r.sources.slice(0, 3).map((s) => sourceLine(s, lang));
+  return {
+    id: r.id,
+    rule: r.rule,
+    band: r.band,
+    bandLabel: BAND_COPY[r.band][lang],
+    mock: r.mock,
+    stale: r.stale,
+    action,
+    evidence,
+    sampleNote: r.mock ? MARKET_COPY.sample[lang] : null,
+    text: `${action} ${evidence.length ? `(${evidence.join("; ")}) ` : ""}${BAND_COPY[r.band][lang]}.${r.mock ? ` ${MARKET_COPY.sample[lang]}` : ""}`,
+  };
+}
+
+/** Recommendations for this tool: its rules, its subject, medium band or better, at most 3. */
+async function recsFor(
+  tx: Tx,
+  ctx: TenantContext,
+  rules: MarketRecommendation["rule"][],
+  subject: { designIds?: string[]; niche?: string },
+) {
+  const all = await market.listRecommendations(tx, ctx, { minBand: "medium", limit: MAX_ROWS });
+  return all
+    .filter((r) => rules.includes(r.rule) && r.band !== "low")
+    .filter((r) => {
+      if (subject.niche) return (r.params.niche ?? r.target.niche) === subject.niche;
+      if (subject.designIds)
+        return r.target.designId != null && subject.designIds.includes(r.target.designId);
+      return true;
+    })
+    .slice(0, MARKET_REC_MAX);
+}
+
+function marketOutput(
+  base: { data: Record<string, unknown>; summary: string; answer: string },
+  rows: { mock: boolean; sources: SignalSourceRef[] }[],
+  recs: MarketRecommendation[],
+  lang: Lang2,
+): ToolOutput {
+  const lines = recs.map((r) => recLine(r, lang));
+  const mock = rows.some((r) => r.mock) || recs.some((r) => r.mock);
+  const recText = lines.length
+    ? `\n\n${lang === "es" ? "Recomendaciones" : "Recommendations"}:\n${lines.map((l, i) => `${i + 1}. ${l.text}`).join("\n")}`
+    : "";
+  return {
+    data: { ...base.data, recommendations: lines.map(({ text: _t, ...l }) => l) },
+    summary: base.summary,
+    answer: `${base.answer}${recText}`,
+    meta: {
+      mock,
+      sources: uniqueSources(rows.flatMap((r) => r.sources)),
+      recommendations: recs.map((r) => ({ id: r.id, rule: r.rule, band: r.band, mock: r.mock })),
+    },
+  };
+}
+
+function marketFailure(tool: string, err: unknown, lang: Lang2): ToolOutput {
+  const notFound = err instanceof ORPCError && err.code === "NOT_FOUND";
+  if (!notFound) log.warn("market tool failed", { tool, error: (err as Error).message });
+  const answer = notFound
+    ? lang === "es"
+      ? "No encontré ese diseño en tu tienda."
+      : "I couldn't find that design in your shop."
+    : lang === "es"
+      ? "Los datos del mercado no están disponibles ahora. Intenta de nuevo en un rato."
+      : "Market data isn't available right now. Try again in a little while.";
+  return {
+    data: { error: notFound ? "not_found" : "unavailable" },
+    summary: `${tool}: ${notFound ? "not found" : "unavailable"}`,
+    answer,
+    meta: { mock: false, sources: [], recommendations: [] },
+  };
+}
+
+function nicheRefusal(tool: string, r: NicheResolution, lang: Lang2): ToolOutput {
+  const dropped = r.kind === "dropped";
+  return {
+    data: {
+      available: false,
+      reason: dropped ? "trademark_screen" : "unknown_niche",
+      rows: [],
+    },
+    summary: `${tool}: ${dropped ? "niche not available" : "unknown niche"}`,
+    answer: dropped ? MARKET_COPY.tmDropped[lang] : MARKET_COPY.unknownNiche[lang],
+    meta: { mock: false, sources: [], recommendations: [] },
+    forbiddenTerms: dropped ? [r.term] : undefined,
+  };
+}
+
+function marketTools(ctx: TenantContext): AssistantTool[] {
+  const tool = <I extends z.ZodObject>(
+    name: string,
+    description: string,
+    input: I,
+    run: (i: z.infer<I>, lang: Lang2) => Promise<ToolOutput>,
+  ): AssistantTool => ({
+    name,
+    description,
+    input,
+    run: async (raw) => {
+      const i = input.parse(raw);
+      const lang: Lang2 = (i as { lang?: Lang2 }).lang ?? "en";
+      try {
+        return await run(i, lang);
+      } catch (err) {
+        return marketFailure(name, err, lang);
+      }
+    },
+  });
+
+  /** designId → that design; niche → the niche; neither → the shop's top designs. */
+  async function subjects(
+    tx: Tx,
+    i: { designId?: string; niche?: string },
+    lang: Lang2,
+  ): Promise<
+    | { kind: "designs"; designs: (DesignRef & { channel: Channel | null })[] }
+    | { kind: "niche"; key: string; label: string }
+    | { kind: "refused"; out: NicheResolution }
+  > {
+    if (i.designId) {
+      const d = await designById(tx, ctx.companyId, i.designId);
+      if (!d) throw new ORPCError("NOT_FOUND", { message: "design not found" });
+      const [top] = await topDesigns(tx, ctx.companyId, 50).then((all) =>
+        all.filter((x) => x.id === d.id),
+      );
+      return { kind: "designs", designs: [{ ...d, channel: top?.channel ?? null }] };
+    }
+    if (i.niche) {
+      const r = await resolveNiche(ctx.companyId, i.niche, lang);
+      return r.kind === "key"
+        ? { kind: "niche", key: r.key, label: r.label }
+        : { kind: "refused", out: r };
+    }
+    return { kind: "designs", designs: await topDesigns(tx, ctx.companyId, MARKET_TOP_DESIGNS) };
+  }
+
+  return [
+    tool(
+      "get_market_trend",
+      "Market trend for one of the shop's designs, a niche, or (with neither) the shop's top designs: trend class (rising, falling, flat, insufficient), 4-week growth and year-over-year as ratios per source with source, date and a mock flag, confidence band, a disagreement flag when own sales and outside interest differ, stale flag, and up to 3 recommendations with fixed actions. Reads stored signals only.",
+      z.object({ ...Subject, lang: Lang }),
+      (i, lang) =>
+        withTenant(ctx.companyId, async (tx) => {
+          const subj = await subjects(tx, i, lang);
+          if (subj.kind === "refused") return nicheRefusal("get_market_trend", subj.out, lang);
+          const targets: Target[] =
+            subj.kind === "niche"
+              ? [{ label: subj.label, input: { niche: subj.key }, design: null }]
+              : subj.designs.map((d) => ({ label: d.name, input: { designId: d.id }, design: d }));
+          const rows = await inOrder(targets.slice(0, MAX_ROWS), async (t) => {
+            const s = await market.getTrendSignal(tx, ctx, t.input);
+            return {
+              design: t.design ? { id: t.design.id, name: t.design.name } : null,
+              niche: subj.kind === "niche" ? subj.key : (s.subject.niche ?? null),
+              label: t.label,
+              trend: s.trend,
+              growth4w: s.growth4w,
+              yoy: s.yoy,
+              windowWeeks: s.windowWeeks,
+              disagreement: s.disagreement,
+              insufficientReason: s.insufficientReason,
+              confidence: s.confidence,
+              band: s.band,
+              stale: s.stale,
+              mock: s.mock,
+              readings: s.readings.slice(0, 6).map((r) => ({
+                source: r.provenance.source,
+                asOf: r.provenance.asOf,
+                mock: r.provenance.mock,
+                trend: r.trend,
+                growth4w: r.growth4w,
+                yoy: r.yoy,
+                n: r.n,
+                insufficientReason: r.insufficientReason,
+              })),
+              sources: s.sources.map(sourceRef),
+            };
+          });
+          const recs = await recsFor(tx, ctx, ["R4", "R5"], {
+            niche: subj.kind === "niche" ? subj.key : undefined,
+            designIds: subj.kind === "designs" ? subj.designs.map((d) => d.id) : undefined,
+          });
+          const line = (r: (typeof rows)[number]) => {
+            if (r.trend === "insufficient")
+              return `**${r.label}**: ${MARKET_COPY.notEnough[lang]} (${INSUFFICIENT[r.insufficientReason ?? "no_source"]?.[lang] ?? ""}).`;
+            const g = signedRatio(r.growth4w);
+            const y = signedRatio(r.yoy);
+            const head = `**${r.label}**: ${TREND_WORD[r.trend]?.[lang]}${g ? `, ${g} ${lang === "es" ? "en 4 semanas" : "over 4 weeks"}` : ""}${y ? `, ${y} ${lang === "es" ? "contra el año pasado" : "year over year"}` : ""} (${BAND_COPY[r.band][lang]}).`;
+            const readings = r.readings
+              .map(
+                (x) =>
+                  `${sourceLine(x, lang)}: ${TREND_WORD[x.trend]?.[lang]}${x.growth4w != null ? ` ${signedRatio(x.growth4w)}` : ""}`,
+              )
+              .join("; ");
+            return [
+              head,
+              readings ? `${readings}.` : "",
+              r.disagreement ? MARKET_COPY.disagreeNote[lang] : "",
+              r.stale ? MARKET_COPY.staleNote[lang] : "",
+            ]
+              .filter(Boolean)
+              .join(" ");
+          };
+          const counts = ["rising", "falling", "flat", "insufficient"].map(
+            (c) => rows.filter((r) => r.trend === c).length,
+          );
+          return marketOutput(
+            {
+              data: { rows, lang },
+              summary: `Market trend: ${counts[0]} rising, ${counts[1]} falling, ${counts[2]} flat, ${counts[3]} not enough data`,
+              answer: rows.length
+                ? rows.map(line).join("\n")
+                : lang === "es"
+                  ? "Todavía no tienes diseños con ventas para medir."
+                  : "You don't have designs with sales to measure yet.",
+            },
+            rows,
+            recs,
+            lang,
+          );
+        }),
+    ),
+    tool(
+      "get_seasonality",
+      "Seasonality for one of the shop's designs, a niche, or (with neither) the shop's top designs: monthly index (1.0 = average month), peak and off months, the act-by date from the shop's lead time, which series the index came from (own, outside, or the Census prior for all US clothing stores), source and date, stale and mock flags, and up to 3 seasonal-prep recommendations. Reads stored signals only.",
+      z.object({ ...Subject, lang: Lang }),
+      (i, lang) =>
+        withTenant(ctx.companyId, async (tx) => {
+          const subj = await subjects(tx, i, lang);
+          if (subj.kind === "refused") return nicheRefusal("get_seasonality", subj.out, lang);
+          const targets: Target[] =
+            subj.kind === "niche"
+              ? [{ label: subj.label, input: { niche: subj.key }, design: null }]
+              : subj.designs.map((d) => ({ label: d.name, input: { designId: d.id }, design: d }));
+          const rows = await inOrder(targets.slice(0, MAX_ROWS), async (t) => {
+            const s = await market.getSeasonalitySignal(tx, ctx, t.input);
+            return {
+              design: t.design ? { id: t.design.id, name: t.design.name } : null,
+              niche: subj.kind === "niche" ? subj.key : (s.subject.niche ?? null),
+              label: t.label,
+              index: s.index.map((m) => ({ month: m.month, index: m.index })),
+              peakMonths: s.peakMonths,
+              offMonths: s.offMonths,
+              indexSource: s.indexSource,
+              actBy: s.actBy,
+              yearsUsed: s.yearsUsed,
+              confidence: s.confidence,
+              band: s.band,
+              stale: s.stale,
+              mock: s.mock,
+              sources: s.sources.map(sourceRef),
+            };
+          });
+          const recs = await recsFor(tx, ctx, ["R1"], {
+            niche: subj.kind === "niche" ? subj.key : undefined,
+            designIds: subj.kind === "designs" ? subj.designs.map((d) => d.id) : undefined,
+          });
+          const months = (ms: number[]) => ms.map((m) => monthName(m, lang)).join(", ");
+          const line = (r: (typeof rows)[number]) => {
+            if (!r.indexSource || !r.index.length)
+              return `**${r.label}**: ${MARKET_COPY.notEnough[lang]}.`;
+            const from =
+              r.indexSource === "census_prior"
+                ? MARKET_COPY.seasonCensus[lang]
+                : r.indexSource === "own"
+                  ? lang === "es"
+                    ? "tus propias ventas"
+                    : "your own sales"
+                  : lang === "es"
+                    ? "interés de afuera"
+                    : "outside interest";
+            const src = r.sources.map((x) => sourceLine(x, lang)).join("; ");
+            const peak = r.peakMonths.length
+              ? `${lang === "es" ? "temporada alta en" : "peaks in"} ${months(r.peakMonths)}`
+              : lang === "es"
+                ? "sin un mes pico claro"
+                : "no clear peak month";
+            const off = r.offMonths.length
+              ? `; ${lang === "es" ? "meses bajos" : "off months"}: ${months(r.offMonths)}`
+              : "";
+            const act = r.actBy
+              ? ` ${lang === "es" ? "Actúa antes del" : "Act by"} ${r.actBy.date}: ${Math.round(r.actBy.weeksToPeak)} ${lang === "es" ? "semanas al pico, tu tiempo de producción es" : "weeks to the peak, your lead time is"} ${Math.round(r.actBy.leadTimeWeeks)} ${lang === "es" ? "semanas" : "weeks"}.${r.actBy.actNow ? (lang === "es" ? " Hazlo ya." : " Act now.") : ""}`
+              : "";
+            return [
+              `**${r.label}**: ${peak}${off} (${from}; ${src}; ${BAND_COPY[r.band][lang]}).${act}`,
+              r.stale ? MARKET_COPY.staleNote[lang] : "",
+            ]
+              .filter(Boolean)
+              .join(" ");
+          };
+          return marketOutput(
+            {
+              data: { rows, lang },
+              summary: `Seasonality: ${rows.filter((r) => r.peakMonths.length).length} of ${rows.length} with a peak, ${rows.filter((r) => r.actBy?.actNow).length} to act on now`,
+              answer: rows.length
+                ? rows.map(line).join("\n")
+                : lang === "es"
+                  ? "Todavía no tienes diseños para revisar."
+                  : "You don't have designs to check yet.",
+            },
+            rows,
+            recs,
+            lang,
+          );
+        }),
+    ),
+    tool(
+      "get_price_position",
+      "Where one design's price sits among comparable listings on a channel: percentile (0..1), band (low, market, premium), Q1, median and Q3 in cents, the number of comparables, source and date, mock flag. Without a designId it uses the shop's best-selling design on that channel; without a channel, that design's main channel. `available: false` with a reason when no approved price source exists (Etsy, TikTok, Shopify), the channel isn't connected, or there are fewer than 8 comparables.",
+      z.object({
+        designId: Subject.designId,
+        channel: z.enum(CHANNELS).optional(),
+        lang: Lang,
+      }),
+      (i, lang) =>
+        withTenant(ctx.companyId, async (tx) => {
+          const d = await pickDesign(tx, i.designId, i.channel);
+          if (!d) return noDesigns("get_price_position", lang);
+          const p = await market.getPricePosition(tx, ctx, { designId: d.id, channel: d.channel });
+          const ch = channelLabel(d.channel);
+          const base = {
+            design: { id: d.id, name: d.name },
+            channel: d.channel,
+            available: p.available,
+            currentPriceCents: p.currentPriceCents,
+            n: p.n,
+            confidence: p.confidence,
+            band: p.band,
+            stale: p.stale,
+            mock: p.mock,
+            sources: p.sources.map(sourceRef),
+          };
+          const recs = p.available ? await recsFor(tx, ctx, ["R2"], { designIds: [d.id] }) : [];
+          const src = base.sources.map((x) => sourceLine(x, lang)).join("; ");
+          if (!p.available)
+            return marketOutput(
+              {
+                data: { ...base, reason: p.reason },
+                summary: `${d.name} on ${ch}: no price position (${p.reason.replace(/_/g, " ")})`,
+                answer: `**${d.name}, ${ch}**: ${fill(UNAVAILABLE[p.reason]?.[lang] ?? "", { channel: ch })}`,
+              },
+              [base],
+              recs,
+              lang,
+            );
+          const bandWord = {
+            low: { en: "low", es: "bajo" },
+            market: { en: "market", es: "de mercado" },
+            premium: { en: "premium", es: "alto" },
+          }[p.priceBand][lang];
+          return marketOutput(
+            {
+              data: {
+                ...base,
+                percentile: p.percentile,
+                priceBand: p.priceBand,
+                q1Cents: p.q1Cents,
+                medianCents: p.medianCents,
+                q3Cents: p.q3Cents,
+                featuredPriceCents: p.featuredPriceCents,
+                density: p.density,
+              },
+              summary: `${d.name} on ${ch}: ${p.priceBand} price band, ${p.n} comparables`,
+              answer:
+                lang === "es"
+                  ? `**${d.name}, ${ch}**: tu precio ${p.currentPriceCents != null ? money(p.currentPriceCents) : ""} está en el percentil ${Math.round(p.percentile * 100)} de ${p.n} publicaciones comparables (rango ${bandWord}). Q1 ${money(p.q1Cents)}, mediana ${money(p.medianCents)}, Q3 ${money(p.q3Cents)}. ${src}. ${BAND_COPY[p.band][lang]}.${p.stale ? ` ${MARKET_COPY.staleNote[lang]}` : ""}`
+                  : `**${d.name}, ${ch}**: your price ${p.currentPriceCents != null ? money(p.currentPriceCents) : ""} sits at the ${Math.round(p.percentile * 100)}th percentile of ${p.n} comparable listings (${bandWord} band). Q1 ${money(p.q1Cents)}, median ${money(p.medianCents)}, Q3 ${money(p.q3Cents)}. ${src}. ${BAND_COPY[p.band][lang]}.${p.stale ? ` ${MARKET_COPY.staleNote[lang]}` : ""}`,
+            },
+            [base],
+            recs,
+            lang,
+          );
+        }),
+    ),
+    tool(
+      "simulate_price",
+      "Margin at candidate prices for one design on a channel, from the shop's own trailing 90-day costs: per price the net per unit (cents) and margin %, break-even price, floor price (lowest price with at least 15% margin), and a price-response estimate or null (volume effect unknown). Optional `prices` in cents, at most 8. Without a designId it uses the shop's best-selling design; without a channel, that design's main channel. `incomplete` lists missing cost lines.",
+      z.object({
+        designId: Subject.designId,
+        channel: z.enum(CHANNELS).optional(),
+        prices: z
+          .array(z.number().int().positive().max(1_000_000))
+          .max(SIMULATE_MAX_PRICES)
+          .optional()
+          .describe("Candidate prices in cents, at most 8"),
+        lang: Lang,
+      }),
+      (i, lang) =>
+        withTenant(ctx.companyId, async (tx) => {
+          const d = await pickDesign(tx, i.designId, i.channel);
+          if (!d) return noDesigns("simulate_price", lang);
+          const s = await market.simulatePrice(tx, ctx, {
+            designId: d.id,
+            channel: d.channel,
+            prices: i.prices,
+          });
+          const ch = channelLabel(d.channel);
+          const rows = s.candidates.slice(0, MAX_ROWS).map((c) => ({
+            priceCents: c.priceCents,
+            origin: c.origin,
+            netPerUnitCents: c.netPerUnitCents,
+            marginPct: c.marginPct,
+            estimatedWeeklyUnits: c.estimatedWeeklyUnits,
+            estimatedWeeklyNetCents: c.estimatedWeeklyNetCents,
+          }));
+          const base = {
+            design: { id: d.id, name: d.name },
+            channel: d.channel,
+            currentPriceCents: s.currentPriceCents,
+            breakEvenCents: s.breakEvenCents,
+            floorPriceCents: s.floorPriceCents,
+            floorMarginPct: s.floorMarginPct,
+            priceResponse: s.priceResponse,
+            incomplete: s.incomplete,
+            missing: s.missing,
+            costBasis: s.costBasis,
+            rows,
+            confidence: s.confidence,
+            band: s.band,
+            stale: s.stale,
+            mock: s.mock,
+            sources: s.sources.map(sourceRef),
+          };
+          const recs = await recsFor(tx, ctx, ["R3"], { designIds: [d.id] });
+          const table = rows
+            .map(
+              (r) =>
+                `${money(r.priceCents)}: ${lang === "es" ? "neto" : "net"} ${money(r.netPerUnitCents)} ${lang === "es" ? "por unidad" : "per unit"}, ${r.marginPct.toFixed(1)}% ${lang === "es" ? "de margen" : "margin"}`,
+            )
+            .join("; ");
+          const floor =
+            s.floorPriceCents != null
+              ? ` ${lang === "es" ? "Precio mínimo" : "Floor price"} (${s.floorMarginPct.toFixed(1)}% ${lang === "es" ? "de margen" : "margin"}): ${money(s.floorPriceCents)}.`
+              : "";
+          const breakEven =
+            s.breakEvenCents != null
+              ? ` ${lang === "es" ? "Punto de equilibrio" : "Break-even"}: ${money(s.breakEvenCents)}.`
+              : "";
+          const volume = s.priceResponse
+            ? ` ${MARKET_COPY.estimate[lang]}: ${lang === "es" ? "elasticidad" : "elasticity"} ${s.priceResponse.elasticity.toFixed(2)}.`
+            : ` (${MARKET_COPY.volumeUnknown[lang]})`;
+          const missing = s.incomplete
+            ? ` ${lang === "es" ? "Faltan costos" : "Some costs are missing"} (${s.missing.join(", ").replace(/_/g, " ")}), ${lang === "es" ? "así que son estimaciones" : "so these are estimates"}.`
+            : "";
+          return marketOutput(
+            {
+              data: { ...base, lang },
+              summary: `${d.name} on ${ch}: ${rows.length} prices simulated${s.floorPriceCents != null ? `, floor ${money(s.floorPriceCents)}` : ""}`,
+              answer: `**${d.name}, ${ch}** (${lang === "es" ? "tus costos de 90 días" : "your 90-day costs"}): ${table}.${breakEven}${floor}${volume}${missing}`,
+            },
+            [base],
+            recs,
+            lang,
+          );
+        }),
+    ),
+  ];
+
+  /** The named design (with its main channel), or the shop's best seller on `channel`. */
+  async function pickDesign(tx: Tx, designId?: string, channel?: Channel) {
+    if (designId) {
+      const d = await designById(tx, ctx.companyId, designId);
+      if (!d) throw new ORPCError("NOT_FOUND", { message: "design not found" });
+      const main = (await topDesigns(tx, ctx.companyId, 50)).find((x) => x.id === d.id);
+      return { ...d, channel: channel ?? main?.channel ?? ("etsy" as Channel) };
+    }
+    const [top] = await topDesigns(tx, ctx.companyId, 1, channel);
+    if (!top) return null;
+    return { id: top.id, name: top.name, channel: channel ?? top.channel ?? ("etsy" as Channel) };
+  }
+}
+
+/** Runs `f` over `xs` one at a time (they share one transaction). */
+async function inOrder<T, R>(xs: T[], f: (x: T) => Promise<R>): Promise<R[]> {
+  const out: R[] = [];
+  for (const x of xs) out.push(await f(x));
+  return out;
+}
+
+function noDesigns(tool: string, lang: "en" | "es"): ToolOutput {
+  return {
+    data: { available: false, reason: "no_designs", rows: [] },
+    summary: `${tool}: no designs with sales`,
+    answer:
+      lang === "es"
+        ? "Todavía no tienes diseños con ventas en ese canal."
+        : "You don't have designs with sales on that channel yet.",
+    meta: { mock: false, sources: [], recommendations: [] },
+  };
 }

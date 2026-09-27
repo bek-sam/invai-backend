@@ -22,6 +22,13 @@ import {
   type AssistantStreamEvent,
   type AssistantTool,
 } from "./providers/types";
+import {
+  describeIssues,
+  fallbackAnswer,
+  MARKET_TOOL_NAMES,
+  type TurnToolOutput,
+  validateAnswer,
+} from "./validators/answer";
 
 /**
  * AI gateway. Every Claude call goes through here so it is metered per company (ai_jobs +
@@ -112,7 +119,8 @@ async function finishJob(
   const credits = tokensToCredits(result.usage);
   // A sample workspace's calls also come back with `model === MOCK_MODEL` (aiProvider() above),
   // so this stays 0 for them regardless of env.mocks.ai, and the spend counters never move.
-  const costCents = result.model === MOCK_MODEL ? 0 : tokensToCostCents(result.usage);
+  // Priced by the model that answered (the niche route runs on Haiku, B-45 price table).
+  const costCents = result.model === MOCK_MODEL ? 0 : tokensToCostCents(result.usage, result.model);
   await withTenant(meta.companyId, async (tx) => {
     await tx
       .update(aiJobs)
@@ -229,30 +237,90 @@ export async function* runAssistant(
 ): AsyncGenerator<AssistantStreamEvent, { credits: number; model: string; aiJobId: string }> {
   const provider = await aiProvider(meta.companyId);
   await assertSpend(meta, provider);
-  const clean = scrubAssistantRun(run);
+  const outputs: TurnToolOutput[] = [];
+  const clean = scrubAssistantRun({ ...run, tools: recordToolOutputs(run.tools, outputs) });
   const aiJobId = await startJob(
     meta,
     { prompt: promptRef(ASSISTANT_PROMPT), message: clean.message.slice(0, 500) },
     provider,
   );
   let text = "";
-  let usageSoFar: AssistantFinal["usage"] = { tokensIn: 0, tokensOut: 0, cacheReadTokens: 0 };
-  const gen = provider.assistant(clean, (u) => {
-    usageSoFar = u;
+  const zero = (): AssistantFinal["usage"] => ({ tokensIn: 0, tokensOut: 0, cacheReadTokens: 0 });
+  // Usage of finished passes (the first answer, when a regeneration follows) plus the live one.
+  let usageDone = zero();
+  let usageSoFar = zero();
+  const add = (a: AssistantFinal["usage"], b: AssistantFinal["usage"]) => ({
+    tokensIn: a.tokensIn + b.tokensIn,
+    tokensOut: a.tokensOut + b.tokensOut,
+    cacheReadTokens: a.cacheReadTokens + b.cacheReadTokens,
   });
+  const track = (u: AssistantFinal["usage"]) => {
+    usageSoFar = add(usageDone, u);
+  };
+  let gen = provider.assistant(clean, track);
   let settled = false;
   try {
+    // Answer guard (spec market-signals Step 6): once a market tool is called, the answer text is
+    // held back, checked against this turn's tool outputs, regenerated once on a failure and
+    // otherwise replaced by the tools' own answers. Other turns stream exactly as before.
+    let guarded = false;
+    let held = "";
     let step = await gen.next();
     while (!step.done) {
-      if (step.value.type === "text") text += step.value.text;
-      yield step.value;
+      const e = step.value;
+      if (e.type === "tool_call" && MARKET_TOOL_NAMES.has(e.name)) guarded = true;
+      if (e.type === "text" && guarded) held += e.text;
+      else {
+        if (e.type === "text") text += e.text;
+        yield e;
+      }
       step = await gen.next();
     }
+    let final = step.value;
+    if (guarded) {
+      const extra = { message: clean.message, context: clean.context };
+      let issues = validateAnswer(held, outputs, extra);
+      let outcome: "pass" | "regenerated" | "fallback" = "pass";
+      if (issues.length) {
+        usageDone = add(usageDone, final.usage);
+        const retry = {
+          ...clean,
+          context: `${clean.context ?? ""}\n\n${describeIssues(issues)}`.trim(),
+        };
+        const firstIssues = issues.map((i) => i.kind);
+        held = "";
+        gen = provider.assistant(retry, track);
+        let r = await gen.next();
+        // The second pass re-reads the same tools; its events stay internal (the UI already has
+        // the chips and vote cards from the first pass).
+        while (!r.done) {
+          if (r.value.type === "text") held += r.value.text;
+          r = await gen.next();
+        }
+        final = { ...r.value, usage: r.value.usage };
+        issues = validateAnswer(held, outputs, extra);
+        outcome = issues.length ? "fallback" : "regenerated";
+        if (issues.length) held = fallbackAnswer(outputs, clean.message);
+        log.warn("assistant answer failed the check", {
+          companyId: meta.companyId,
+          outcome,
+          firstIssues,
+          secondIssues: issues.map((i) => i.kind),
+        });
+      }
+      log.info("assistant answer check", { companyId: meta.companyId, outcome });
+      text += held;
+      if (held) yield { type: "text", text: held };
+    }
     settled = true;
-    const credits = await finishJob(meta, aiJobId, step.value, {
-      text: sanitizeText(text.slice(0, 4000)),
-    });
-    const result = { credits, model: step.value.model, aiJobId };
+    const usage = add(usageDone, final.usage);
+    const credits = await finishJob(
+      meta,
+      aiJobId,
+      { ...final, usage },
+      { text: sanitizeText(text.slice(0, 4000)) },
+    );
+    const result = { credits, model: final.model, aiJobId };
     onSettle?.(result);
     return result;
   } catch (err) {
@@ -273,6 +341,27 @@ export async function* runAssistant(
       onSettle?.({ credits, model, aiJobId });
     }
   }
+}
+
+/** Keeps each tool result of the turn (before the data envelope) for the answer check. */
+function recordToolOutputs(tools: AssistantTool[], into: TurnToolOutput[]): AssistantTool[] {
+  return tools.map((t) => ({
+    ...t,
+    run: async (input) => {
+      const out = await t.run(input);
+      into.push({
+        name: t.name,
+        data: out.data,
+        summary: out.summary,
+        answer: out.answer,
+        meta: out.meta,
+        forbiddenTerms: out.forbiddenTerms,
+      });
+      // Internal only: never sent to the model or the web.
+      const { forbiddenTerms: _f, ...rest } = out;
+      return rest;
+    },
+  }));
 }
 
 export { AiOutputError, AiRefusalError };

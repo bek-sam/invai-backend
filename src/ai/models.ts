@@ -6,20 +6,30 @@
 
 export type Effort = "low" | "medium" | "high";
 
-export type AiRoute = "listing_copy" | "trademark_judge" | "assistant";
+export type AiRoute = "listing_copy" | "trademark_judge" | "assistant" | "market_niche";
 
 export type RouteConfig = {
   model: string;
-  effort: Effort;
+  /**
+   * `output_config.effort`, or null for a model that rejects it (Haiku 4.5). A null-effort route
+   * also runs without thinking and without the refusal-fallback beta (Opus/Fable only).
+   */
+  effort: Effort | null;
   maxTokens: number;
 };
 
 export const DEFAULT_MODEL = "claude-opus-5";
+export const SONNET_MODEL = "claude-sonnet-5";
+export const HAIKU_MODEL = "claude-haiku-4-5";
 
 export const ROUTES: Record<AiRoute, RouteConfig> = {
   listing_copy: { model: DEFAULT_MODEL, effort: "medium", maxTokens: 16_000 },
   trademark_judge: { model: DEFAULT_MODEL, effort: "low", maxTokens: 4_000 },
   assistant: { model: DEFAULT_MODEL, effort: "high", maxTokens: 32_000 },
+  // Wave 18 (T-18-4, spec market-signals Step 2.2): one-label niche classification, a bulk route
+  // run by the nightly mapper only when stems don't match. Haiku per the wave plan (decision 0007
+  // bulk-route rule); real-model eval pending OI-8. Output is `{niche, confidence}`, well under 512.
+  market_niche: { model: HAIKU_MODEL, effort: null, maxTokens: 512 },
 };
 
 /**
@@ -48,9 +58,6 @@ export function tokensToCredits(u: {
 }
 
 /* --------------------------------- price table --------------------------------- */
-
-export const SONNET_MODEL = "claude-sonnet-5";
-export const HAIKU_MODEL = "claude-haiku-4-5";
 
 /** Cents per million tokens, list price. */
 export type ModelPriceCents = {

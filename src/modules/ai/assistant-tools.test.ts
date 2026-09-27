@@ -1,4 +1,7 @@
-import { beforeAll, describe, expect, it } from "vitest";
+import type { MarketRecommendation, MarketTrend, SignalSource } from "@invai/contracts";
+import { eq } from "drizzle-orm";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { MARKET_COPY } from "../../ai/market-copy";
 import { planAssistantCalls } from "../../ai/providers/mock";
 import type { ToolOutput } from "../../ai/providers/types";
 import { withSystem } from "../../db/client";
@@ -15,8 +18,58 @@ import {
   refundEvents,
   reprints,
 } from "../../db/schema";
-import { createCompany, createUser, tenantContext } from "../../test/fixtures";
+import { createCompany, createConnection, createUser, tenantContext } from "../../test/fixtures";
+import * as market from "../market/service";
 import { assistantTools, previousPeriod } from "./assistant-tools";
+
+// T-18-4: the market service (T-18-3's unit) is replaced by contract-shaped fixtures in the
+// "market tools" block below; the taxonomy is a small fixed list. Nothing above uses it.
+vi.mock("../market/service", async (importOriginal) => {
+  const real = await importOriginal<typeof import("../market/service")>();
+  const NICHES = [
+    {
+      key: "halloween",
+      family: "Holidays",
+      labelEn: "Halloween",
+      labelEs: "Halloween",
+      stems: [],
+      queries: [],
+      peakMonths: [10],
+    },
+    {
+      key: "dog-mom",
+      family: "Family",
+      labelEn: "Dog mom",
+      labelEs: "Mamá de perro",
+      stems: [],
+      queries: [],
+      peakMonths: [],
+    },
+    {
+      key: "camping",
+      family: "Hobbies",
+      labelEn: "Camping",
+      labelEs: "Campamento",
+      stems: [],
+      queries: [],
+      peakMonths: [],
+    },
+  ];
+  return {
+    ...real,
+    NICHES,
+    nicheLabel: (key: string, lang: "en" | "es") => {
+      const n = NICHES.find((x) => x.key === key);
+      return n ? (lang === "es" ? n.labelEs : n.labelEn) : key;
+    },
+    getTrendSignal: vi.fn(),
+    getSeasonalitySignal: vi.fn(),
+    getPricePosition: vi.fn(),
+    simulatePrice: vi.fn(),
+    listRecommendations: vi.fn(),
+    recordRecommendationsShown: vi.fn(),
+  };
+});
 
 /*
  * T-17-2 analyst tools, checked against hand-built fixtures: every expected number below is
@@ -830,5 +883,493 @@ describe("mock routing for the analyst tools", () => {
     });
     const [ch] = planAssistantCalls("and only Etsy, this week vs last week?", now);
     expect(ch?.input.channel).toBe("etsy");
+  });
+});
+
+/* ============================ market tools (T-18-4) ============================ */
+
+/*
+ * The four market tools against fixture signals shaped by the contract (`MarketTrend`, ...).
+ * The market service (T-18-3's unit) is replaced by fixtures here; the designs, sales and
+ * tenancy are real rows in the test DB. QA's `market.acceptance.test.ts` covers the real engine.
+ */
+
+const AS_OF = "2026-09-20T00:00:00.000Z";
+const prov = (source: SignalSource, mock: boolean) => ({
+  source,
+  licence: source === "own" ? ("first_party" as const) : ("official_api" as const),
+  asOf: AS_OF,
+  fetchedAt: AS_OF,
+  mock,
+});
+const subjectOf = (i: { designId: string } | { niche: string }) => ({
+  designId: "designId" in i ? i.designId : null,
+  designName: null,
+  niche: "niche" in i ? i.niche : null,
+});
+function trendFixture(
+  i: { designId: string } | { niche: string },
+  over: Partial<MarketTrend> = {},
+): MarketTrend {
+  return {
+    subject: subjectOf(i),
+    confidence: 0.8,
+    band: "high",
+    stale: false,
+    mock: true,
+    sources: [prov("own", false), prov("google_trends", true)],
+    asOf: AS_OF,
+    trend: "rising",
+    growth4w: 0.1834,
+    yoy: 0.05,
+    windowWeeks: 26,
+    readings: [
+      {
+        provenance: prov("own", false),
+        trend: "rising",
+        growth4w: 0.21,
+        yoy: null,
+        n: 26,
+        insufficientReason: null,
+      },
+      {
+        provenance: prov("google_trends", true),
+        trend: "rising",
+        growth4w: 0.12,
+        yoy: 0.05,
+        n: 26,
+        insufficientReason: null,
+      },
+    ],
+    disagreement: false,
+    insufficientReason: null,
+    ...over,
+  };
+}
+function rec(
+  rule: MarketRecommendation["rule"],
+  over: Partial<MarketRecommendation> = {},
+): MarketRecommendation {
+  return {
+    id: crypto.randomUUID(),
+    rule,
+    action: "price_test_up",
+    target: { designId: null, designName: "Retro Camping Bear", niche: null, channel: "amazon" },
+    params: {
+      designName: "Retro Camping Bear",
+      channel: "amazon",
+      testPriceMinCents: 1364,
+      testPriceMaxCents: 1429,
+      floorPriceCents: 2249,
+      niche: "camping",
+    },
+    confidence: 0.55,
+    band: "medium",
+    mock: true,
+    sources: [prov("amazon_pricing", true)],
+    evidenceSignalIds: [],
+    stale: false,
+    shownIn: null,
+    shownAt: null,
+    vote: null,
+    votedAt: null,
+    adoptedAt: null,
+    outcome: null,
+    createdAt: AS_OF,
+    ...over,
+  };
+}
+
+describe("market tools (T-18-4)", () => {
+  const m = vi.mocked(market);
+  type MarketShop = { ctx: ReturnType<typeof tenantContext>; designIds: string[] };
+  let a: MarketShop;
+  let b: MarketShop;
+  const run = (ctx: MarketShop["ctx"], name: string, input: Record<string, unknown> = {}) => {
+    const tool = assistantTools(ctx).find((t) => t.name === name);
+    if (!tool) throw new Error(`no tool ${name}`);
+    return tool.run(input);
+  };
+
+  async function marketShop(names: string[]): Promise<MarketShop> {
+    const co = await createCompany();
+    const owner = await createUser(co.id, "owner");
+    const conn = await createConnection(co.id, "etsy");
+    const ids: string[] = [];
+    for (const [k, name] of names.entries()) {
+      const [d] = await withSystem((tx) =>
+        tx
+          .insert(designs)
+          .values({ companyId: co.id, code: `MT-${uniq++}`, name, tags: [] })
+          .returning(),
+      );
+      if (!d) throw new Error("design insert failed");
+      ids.push(d.id);
+      // Recent sales (inside the 90-day window), more for the earlier names.
+      for (let u = 0; u < names.length - k; u++)
+        await sale(co.id, conn.id, {
+          channel: "etsy",
+          designId: d.id,
+          placedAt: new Date(Date.now() - (5 + u) * 86_400_000).toISOString(),
+          revenue: 2499,
+          net: 900,
+        });
+    }
+    return { ctx: tenantContext(co.id, owner.id, "owner"), designIds: ids };
+  }
+
+  beforeAll(async () => {
+    a = await marketShop(["Spooky Pumpkin Ghost", "Witch Please"]);
+    b = await marketShop(["Other Shop Tee"]);
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    m.getTrendSignal.mockImplementation(async (_tx, _ctx, i) => trendFixture(i));
+    m.listRecommendations.mockResolvedValue([]);
+  });
+
+  it("AC10 tenancy: each shop's shop-wide answer reads only its own designs, inside its own tenant", async () => {
+    const outA = await run(a.ctx, "get_market_trend");
+    const rowsA = (outA.data as { rows: { design: { id: string } }[] }).rows;
+    expect(rowsA.map((r) => r.design.id)).toEqual(a.designIds);
+    for (const [, ctx, input] of m.getTrendSignal.mock.calls) {
+      expect(ctx.companyId).toBe(a.ctx.companyId);
+      expect(b.designIds).not.toContain((input as { designId?: string }).designId);
+    }
+    m.getTrendSignal.mockClear();
+    const outB = await run(b.ctx, "get_market_trend");
+    expect(
+      (outB.data as { rows: { design: { id: string } }[] }).rows.map((r) => r.design.id),
+    ).toEqual(b.designIds);
+    for (const [, ctx] of m.getTrendSignal.mock.calls) expect(ctx.companyId).toBe(b.ctx.companyId);
+    // Another shop's design id is not found, never read.
+    m.getTrendSignal.mockClear();
+    const cross = await run(a.ctx, "get_market_trend", { designId: b.designIds[0] });
+    expect(cross.data).toEqual({ error: "not_found" });
+    expect(m.getTrendSignal).not.toHaveBeenCalled();
+    const price = await run(a.ctx, "simulate_price", { designId: b.designIds[0] });
+    expect(price.data).toEqual({ error: "not_found" });
+  });
+
+  it("AC2: source and date on every outside fact, 'Sample data' on mock ones, provenance on the event", async () => {
+    const out = await run(a.ctx, "get_market_trend");
+    expect(out.answer).toContain("Google Trends, as of 2026-09-20 (Sample data)");
+    expect(out.answer).toContain("+18.3% over 4 weeks");
+    expect(out.meta?.mock).toBe(true);
+    expect(out.meta?.sources).toEqual([
+      { source: "own", asOf: AS_OF, mock: false },
+      { source: "google_trends", asOf: AS_OF, mock: true },
+    ]);
+    const rows = (out.data as { rows: unknown[] }).rows;
+    expect(rows.length).toBeLessThanOrEqual(20);
+    // Whitelisted fields only: no licence, fetchedAt or anything a provider might carry.
+    expect(JSON.stringify(out.data)).not.toMatch(/licence|fetchedAt|seller/);
+  });
+
+  it("AC7, AC8, AC10: insufficient says what is missing; disagreement names both ways; stale adds the note", async () => {
+    m.getTrendSignal.mockImplementation(async (_tx, _ctx, i) =>
+      "designId" in i && i.designId === a.designIds[0]
+        ? trendFixture(i, {
+            trend: "insufficient",
+            growth4w: null,
+            yoy: null,
+            insufficientReason: "too_few_points",
+            band: "low",
+            readings: [],
+          })
+        : trendFixture(i, {
+            stale: true,
+            disagreement: true,
+            readings: [
+              {
+                provenance: prov("own", false),
+                trend: "rising",
+                growth4w: 0.2,
+                yoy: null,
+                n: 26,
+                insufficientReason: null,
+              },
+              {
+                provenance: prov("google_trends", true),
+                trend: "falling",
+                growth4w: -0.16,
+                yoy: null,
+                n: 26,
+                insufficientReason: null,
+              },
+            ],
+          }),
+    );
+    const out = await run(a.ctx, "get_market_trend");
+    expect(out.answer).toContain(
+      "**Spooky Pumpkin Ghost**: Not enough data (fewer than 13 weekly points).",
+    );
+    expect(out.answer).toMatch(
+      /Your sales, as of 2026-09-20: rising \+20\.0%; Google Trends, as of 2026-09-20 \(Sample data\): falling -16\.0%/,
+    );
+    expect(out.answer).toContain(MARKET_COPY.disagreeNote.en);
+    expect(out.answer).toContain(MARKET_COPY.staleNote.en);
+    expect(out.meta?.recommendations).toEqual([]);
+  });
+
+  it("AC3 recommendations: at most 3, only the tool's rules and medium band or better, fixed action + band + rec.sample", async () => {
+    const recs = [
+      rec("R4", {
+        params: { niche: "camping" },
+        target: {
+          designId: a.designIds[0] ?? null,
+          designName: null,
+          niche: "camping",
+          channel: null,
+        },
+      }),
+      rec("R5", {
+        target: {
+          designId: a.designIds[1] ?? null,
+          designName: "Witch Please",
+          niche: null,
+          channel: null,
+        },
+        params: { designName: "Witch Please" },
+        band: "high",
+        mock: false,
+        sources: [prov("own", false)],
+      }),
+      rec("R5", {
+        target: { designId: a.designIds[0] ?? null, designName: null, niche: null, channel: null },
+        params: { designName: "Spooky Pumpkin Ghost" },
+      }),
+      rec("R4", {
+        target: { designId: a.designIds[1] ?? null, designName: null, niche: null, channel: null },
+        band: "low",
+      }),
+      rec("R2", {
+        target: {
+          designId: a.designIds[0] ?? null,
+          designName: null,
+          niche: null,
+          channel: "amazon",
+        },
+      }),
+      rec("R5", {
+        target: { designId: b.designIds[0] ?? null, designName: null, niche: null, channel: null },
+      }),
+    ];
+    m.listRecommendations.mockResolvedValue(recs);
+    const out = await run(a.ctx, "get_market_trend");
+    const shown = out.meta?.recommendations ?? [];
+    expect(shown).toHaveLength(3);
+    expect(shown.map((r) => r.rule)).toEqual(["R4", "R5", "R5"]);
+    expect(shown.map((r) => r.id)).toEqual([recs[0]?.id, recs[1]?.id, recs[2]?.id]);
+    expect(out.answer).toContain("Make 1–2 new designs for the Camping niche.");
+    expect(out.answer).toContain(
+      "Pause ads on Witch Please and move it down your list. (Your sales, as of 2026-09-20) High confidence.",
+    );
+    expect(out.answer).toContain(`Medium confidence: test it. ${MARKET_COPY.sample.en}`);
+    expect(m.listRecommendations.mock.calls[0]?.[2]).toMatchObject({ minBand: "medium" });
+  });
+
+  it("AC31: a trademark-screened niche gets the fixed line, no lookup, no signal, no echo", async () => {
+    const out = await run(a.ctx, "get_market_trend", { niche: "Disney" });
+    expect(out.answer).toBe(MARKET_COPY.tmDropped.en);
+    expect(out.data).toEqual({ available: false, reason: "trademark_screen", rows: [] });
+    expect(out.summary.toLowerCase()).not.toContain("disney");
+    expect(out.meta?.sources).toEqual([]);
+    expect(out.forbiddenTerms).toEqual(["Disney"]);
+    expect(m.getTrendSignal).not.toHaveBeenCalled();
+    const es = await run(a.ctx, "get_seasonality", { niche: "Disney", lang: "es" });
+    expect(es.answer).toBe(MARKET_COPY.tmDropped.es);
+  });
+
+  it("a niche named by label resolves to its key; an unknown one is refused without a lookup", async () => {
+    m.getSeasonalitySignal.mockImplementation(async (_tx, _ctx, i) => ({
+      subject: subjectOf(i),
+      confidence: 0.6,
+      band: "medium",
+      stale: false,
+      mock: false,
+      sources: [prov("census", false)],
+      asOf: AS_OF,
+      index: Array.from({ length: 12 }, (_, k) => ({ month: k + 1, index: k === 9 ? 1.6 : 0.95 })),
+      peakMonths: [10],
+      offMonths: [],
+      indexSource: "census_prior",
+      actBy: {
+        date: "2026-09-07",
+        peakMonth: 10,
+        weeksToPeak: 6.4,
+        leadTimeWeeks: 4,
+        actNow: true,
+      },
+      yearsUsed: 10,
+    }));
+    const out = await run(a.ctx, "get_seasonality", { niche: "Halloween" });
+    expect(m.getSeasonalitySignal.mock.calls[0]?.[2]).toEqual({ niche: "halloween" });
+    expect(out.answer).toBe(
+      "**Halloween**: peaks in October (All US clothing stores, not specific to your niche; US Census retail trade, as of 2026-09-20; Medium confidence: test it). Act by 2026-09-07: 6 weeks to the peak, your lead time is 4 weeks. Act now.",
+    );
+    const unknown = await run(a.ctx, "get_seasonality", { niche: "Sunset Palms" });
+    expect((unknown.data as { reason: string }).reason).toBe("unknown_niche");
+  });
+
+  it("AC6: Etsy price position is unavailable with the fixed reason; Spanish copy when lang is es", async () => {
+    m.getPricePosition.mockImplementation(async (_tx, _ctx, i) => ({
+      subject: { designId: i.designId, designName: null, niche: null },
+      confidence: 0,
+      band: "low",
+      stale: false,
+      mock: false,
+      sources: [],
+      asOf: AS_OF,
+      channel: i.channel,
+      currentPriceCents: 2499,
+      n: 0,
+      available: false,
+      reason: "no_compliant_source",
+    }));
+    const out = await run(a.ctx, "get_price_position");
+    expect(m.getPricePosition.mock.calls[0]?.[2]).toEqual({
+      designId: a.designIds[0],
+      channel: "etsy",
+    });
+    expect(out.data).toMatchObject({
+      available: false,
+      reason: "no_compliant_source",
+      currentPriceCents: 2499,
+    });
+    expect(out.answer).toBe(
+      "**Spooky Pumpkin Ghost, Etsy**: There's no approved price source for Etsy yet.",
+    );
+    const es = await run(a.ctx, "get_price_position", { lang: "es" });
+    expect(es.answer).toContain("Todavía no hay una fuente de precios aprobada para Etsy.");
+  });
+
+  it("simulate_price: at most 8 candidate prices, money in cents in data and dollars in the answer", async () => {
+    m.simulatePrice.mockImplementation(async (_tx, _ctx, i) => ({
+      subject: { designId: i.designId, designName: null, niche: null },
+      confidence: 0.9,
+      band: "high",
+      stale: false,
+      mock: false,
+      sources: [prov("own", false)],
+      asOf: AS_OF,
+      channel: i.channel,
+      currentPriceCents: 1999,
+      costBasis: {
+        unitCostCents: 595,
+        shippingChargedCents: 0,
+        adsPerUnitCents: 290,
+        refundRate: 0,
+        feePct: 6.5,
+        feeFixedCents: 20,
+        periodDays: 90,
+      },
+      candidates: [
+        {
+          priceCents: 1999,
+          origin: "current",
+          netPerUnitCents: 239,
+          marginPct: 11.96,
+          estimatedWeeklyUnits: null,
+          estimatedWeeklyNetCents: null,
+        },
+        {
+          priceCents: 2199,
+          origin: "plus_10",
+          netPerUnitCents: 426,
+          marginPct: 19.37,
+          estimatedWeeklyUnits: null,
+          estimatedWeeklyNetCents: null,
+        },
+      ],
+      breakEvenCents: 1745,
+      floorPriceCents: 2105,
+      floorMarginPct: 15,
+      priceResponse: null,
+      incomplete: false,
+      missing: [],
+    }));
+    await expect(
+      run(a.ctx, "simulate_price", { prices: [1, 2, 3, 4, 5, 6, 7, 8, 9] }),
+    ).rejects.toThrow();
+    const out = await run(a.ctx, "simulate_price", { prices: [1999, 2199] });
+    expect(m.simulatePrice.mock.calls[0]?.[2]).toEqual({
+      designId: a.designIds[0],
+      channel: "etsy",
+      prices: [1999, 2199],
+    });
+    expect(
+      (out.data as { rows: { netPerUnitCents: number }[] }).rows.map((r) => r.netPerUnitCents),
+    ).toEqual([239, 426]);
+    expect(out.answer).toBe(
+      "**Spooky Pumpkin Ghost, Etsy** (your 90-day costs): $19.99: net $2.39 per unit, 12.0% margin; $21.99: net $4.26 per unit, 19.4% margin. Break-even: $17.45. Floor price (15.0% margin): $21.05. (volume effect unknown)",
+    );
+  });
+
+  it("AC16: the tools write nothing (no business row changes, no 'shown' write from a tool)", async () => {
+    const snapshot = () =>
+      withSystem(async (tx) => ({
+        designs: (await tx.select().from(designs).where(eq(designs.companyId, a.ctx.companyId)))
+          .length,
+        profit: (
+          await tx.select().from(profitLines).where(eq(profitLines.companyId, a.ctx.companyId))
+        ).length,
+        orders: (await tx.select().from(orders).where(eq(orders.companyId, a.ctx.companyId)))
+          .length,
+        listings: (await tx.select().from(listings).where(eq(listings.companyId, a.ctx.companyId)))
+          .length,
+      }));
+    const before = await snapshot();
+    for (const name of [
+      "get_market_trend",
+      "get_seasonality",
+      "get_price_position",
+      "simulate_price",
+    ])
+      await run(a.ctx, name);
+    expect(await snapshot()).toEqual(before);
+    expect(m.recordRecommendationsShown).not.toHaveBeenCalled();
+  });
+
+  it("a market service failure becomes a plain tool answer, not a broken turn", async () => {
+    m.getTrendSignal.mockRejectedValue(new Error("boom"));
+    const out = await run(a.ctx, "get_market_trend", { lang: "es" });
+    expect(out.data).toEqual({ error: "unavailable" });
+    expect(out.answer).toMatch(/^Los datos del mercado no están disponibles/);
+  });
+
+  it("AC8 mock routing: trend, season and price words reach the market tools, with language and niche", () => {
+    const now = new Date("2026-09-27T12:00:00Z");
+    const plan = (q: string) => planAssistantCalls(q, now);
+    expect(plan("Which of my designs are trending?")).toEqual([
+      { tool: "get_market_trend", input: { lang: "en" } },
+    ]);
+    expect(plan("¿Cuáles de mis diseños están en tendencia?")).toEqual([
+      { tool: "get_market_trend", input: { lang: "es" } },
+    ]);
+    expect(plan("When should I get ready for Halloween?")).toEqual([
+      { tool: "get_seasonality", input: { niche: "halloween", lang: "en" } },
+    ]);
+    expect(plan("When should I get ready for the holidays?")).toEqual([
+      { tool: "get_seasonality", input: { lang: "en" } },
+    ]);
+    expect(plan("¿Cuándo debo prepararme para las fiestas? temporada")[0]?.tool).toBe(
+      "get_seasonality",
+    );
+    expect(plan("Am I priced right on Amazon?").map((c) => [c.tool, c.input.channel])).toEqual([
+      ["get_price_position", "amazon"],
+      ["simulate_price", "amazon"],
+    ]);
+    expect(plan("¿Mi precio en Amazon está bien?").map((c) => c.input.lang)).toEqual(["es", "es"]);
+    expect(plan("Is the Dog Mom niche trending?")).toEqual([
+      { tool: "get_market_trend", input: { niche: "Dog Mom", lang: "en" } },
+    ]);
+    expect(plan("How is the Disney niche doing?")[0]?.input.niche).toBe("Disney");
+    expect(plan("¿Cómo va el nicho Disney?")[0]?.input).toEqual({ niche: "Disney", lang: "es" });
+    // Wave 17 routing is unchanged for its own words.
+    expect(plan("How much profit did I make last week?").map((c) => c.tool)).toEqual([
+      "get_profit",
+    ]);
   });
 });

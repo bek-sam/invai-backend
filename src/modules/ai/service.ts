@@ -8,7 +8,7 @@ import type {
   TrademarkCheck,
   ValidationResult,
 } from "@invai/contracts";
-import { CHANNEL_RULES } from "@invai/contracts";
+import { CHANNEL_RULES, RecommendationRef } from "@invai/contracts";
 import { ORPCError } from "@orpc/server";
 import { and, asc, desc, eq, gte, ilike, inArray, lte, or, type SQL, sql } from "drizzle-orm";
 import type { z } from "zod";
@@ -43,6 +43,7 @@ import { emit } from "../../lib/outbox";
 import { keyset, type PageInput } from "../../lib/pagination";
 import { publish } from "../../lib/realtime";
 import { objectKey, presignGet, putObject } from "../../lib/s3";
+import { recordRecommendationsShown } from "../market/service";
 import { assistantTools } from "./assistant-tools";
 import { assertTrademarkGate, checkTrademarks, type TmInput } from "./trademark";
 
@@ -1227,6 +1228,9 @@ export async function* ask(
   yield { type: "start", conversationId, messageId };
   let text = "";
   const toolCalls: { name: string; input: Record<string, unknown>; summary?: string }[] = [];
+  // Wave 18: recommendations shown in this turn's tool results (vote cards) and the mock flag.
+  const shown = new Map<string, RecommendationRef>();
+  let turnMock = false;
   let credits = 0;
   let failed = false;
   // `settled` mirrors gateway.ts's `runAssistant`: false only means this generator itself was torn
@@ -1273,7 +1277,17 @@ export async function* ask(
       } else {
         const call = [...toolCalls].reverse().find((c) => c.name === e.name && !c.summary);
         if (call) call.summary = e.summary;
-        yield { type: "tool_result", name: e.name, summary: e.summary };
+        const recs = (e.meta?.recommendations ?? []).slice(0, 3);
+        for (const r of recs) shown.set(r.id, r);
+        if (e.meta?.mock) turnMock = true;
+        yield {
+          type: "tool_result",
+          name: e.name,
+          summary: e.summary,
+          ...(e.meta?.mock !== undefined ? { mock: e.meta.mock } : {}),
+          ...(e.meta?.sources ? { sources: e.meta.sources } : {}),
+          ...(e.meta ? { recommendations: recs } : {}),
+        };
       }
       step = await gen.next();
     }
@@ -1307,7 +1321,11 @@ export async function* ask(
           .update(assistantMessages)
           .set({
             text: sanitizeText(text),
-            toolCalls: sanitizeDeep({ calls: toolCalls }),
+            toolCalls: sanitizeDeep({
+              calls: toolCalls,
+              ...(shown.size ? { recommendations: [...shown.values()] } : {}),
+              ...(turnMock ? { mock: true } : {}),
+            }),
             creditsUsed: credits,
           })
           .where(eq(assistantMessages.id, messageId));
@@ -1317,6 +1335,22 @@ export async function* ask(
         .set({ updatedAt: new Date() })
         .where(eq(assistantConversations.id, conversationId));
     });
+    if (shown.size && !(failed && !text && !toolCalls.length)) {
+      // Once per turn (spec AC33): the market module stores where and when they were shown. Its
+      // own transaction, so a failure here never loses the answer that was already saved.
+      await withTenant(ctx.companyId, (tx) =>
+        recordRecommendationsShown(tx, ctx, {
+          ids: [...shown.keys()],
+          shownIn: "assistant",
+          refId: messageId,
+        }),
+      ).catch((err) =>
+        log.warn("could not record shown recommendations", {
+          companyId: ctx.companyId,
+          error: (err as Error).message,
+        }),
+      );
+    }
   }
   yield { type: "done", conversationId, messageId, creditsUsed: credits };
 }
@@ -1346,6 +1380,28 @@ export async function listConversations(tx: Tx, ctx: Ctx, input: PageInput) {
   );
 }
 
+/**
+ * Wave 18 (spec AC33): the recommendations an assistant message showed and its mock flag, read
+ * back from `assistant_messages.toolCalls`, so the vote cards survive a reload. Entries that don't
+ * parse are skipped; messages from before wave 18 get neither field.
+ */
+export function storedRecommendations(toolCalls: unknown): {
+  recommendations?: RecommendationRef[];
+  mock?: boolean;
+} {
+  const t = toolCalls as { recommendations?: unknown; mock?: unknown } | null;
+  const recs = Array.isArray(t?.recommendations)
+    ? t.recommendations.flatMap((r) => {
+        const p = RecommendationRef.safeParse(r);
+        return p.success ? [p.data] : [];
+      })
+    : [];
+  return {
+    ...(recs.length ? { recommendations: recs } : {}),
+    ...(t?.mock === true ? { mock: true } : {}),
+  };
+}
+
 export async function getConversation(tx: Tx, ctx: Ctx, id: string) {
   const [c] = await tx
     .select()
@@ -1370,6 +1426,7 @@ export async function getConversation(tx: Tx, ctx: Ctx, id: string) {
       role: m.role,
       text: m.text,
       createdAt: m.createdAt.toISOString(),
+      ...storedRecommendations(m.toolCalls),
     })),
     createdAt: c.createdAt.toISOString(),
     updatedAt: c.updatedAt.toISOString(),

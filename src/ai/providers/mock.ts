@@ -1,11 +1,14 @@
 import { CHANNEL_RULES, type Channel } from "@invai/contracts";
 import type { z } from "zod";
 import { logger } from "../../lib/log";
+import { detectLang } from "../market-copy";
 import { MOCK_MODEL } from "../models";
 import { resolvePeriod } from "../periods";
 import type {
   ListingCopy,
   ListingVars,
+  NicheClassification,
+  NicheVars,
   PromptDef,
   TrademarkJudgement,
   TrademarkJudgeVars,
@@ -252,11 +255,111 @@ function previousOf(
   return null;
 }
 
+/**
+ * Niche classification without a model: the niche whose key or label words all appear in the
+ * design's name and tags (most words wins), at 0.8; otherwise none at 0.2. Deterministic.
+ */
+export function mockNiche(v: NicheVars): NicheClassification {
+  const words = new Set(
+    [v.name, ...v.tags]
+      .join(" ")
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter(Boolean),
+  );
+  let best: { key: string; score: number } | null = null;
+  for (const n of v.niches) {
+    const parts = [
+      ...new Set([...n.key.split("-"), ...n.labelEn.toLowerCase().split(/[^a-z0-9]+/)]),
+    ].filter((w) => w.length > 1);
+    const need = n.key.split("-").filter(Boolean);
+    if (!need.length || !need.every((w) => words.has(w))) continue;
+    const score = parts.filter((w) => words.has(w)).length;
+    if (!best || score > best.score) best = { key: n.key, score };
+  }
+  return best ? { niche: best.key, confidence: 0.8 } : { niche: null, confidence: 0.2 };
+}
+
+const NICHE_STOP = new Set([
+  "the",
+  "a",
+  "an",
+  "is",
+  "how",
+  "my",
+  "for",
+  "about",
+  "el",
+  "la",
+  "del",
+  "de",
+]);
+
+/** A niche the user names: "the Dog Mom niche", "el nicho Disney", or a quoted "term". */
+export function nicheFromMessage(message: string): string | null {
+  const quoted = /["“”«]([^"“”»]{2,40})["“”»]/.exec(message);
+  if (quoted?.[1]) return quoted[1].trim();
+  const before = /((?:[\p{L}0-9'&-]+\s+){0,2}[\p{L}0-9'&-]+)\s+niche\b/iu.exec(message);
+  const after =
+    /\bnicho\s+(?:de\s+)?([\p{L}0-9'&-]+(?:\s+[\p{L}0-9'&-]+){0,2}?)\s*(?:[?.!,¿]|$)/iu.exec(
+      message,
+    );
+  const raw = before?.[1] ?? after?.[1];
+  if (!raw) return null;
+  const words = raw.split(/\s+/);
+  while (words.length && NICHE_STOP.has((words[0] ?? "").toLowerCase())) words.shift();
+  return words.length ? words.join(" ") : null;
+}
+
+/** Holiday and season words that name a taxonomy niche directly. */
+const SEASON_NICHES: [RegExp, string][] = [
+  [/halloween/i, "halloween"],
+  [/christmas|navidad/i, "christmas"],
+  [/thanksgiving|acci[oó]n de gracias/i, "thanksgiving"],
+  [/valentine|san valent[ií]n/i, "valentines"],
+  [/mother'?s day|d[ií]a de las madres/i, "mothers-day"],
+  [/father'?s day|d[ií]a del padre/i, "fathers-day"],
+  [/back.to.school|regreso a clases/i, "back-to-school"],
+  [/d[ií]a de (los )?muertos/i, "dia-de-muertos"],
+];
+
+/**
+ * Wave 18 market routing (T-18-4 AC8): trend, season and price questions go to the market tools,
+ * with the user's language and any niche, holiday or channel the message names.
+ */
+function planMarketCalls(message: string): PlannedCall[] {
+  const t = message.toLowerCase();
+  const lang = detectLang(message);
+  const channel = CHANNEL_WORDS.find(
+    (c) => t.includes(c) || (c === "tiktok" && t.includes("tik tok")),
+  );
+  const named = nicheFromMessage(message);
+  const holiday = SEASON_NICHES.find(([re]) => re.test(message))?.[1] ?? null;
+  const niche = named ?? holiday;
+  const subject = niche ? { niche } : {};
+  const calls: PlannedCall[] = [];
+  const trend = /trending|\btrends?\b|tendencia|\bniche\b|\bnicho\b/.test(t);
+  const season =
+    /holiday|season|halloween|christmas|get ready|temporada|fiestas|navidad|prepar/.test(t);
+  const price = /priced right|price position|precio|pricing|\bmy price|price ok|priced/.test(t);
+  if (trend && !(season && !named))
+    calls.push({ tool: "get_market_trend", input: { ...subject, lang } });
+  if (season) calls.push({ tool: "get_seasonality", input: { ...subject, lang } });
+  if (price) {
+    const scoped = channel && channel !== "ebay" ? { channel } : {};
+    calls.push({ tool: "get_price_position", input: { ...scoped, lang } });
+    calls.push({ tool: "simulate_price", input: { ...scoped, lang } });
+  }
+  return calls;
+}
+
 export function planAssistantCalls(message: string, now: Date): PlannedCall[] {
   return planCalls(message, now).calls;
 }
 
 function planCalls(message: string, now: Date): { calls: PlannedCall[]; fallback: boolean } {
+  const market = planMarketCalls(message);
+  if (market.length) return { calls: market, fallback: false };
   const t = message.toLowerCase();
   // "this week vs last week": the current period is this week, compared with last week.
   const both = /\bthis week\b/.test(t) && /\blast week\b/.test(t);
@@ -413,7 +516,7 @@ async function* mockAssistant(
     yield { type: "tool_call", name: tool.name, input };
     const out = await tool.run(input);
     results.push(out.data);
-    yield { type: "tool_result", name: tool.name, summary: out.summary };
+    yield { type: "tool_result", name: tool.name, summary: out.summary, meta: out.meta };
     answers.push(out.answer);
     // A running estimate (no model call, so this is the same deterministic formula as the final
     // usage below), so a caller torn down mid-loop can still charge for the answer built so far.
@@ -441,7 +544,8 @@ export const mockProvider: AiProvider = {
           reason: "Mock provider: flagged for human review.",
         })),
       } satisfies TrademarkJudgement;
-    } else {
+    } else if (prompt.id === "market_niche") output = mockNiche(vars as NicheVars);
+    else {
       // Unknown prompt id (a new route, or a typo): don't 500 the request — warn and hand back a
       // schema-valid placeholder so callers exercise the real path end to end (B-45 hardening).
       log.warn("no fixture for prompt; returning a schema-valid default", { promptId: prompt.id });

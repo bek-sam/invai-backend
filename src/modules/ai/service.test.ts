@@ -23,10 +23,34 @@ import { parseCsvObjects } from "../../lib/csv";
 import { getObject } from "../../lib/s3";
 import { createCompany, createUser, tenantContext } from "../../test/fixtures";
 import { periodOf } from "../billing/service";
+import * as market from "../market/service";
 import { clearSampleWorkspaceCache } from "../tenancy/demo-flag";
 import { assistantTools } from "./assistant-tools";
 import * as svc from "./service";
 import { combineRisk, matchRisk } from "./trademark";
+
+// T-18-4: market reads and the "shown" write are T-18-3's unit; the "tool_result pass-through"
+// block at the end replaces them with contract-shaped fixtures. No other test here calls them.
+vi.mock("../market/service", async (importOriginal) => {
+  const real = await importOriginal<typeof import("../market/service")>();
+  return {
+    ...real,
+    NICHES: [
+      {
+        key: "halloween",
+        family: "Holidays",
+        labelEn: "Halloween",
+        labelEs: "Halloween",
+        stems: [],
+        queries: [],
+        peakMonths: [10],
+      },
+    ],
+    getTrendSignal: vi.fn(),
+    listRecommendations: vi.fn(),
+    recordRecommendationsShown: vi.fn(),
+  };
+});
 
 // Trademark marks (and the plan catalog) are no longer seeded per test file: the global test
 // setup runs `runMigrations`, which calls `ensureReferenceData` (src/db/reference), so
@@ -624,8 +648,8 @@ describe("ai module", () => {
       return tenantContext(co.id, owner.id, "owner");
     }
 
-    it("prompt v4: version, iterations, language, analyst mode and honesty rules", () => {
-      expect(ASSISTANT_PROMPT.version).toBe(4);
+    it("prompt v5: version, iterations, language, analyst mode and honesty rules", () => {
+      expect(ASSISTANT_PROMPT.version).toBe(5);
       expect(ASSISTANT_MAX_ITERATIONS).toBe(10);
       const p = ASSISTANT_PROMPT.system;
       expect(p).toMatch(/Reply in the language of the user's latest message: English or Spanish/);
@@ -635,7 +659,13 @@ describe("ai module", () => {
         expect(p).toContain(part);
       expect(p).toMatch(/incomplete/);
       expect(p).toMatch(/Ad attribution is per channel only/);
-      expect(p).toMatch(/Never cite outside market facts/);
+      // Wave 18: "never cite outside market facts" became "only market facts from market tools".
+      expect(p).toMatch(/Only market facts from market tools/);
+      expect(p).toMatch(/Never use your own general knowledge about markets/);
+      expect(p).toMatch(/Every number you state must appear in a tool result of this turn/);
+      expect(p).toMatch(/Sample data.*Datos de muestra/);
+      expect(p).toMatch(/Never name, link or quote other sellers/);
+      expect(p).toMatch(/trademark_screen/);
       expect(p).toMatch(/Never promise results/);
       // Nothing per-shop or per-request in the cached text.
       expect(p).not.toMatch(/\d{4}-\d{2}-\d{2}|America\//);
@@ -760,6 +790,151 @@ describe("ai module", () => {
       });
       expect(long?.length).toBe(svc.TOOL_LINE_MAX);
       expect(long?.endsWith("…]")).toBe(true);
+    });
+  });
+});
+
+/* ============================ T-18-4 tool_result pass-through ============================ */
+
+describe("assistant market turn: provenance and recommendations (T-18-4, spec AC33)", () => {
+  const AS_OF = "2026-09-20T00:00:00.000Z";
+  const m = vi.mocked(market);
+  const recIds = [crypto.randomUUID(), crypto.randomUUID()];
+
+  async function owner() {
+    const co = await createCompany();
+    const u = await createUser(co.id, "owner");
+    return tenantContext(co.id, u.id, "owner");
+  }
+  async function turn(ctx: ReturnType<typeof tenantContext>, message: string) {
+    const events: AssistantEvent[] = [];
+    for await (const e of svc.ask(ctx, { message })) events.push(e);
+    return events;
+  }
+
+  beforeAll(() => {
+    m.getTrendSignal.mockImplementation(async () => ({
+      subject: { designId: null, designName: null, niche: "halloween" },
+      confidence: 0.8,
+      band: "high",
+      stale: false,
+      mock: true,
+      sources: [
+        {
+          source: "google_trends",
+          licence: "official_api",
+          asOf: AS_OF,
+          fetchedAt: AS_OF,
+          mock: true,
+        },
+      ],
+      asOf: AS_OF,
+      trend: "rising",
+      growth4w: 0.2,
+      yoy: null,
+      windowWeeks: 26,
+      readings: [],
+      disagreement: false,
+      insufficientReason: null,
+    }));
+    m.listRecommendations.mockResolvedValue(
+      recIds.map((id, k) => ({
+        id,
+        rule: "R4" as const,
+        action: "new_designs_in_niche" as const,
+        target: { designId: null, designName: null, niche: "halloween", channel: null },
+        params: { niche: "halloween" },
+        confidence: 0.75 - k * 0.2,
+        band: k === 0 ? ("high" as const) : ("medium" as const),
+        mock: true,
+        sources: [
+          {
+            source: "google_trends" as const,
+            licence: "official_api" as const,
+            asOf: AS_OF,
+            fetchedAt: AS_OF,
+            mock: true,
+          },
+        ],
+        evidenceSignalIds: [],
+        stale: false,
+        shownIn: null,
+        shownAt: null,
+        vote: null,
+        votedAt: null,
+        adoptedAt: null,
+        outcome: null,
+        createdAt: AS_OF,
+      })),
+    );
+  });
+
+  it("streams mock, sources and recommendations on tool_result, records 'shown' once, and returns them after a reload", async () => {
+    m.recordRecommendationsShown.mockClear();
+    const ctx = await owner();
+    const events = await turn(ctx, "Is the Halloween niche trending?");
+    for (const e of events) expect(AssistantEvent.safeParse(e).success, e.type).toBe(true);
+    const result = events.find((e) => e.type === "tool_result" && e.name === "get_market_trend");
+    expect(result).toMatchObject({
+      mock: true,
+      sources: [{ source: "google_trends", asOf: AS_OF, mock: true }],
+      recommendations: [
+        { id: recIds[0], rule: "R4", band: "high", mock: true },
+        { id: recIds[1], rule: "R4", band: "medium", mock: true },
+      ],
+    });
+    const done = events.at(-1);
+    if (done?.type !== "done") throw new Error("no done event");
+    expect(m.recordRecommendationsShown).toHaveBeenCalledTimes(1);
+    expect(m.recordRecommendationsShown.mock.calls[0]?.[2]).toEqual({
+      ids: recIds,
+      shownIn: "assistant",
+      refId: done.messageId,
+    });
+    const text = events.flatMap((e) => (e.type === "text_delta" ? [e.text] : [])).join("");
+    expect(text).toContain("Google Trends, as of 2026-09-20 (Sample data)");
+    expect(text).toContain("Make 1–2 new designs for the Halloween niche.");
+
+    const conv = await withTenant(ctx.companyId, (tx) =>
+      svc.getConversation(tx, ctx, done.conversationId),
+    );
+    const [user, reply] = conv.messages;
+    expect(user).not.toHaveProperty("recommendations");
+    expect(reply?.id).toBe(done.messageId);
+    expect(reply).toMatchObject({
+      mock: true,
+      recommendations: [
+        { id: recIds[0], rule: "R4", band: "high", mock: true },
+        { id: recIds[1], rule: "R4", band: "medium", mock: true },
+      ],
+    });
+  });
+
+  it("wave 17 tools keep their plain tool_result, and a failed 'shown' write never breaks the turn", async () => {
+    m.recordRecommendationsShown.mockClear();
+    const ctx = await owner();
+    const plain = await turn(ctx, "What was my profit last week?");
+    const r = plain.find((e) => e.type === "tool_result");
+    expect(r && Object.keys(r).sort()).toEqual(["name", "summary", "type"]);
+    expect(m.recordRecommendationsShown).not.toHaveBeenCalled();
+
+    m.recordRecommendationsShown.mockRejectedValueOnce(new Error("market store down"));
+    const events = await turn(ctx, "Is the Halloween niche trending?");
+    expect(events.at(-1)?.type).toBe("done");
+    expect(events.some((e) => e.type === "error")).toBe(false);
+  });
+
+  it("storedRecommendations reads only well-formed entries", () => {
+    expect(svc.storedRecommendations(null)).toEqual({});
+    expect(svc.storedRecommendations({ calls: [] })).toEqual({});
+    expect(
+      svc.storedRecommendations({
+        recommendations: [{ id: recIds[0], rule: "R1", band: "high", mock: false }, { id: "x" }],
+        mock: true,
+      }),
+    ).toEqual({
+      recommendations: [{ id: recIds[0], rule: "R1", band: "high", mock: false }],
+      mock: true,
     });
   });
 });

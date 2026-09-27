@@ -20,6 +20,8 @@ export const AI_JOB_KINDS = [
   "assistant",
   "ocr",
   "mockup",
+  // Wave 18 (T-18-4): the Haiku niche fallback for the market mapper (enumText: no migration).
+  "market_niche",
 ] as const;
 export const AI_JOB_STATUSES = ["queued", "running", "done", "failed"] as const;
 
