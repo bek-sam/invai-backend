@@ -268,8 +268,8 @@
       },
       "costCentsMedian": 0,
       "costCentsP95": 0,
-      "latencyMsMedian": 9,
-      "latencyMsP95": 19,
+      "latencyMsMedian": 10,
+      "latencyMsP95": 16,
       "cacheHitRate": 0
     },
     {
@@ -285,6 +285,161 @@
       "costCentsP95": 0,
       "latencyMsMedian": 0,
       "latencyMsP95": 0,
+      "cacheHitRate": 0
+    },
+    {
+      "route": "market",
+      "mode": "mock",
+      "cases": 21,
+      "plumbingPass": 19,
+      "qualityPass": 17,
+      "qualityAssessed": 19,
+      "byTag": {
+        "trend": {
+          "plumbingPass": 3,
+          "qualityPass": 3,
+          "total": 3
+        },
+        "AC2": {
+          "plumbingPass": 1,
+          "qualityPass": 1,
+          "total": 1
+        },
+        "spanish": {
+          "plumbingPass": 3,
+          "qualityPass": 3,
+          "total": 4
+        },
+        "AC15": {
+          "plumbingPass": 2,
+          "qualityPass": 2,
+          "total": 3
+        },
+        "price": {
+          "plumbingPass": 3,
+          "qualityPass": 3,
+          "total": 3
+        },
+        "AC30": {
+          "plumbingPass": 1,
+          "qualityPass": 1,
+          "total": 1
+        },
+        "season": {
+          "plumbingPass": 1,
+          "qualityPass": 1,
+          "total": 3
+        },
+        "AC3": {
+          "plumbingPass": 0,
+          "qualityPass": 0,
+          "total": 1
+        },
+        "starter": {
+          "plumbingPass": 1,
+          "qualityPass": 1,
+          "total": 1
+        },
+        "thin": {
+          "plumbingPass": 2,
+          "qualityPass": 2,
+          "total": 2
+        },
+        "AC6": {
+          "plumbingPass": 1,
+          "qualityPass": 1,
+          "total": 1
+        },
+        "AC7": {
+          "plumbingPass": 1,
+          "qualityPass": 1,
+          "total": 1
+        },
+        "trademark": {
+          "plumbingPass": 3,
+          "qualityPass": 3,
+          "total": 3
+        },
+        "AC12": {
+          "plumbingPass": 2,
+          "qualityPass": 2,
+          "total": 2
+        },
+        "AC31": {
+          "plumbingPass": 2,
+          "qualityPass": 2,
+          "total": 2
+        },
+        "sellers": {
+          "plumbingPass": 1,
+          "qualityPass": 1,
+          "total": 1
+        },
+        "AC13": {
+          "plumbingPass": 1,
+          "qualityPass": 1,
+          "total": 1
+        },
+        "injection": {
+          "plumbingPass": 2,
+          "qualityPass": 2,
+          "total": 2
+        },
+        "AC14": {
+          "plumbingPass": 2,
+          "qualityPass": 2,
+          "total": 2
+        },
+        "number_without_source": {
+          "plumbingPass": 1,
+          "qualityPass": 1,
+          "total": 1
+        },
+        "AC11": {
+          "plumbingPass": 2,
+          "qualityPass": 1,
+          "total": 2
+        },
+        "unknown_niche": {
+          "plumbingPass": 1,
+          "qualityPass": 1,
+          "total": 1
+        },
+        "simulate": {
+          "plumbingPass": 1,
+          "qualityPass": 1,
+          "total": 1
+        },
+        "read_only": {
+          "plumbingPass": 1,
+          "qualityPass": 0,
+          "total": 1
+        },
+        "AC16": {
+          "plumbingPass": 1,
+          "qualityPass": 0,
+          "total": 1
+        },
+        "disagreement": {
+          "plumbingPass": 1,
+          "qualityPass": 1,
+          "total": 1
+        },
+        "AC8": {
+          "plumbingPass": 1,
+          "qualityPass": 1,
+          "total": 1
+        },
+        "promise": {
+          "plumbingPass": 1,
+          "qualityPass": 0,
+          "total": 1
+        }
+      },
+      "costCentsMedian": 0,
+      "costCentsP95": 0,
+      "latencyMsMedian": 15,
+      "latencyMsP95": 50,
       "cacheHitRate": 0
     }
   ]
