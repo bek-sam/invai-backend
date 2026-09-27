@@ -33,12 +33,14 @@ function endOfIsoWeekIso(period: string): string {
   if (!match) throw new Error(`period not in "YYYY-Www" form: ${period}`);
   const year = Number(match[1]);
   const week = Number(match[2]);
-  // Standard ISO-week-to-date algorithm: week N's Thursday is the Nth Thursday-anchored week of
-  // the year; walk back/forward from a rough guess to the Monday, then add 6 days for Sunday.
-  const rough = new Date(Date.UTC(year, 0, 1 + (week - 1) * 7));
-  const dow = rough.getUTCDay() || 7; // Monday=1 .. Sunday=7
-  const monday = new Date(rough);
-  monday.setUTCDate(rough.getUTCDate() - dow + 1);
+  // Standard ISO-week-to-date algorithm: ISO week 1 is the week that *contains* 4 January (not
+  // 1 January), so the anchor for the Monday of week 1 must be 4 January, never 1 January
+  // (round-2 finding: anchoring on 1 Jan puts week 1 a week early whenever 1 Jan falls on a
+  // Fri/Sat/Sun). From there, week N's Monday is (N-1)*7 days after week 1's Monday.
+  const jan4 = Date.UTC(year, 0, 4);
+  const jan4Dow = new Date(jan4).getUTCDay() || 7; // Monday=1 .. Sunday=7
+  const week1Monday = jan4 - (jan4Dow - 1) * 86_400_000;
+  const monday = new Date(week1Monday + (week - 1) * 7 * 86_400_000);
   const sunday = new Date(monday);
   sunday.setUTCDate(monday.getUTCDate() + 6);
   sunday.setUTCHours(23, 59, 59, 999);
