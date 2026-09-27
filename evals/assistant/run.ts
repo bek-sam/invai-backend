@@ -8,6 +8,7 @@ import type { EvalTenant } from "../lib/fixtures";
 import { callAssistant } from "../lib/gateway-run";
 import { loadCases } from "../lib/jsonl";
 import type { CaseResult, RouteReport } from "../lib/types";
+import { createSeededEvalTenant } from "./seed";
 
 const dir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -42,16 +43,25 @@ function containsAny(text: string, needles: string[] | undefined): boolean | nul
 }
 
 export async function runAssistantEvals(tenant: EvalTenant): Promise<RouteReport> {
-  const cases = loadCases<{ message: string }, AssistantExpect>(path.join(dir, "cases.jsonl"));
+  const cases = loadCases<{ message: string; tenant?: "seeded" }, AssistantExpect>(
+    path.join(dir, "cases.jsonl"),
+  );
   const mode: RouteReport["mode"] = env.mocks.ai ? "mock" : "real";
-  const tools = assistantTools(systemContext(tenant.companyId));
+  // Cases with `vars.tenant: "seeded"` run against a second tenant with a small known business
+  // (seed.ts, T-17-2): the analyst tools need real numbers, and the empty tenant must stay empty
+  // for the zero-state cases above.
+  const seeded = cases.some((c) => c.vars.tenant === "seeded")
+    ? await createSeededEvalTenant()
+    : null;
   const results: CaseResult[] = [];
 
   for (const c of cases) {
+    const who = c.vars.tenant === "seeded" && seeded ? seeded : tenant;
+    const tools = assistantTools(systemContext(who.companyId));
     const res = await callAssistant(
       {
-        companyId: tenant.companyId,
-        userId: tenant.userId,
+        companyId: who.companyId,
+        userId: who.userId,
         kind: "assistant",
         creditKind: "assistant",
         entity: null,

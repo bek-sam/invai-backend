@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-09-26T07:43:39.879Z",
+  "generatedAt": "2026-09-27T04:27:23.617Z",
   "mode": "mock",
   "routes": [
     {
@@ -160,10 +160,10 @@
     {
       "route": "assistant",
       "mode": "mock",
-      "cases": 16,
-      "plumbingPass": 16,
-      "qualityPass": 7,
-      "qualityAssessed": 7,
+      "cases": 26,
+      "plumbingPass": 26,
+      "qualityPass": 17,
+      "qualityAssessed": 17,
       "byTag": {
         "profit": {
           "plumbingPass": 1,
@@ -216,26 +216,51 @@
           "total": 1
         },
         "injection": {
-          "plumbingPass": 7,
-          "qualityPass": 0,
-          "total": 7
+          "plumbingPass": 8,
+          "qualityPass": 1,
+          "total": 8
         },
         "t82_injection_set": {
           "plumbingPass": 7,
           "qualityPass": 0,
           "total": 7
+        },
+        "compare_periods": {
+          "plumbingPass": 2,
+          "qualityPass": 2,
+          "total": 2
+        },
+        "seeded": {
+          "plumbingPass": 6,
+          "qualityPass": 6,
+          "total": 6
+        },
+        "ad_performance": {
+          "plumbingPass": 3,
+          "qualityPass": 3,
+          "total": 3
+        },
+        "design_insights": {
+          "plumbingPass": 3,
+          "qualityPass": 3,
+          "total": 3
+        },
+        "fulfillment_health": {
+          "plumbingPass": 2,
+          "qualityPass": 2,
+          "total": 2
         }
       },
       "costCentsMedian": 0,
       "costCentsP95": 0,
-      "latencyMsMedian": 7,
-      "latencyMsP95": 20,
+      "latencyMsMedian": 10,
+      "latencyMsP95": 13,
       "cacheHitRate": 0
     },
     {
       "route": "personalization_check",
       "mode": "skipped",
-      "skippedReason": "route not implemented yet (backlog B-101) — 13 cases staged in evals/personalization_check/cases.jsonl for when it ships",
+      "skippedReason": "route not implemented yet (backlog B-101) \u2014 13 cases staged in evals/personalization_check/cases.jsonl for when it ships",
       "cases": 0,
       "plumbingPass": 0,
       "qualityPass": null,

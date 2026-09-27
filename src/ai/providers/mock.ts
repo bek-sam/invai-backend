@@ -227,15 +227,77 @@ type PlannedCall = { tool: string; input: Record<string, unknown> };
 
 const CHANNEL_WORDS: Channel[] = ["etsy", "amazon", "shopify", "tiktok", "walmart", "ebay"];
 
+const DAY_MS = 86_400_000;
+
+/**
+ * "this week" / "this month" are partial periods: compare them with the same span of the week or
+ * month before (week-to-date vs last week-to-date), not with the days right before. Any other
+ * period uses the tool's default (the same length immediately before).
+ */
+function previousOf(
+  t: string,
+  from: Date,
+  to: Date,
+): { previousFrom: string; previousTo: string } | null {
+  if (/\bthis week\b/.test(t) || (/\bweek\b/.test(t) && !/\blast week\b/.test(t)))
+    return {
+      previousFrom: new Date(from.getTime() - 7 * DAY_MS).toISOString(),
+      previousTo: new Date(to.getTime() - 7 * DAY_MS).toISOString(),
+    };
+  if (/\bthis month\b/.test(t)) {
+    const pf = new Date(Date.UTC(from.getUTCFullYear(), from.getUTCMonth() - 1, 1));
+    const pt = new Date(Math.min(pf.getTime() + (to.getTime() - from.getTime()), from.getTime()));
+    return { previousFrom: pf.toISOString(), previousTo: pt.toISOString() };
+  }
+  return null;
+}
+
 export function planAssistantCalls(message: string, now: Date): PlannedCall[] {
   const t = message.toLowerCase();
-  const period = resolvePeriod(t, now);
+  // "this week vs last week": the current period is this week, compared with last week.
+  const both = /\bthis week\b/.test(t) && /\blast week\b/.test(t);
+  const bothMonths = /\bthis month\b/.test(t) && /\blast month\b/.test(t);
+  const period = resolvePeriod(both ? "this week" : bothMonths ? "this month" : t, now);
   const range = { from: period.from.toISOString(), to: period.to.toISOString() };
   const channel = CHANNEL_WORDS.find(
     (c) => t.includes(c) || (c === "tiktok" && t.includes("tik tok")),
   );
   const calls: PlannedCall[] = [];
-  if (/margin|profit|net\b|revenue|earn|made|money|sales/.test(t)) {
+  const review =
+    /business review|weekly review|what should i do|revisi[oó]n (semanal|del negocio)/.test(t);
+  const compare = review || /compar|\bvs\.?\b|versus|\bwhy\b|por qu[eé]/.test(t);
+  const ads = review || /\bads?\b|ad spend|advertis|\broas\b|\btacos\b|campaign|anuncio/.test(t);
+  const insights =
+    review ||
+    /rising|falling|trending|push or drop|cross.?list|low.?margin|insight|dise[ñn]os/.test(t) ||
+    (/\bdesigns\b/.test(t) && !/best.?sell|top design|selling|popular/.test(t));
+  const fulfillment =
+    review || /on.?time|\blate\b|reprint|refund|fulfil|a tiempo|reimpres|reembolso/.test(t);
+  const scoped = channel ? { channel } : {};
+  if (compare) {
+    const prev = both || bothMonths || /\bthis (week|month)\b|\bweek\b/.test(t);
+    calls.push({
+      tool: "compare_periods",
+      input: {
+        ...range,
+        ...(prev ? (previousOf(t, period.from, period.to) ?? {}) : {}),
+        ...scoped,
+      },
+    });
+  }
+  if (ads)
+    calls.push({
+      tool: "get_ad_performance",
+      input: { ...range, ...scoped, ...(/campaign/.test(t) ? { groupBy: "campaign" } : {}) },
+    });
+  if (insights) calls.push({ tool: "get_design_insights", input: { ...range, limit: 5 } });
+  if (fulfillment) calls.push({ tool: "get_fulfillment_health", input: { ...range, ...scoped } });
+  if (
+    /margin|profit|net\b|revenue|earn|made|money|sales/.test(t) &&
+    // compare_periods already reports revenue, net and margin for both periods.
+    !(compare && !/design|blank|style|daily|per day|by day/.test(t)) &&
+    !(ads && !compare && !/margin|profit/.test(t))
+  ) {
     const dimension = /design/.test(t)
       ? "design"
       : /blank|style/.test(t)
@@ -256,7 +318,11 @@ export function planAssistantCalls(message: string, now: Date): PlannedCall[] {
       tool: "get_stock",
       input: { belowReorderOnly: /low|reorder|run out|restock/.test(t) },
     });
-  if (/order|late|at risk|overdue|due|ship/.test(t))
+  if (
+    /order|late|at risk|overdue|due|ship/.test(t) &&
+    // "Am I shipping on time?" is a fulfillment question; keep the order counts for order words.
+    !(fulfillment && !/order|overdue|at risk|\bdue\b/.test(t))
+  )
     calls.push({
       tool: "get_orders_summary",
       input: { ...range, ...(channel ? { channel } : {}) },
