@@ -31,16 +31,27 @@ type AmazonCompetitiveSummary = {
 };
 type AmazonResponse = { CompetitiveSummaries: AmazonCompetitiveSummary[] };
 
-function toObservations(summary: AmazonCompetitiveSummary): PriceObservation[] {
+function toObservations(
+  summary: AmazonCompetitiveSummary,
+  garmentClass: string,
+): PriceObservation[] {
   const offers = [
     ...(summary.FeaturedBuyingOptions ?? []),
     ...(summary.LowestPricedOffers ?? []).flatMap((g) => g.Offers ?? []),
   ];
   // Amazon's own offer objects carry `SellerId`: dropped here, never returned (AC7).
+  // getCompetitiveSummary doesn't say whether a competing offer is a personalized listing or its
+  // own garment class, so this skeleton (never selected in this build, decision 0006) sets
+  // documented defaults: `personalized: false`, and `garmentClass` copied from the request's own
+  // item (searchCatalogItems is expected to be scoped to the same garment class already, round
+  // 2). Whoever wires a real key should look for a real per-offer signal for both before trusting
+  // either.
   return offers.map((o) => ({
     landedPriceCents: Math.round((o.LandedPrice?.Amount ?? 0) * 100),
     isFeatured: !!o.IsFeaturedMerchant,
     offerCount: offers.length,
+    personalized: false,
+    garmentClass,
   }));
 }
 
@@ -50,6 +61,7 @@ export function amazonPricingProvider(conn: Connection): PricingProvider {
     mock: false,
     async comparables(_conn, own) {
       const asins = own.map((o) => o.ref).slice(0, 20); // getCompetitiveSummary takes 1-20 ASINs
+      const garmentClassByRef = new Map(own.map((o) => [o.ref, o.garmentClass]));
       const res = await fetchJsonWithPolicy<AmazonResponse>({
         source: "amazon_pricing",
         url: `${BASE}/products/pricing/2022-05-01/items/competitiveSummary?asins=${asins.join(",")}&marketplaceId=ATVPDKIKX0DER`,
@@ -62,7 +74,7 @@ export function amazonPricingProvider(conn: Connection): PricingProvider {
         licence: "official_api",
         channel: "amazon",
         ownRef: s.Asin,
-        observations: toObservations(s),
+        observations: toObservations(s, garmentClassByRef.get(s.Asin) ?? "other"),
         asOf: now,
         fetchedAt: now,
         requestKey: `amazon_pricing:${conn.id}:${s.Asin}`,

@@ -24,10 +24,16 @@ export * from "./types";
  * The demand providers this build knows about: Census (real client + fixture, AC2) and Google
  * Trends, Pinterest Trends and Jungle Scout (mock only today, AC1/AC4 -- no key is ever set in
  * this build). Real only when its own key is set; otherwise the deterministic mock, `mock: true`.
+ *
+ * Reviewer finding 1: Census is never the per-query hash mock. `censusDemandProvider()` already
+ * picks the real client or the recorded fixture itself (`mock: env.mocks.census`), and either way
+ * returns exactly the one NAICS-448 series it always has -- never 40 made-up series for 40
+ * taxonomy queries labelled "public_dataset". The other three sources have no fixture, so they
+ * fall back to the generic per-query mock when their key is unset.
  */
 export function marketDemandProviders(): DemandProvider[] {
   return [
-    env.mocks.census ? mockDemandProvider("census", "public_dataset") : censusDemandProvider(),
+    censusDemandProvider(),
     env.mocks.googleTrends
       ? mockDemandProvider("google_trends", "official_api")
       : googleTrendsDemandProvider(),

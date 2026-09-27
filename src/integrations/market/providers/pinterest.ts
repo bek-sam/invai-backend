@@ -1,5 +1,6 @@
 import { env } from "../../../env";
 import { fetchJsonWithPolicy } from "../http";
+import { seriesAsOf } from "../period";
 import type { DemandProvider, DemandSeries, SeriesPoint } from "../types";
 
 /*
@@ -35,11 +36,8 @@ async function fetchOne(
     url: `https://api.pinterest.com/v5/trends/keywords/US/top/growing?include_keywords=${encodeURIComponent(query)}`,
     init: { headers: { authorization: `Bearer ${env.PINTEREST_API_KEY}` } },
     // No published per-app quota (research 14 §1.2, "[U]"): one request per 2s until confirmed.
-    rateLimit: {
-      key: `market:pinterest_trends:${env.PINTEREST_API_KEY}`,
-      capacity: 1,
-      perMs: 2_000,
-    },
+    // Reviewer finding 2: constant bucket, never the bearer token (see google-trends.ts).
+    rateLimit: { key: "market:pinterest_trends", capacity: 1, perMs: 2_000 },
   });
   const match = res.trends.find((t) => t.keyword === query) ?? res.trends[0];
   const series = match?.time_series ?? {};
@@ -55,7 +53,7 @@ async function fetchOne(
     granularity,
     scale: "relative_0_100",
     points,
-    asOf: points.at(-1)?.period ?? now,
+    asOf: seriesAsOf(points, granularity, now),
     fetchedAt: now,
     requestKey: `pinterest_trends:${query}:${granularity}:${years}`,
     mock: false,

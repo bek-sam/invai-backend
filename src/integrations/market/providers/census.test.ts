@@ -1,3 +1,4 @@
+import { Timestamp } from "@invai/contracts";
 import { describe, expect, it } from "vitest";
 import { env } from "../../../env";
 import { censusDemandProvider, censusRetailSeries } from "./census";
@@ -18,7 +19,7 @@ describe("censusRetailSeries (AC2: real client, fixture fallback)", () => {
     const periods = series.points.map((p) => p.period);
     const sorted = [...periods].sort();
     expect(periods).toEqual(sorted);
-    expect(series.asOf).toBe(series.points.at(-1)?.period);
+    expect(series.asOf.startsWith(series.points.at(-1)?.period ?? "")).toBe(true);
   });
 
   it("carries real-looking retail sales values with a December peak (documented shape)", async () => {
@@ -34,6 +35,12 @@ describe("censusRetailSeries (AC2: real client, fixture fallback)", () => {
     const a = await censusRetailSeries({ years: 5 });
     const b = await censusRetailSeries({ years: 5 });
     expect(a.points).toEqual(b.points);
+  });
+
+  it("asOf parses as an @invai/contracts Timestamp (AC6, reviewer finding 3)", async () => {
+    const series = await censusRetailSeries({ years: 1 });
+    expect(() => Timestamp.parse(series.asOf)).not.toThrow();
+    expect(series.asOf.startsWith(series.points.at(-1)?.period ?? "")).toBe(true);
   });
 
   it("censusDemandProvider wraps it as a one-source DemandProvider", async () => {

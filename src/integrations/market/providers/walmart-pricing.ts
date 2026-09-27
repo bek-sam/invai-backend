@@ -20,13 +20,19 @@ type WalmartOffer = { price?: number; isBuyBoxWinner?: boolean; sellerId?: strin
 type WalmartPricingInsight = { itemId: string; offers?: WalmartOffer[] };
 type WalmartResponse = { items: WalmartPricingInsight[] };
 
-function toObservations(item: WalmartPricingInsight): PriceObservation[] {
+function toObservations(item: WalmartPricingInsight, garmentClass: string): PriceObservation[] {
   const offers = item.offers ?? [];
   // Walmart's own offer objects carry `sellerId`: dropped here, never returned (AC7).
+  // getPricingInsights doesn't say whether a competing offer is a personalized listing or its own
+  // garment class, so this skeleton (never selected in this build) sets documented defaults:
+  // `personalized: false`, and `garmentClass` copied from the request's own item (round 2);
+  // re-check both before a real Walmart Solution Provider key is ever set.
   return offers.map((o) => ({
     landedPriceCents: Math.round((o.price ?? 0) * 100),
     isFeatured: !!o.isBuyBoxWinner,
     offerCount: offers.length,
+    personalized: false,
+    garmentClass,
   }));
 }
 
@@ -35,6 +41,7 @@ export function walmartPricingProvider(conn: Connection): PricingProvider {
     source: "walmart_pricing",
     mock: false,
     async comparables(_conn, own) {
+      const garmentClassByRef = new Map(own.map((o) => [o.ref, o.garmentClass]));
       const res = await fetchJsonWithPolicy<WalmartResponse>({
         source: "walmart_pricing",
         url: `${BASE}/v3/price/getPricingInsights`,
@@ -52,7 +59,7 @@ export function walmartPricingProvider(conn: Connection): PricingProvider {
         licence: "official_api",
         channel: "walmart",
         ownRef: item.itemId,
-        observations: toObservations(item),
+        observations: toObservations(item, garmentClassByRef.get(item.itemId) ?? "other"),
         asOf: now,
         fetchedAt: now,
         requestKey: `walmart_pricing:${conn.id}:${item.itemId}`,

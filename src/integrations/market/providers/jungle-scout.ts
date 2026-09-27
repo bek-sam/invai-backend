@@ -1,5 +1,6 @@
 import { env } from "../../../env";
 import { fetchJsonWithPolicy } from "../http";
+import { seriesAsOf } from "../period";
 import type { DemandProvider, DemandSeries, SeriesPoint } from "../types";
 
 /*
@@ -57,7 +58,7 @@ async function fetchOne(
     granularity,
     scale: "absolute",
     points,
-    asOf: points.at(-1)?.period ?? now,
+    asOf: seriesAsOf(points, granularity, now),
     fetchedAt: now,
     requestKey: `jungle_scout:${query}:${granularity}:${years}`,
     mock: false,

@@ -1,5 +1,6 @@
 import { env } from "../../../env";
 import { fetchJsonWithPolicy } from "../http";
+import { seriesAsOf } from "../period";
 import type { DemandProvider, DemandSeries, SeriesPoint } from "../types";
 
 /*
@@ -28,12 +29,11 @@ async function fetchOne(
   const res = await fetchJsonWithPolicy<GoogleTrendsResponse>({
     source: "google_trends",
     url: `${PLACEHOLDER_BASE}/query?terms=${encodeURIComponent(query)}&years=${years}&granularity=${granularity}&key=${env.GOOGLE_TRENDS_API_KEY}`,
-    // No published quota (research 14 §4.2, "[U]"): one request every 5s per key until confirmed.
-    rateLimit: {
-      key: `market:google_trends:${env.GOOGLE_TRENDS_API_KEY}`,
-      capacity: 1,
-      perMs: 5_000,
-    },
+    // No published quota (research 14 §4.2, "[U]"): one request every 5s until confirmed.
+    // Reviewer finding 2: the bucket is a constant, never the key itself -- a key must not end up
+    // in a Redis key, a BullMQ failedReason or a log line (`market:census`/`market:jungle_scout`
+    // already did this; this fixes the two that didn't).
+    rateLimit: { key: "market:google_trends", capacity: 1, perMs: 5_000 },
   });
   const points: SeriesPoint[] = res.points.map((p) => ({ period: p.time, value: p.value }));
   const now = new Date().toISOString();
@@ -45,7 +45,7 @@ async function fetchOne(
     granularity,
     scale: "consistent_scaled",
     points,
-    asOf: points.at(-1)?.period ?? now,
+    asOf: seriesAsOf(points, granularity, now),
     fetchedAt: now,
     requestKey: `google_trends:${query}:${granularity}:${years}`,
     mock: false,

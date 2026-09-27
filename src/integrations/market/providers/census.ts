@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import { env } from "../../../env";
 import { logger } from "../../../lib/log";
 import { fetchJsonWithPolicy } from "../http";
+import { seriesAsOf } from "../period";
 import type { DemandSeries, SeriesPoint } from "../types";
 
 /*
@@ -102,7 +103,7 @@ export async function censusRetailSeries({ years }: { years: number }): Promise<
     granularity: "month",
     scale: "absolute",
     points,
-    asOf: points.at(-1)?.period ?? now,
+    asOf: seriesAsOf(points, "month", now),
     fetchedAt: now,
     requestKey: `census:naics448:${years}`,
     mock,

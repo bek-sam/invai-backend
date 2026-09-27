@@ -12,6 +12,27 @@ describe("marketDemandProviders (AC3: real only when the key is set)", () => {
     ]);
     expect(providers.every((p) => p.mock)).toBe(true);
   });
+
+  it("reviewer finding 1: census is the recorded fixture, never a per-query hash mock", async () => {
+    const [census] = marketDemandProviders();
+    // 40 taxonomy queries in, still exactly one NAICS-448 series out, on the fixture's own scale.
+    const queries = Array.from({ length: 40 }, (_, i) => `taxonomy-query-${i}`);
+    const series = await census?.series({ queries, granularity: "month", years: 3 });
+    expect(series).toHaveLength(1);
+    expect(series?.[0]?.query).toBe("naics_448_clothing_retail");
+    expect(series?.[0]?.licence).toBe("public_dataset");
+    expect(series?.[0]?.scale).toBe("absolute");
+    expect(series?.[0]?.mock).toBe(true);
+
+    // Calling it again with a completely different query list returns the identical fixture:
+    // the fixture never varies by query, unlike the generic per-query mock other sources use.
+    const again = await census?.series({
+      queries: ["other query"],
+      granularity: "month",
+      years: 3,
+    });
+    expect(again?.[0]?.points).toEqual(series?.[0]?.points);
+  });
 });
 
 describe("marketPricingProvider (AC3: Amazon/Walmart only, sample workspace always mock)", () => {
