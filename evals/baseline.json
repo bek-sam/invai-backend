@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-09-27T04:33:42.500Z",
+  "generatedAt": "2026-09-27T04:45:52.139Z",
   "mode": "mock",
   "routes": [
     {
@@ -269,7 +269,7 @@
       "costCentsMedian": 0,
       "costCentsP95": 0,
       "latencyMsMedian": 9,
-      "latencyMsP95": 16,
+      "latencyMsP95": 19,
       "cacheHitRate": 0
     },
     {

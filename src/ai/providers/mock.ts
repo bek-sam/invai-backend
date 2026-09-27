@@ -253,6 +253,10 @@ function previousOf(
 }
 
 export function planAssistantCalls(message: string, now: Date): PlannedCall[] {
+  return planCalls(message, now).calls;
+}
+
+function planCalls(message: string, now: Date): { calls: PlannedCall[]; fallback: boolean } {
   const t = message.toLowerCase();
   // "this week vs last week": the current period is this week, compared with last week.
   const both = /\bthis week\b/.test(t) && /\blast week\b/.test(t);
@@ -335,8 +339,56 @@ export function planAssistantCalls(message: string, now: Date): PlannedCall[] {
   if (!calls.length) {
     calls.push({ tool: "get_orders_summary", input: range });
     calls.push({ tool: "get_profit", input: { dimension: "channel", ...range } });
+    return { calls, fallback: true };
   }
-  return calls;
+  return { calls, fallback: false };
+}
+
+const TOOL_LINE = "[Tools used earlier: ";
+/** Tools whose input takes a `channel` filter, so "and only Etsy?" can narrow them. */
+const CHANNEL_TOOLS = new Set([
+  "get_profit",
+  "get_orders_summary",
+  "compare_periods",
+  "get_ad_performance",
+  "get_fulfillment_health",
+]);
+const PERIOD_WORDS = /\b(today|yesterday|week|month|(?:last|past)\s+\d{1,3}\s+days?)\b/;
+
+/**
+ * A follow-up with no tool keywords of its own ("And only Etsy?"): re-plan the previous user
+ * question (same tools as the earlier turn's tool line, same period, same `now`, so the result is
+ * deterministic), then apply the channel or period the follow-up names. Null when the history has
+ * no earlier tool-backed turn.
+ */
+export function planFollowUp(
+  message: string,
+  history: AssistantRun["history"],
+  now: Date,
+): PlannedCall[] | null {
+  const k = history.findLastIndex((h) => h.role === "assistant" && h.text.startsWith(TOOL_LINE));
+  const prevUser = k > 0 ? history.slice(0, k).findLast((h) => h.role === "user") : undefined;
+  if (!prevUser) return null;
+  const line = history[k]?.text.split("\n")[0] ?? "";
+  const used = new Set([...line.matchAll(/(?:: |; )([a-z]+_[a-z_]+)/g)].map((m) => m[1]));
+  const base = planCalls(prevUser.text, now).calls.filter((c) => used.has(c.tool));
+  if (!base.length) return null;
+  const t = message.toLowerCase();
+  const channel = CHANNEL_WORDS.find(
+    (c) => t.includes(c) || (c === "tiktok" && t.includes("tik tok")),
+  );
+  const period = PERIOD_WORDS.test(t) ? resolvePeriod(t, now) : null;
+  return base.map((c) => {
+    const input: Record<string, unknown> = { ...c.input };
+    if (period && "from" in input) {
+      input.from = period.from.toISOString();
+      input.to = period.to.toISOString();
+      delete input.previousFrom;
+      delete input.previousTo;
+    }
+    if (channel && CHANNEL_TOOLS.has(c.tool)) input.channel = channel;
+    return { tool: c.tool, input };
+  });
 }
 
 function* chunks(text: string): Generator<string> {
@@ -348,7 +400,10 @@ async function* mockAssistant(
   run: AssistantRun,
   onUsage?: (usage: TokenUsage) => void,
 ): AsyncGenerator<AssistantStreamEvent, AssistantFinal> {
-  const planned = planAssistantCalls(run.message, run.now);
+  const own = planCalls(run.message, run.now);
+  const planned = own.fallback
+    ? (planFollowUp(run.message, run.history, run.now) ?? own.calls)
+    : own.calls;
   const answers: string[] = [];
   const results: unknown[] = [];
   for (const call of planned) {

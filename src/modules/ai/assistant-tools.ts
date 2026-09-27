@@ -60,6 +60,40 @@ const ACTIVE_CONNECTION = ["connected", "csv_only", "error"] as const;
 
 type Period = { from: string; to: string };
 
+/** S-33: the longest period any assistant tool will scan. */
+export const MAX_RANGE_DAYS = 400;
+
+/**
+ * S-33: a bad or oversized period comes back as a normal tool result carrying `error`, so the
+ * model can retry with a valid range (and the UI still gets its tool_result), instead of a thrown
+ * error that ends the mock run or scans a century of rows.
+ */
+function rangeProblem(i: Record<string, unknown>): string | null {
+  const pairs: [unknown, unknown, string][] = [
+    [i.from, i.to, "from/to"],
+    [i.previousFrom, i.previousTo, "previousFrom/previousTo"],
+  ];
+  for (const [a, b, what] of pairs) {
+    if (a === undefined && b === undefined) continue;
+    const f = new Date(String(a));
+    const t = new Date(String(b));
+    if (Number.isNaN(f.getTime()) || Number.isNaN(t.getTime()))
+      return `Invalid ${what}: use ISO 8601 timestamps.`;
+    if (f >= t) return `Invalid ${what}: the start must be before the end.`;
+    if (t.getTime() - f.getTime() > MAX_RANGE_DAYS * 86_400_000)
+      return `Range too long (${what}); max ${MAX_RANGE_DAYS} days. Ask for a shorter period or split it.`;
+  }
+  return null;
+}
+
+function rangeRefusal(tool: string, message: string): ToolOutput {
+  return {
+    data: { error: "invalid_range", message, maxDays: MAX_RANGE_DAYS },
+    summary: `${tool}: ${message}`,
+    answer: message,
+  };
+}
+
 const ratio = (a: number, b: number) => (b > 0 ? a / b : null);
 const perUnit = (a: number, b: number) => (b > 0 ? Math.round(a / b) : null);
 const changeOf = (cur: number, prev: number) => ({
@@ -137,7 +171,11 @@ export function assistantTools(ctx: TenantContext): AssistantTool[] {
     name,
     description,
     input,
-    run: (raw) => run(input.parse(raw)),
+    run: async (raw) => {
+      const i = input.parse(raw);
+      const problem = rangeProblem(i as Record<string, unknown>);
+      return problem ? rangeRefusal(name, problem) : run(i);
+    },
   });
 
   return [

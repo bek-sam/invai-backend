@@ -413,10 +413,10 @@ describe("compare_periods", () => {
     expect(d.byChannel.map((r: Data) => r.channel)).toEqual(["etsy"]);
   });
 
-  it("rejects a range that ends before it starts", async () => {
-    await expect(tool(A.ctx, "compare_periods")({ from: CUR.to, to: CUR.from })).rejects.toThrow(
-      /before/,
-    );
+  it("returns a recoverable error for a range that ends before it starts", async () => {
+    const out = await tool(A.ctx, "compare_periods")({ from: CUR.to, to: CUR.from });
+    expect(out.data).toMatchObject({ error: "invalid_range" });
+    expect(out.answer).toMatch(/start must be before the end/);
   });
 });
 
@@ -705,6 +705,68 @@ describe("small shop: one channel, no ad spend", () => {
     expect(ins.incomplete).toBe(false);
     const ful: Data = (await tool(ctx, "get_fulfillment_health")(CUR)).data;
     expect(ful.totals).toMatchObject({ shipped: 3, onTimeRate: 1, reprints: 0, refunds: 0 });
+  });
+});
+
+describe("S-33: range span cap", () => {
+  const names = [
+    "get_profit",
+    "get_orders_summary",
+    "get_listing_performance",
+    "get_channel_performance",
+    "compare_periods",
+    "get_ad_performance",
+    "get_design_insights",
+    "get_fulfillment_health",
+  ];
+  const extra: Record<string, Record<string, unknown>> = { get_profit: { dimension: "channel" } };
+
+  it("refuses a 100-year range on every ranged tool, with a message the model can act on", async () => {
+    for (const name of names) {
+      const out = await tool(
+        A.ctx,
+        name,
+      )({
+        from: "1900-01-01T00:00:00.000Z",
+        to: "2026-01-01T00:00:00.000Z",
+        ...extra[name],
+      });
+      expect(out.data, name).toEqual({
+        error: "invalid_range",
+        message: "Range too long (from/to); max 400 days. Ask for a shorter period or split it.",
+        maxDays: 400,
+      });
+      expect(out.summary, name).toContain("Range too long");
+    }
+  });
+
+  it("refuses from after to, bad dates and an oversized previous period; allows 400 days", async () => {
+    const bad = [
+      { from: CUR.to, to: CUR.from },
+      { from: "not a date", to: CUR.to },
+    ];
+    for (const r of bad)
+      expect(((await tool(A.ctx, "get_orders_summary")(r)).data as Data).error).toBe(
+        "invalid_range",
+      );
+    const prev = await tool(
+      A.ctx,
+      "compare_periods",
+    )({
+      ...CUR,
+      previousFrom: "2000-01-01T00:00:00.000Z",
+      previousTo: "2026-01-01T00:00:00.000Z",
+    });
+    expect((prev.data as Data).message).toMatch(/previousFrom\/previousTo/);
+    const ok = await tool(
+      A.ctx,
+      "get_orders_summary",
+    )({
+      from: "2025-05-11T00:00:00.000Z",
+      to: "2026-06-15T00:00:00.000Z", // exactly 400 days
+    });
+    expect((ok.data as Data).error).toBeUndefined();
+    expect((ok.data as Data).total).toBeGreaterThan(0);
   });
 });
 

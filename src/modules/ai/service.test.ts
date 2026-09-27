@@ -6,7 +6,7 @@ import { assertCredits } from "../../ai/credits";
 import { aiProvider } from "../../ai/gateway";
 import { ASSISTANT_MAX_ITERATIONS, ASSISTANT_PROMPT } from "../../ai/prompts";
 import { assistantSystem } from "../../ai/providers/anthropic";
-import { mockProvider } from "../../ai/providers/mock";
+import { mockProvider, planFollowUp } from "../../ai/providers/mock";
 import type { AssistantRun } from "../../ai/providers/types";
 import { withSystem, withTenant } from "../../db/client";
 import {
@@ -707,6 +707,37 @@ describe("ai module", () => {
       expect(second.context).toMatch(/^Shop context/);
       // Turn 1 had no earlier turns.
       expect((runs[0] as AssistantRun).history).toEqual([]);
+    });
+
+    it("mock follow-up: 'And only Etsy?' reuses turn 1's tool and period, narrowed to Etsy", async () => {
+      const first = await askAll(ctx, "How did this week compare to last week?");
+      const convId = first[0]?.type === "start" ? first[0].conversationId : "";
+      const second = await askAll(ctx, "And only Etsy?", convId);
+      const call1 = first.find((e) => e.type === "tool_call");
+      const calls2 = second.filter((e) => e.type === "tool_call");
+      expect(call1).toMatchObject({ name: "compare_periods" });
+      expect(calls2).toHaveLength(1);
+      expect(calls2[0]).toEqual({
+        type: "tool_call",
+        name: "compare_periods",
+        input: { ...(call1?.type === "tool_call" ? call1.input : {}), channel: "etsy" },
+      });
+      // A follow-up that names a new period re-plans the same tool for that period.
+      const now = new Date("2026-09-24T15:00:00Z");
+      const history = [
+        { role: "user" as const, text: "Are my ads paying off?" },
+        {
+          role: "assistant" as const,
+          text: "[Tools used earlier: get_ad_performance (Ads …)]\nROAS …",
+        },
+      ];
+      expect(planFollowUp("and last month?", history, now)).toEqual([
+        {
+          tool: "get_ad_performance",
+          input: { from: "2026-08-01T00:00:00.000Z", to: "2026-09-01T00:00:00.000Z" },
+        },
+      ]);
+      expect(planFollowUp("And only Etsy?", [], now)).toBeNull();
     });
 
     it("toolMemoryLine: compact, capped at 600 characters, no brackets or newlines", () => {
