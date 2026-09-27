@@ -23,7 +23,7 @@ const GLOBAL_TABLES = new Set([
   "invitations",
 ]);
 /** Global catalogs: RLS on, read-only for the app role. */
-const PUBLIC_READ_TABLES = new Set(["plans", "trademark_marks"]);
+const PUBLIC_READ_TABLES = new Set(["plans", "trademark_marks", "market_series_cache"]);
 
 type TableInfo = {
   name: string;
@@ -98,10 +98,11 @@ describe("RLS coverage", () => {
       select t, has_table_privilege('invai_app', t, 'INSERT') as ins,
         has_table_privilege('invai_app', t, 'UPDATE') as upd,
         has_table_privilege('invai_app', t, 'DELETE') as del
-      from unnest(array['plans', 'trademark_marks', 'audit_log', 'order_item_transitions']) t`);
+      from unnest(array['plans', 'trademark_marks', 'market_series_cache', 'audit_log', 'order_item_transitions']) t`);
     const by = Object.fromEntries(res.rows.map((r) => [r.t, r]));
     expect(by.plans).toMatchObject({ ins: false, upd: false, del: false });
     expect(by.trademark_marks).toMatchObject({ ins: false, upd: false, del: false });
+    expect(by.market_series_cache).toMatchObject({ ins: false, upd: false, del: false });
     expect(by.audit_log).toMatchObject({ upd: false, del: false });
     expect(by.order_item_transitions).toMatchObject({ upd: false, del: false });
   });
