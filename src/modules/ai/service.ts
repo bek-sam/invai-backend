@@ -1110,6 +1110,13 @@ export function toolMemoryLine(toolCalls: unknown): string | null {
   return `${TOOL_LINE_HEAD}${body.length > room ? `${body.slice(0, room - 1)}…` : body}]`;
 }
 
+/**
+ * A turn's user and assistant messages are inserted in one transaction, so they share `createdAt`
+ * (`now()` is the transaction start). This tie-break keeps the user message first in every read;
+ * without it the pair could come back reversed and a follow-up lost its earlier question.
+ */
+const USER_FIRST = sql`(${assistantMessages.role} = 'assistant')`;
+
 /** Channels the assistant treats as connected (the same set as the cross-listing check). */
 const CONTEXT_CONNECTION_STATUSES = ["connected", "csv_only", "error"] as const;
 
@@ -1191,7 +1198,7 @@ export async function* ask(
       })
       .from(assistantMessages)
       .where(eq(assistantMessages.conversationId, conversationId))
-      .orderBy(desc(assistantMessages.createdAt))
+      .orderBy(desc(assistantMessages.createdAt), desc(USER_FIRST))
       .limit(20);
     await tx.insert(assistantMessages).values({
       companyId: ctx.companyId,
@@ -1417,7 +1424,7 @@ export async function getConversation(tx: Tx, ctx: Ctx, id: string) {
     .select()
     .from(assistantMessages)
     .where(eq(assistantMessages.conversationId, id))
-    .orderBy(asc(assistantMessages.createdAt));
+    .orderBy(asc(assistantMessages.createdAt), asc(USER_FIRST));
   return {
     id: c.id,
     title: c.title,

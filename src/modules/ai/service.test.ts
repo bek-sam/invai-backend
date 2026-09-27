@@ -10,6 +10,8 @@ import { mockProvider, planFollowUp } from "../../ai/providers/mock";
 import type { AssistantRun } from "../../ai/providers/types";
 import { withSystem, withTenant } from "../../db/client";
 import {
+  assistantConversations,
+  assistantMessages,
   blankVariants,
   channelConnections,
   companies,
@@ -806,9 +808,13 @@ describe("assistant market turn: provenance and recommendations (T-18-4, spec AC
     const u = await createUser(co.id, "owner");
     return tenantContext(co.id, u.id, "owner");
   }
-  async function turn(ctx: ReturnType<typeof tenantContext>, message: string) {
+  async function turn(
+    ctx: ReturnType<typeof tenantContext>,
+    message: string,
+    conversationId?: string,
+  ) {
     const events: AssistantEvent[] = [];
-    for await (const e of svc.ask(ctx, { message })) events.push(e);
+    for await (const e of svc.ask(ctx, { message, conversationId })) events.push(e);
     return events;
   }
 
@@ -922,6 +928,42 @@ describe("assistant market turn: provenance and recommendations (T-18-4, spec AC
     const events = await turn(ctx, "Is the Halloween niche trending?");
     expect(events.at(-1)?.type).toBe("done");
     expect(events.some((e) => e.type === "error")).toBe(false);
+  });
+
+  it("a turn's user and assistant messages share a timestamp, and reads still put the user first", async () => {
+    const ctx = await owner();
+    const at = new Date("2026-09-20T10:00:00Z");
+    // The assistant row is written first on purpose, with the same createdAt as the user row.
+    const convId = await withTenant(ctx.companyId, async (tx) => {
+      const [c] = await tx
+        .insert(assistantConversations)
+        .values({ companyId: ctx.companyId, userId: ctx.userId as string, title: "t" })
+        .returning();
+      if (!c) throw new Error("conversation insert failed");
+      await tx.insert(assistantMessages).values({
+        companyId: ctx.companyId,
+        conversationId: c.id,
+        role: "assistant",
+        text: "Compared.",
+        toolCalls: { calls: [{ name: "compare_periods", input: {}, summary: "s" }] },
+        createdAt: at,
+      });
+      await tx.insert(assistantMessages).values({
+        companyId: ctx.companyId,
+        conversationId: c.id,
+        role: "user",
+        text: "How did this week compare to last week?",
+        createdAt: at,
+      });
+      return c.id;
+    });
+    const conv = await withTenant(ctx.companyId, (tx) => svc.getConversation(tx, ctx, convId));
+    expect(conv.messages.map((m) => m.role)).toEqual(["user", "assistant"]);
+    // The follow-up finds the earlier question and reuses its one tool.
+    const events = await turn(ctx, "And only Etsy?", convId);
+    expect(
+      events.filter((e) => e.type === "tool_call").map((e) => e.type === "tool_call" && e.name),
+    ).toEqual(["compare_periods"]);
   });
 
   it("storedRecommendations reads only well-formed entries", () => {
