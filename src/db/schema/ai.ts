@@ -164,6 +164,7 @@ export const CREDIT_KINDS = [
   "personalization_check",
   "assistant",
   "mockup",
+  "market_niche", // contracts 0.6.1; the niche route still charges sku_suggestion until switched
 ] as const;
 
 /** Per-company AI credit ledger: allowance/packs in (+), every job out (−). */

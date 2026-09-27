@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-09-27T04:45:52.139Z",
+  "generatedAt": "2026-09-27T16:03:40.852Z",
   "mode": "mock",
   "routes": [
     {
@@ -98,8 +98,8 @@
       },
       "costCentsMedian": 0,
       "costCentsP95": 0,
-      "latencyMsMedian": 6,
-      "latencyMsP95": 9,
+      "latencyMsMedian": 5,
+      "latencyMsP95": 8,
       "cacheHitRate": 0
     },
     {
@@ -154,7 +154,7 @@
       "costCentsMedian": 0,
       "costCentsP95": 0,
       "latencyMsMedian": 5,
-      "latencyMsP95": 6,
+      "latencyMsP95": 7,
       "cacheHitRate": 0
     },
     {
@@ -268,8 +268,8 @@
       },
       "costCentsMedian": 0,
       "costCentsP95": 0,
-      "latencyMsMedian": 10,
-      "latencyMsP95": 16,
+      "latencyMsMedian": 8,
+      "latencyMsP95": 21,
       "cacheHitRate": 0
     },
     {
@@ -438,8 +438,8 @@
       },
       "costCentsMedian": 0,
       "costCentsP95": 0,
-      "latencyMsMedian": 15,
-      "latencyMsP95": 50,
+      "latencyMsMedian": 10,
+      "latencyMsP95": 25,
       "cacheHitRate": 0
     }
   ]

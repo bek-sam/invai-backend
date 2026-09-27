@@ -4,6 +4,12 @@ import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { MARKET_COPY } from "../../ai/market-copy";
 import { planAssistantCalls } from "../../ai/providers/mock";
 import type { ToolOutput } from "../../ai/providers/types";
+import {
+  fallbackAnswer,
+  MARKET_TOOL_NAMES,
+  type TurnToolOutput,
+  validateAnswer,
+} from "../../ai/validators/answer";
 import { withSystem } from "../../db/client";
 import {
   adSpend,
@@ -1378,6 +1384,166 @@ describe("market tools (T-18-4)", () => {
     expect(out.answer).toBe(
       "**Spooky Pumpkin Ghost, Etsy** (your 90-day costs): $19.99: net $2.39 per unit, 12.0% margin; $21.99: net $4.26 per unit, 19.4% margin. Break-even: $17.45. Floor price (15.0% margin): $21.05. (volume effect unknown)",
     );
+  });
+
+  describe("fallback discloses mock sources (T-18-4 r2)", () => {
+    const simulated = (mock: boolean) => ({
+      confidence: 0.4,
+      band: "medium" as const,
+      stale: false,
+      mock,
+      sources: [prov("own", false), prov("amazon_pricing", mock)],
+      asOf: AS_OF,
+      currentPriceCents: 1999,
+      costBasis: {
+        unitCostCents: 595,
+        shippingChargedCents: 0,
+        adsPerUnitCents: 0,
+        refundRate: 0,
+        feePct: 15,
+        feeFixedCents: 0,
+        periodDays: 90,
+      },
+      candidates: [
+        {
+          priceCents: 1999,
+          origin: "current" as const,
+          netPerUnitCents: 1104,
+          marginPct: 55.23,
+          estimatedWeeklyUnits: null,
+          estimatedWeeklyNetCents: null,
+        },
+      ],
+      breakEvenCents: 700,
+      floorPriceCents: 834,
+      floorMarginPct: 15,
+      priceResponse: null,
+      incomplete: false,
+      missing: [],
+    });
+    const mockAll = () => {
+      m.listRecommendations.mockResolvedValue([]);
+      m.getTrendSignal.mockImplementation(async (_tx, _ctx, i) =>
+        trendFixture(i, {
+          trend: "insufficient",
+          growth4w: null,
+          yoy: null,
+          insufficientReason: "too_few_points",
+          band: "low",
+          readings: [],
+        }),
+      );
+      m.getSeasonalitySignal.mockImplementation(async (_tx, _ctx, i) => ({
+        subject: subjectOf(i),
+        confidence: 0,
+        band: "low",
+        stale: false,
+        mock: true,
+        sources: [prov("google_trends", true)],
+        asOf: AS_OF,
+        index: [],
+        peakMonths: [],
+        offMonths: [],
+        indexSource: null,
+        actBy: null,
+        yearsUsed: 0,
+      }));
+      m.getPricePosition.mockImplementation(async (_tx, _ctx, i) => ({
+        subject: { designId: i.designId, designName: null, niche: null },
+        confidence: 0,
+        band: "low",
+        stale: false,
+        mock: true,
+        sources: [prov("own", false), prov("amazon_pricing", true)],
+        asOf: AS_OF,
+        channel: i.channel,
+        currentPriceCents: 1999,
+        n: 6,
+        available: false,
+        reason: "too_few_comparables",
+      }));
+      m.simulatePrice.mockImplementation(async (_tx, _ctx, i) => ({
+        subject: { designId: i.designId, designName: null, niche: null },
+        channel: i.channel,
+        ...simulated(true),
+      }));
+    };
+    const turn = (name: string, out: ToolOutput): TurnToolOutput => ({ name, ...out });
+
+    it("get_price_position unavailable with mock comparables names the source, date and 'Sample data'", async () => {
+      mockAll();
+      const out = await run(a.ctx, "get_price_position", {
+        designId: a.designIds[0],
+        channel: "amazon",
+      });
+      expect(out.data).toMatchObject({ available: false, reason: "too_few_comparables" });
+      expect(out.meta?.recommendations).toEqual([]);
+      expect(out.answer).toMatch(/as of 2026-09-20 \(Sample data\)/);
+      const es = await run(a.ctx, "get_price_position", {
+        designId: a.designIds[0],
+        channel: "amazon",
+        lang: "es",
+      });
+      expect(es.answer).toMatch(/al 2026-09-20 \(Datos de muestra\)/);
+      const t = [turn("get_price_position", out)];
+      const q = "Am I priced right on Amazon?";
+      expect(validateAnswer(fallbackAnswer(t, q), t, { message: q })).toEqual([]);
+    });
+
+    it("simulate_price with mock comparables names the source, date and 'Sample data'", async () => {
+      mockAll();
+      const out = await run(a.ctx, "simulate_price", {
+        designId: a.designIds[0],
+        channel: "amazon",
+      });
+      expect(out.meta?.mock).toBe(true);
+      expect(out.meta?.recommendations).toEqual([]);
+      expect(out.answer).toMatch(/as of 2026-09-20 \(Sample data\)/);
+      const es = await run(a.ctx, "simulate_price", {
+        designId: a.designIds[0],
+        channel: "amazon",
+        lang: "es",
+      });
+      expect(es.answer).toMatch(/al 2026-09-20 \(Datos de muestra\)/);
+      const t = [turn("simulate_price", out)];
+      const q = "What margin would I get if I priced higher?";
+      expect(validateAnswer(fallbackAnswer(t, q), t, { message: q })).toEqual([]);
+    });
+
+    it("every market tool's fallback passes the answer check when its sources are mock (en and es)", async () => {
+      mockAll();
+      for (const lang of ["en", "es"] as const) {
+        const q =
+          lang === "es"
+            ? "¿Cómo va el mercado de mis diseños?"
+            : "How is the market for my designs?";
+        for (const name of MARKET_TOOL_NAMES) {
+          const out = await run(a.ctx, name, { designId: a.designIds[0], lang });
+          expect(out.meta?.mock, name).toBe(true);
+          const t = [turn(name, out)];
+          expect(
+            validateAnswer(fallbackAnswer(t, q), t, { message: q }),
+            `${name} ${lang}`,
+          ).toEqual([]);
+        }
+        const all: TurnToolOutput[] = [];
+        for (const name of MARKET_TOOL_NAMES)
+          all.push(turn(name, await run(a.ctx, name, { designId: a.designIds[0], lang })));
+        expect(validateAnswer(fallbackAnswer(all, q), all, { message: q })).toEqual([]);
+      }
+    });
+
+    it("an own-cost-only simulation adds no source line", async () => {
+      mockAll();
+      m.simulatePrice.mockImplementation(async (_tx, _ctx, i) => ({
+        subject: { designId: i.designId, designName: null, niche: null },
+        channel: i.channel,
+        ...simulated(false),
+        sources: [prov("own", false)],
+      }));
+      const out = await run(a.ctx, "simulate_price", { designId: a.designIds[0] });
+      expect(out.answer).not.toMatch(/as of|Sample data/);
+    });
   });
 
   it("AC16: the tools write nothing (no business row changes, no 'shown' write from a tool)", async () => {

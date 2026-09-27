@@ -1294,17 +1294,35 @@ function marketOutput(
   const recText = lines.length
     ? `\n\n${lang === "es" ? "Recomendaciones" : "Recommendations"}:\n${lines.map((l, i) => `${i + 1}. ${l.text}`).join("\n")}`
     : "";
+  const sources = uniqueSources(rows.flatMap((r) => r.sources));
   return {
     data: { ...base.data, recommendations: lines.map(({ text: _t, ...l }) => l) },
     summary: base.summary,
-    answer: `${base.answer}${recText}`,
+    answer: `${base.answer}${recText}${disclosure(`${base.answer}${recText}`, mock, sources, lang)}`,
     meta: {
       mock,
-      sources: uniqueSources(rows.flatMap((r) => r.sources)),
+      sources,
       recommendations: recs.map((r) => ({ id: r.id, rule: r.rule, band: r.band, mock: r.mock })),
     },
   };
 }
+
+/**
+ * The code-written answer is also the gateway's fail-closed fallback, so it must pass the answer
+ * check on its own: a mock source says "Sample data", an outside source carries its date. Templates
+ * that already name their sources get nothing added.
+ */
+function disclosure(text: string, mock: boolean, sources: SignalSourceRef[], lang: Lang2): string {
+  const needSample = mock && !SAMPLE_LABEL.test(text);
+  const needDate = sources.some((s) => s.source !== "own") && !ISO_DAY.test(text);
+  if (!needSample && !needDate) return "";
+  const line = sources.map((s) => sourceLine(s, lang)).join("; ");
+  const parts = [line ? `${line}.` : ""];
+  if (mock && !SAMPLE_LABEL.test(line)) parts.push(MARKET_COPY.sample[lang]);
+  return `\n${parts.filter(Boolean).join(" ")}`;
+}
+const SAMPLE_LABEL = /sample data|datos de muestra/i;
+const ISO_DAY = /\d{4}-\d{2}-\d{2}/;
 
 function marketFailure(tool: string, err: unknown, lang: Lang2): ToolOutput {
   const notFound = err instanceof ORPCError && err.code === "NOT_FOUND";
@@ -1590,7 +1608,7 @@ function marketTools(ctx: TenantContext): AssistantTool[] {
               {
                 data: { ...base, reason: p.reason },
                 summary: `${d.name} on ${ch}: no price position (${p.reason.replace(/_/g, " ")})`,
-                answer: `**${d.name}, ${ch}**: ${fill(UNAVAILABLE[p.reason]?.[lang] ?? "", { channel: ch })}`,
+                answer: `**${d.name}, ${ch}**: ${fill(UNAVAILABLE[p.reason]?.[lang] ?? "", { channel: ch })}${src ? ` ${src}.` : ""}`,
               },
               [base],
               recs,
@@ -1695,11 +1713,15 @@ function marketTools(ctx: TenantContext): AssistantTool[] {
           const missing = s.incomplete
             ? ` ${lang === "es" ? "Faltan costos" : "Some costs are missing"} (${s.missing.join(", ").replace(/_/g, " ")}), ${lang === "es" ? "así que son estimaciones" : "so these are estimates"}.`
             : "";
+          // Own costs need no source line; a mock or outside comparables source does.
+          const src = base.sources.some((x) => x.mock || x.source !== "own")
+            ? base.sources.map((x) => sourceLine(x, lang)).join("; ")
+            : "";
           return marketOutput(
             {
               data: { ...base, lang },
               summary: `${d.name} on ${ch}: ${rows.length} prices simulated${s.floorPriceCents != null ? `, floor ${money(s.floorPriceCents)}` : ""}`,
-              answer: `**${d.name}, ${ch}** (${lang === "es" ? "tus costos de 90 días" : "your 90-day costs"}): ${table}.${breakEven}${floor}${volume}${missing}`,
+              answer: `**${d.name}, ${ch}** (${lang === "es" ? "tus costos de 90 días" : "your 90-day costs"}): ${table}.${breakEven}${floor}${volume}${missing}${src ? ` ${src}.` : ""}`,
             },
             [base],
             recs,
