@@ -29,6 +29,7 @@ import {
 import { getJob, runJobInline } from "../../lib/queues";
 import { createCompany, createUser, tenantContext } from "../../test/fixtures";
 import * as market from "../market/service";
+import { localYmd } from "../market/signals";
 import { assistantTools } from "./assistant-tools";
 import * as svc from "./service";
 
@@ -156,6 +157,20 @@ const REC_SAMPLE = /Sample data, not your real market|Datos de muestra, no tu me
 const DAY = 86_400_000;
 const WEEK = 7 * DAY;
 const uniq = () => crypto.randomUUID().slice(0, 12);
+
+/** Every fixture company keeps the schema default (`companies.timezone`); `localYmd` needs it. */
+const TIME_ZONE = "America/Phoenix";
+
+/**
+ * ISO weekday (Mon=1..Sun=7) of `at`'s local calendar date, the convention `completeWeeks` uses.
+ * Second pass (QA): a fixed "-3 days" only placed `weeksAgo` in its intended ISO week for a
+ * Thursday-Sunday `now`; a Tuesday `now` put weeksAgo=1 a week early, leaving the true last
+ * complete ISO week empty (same cause as `market.acceptance.test.ts`'s AC17 fixture bug).
+ */
+function isoWeekday(at: Date): number {
+  const day = new Date(`${localYmd(at, TIME_ZONE)}T00:00:00.000Z`).getUTCDay();
+  return day === 0 ? 7 : day;
+}
 type Connection = typeof channelConnections.$inferSelect;
 
 async function connection(companyId: string, channel: Channel, status: "connected" | "csv_only") {
@@ -234,7 +249,8 @@ async function weeklySales(
   for (let i = 0; i < series.length; i++) {
     const units = series[i] ?? 0;
     if (units <= 0) continue;
-    const placedAt = new Date(now.getTime() - (series.length - i) * WEEK - 3 * DAY);
+    const weeksAgo = series.length - i;
+    const placedAt = new Date(now.getTime() - weeksAgo * WEEK - (isoWeekday(now) - 4) * DAY);
     await withSystem(async (tx) => {
       const [order] = await tx
         .insert(orders)
@@ -296,14 +312,21 @@ const FLOOR_BREACH: Costs = {
   labor: 120,
   ads: 290,
 };
-/** Costs that leave ~19% at $12.99 (R2 territory: < 25%, ≥ 15%). */
+/**
+ * Costs that leave ~19% margin at $10.00 (R2 territory: < 25%, ≥ 15%). Second pass, QA: at the
+ * original $12.99, `market/compute.ts`'s margin signal ignores `channelFeesCents` from
+ * `profitLines` and recomputes the channel fee fresh from the default fee schedule (Amazon
+ * apparel referral: 5% under $20, `finance/profit.ts`), giving ~29% margin, not the intended
+ * ~19% -- above the R2 threshold, so R2 never fired. $10.00 also keeps the R2 test-price ceiling
+ * (p0 x 1.1) safely under the mock's own $12.00 comparable floor.
+ */
 const THIN: Costs = {
-  fees: 195,
-  blank: 285,
+  fees: 50,
+  blank: 300,
   transfer: 150,
-  label: 300,
+  label: 230,
   packaging: 45,
-  labor: 80,
+  labor: 35,
   ads: 0,
 };
 /** Costs that leave ~38% at $24.99. */
@@ -404,16 +427,16 @@ describe("T-18-4 market answers on a fixture shop (spec AC2, AC16, AC30, AC31, A
     // Two Halloween designs on Etsy, both below the 15% margin floor (R1 + R3 each).
     for (const name of ["Spooky Pumpkin Ghost", "Witch Please"]) {
       const d = await design(s.id, name, ["halloween"]);
-      await product(s.id, d.id, "etsy", 19.99);
+      await product(s.id, d.id, "etsy", 1999); // Cents (contract), not dollars
       await listing(s.id, s.etsy, d.id, `${name} tee`);
       await weeklySales(s.id, s.etsy, d.id, flat(30, 3), now, 1999);
       await profitFor(s.id, d.id, FLOOR_BREACH);
     }
     // One camping design on Amazon at a low price with thin margin (R2, on mock comparables).
     const camp = await design(s.id, "Retro Camping Bear", ["camping", "retro"]);
-    await product(s.id, camp.id, "amazon", 12.99);
+    await product(s.id, camp.id, "amazon", 1000); // second pass, QA: see THIN's comment
     await listing(s.id, amazon, camp.id, "Retro Camping Bear tee");
-    await weeklySales(s.id, amazon, camp.id, flat(30, 4), now, 1299);
+    await weeklySales(s.id, amazon, camp.id, flat(30, 4), now, 1000);
     await profitFor(s.id, camp.id, THIN);
     await runShopJobs(s.id);
   }, 180_000);
@@ -536,7 +559,7 @@ describe("T-18-4 thin data: a small Etsy-only shop with 10 weeks of history (spe
     s = await shop("Small Bloom");
     const now = freeze(NOW);
     const d = await design(s.id, "Dog Mom Life", ["dog mom"]);
-    await product(s.id, d.id, "etsy", 24.99);
+    await product(s.id, d.id, "etsy", 2499); // Cents (contract), not dollars
     await listing(s.id, s.etsy, d.id, "Dog Mom Life tee");
     await weeklySales(s.id, s.etsy, d.id, flat(10, 4), now);
     await profitFor(s.id, d.id, HEALTHY);

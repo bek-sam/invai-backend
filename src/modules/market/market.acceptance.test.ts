@@ -35,6 +35,7 @@ import {
   type Channel,
   channelConnections,
   designs,
+  inventoryMovements,
   listings,
   locations,
   orderItems,
@@ -50,6 +51,7 @@ import { getJob, runJobInline } from "../../lib/queues";
 import { createCompany, createUser, tenantContext } from "../../test/fixtures";
 import { periodOf } from "../billing/service";
 import * as market from "./service";
+import { completeWeeks, filterComparables, fitTrend, localYmd } from "./signals";
 
 /* ---- The module under test --------------------------------------------------------------- */
 
@@ -114,6 +116,25 @@ const WEEK = 7 * DAY;
 const uniq = () => crypto.randomUUID().slice(0, 12);
 type Connection = typeof channelConnections.$inferSelect;
 type Design = typeof designs.$inferSelect;
+
+/** Every fixture company keeps the schema default (`companies.timezone`); `completeWeeks` needs it. */
+const TIME_ZONE = "America/Phoenix";
+
+/** ISO weekday (Mon=1..Sun=7) of `at`'s local calendar date, the convention `completeWeeks` uses. */
+function isoWeekday(at: Date): number {
+  const day = new Date(`${localYmd(at, TIME_ZONE)}T00:00:00.000Z`).getUTCDay();
+  return day === 0 ? 7 : day;
+}
+
+/**
+ * Monday (UTC midnight) of the ISO week `weeksAgo` complete weeks back from `now`, i.e. the same
+ * week `completeWeeks(now, TIME_ZONE, weeksAgo)[0]` names.
+ */
+function weekMonday(now: Date, weeksAgo: number): Date {
+  const [wk] = completeWeeks(now, TIME_ZONE, weeksAgo);
+  if (!wk) throw new Error("weeksAgo must be >= 1");
+  return new Date(`${wk.monday}T00:00:00.000Z`);
+}
 
 type Shop = { id: string; ownerId: string; owner: TenantContext; etsy: Connection };
 
@@ -273,9 +294,20 @@ type SaleInput = {
   now: Date;
 };
 
-/** One order with `units` items (one item = one unit) placed `weeksAgo` weeks before `now`. */
+/**
+ * One order with `units` items (one item = one unit) placed `weeksAgo` weeks before `now`.
+ * `weeksAgo` counts complete ISO weeks back (1 = the most recent complete week, the same weeks
+ * `completeWeeks` computes), placed mid-week so it lands in that week regardless of what weekday
+ * `now` falls on. A fixed "-3 days" only did that for a Thursday-Sunday `now`; second pass (QA):
+ * with a Tuesday `now` it put weeksAgo=1 a week too early, leaving the true last complete ISO
+ * week empty (AC17). `weeksAgo: 0` is a different case (AC26/AC27's day-by-day price-response
+ * loop): it just needs a moment slightly before a moving `now`, not a specific ISO week, so it
+ * keeps the old fixed offset.
+ */
 async function sale(companyId: string, conn: Connection, s: SaleInput) {
-  const placedAt = new Date(s.now.getTime() - s.weeksAgo * WEEK - 3 * DAY);
+  const placedAt = new Date(
+    s.now.getTime() - s.weeksAgo * WEEK - (s.weeksAgo === 0 ? 3 : isoWeekday(s.now) - 4) * DAY,
+  );
   const doneAt = new Date(placedAt.getTime() + (s.leadHours ?? 48) * 3_600_000);
   const price = s.priceCents ?? 2499;
   const state = s.state ?? "shipped";
@@ -369,7 +401,12 @@ type Costs = {
   labor: number;
   ads: number;
 };
-/** Profit lines for every shipped item of a design: margin = (revenue − costs) / revenue. */
+/**
+ * Profit lines for every shipped item of a design: margin = (revenue − costs) / revenue. A
+ * second call for the same design (AC26 calls it once before, once after a day-by-day sales
+ * loop) only adds lines for items the first call hadn't seen yet -- `profit_lines` has one row
+ * per order item.
+ */
 async function profitFor(companyId: string, designId: string, costs: Costs) {
   await withSystem(async (tx) => {
     const rows = await tx
@@ -391,37 +428,50 @@ async function profitFor(companyId: string, designId: string, costs: Costs) {
       );
     const total = Object.values(costs).reduce((a, b) => a + b, 0);
     if (!rows.length) return;
-    await tx.insert(profitLines).values(
-      rows.map((r) => ({
-        companyId,
-        orderId: r.orderId,
-        orderItemId: r.id,
-        channel: r.channel,
-        designId,
-        revenueCents: r.price,
-        channelFeesCents: costs.fees,
-        blankCostCents: costs.blank,
-        transferCostCents: costs.transfer,
-        labelCostCents: costs.label,
-        packagingCostCents: costs.packaging,
-        laborCostCents: costs.labor,
-        adsCostCents: costs.ads,
-        refundsCents: 0,
-        netCents: r.price - total,
-        marginPct: ((r.price - total) / r.price) * 100,
-        placedAt: r.placedAt,
-      })),
-    );
+    await tx
+      .insert(profitLines)
+      .values(
+        rows.map((r) => ({
+          companyId,
+          orderId: r.orderId,
+          orderItemId: r.id,
+          channel: r.channel,
+          designId,
+          revenueCents: r.price,
+          channelFeesCents: costs.fees,
+          blankCostCents: costs.blank,
+          transferCostCents: costs.transfer,
+          labelCostCents: costs.label,
+          packagingCostCents: costs.packaging,
+          laborCostCents: costs.labor,
+          adsCostCents: costs.ads,
+          refundsCents: 0,
+          netCents: r.price - total,
+          marginPct: ((r.price - total) / r.price) * 100,
+          placedAt: r.placedAt,
+        })),
+      )
+      .onConflictDoNothing({ target: [profitLines.companyId, profitLines.orderItemId] });
   });
 }
-/** Costs that leave about 19% margin at $12.99 (R2 territory: < 25% but ≥ 15%). */
+/**
+ * Costs that leave about 19% margin at $10.00 (R2 territory: < 25% but ≥ 15%). Second pass, QA:
+ * two fixes over the first pass. (1) At the original $12.99 the R2 test-price ceiling (p0 × 1.1)
+ * could land below the mock's own random comparable median (base $12.00–$32.00), so `min <= max`
+ * sometimes failed and R2 didn't fire; $10.00 keeps p0 × 1.1 under the mock's $12.00 floor, so the
+ * window always opens. (2) `market/compute.ts`'s margin signal never reads `channelFeesCents` from
+ * `profitLines` (only `blank/transfer/label/packaging/labor`); it recomputes the channel fee fresh
+ * from the default fee schedule (Amazon apparel referral: 5% under $20, `finance/profit.ts`). So
+ * `fees` here is realistic bookkeeping only -- the real fee the engine uses is 5% of $10.00 = 50¢,
+ * folded into the 660¢ + 50¢ = 710¢ that gives 19% (not the 810¢ the first pass assumed).
+ */
 const THIN_COSTS: Costs = {
-  fees: 195,
-  blank: 285,
+  fees: 50,
+  blank: 300,
   transfer: 150,
-  label: 300,
+  label: 230,
   packaging: 45,
-  labor: 80,
+  labor: 35,
   ads: 0,
 };
 /** Costs that leave about 38% margin at $24.99. */
@@ -502,7 +552,7 @@ describe("T-18-3 happy path on a fixture shop (spec AC1, AC3)", () => {
     teacher = await design(s.id, { name: "Best Teacher Ever", tags: ["teacher", "classroom"] });
     odd = await design(s.id, { name: "Zorbnak Quux", tags: ["zorbnak"] });
     const blankId = (await blank(s.id, { onHand: 4, reorderPoint: 24 })).id;
-    await product(s.id, pumpkin.id, [{ channel: "etsy", price: 24.99 }]);
+    await product(s.id, pumpkin.id, [{ channel: "etsy", price: 2499 }]); // Cents (contract), not dollars
     await listing(s.id, s.etsy, pumpkin.id, "Spooky Pumpkin Ghost tee");
     // 30 weeks of steady sales on Etsy only, pressed on the tracked blank, 48 h paid → shipped.
     await weeklySales(s.id, s.etsy, pumpkin.id, flat(30, 3), now, {
@@ -611,6 +661,10 @@ describe("T-18-3 own history and comparables (spec AC17, AC19, AC6)", () => {
       tags: ["dog mom", "personalized"],
       personalizationTemplateId: crypto.randomUUID(),
     });
+    // AC19 needs a stored price-position signal for `custom`, which `refreshPricing` only builds
+    // for a design with an active listing on the channel (second pass, QA).
+    await listing(s.id, amazon, custom.id, "Custom Name Dog Mom tee");
+    await product(s.id, custom.id, [{ channel: "amazon", price: 2499 }]);
     await weeklySales(s.id, amazon, custom.id, flat(20, 2), now);
     await runShopJobs(s.id);
   }, 120_000);
@@ -628,8 +682,10 @@ describe("T-18-3 own history and comparables (spec AC17, AC19, AC6)", () => {
     expect(own?.trend).not.toBe("insufficient");
   });
 
-  it("AC17 (hand SQL): the shipped, non-reprint unit count for the contaminated week is 3", async () => {
-    const weekStart = new Date(new Date(NOW).getTime() - WEEK - 4 * DAY);
+  it("AC17 (hand SQL): the shipped, non-reprint unit count for the last complete ISO week is 3", async () => {
+    // The boundary `completeWeeks` itself uses (second pass, QA: a hand-rolled "-4 days" window
+    // didn't match a Tuesday `now`'s real last complete ISO week, so it proved nothing).
+    const weekStart = weekMonday(new Date(NOW), 1);
     const weekEnd = new Date(weekStart.getTime() + WEEK);
     const rows = await withSystem((tx) =>
       tx.execute<{ n: number }>(sql`
@@ -648,31 +704,48 @@ describe("T-18-3 own history and comparables (spec AC17, AC19, AC6)", () => {
       connection: amazon,
     });
     expect(provider?.mock).toBe(true);
-    if (!provider) return;
-    // Spec step 2.5 filters comparables on the personalization flag, so the provider must take it
-    // on the own item and mark it on each observation. T-18-2's stub has neither yet.
-    type OwnItem = Parameters<typeof provider.comparables>[1][number] & { personalized?: boolean };
-    const own = (personalized: boolean): OwnItem => ({
-      ref: custom.id,
-      keywords: ["custom name dog mom shirt"],
-      garmentClass: "tee",
-      personalized,
-    });
-    const [plain] = await provider.comparables(amazon, [own(false)]);
-    const [personal] = await provider.comparables(amazon, [own(true)]);
-    expect(plain?.observations.length).toBeGreaterThanOrEqual(8);
-    expect(personal?.observations.length).toBeGreaterThanOrEqual(8);
-    expect(personal?.observations).not.toEqual(plain?.observations);
-    const flagged = (personal?.observations ?? []).filter(
-      (o) => (o as { personalized?: boolean }).personalized === true,
+
+    // Per the tech lead's decision (wave.md, 2026-09-27): the comparable filter is T-18-3's
+    // normalize step (`filterComparables` in `./signals`), not the provider -- a provider returns
+    // the raw mix (T-18-2 round 2). So this asserts on the filtered comparables `getPricePosition`
+    // actually used, read back from the same stored snapshot it reads, not on the provider output.
+    const snap = await withSystem((tx) =>
+      tx.execute<{ observations: unknown; personalized: boolean }>(sql`
+        select observations, personalized from market_price_snapshots
+        where company_id = ${s.id} and design_id = ${custom.id} and channel = 'amazon'
+        order by fetched_at desc limit 1`),
     );
-    expect(flagged.length).toBe(personal?.observations.length);
+    const row = snap.rows[0];
+    expect(row, "a stored pricing snapshot for the personalized design").toBeDefined();
+    if (!row) return;
+    expect(row.personalized).toBe(true);
+    const rawObs = row.observations as {
+      landedPriceCents: number;
+      isFeatured: boolean;
+      offerCount: number | null;
+      personalized?: boolean;
+    }[];
+    // The raw fetch isn't pre-filtered: it's a real mix, or the filter below proves nothing.
+    expect(rawObs.some((o) => o.personalized === true)).toBe(true);
+    expect(rawObs.some((o) => (o.personalized ?? false) === false)).toBe(true);
+
+    const matched = filterComparables(rawObs, true);
+    const mismatched = filterComparables(rawObs, false);
+    expect(matched.every((o) => o.personalized === true)).toBe(true);
+    expect(mismatched.every((o) => (o.personalized ?? false) === false)).toBe(true);
+    expect(matched.length).toBeGreaterThan(0);
+    expect(mismatched.length).not.toBe(matched.length);
 
     const svc = await service();
     const pos = await withTenant(s.id, (tx) =>
       svc.getPricePosition(tx, s.owner, { designId: custom.id, channel: "amazon" }),
     );
-    expect(pos.n).toBeLessThanOrEqual(flagged.length);
+    // Price position's own count is exactly the personalization-matched filter's result -- never
+    // the raw mix, and never the opposite-flag group.
+    expect(pos.n).toBe(matched.length);
+    expect(pos.n).not.toBe(rawObs.length);
+    if (mismatched.length) expect(pos.n).not.toBe(mismatched.length);
+    expect(pos.available).toBe(matched.length >= 8);
     if (!pos.available) expect(pos.reason).toBe("too_few_comparables");
   });
 
@@ -701,6 +774,97 @@ describe("T-18-3 own history and comparables (spec AC17, AC19, AC6)", () => {
       true,
     );
     expect(sim.sources.every((p) => p.source === "own")).toBe(true);
+  });
+});
+
+/* ============================================================================================ */
+
+/**
+ * AC18 (second pass, QA, now that T-18-3's history schema exists): out-of-stock weeks are
+ * excluded from the trend fit, never counted as a zero-sales week. The "R1 names the blank and
+ * links to reorder" half of AC18 is already proven by AC3's `blankBelowReorderPoint` assertion
+ * above; this block covers the exclusion half only.
+ */
+describe("T-18-3 out-of-stock weeks excluded from the trend fit (spec AC18)", () => {
+  it("AC18 (pure): fitTrend skips a null week (excluded), but counts a 0 as a real zero-sales week", () => {
+    const steady: (number | null)[] = Array.from({ length: 26 }, () => 4);
+    const excluded = [...steady];
+    excluded[22] = null;
+    excluded[23] = null;
+    const counted = [...steady];
+    counted[22] = 0;
+    counted[23] = 0;
+    const fitExcluded = fitTrend(excluded);
+    const fitCounted = fitTrend(counted);
+    // The 2 out-of-stock weeks shrink the fit window (excluded), not the zero-sales window
+    // (counted): the same behavior `compute.ts` relies on when it nulls out an out-of-stock week.
+    expect(fitExcluded.windowPoints).toBe(24);
+    expect(fitCounted.windowPoints).toBe(26);
+    // Steady sales everywhere else: excluding the gap reads flat, not falling.
+    expect(fitExcluded.trend).toBe("flat");
+    expect(fitExcluded.g4).toBeCloseTo(0, 6);
+  });
+
+  describe("end to end", () => {
+    let s: Shop;
+    let d: Design;
+    let blankId: string;
+    const NOW = "2026-09-15T16:00:00.000Z";
+    // weeksAgo 8-9 are out of stock: a restock lands at weeksAgo 7 (recent), a big consumption at
+    // weeksAgo 9 (older) -- so end-of-week stock is <= 0 only for weeks 8 and 9, walking backward
+    // from `stockLevels.onHand` the way `outOfStockWeeks` (history.ts) reconstructs history.
+    const OOS_WEEKS_AGO = [8, 9];
+
+    beforeAll(async () => {
+      s = await shop();
+      const now = freeze(NOW);
+      d = await design(s.id, { name: "Steady Camper", tags: ["camping"] });
+      blankId = (await blank(s.id, { onHand: 50, reorderPoint: 10 })).id;
+      const [location] = await withSystem((tx) =>
+        tx.select().from(locations).where(eq(locations.companyId, s.id)),
+      );
+      if (!location) throw new Error("location missing (blank() fixture)");
+      const movement = (weeksAgo: number, kind: "receive" | "consume", qty: number) =>
+        withSystem((tx) =>
+          tx.insert(inventoryMovements).values({
+            companyId: s.id,
+            blankVariantId: blankId,
+            locationId: location.id,
+            kind,
+            qty,
+            createdAt: new Date(weekMonday(now, weeksAgo).getTime() + 3 * DAY),
+            idempotencyKey: `ac18:${weeksAgo}:${kind}`,
+          }),
+        );
+      await movement(7, "receive", 80);
+      await movement(9, "consume", -50);
+      const series = flat(30, 4);
+      for (const w of OOS_WEEKS_AGO) series[30 - w] = 0; // no stock, no sale that week
+      await weeklySales(s.id, s.etsy, d.id, series, now, { blankVariantId: blankId });
+      await runShopJobs(s.id);
+    }, 120_000);
+    afterAll(() => vi.useRealTimers());
+
+    it("AC18: the engine excludes the 2 out-of-stock weeks from the trend, not as zero sales", async () => {
+      const svc = await service();
+      const trend = await withTenant(s.id, (tx) =>
+        svc.getTrendSignal(tx, s.owner, { designId: d.id }),
+      );
+      const own = ownReading(trend);
+      expect(own, "28 real weeks of sales, well above the 13-point minimum").toBeDefined();
+      expect(own?.insufficientReason).toBeNull();
+      // Not "falling": counted as zero sales, the 2-week gap inside the 26-week fit window would
+      // read as a demand drop; excluded, steady sales elsewhere still reads flat.
+      expect(own?.trend).toBe("flat");
+
+      const raw = await withSystem((tx) =>
+        tx.execute<{ value: { outOfStockWeeks?: number } }>(sql`
+          select value from market_signals
+          where company_id = ${s.id} and subject_id = ${d.id} and signal = 'trend'
+          order by computed_on desc limit 1`),
+      );
+      expect(raw.rows[0]?.value?.outOfStockWeeks).toBe(OOS_WEEKS_AGO.length);
+    });
   });
 });
 
@@ -783,7 +947,7 @@ describe("T-18-3 read-only, credits, corrections (spec AC16, AC21, AC25, AC32 ba
     designer = tenantContext(s.id, (await user(s.id, "designer")).id, "designer");
     const now = freeze(NOW);
     d = await design(s.id, { name: "Pumpkin Patch Crew", tags: ["halloween", "pumpkin"] });
-    await product(s.id, d.id, [{ channel: "etsy", price: 22.99 }]);
+    await product(s.id, d.id, [{ channel: "etsy", price: 2299 }]); // Cents (contract), not dollars
     await weeklySales(s.id, s.etsy, d.id, flat(20, 2), now);
     await profitFor(s.id, d.id, HEALTHY_COSTS);
   }, 120_000);
@@ -890,7 +1054,7 @@ describe("T-18-3 tenancy and permissions (spec AC23, AC24)", () => {
     const now = freeze("2026-09-15T16:00:00.000Z");
     designA = await design(a.id, { name: "Ghost Crew A", tags: ["halloween"] });
     designB = await design(b.id, { name: "Ghost Crew B", tags: ["halloween"] });
-    await product(a.id, designA.id, [{ channel: "etsy", price: 19.99 }]);
+    await product(a.id, designA.id, [{ channel: "etsy", price: 1999 }]); // Cents (contract), not dollars
     await weeklySales(a.id, a.etsy, designA.id, flat(30, 4), now);
     await profitFor(a.id, designA.id, { ...HEALTHY_COSTS, ads: 200 });
     await runShopJobs(a.id);
@@ -1006,12 +1170,12 @@ describe("T-18-3 feedback: votes, adoption, outcome (spec AC26, AC27, AC30, AC33
   let bear: Design;
   let bearProduct: typeof products.$inferSelect;
   const NOW = "2026-09-15T16:00:00.000Z";
-  const P0 = 1299; // well below any $5–$80 comparable set's median
+  const P0 = 1000; // well under the mock's $12.00 comparable floor (second pass, QA: see THIN_COSTS)
 
   /** A design listed on Amazon at p0 with thin margin and a flat 30 weeks: R2 territory. */
   async function thinAmazonDesign(name: string, now: Date) {
     const d = await design(s.id, { name, tags: ["camping", "retro"] });
-    const p = await product(s.id, d.id, [{ channel: "amazon", price: P0 / 100 }]);
+    const p = await product(s.id, d.id, [{ channel: "amazon", price: P0 }]); // P0 is already cents
     await listing(s.id, amazon, d.id, `${name} tee`);
     await weeklySales(s.id, amazon, d.id, flat(30, 4), now, { priceCents: P0 });
     await profitFor(s.id, d.id, THIN_COSTS);
@@ -1062,7 +1226,7 @@ describe("T-18-3 feedback: votes, adoption, outcome (spec AC26, AC27, AC30, AC33
     await withSystem((tx) =>
       tx
         .update(products)
-        .set({ prices: [{ channel: "amazon", price: (P0 * 1.06) / 100 }] })
+        .set({ prices: [{ channel: "amazon", price: Math.round(P0 * 1.06) }] }) // cents, not dollars
         .where(eq(products.id, bearProduct.id)),
     );
     vi.setSystemTime(new Date(new Date(NOW).getTime() + 10 * DAY));
@@ -1080,9 +1244,14 @@ describe("T-18-3 feedback: votes, adoption, outcome (spec AC26, AC27, AC30, AC33
     const { d: moose, p: mooseProduct } = await thinAmazonDesign("Retro Camping Moose", now);
     // A control design in the same garment class, steady, for the difference-in-differences.
     const fox = await design(s.id, { name: "Retro Camping Fox", tags: ["camping", "retro"] });
-    await product(s.id, fox.id, [{ channel: "amazon", price: 24.99 }]);
+    await product(s.id, fox.id, [{ channel: "amazon", price: 2499 }]); // Cents (contract), not dollars
     await weeklySales(s.id, amazon, fox.id, flat(30, 4), now, { priceCents: 2499 });
     await profitFor(s.id, fox.id, { ...HEALTHY_COSTS, fees: 375 });
+    // `moose` and `fox` are new since `beforeAll`'s `runShopJobs`: a price-position signal needs
+    // a stored comparables snapshot, which only `refreshPricing` fetches (second pass, QA: the
+    // first pass called `computeSignals` alone, so moose never got a price position and R2 never
+    // fired).
+    await runMarketJob(JOB.refreshPricing, { companyId: s.id });
     await runMarketJob(JOB.computeSignals, { companyId: s.id });
     const rec = await r2For(moose.id);
     expect(rec, "R2 for the second thin design").toBeDefined();
@@ -1094,7 +1263,7 @@ describe("T-18-3 feedback: votes, adoption, outcome (spec AC26, AC27, AC30, AC33
     await withSystem((tx) =>
       tx
         .update(products)
-        .set({ prices: [{ channel: "amazon", price: newPrice / 100 }] })
+        .set({ prices: [{ channel: "amazon", price: newPrice }] }) // newPrice is already cents
         .where(eq(products.id, mooseProduct.id)),
     );
     for (let day = 3; day <= 31; day += 2) {
