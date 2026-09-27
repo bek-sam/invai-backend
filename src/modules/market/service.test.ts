@@ -573,7 +573,7 @@ describe("happy path on a fixture shop (AC1, AC3) with shaped test providers", (
     pumpkin = await design(s.id, "Spooky Pumpkin Ghost", ["halloween", "ghost"]);
     teacher = await design(s.id, "Best Teacher Ever", ["teacher", "classroom"]);
     const b = await blank(s.id, 4, 24);
-    await product(s.id, pumpkin.id, [{ channel: "etsy", price: 24.99 }]);
+    await product(s.id, pumpkin.id, [{ channel: "etsy", price: 2499 }]);
     await listing(s.id, s.etsy, pumpkin.id);
     await sales(s, s.etsy, pumpkin.id, flat(30, 3), now, {
       blankVariantId: b.variant.id,
@@ -687,13 +687,13 @@ describe("price position, simulate_price, R2/R3 (AC4–AC6, AC19)", () => {
     amazon = await connection(s.id, "amazon", "connected");
     tee = await design(s.id, "Retro Camping Bear", ["camping"]);
     await product(s.id, tee.id, [
-      { channel: "amazon", price: 12.99 },
-      { channel: "etsy", price: 12.99 },
+      { channel: "amazon", price: 1299 },
+      { channel: "etsy", price: 1299 },
     ]);
     await listing(s.id, amazon, tee.id);
     await sales(s, amazon, tee.id, flat(30, 4), now, { priceCents: 1299 });
     custom = await design(s.id, "Custom Name Dog Mom", ["dog mom"], true);
-    await product(s.id, custom.id, [{ channel: "amazon", price: 19.99 }]);
+    await product(s.id, custom.id, [{ channel: "amazon", price: 1999 }]);
     await sales(s, amazon, custom.id, flat(20, 2), now, { priceCents: 1999 });
     await runAll(s.id);
   }, 120_000);
@@ -795,7 +795,7 @@ describe("price position, simulate_price, R2/R3 (AC4–AC6, AC19)", () => {
 
   it("simulate_price is incomplete (not an error) when the design has no cost data", async () => {
     const fresh = await design(s.id, "No Sales Yet", ["camping"]);
-    await product(s.id, fresh.id, [{ channel: "etsy", price: 20 }]);
+    await product(s.id, fresh.id, [{ channel: "etsy", price: 2000 }]);
     const sim = await withTenant(s.id, (tx) =>
       svc.simulatePrice(tx, s.owner, { designId: fresh.id, channel: "etsy" }),
     );
@@ -854,7 +854,7 @@ describe("mock visibility rule (AC29, AC22)", () => {
     const amazon = await connection(s.id, "amazon", "connected");
     const d = await design(s.id, "Retro Camping Bear", ["camping"]);
     const d2 = await design(s.id, "Camping Crew", ["camping", "tent"]);
-    await product(s.id, d.id, [{ channel: "amazon", price: 12.99 }]);
+    await product(s.id, d.id, [{ channel: "amazon", price: 1299 }]);
     await sales(s, amazon, d.id, flat(30, 4), now, { priceCents: 1299 });
     await sales(s, amazon, d2.id, flat(30, 2), now, { priceCents: 1299 });
     clearSampleWorkspaceCache();
@@ -1045,7 +1045,7 @@ describe("recommendations: tenancy, votes, shown, feedback, digest (AC23, AC24, 
     b = await shop();
     amazon = await connection(a.id, "amazon", "connected");
     bear = await design(a.id, "Retro Camping Bear", ["camping"]);
-    await product(a.id, bear.id, [{ channel: "amazon", price: 12.99 }]);
+    await product(a.id, bear.id, [{ channel: "amazon", price: 1299 }]);
     await listing(a.id, amazon, bear.id);
     await sales(a, amazon, bear.id, flat(30, 4), now, { priceCents: 1299 });
     const fox = await design(a.id, "Retro Camping Fox", ["camping"]);
@@ -1139,7 +1139,7 @@ describe("recommendations: tenancy, votes, shown, feedback, digest (AC23, AC24, 
     await withSystem((tx) =>
       tx
         .update(products)
-        .set({ prices: [{ channel: "amazon", price: 13.79 }] })
+        .set({ prices: [{ channel: "amazon", price: 1379 }] })
         .where(eq(products.designId, bear.id)),
     );
     vi.setSystemTime(new Date(now.getTime() + 5 * DAY));
@@ -1273,5 +1273,20 @@ describe("read-only by construction (AC16)", () => {
       ].filter((t) => targets.has(t)),
     );
     expect([...targets].every((t) => t.startsWith("market"))).toBe(true);
+  });
+});
+
+describe("permanent failures", () => {
+  it("a per-shop job for a company that doesn't exist stops retrying (UnrecoverableError)", async () => {
+    const { UnrecoverableError } = await import("bullmq");
+    const missing = "00000000-0000-4000-8000-00000000dead";
+    for (const name of [
+      "market.computeSignals",
+      "market.refreshPricing",
+      "market.trackRecommendations",
+    ])
+      await expect(runJobInline(job(name), { companyId: missing })).rejects.toBeInstanceOf(
+        UnrecoverableError,
+      );
   });
 });

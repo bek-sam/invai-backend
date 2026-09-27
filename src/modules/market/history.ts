@@ -231,7 +231,8 @@ export async function currentPrices(
     const m = getOrSet(out, r.designId, () => new Map<Channel, number>());
     for (const p of r.prices) {
       const ch = p.channel as Channel;
-      if (!m.has(ch) && Number.isFinite(p.price)) m.set(ch, Math.round(p.price * 100));
+      // `ProductPrice.price` is integer cents (contracts `Cents`).
+      if (!m.has(ch) && Number.isFinite(p.price)) m.set(ch, Math.round(p.price));
     }
   }
   return out;

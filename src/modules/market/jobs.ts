@@ -13,7 +13,7 @@ import {
 import { env } from "../../env";
 import type { DemandSeries } from "../../integrations/market";
 import { errorData, logger } from "../../lib/log";
-import { defineJob, onEvent, queues } from "../../lib/queues";
+import { defineJob, onEvent, permanentFailure, queues } from "../../lib/queues";
 import { isSampleWorkspace } from "../tenancy/demo-flag";
 import { computeSignalsForShop } from "./compute";
 import { MARKET_CONFIG, mockSourcesAllowed } from "./config";
@@ -36,6 +36,15 @@ const log = logger("market.jobs");
 const DAY_MS = 86_400_000;
 
 const utcDay = (d = new Date()) => d.toISOString().slice(0, 10);
+
+/** A per-shop job for a company that no longer exists can never succeed: stop retrying. */
+async function assertCompany(companyId: string) {
+  // Cross-tenant existence check by id only (the job has no tenant yet).
+  const [row] = await withSystem((tx) =>
+    tx.select({ id: companies.id }).from(companies).where(eq(companies.id, companyId)),
+  );
+  if (!row) permanentFailure(`market: company ${companyId} not found`);
+}
 
 /* ------------------------------ nightly global demand refresh ------------------------------ */
 
@@ -470,7 +479,10 @@ export const refreshPricingJob = defineJob({
   name: "market.refreshPricing",
   input: z.object({ companyId: z.uuid(), day: z.string().optional() }),
   jobId: (i) => `market-pricing-${i.companyId}-${i.day ?? utcDay()}`,
-  handler: async ({ companyId }) => refreshPricing(companyId),
+  handler: async ({ companyId }) => {
+    await assertCompany(companyId);
+    return refreshPricing(companyId);
+  },
 });
 
 /* ------------------------------ per-shop signals ------------------------------ */
@@ -487,6 +499,7 @@ export const computeSignalsJob = defineJob({
   jobId: (i) =>
     `market-signals-${i.companyId}-${i.day ?? utcDay()}${i.designIds?.length ? `-${[...i.designIds].sort().join("-")}` : ""}`,
   handler: async ({ companyId, designIds }) => {
+    await assertCompany(companyId);
     const deps = integrationsMarket();
     const res = await computeSignalsForShop(
       companyId,
@@ -511,8 +524,10 @@ export const trackRecommendationsJob = defineJob({
   name: "market.trackRecommendations",
   input: z.object({ companyId: z.uuid(), day: z.string().optional() }),
   jobId: (i) => `market-track-${i.companyId}-${i.day ?? utcDay()}`,
-  handler: async ({ companyId }) =>
-    withTenant(companyId, (tx) => trackRecommendations(tx, companyId, new Date())),
+  handler: async ({ companyId }) => {
+    await assertCompany(companyId);
+    return withTenant(companyId, (tx) => trackRecommendations(tx, companyId, new Date()));
+  },
 });
 
 /* ------------------------------ schedulers ------------------------------ */
