@@ -8,6 +8,7 @@ import type {
   TrademarkCheck,
   ValidationResult,
 } from "@invai/contracts";
+import { CHANNEL_RULES } from "@invai/contracts";
 import { ORPCError } from "@orpc/server";
 import { and, asc, desc, eq, gte, ilike, inArray, lte, or, type SQL, sql } from "drizzle-orm";
 import type { z } from "zod";
@@ -48,6 +49,7 @@ import { assertTrademarkGate, checkTrademarks, type TmInput } from "./trademark"
 const log = logger("ai");
 
 type PublishStatus = z.infer<typeof PublishStatusSchema>;
+type AssistantToolName = Extract<AssistantEvent, { type: "tool_call" }>["name"];
 
 /*
  * AI module: listing drafts (generate → review → approve → publish/export), deterministic
@@ -1082,6 +1084,74 @@ export async function trademarkCheck(
 
 /* --------------------------------- assistant --------------------------------- */
 
+/** Most characters an earlier turn's tool line may take in the history sent to the model. */
+export const TOOL_LINE_MAX = 600;
+const TOOL_LINE_HEAD = "[Tools used earlier: ";
+
+/**
+ * T-17-3 tool memory: one compact line for an earlier assistant turn, naming the tools it called
+ * and their one-line summaries (from `assistant_messages.toolCalls`), so follow-ups build on
+ * them. Brackets, angle brackets and newlines are removed so no summary can end the line early or
+ * open a fake tag; the gateway scrubs PII from history (this line included) before the model.
+ */
+export function toolMemoryLine(toolCalls: unknown): string | null {
+  const calls = (toolCalls as { calls?: unknown } | null)?.calls;
+  if (!Array.isArray(calls)) return null;
+  const parts = calls
+    .filter((c): c is { name: string; summary?: unknown } => typeof c?.name === "string")
+    .map((c) => (typeof c.summary === "string" && c.summary ? `${c.name} (${c.summary})` : c.name));
+  if (!parts.length) return null;
+  const body = parts
+    .join("; ")
+    .replace(/[\r\n]+/g, " ")
+    .replace(/[<>[\]]/g, "");
+  const room = TOOL_LINE_MAX - TOOL_LINE_HEAD.length - 1;
+  return `${TOOL_LINE_HEAD}${body.length > room ? `${body.slice(0, room - 1)}…` : body}]`;
+}
+
+/** Channels the assistant treats as connected (the same set as the cross-listing check). */
+const CONTEXT_CONNECTION_STATUSES = ["connected", "csv_only", "error"] as const;
+
+/**
+ * T-17-3 shop context: time zone, "today" there, connected channels and currency. Sent as a second
+ * system block after the cached prefix (never inside it), so the prefix stays byte-identical
+ * across shops. Channel labels only: no connection names, which are shop-entered text.
+ */
+export async function shopContext(tx: Tx, companyId: string, now: Date): Promise<string> {
+  const [c] = await tx
+    .select({ tz: companies.timezone })
+    .from(companies)
+    .where(eq(companies.id, companyId));
+  let tz = c?.tz ?? "UTC";
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: tz });
+  } catch {
+    tz = "UTC";
+  }
+  const day = new Intl.DateTimeFormat("en-CA", {
+    timeZone: tz,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(now);
+  const weekday = new Intl.DateTimeFormat("en-US", { timeZone: tz, weekday: "long" }).format(now);
+  const conns = await tx
+    .selectDistinct({ channel: channelConnections.channel, status: channelConnections.status })
+    .from(channelConnections)
+    .where(
+      and(
+        eq(channelConnections.companyId, companyId),
+        inArray(channelConnections.status, [...CONTEXT_CONNECTION_STATUSES]),
+      ),
+    );
+  const channels = [...new Set(conns.map((r) => r.channel))].sort().map((ch) => {
+    const label = CHANNEL_RULES[ch as Channel]?.label ?? ch;
+    const csvOnly = conns.every((r) => r.channel !== ch || r.status === "csv_only");
+    return csvOnly ? `${label} (CSV import)` : label;
+  });
+  return `Shop context (set by InvAI, not by the user): time zone ${tz}; today is ${weekday} ${day} in that time zone (now ${now.toISOString()}); connected channels: ${channels.length ? channels.join(", ") : "none"}; currency USD.`;
+}
+
 export async function* ask(
   ctx: Ctx,
   input: { message: string; conversationId?: string },
@@ -1090,6 +1160,7 @@ export async function* ask(
   const userId = ctx.userId;
   // Postgres text rejects NUL (22021): sanitize before the conversation rows are written.
   const message = sanitizeText(input.message);
+  const now = new Date();
   const setup = await withTenant(ctx.companyId, async (tx) => {
     await assertCredits(tx, ctx.companyId, 1);
     let conversationId = input.conversationId;
@@ -1112,7 +1183,11 @@ export async function* ask(
       conversationId = c?.id as string;
     }
     const history = await tx
-      .select({ role: assistantMessages.role, text: assistantMessages.text })
+      .select({
+        role: assistantMessages.role,
+        text: assistantMessages.text,
+        toolCalls: assistantMessages.toolCalls,
+      })
       .from(assistantMessages)
       .where(eq(assistantMessages.conversationId, conversationId))
       .orderBy(desc(assistantMessages.createdAt))
@@ -1127,10 +1202,28 @@ export async function* ask(
       .insert(assistantMessages)
       .values({ companyId: ctx.companyId, conversationId, role: "assistant", text: "" })
       .returning({ id: assistantMessages.id });
-    return { conversationId, history: history.reverse(), messageId: assistantMsg?.id as string };
+    return {
+      conversationId,
+      history: history.reverse().map((h) => {
+        const line = h.role === "assistant" ? toolMemoryLine(h.toolCalls) : null;
+        return { role: h.role, text: line ? `${line}\n${h.text}` : h.text };
+      }),
+      context: await shopContext(tx, ctx.companyId, now),
+      messageId: assistantMsg?.id as string,
+    };
   });
 
   const { conversationId, messageId } = setup;
+  // Counts and tool names only: never message text (it can hold anything the user typed).
+  log.debug("assistant history", {
+    companyId: ctx.companyId,
+    historyTurns: setup.history.length,
+    toolLines: setup.history
+      .filter((h) => h.text.startsWith(TOOL_LINE_HEAD))
+      .map((h) =>
+        [...(h.text.split("\n")[0] ?? "").matchAll(/(?:: |; )([a-z]+_[a-z_]+)/g)].map((m) => m[1]),
+      ),
+  });
   yield { type: "start", conversationId, messageId };
   let text = "";
   const toolCalls: { name: string; input: Record<string, unknown>; summary?: string }[] = [];
@@ -1152,10 +1245,11 @@ export async function* ask(
     },
     {
       system: ASSISTANT_PROMPT.system,
+      context: setup.context,
       history: setup.history,
       message,
       tools: assistantTools(ctx),
-      now: new Date(),
+      now,
     },
     // Fires with the real charged credits however runAssistant ends, including the disconnect
     // path below (see the comment on runAssistant itself for why this isn't read off its return
@@ -1173,13 +1267,9 @@ export async function* ask(
         yield { type: "text_delta", text: e.text };
       } else if (e.type === "tool_call") {
         toolCalls.push({ name: e.name, input: e.input });
-        // get_production_status is not in the contract's tool_call enum; its result still streams.
-        if (e.name !== "get_production_status")
-          yield {
-            type: "tool_call",
-            name: e.name as "get_profit",
-            input: e.input,
-          };
+        // Every assistant tool name is in the contract's tool_call enum (T-17-1; service.test.ts
+        // checks each one parses).
+        yield { type: "tool_call", name: e.name as AssistantToolName, input: e.input };
       } else {
         const call = [...toolCalls].reverse().find((c) => c.name === e.name && !c.summary);
         if (call) call.summary = e.summary;

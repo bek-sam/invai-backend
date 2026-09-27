@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-09-27T04:27:23.617Z",
+  "generatedAt": "2026-09-27T04:33:42.500Z",
   "mode": "mock",
   "routes": [
     {
@@ -160,8 +160,8 @@
     {
       "route": "assistant",
       "mode": "mock",
-      "cases": 26,
-      "plumbingPass": 26,
+      "cases": 30,
+      "plumbingPass": 30,
       "qualityPass": 17,
       "qualityAssessed": 17,
       "byTag": {
@@ -176,9 +176,9 @@
           "total": 1
         },
         "orders": {
-          "plumbingPass": 1,
+          "plumbingPass": 2,
           "qualityPass": 1,
-          "total": 1
+          "total": 2
         },
         "listing_performance": {
           "plumbingPass": 1,
@@ -231,9 +231,9 @@
           "total": 2
         },
         "seeded": {
-          "plumbingPass": 6,
+          "plumbingPass": 9,
           "qualityPass": 6,
-          "total": 6
+          "total": 9
         },
         "ad_performance": {
           "plumbingPass": 3,
@@ -249,12 +249,27 @@
           "plumbingPass": 2,
           "qualityPass": 2,
           "total": 2
+        },
+        "spanish": {
+          "plumbingPass": 2,
+          "qualityPass": 0,
+          "total": 2
+        },
+        "follow_up": {
+          "plumbingPass": 1,
+          "qualityPass": 0,
+          "total": 1
+        },
+        "business_review": {
+          "plumbingPass": 2,
+          "qualityPass": 0,
+          "total": 2
         }
       },
       "costCentsMedian": 0,
       "costCentsP95": 0,
-      "latencyMsMedian": 10,
-      "latencyMsP95": 13,
+      "latencyMsMedian": 9,
+      "latencyMsP95": 16,
       "cacheHitRate": 0
     },
     {

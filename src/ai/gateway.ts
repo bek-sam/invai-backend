@@ -10,7 +10,7 @@ import { assertSpendAvailable, recordSpend } from "./breaker";
 import { assertCredits, type CreditKind, chargeCredits } from "./credits";
 import { MOCK_MODEL, tokensToCostCents, tokensToCredits } from "./models";
 import { stripPii, stripPiiDeep } from "./pii";
-import { type PromptDef, promptRef } from "./prompts";
+import { ASSISTANT_PROMPT, type PromptDef, promptRef } from "./prompts";
 import { anthropicProvider } from "./providers/anthropic";
 import { mockProvider } from "./providers/mock";
 import {
@@ -202,6 +202,7 @@ export function scrubAssistantRun(run: AssistantRun): AssistantRun {
   return {
     ...run,
     message: stripPii(sanitizeText(run.message)),
+    context: run.context == null ? undefined : stripPii(sanitizeText(run.context)),
     history: run.history.map((h) => ({ ...h, text: stripPii(sanitizeText(h.text)) })),
     tools: isolateToolResults(run.tools),
   };
@@ -229,7 +230,11 @@ export async function* runAssistant(
   const provider = await aiProvider(meta.companyId);
   await assertSpend(meta, provider);
   const clean = scrubAssistantRun(run);
-  const aiJobId = await startJob(meta, { message: clean.message.slice(0, 500) }, provider);
+  const aiJobId = await startJob(
+    meta,
+    { prompt: promptRef(ASSISTANT_PROMPT), message: clean.message.slice(0, 500) },
+    provider,
+  );
   let text = "";
   let usageSoFar: AssistantFinal["usage"] = { tokensIn: 0, tokensOut: 0, cacheReadTokens: 0 };
   const gen = provider.assistant(clean, (u) => {

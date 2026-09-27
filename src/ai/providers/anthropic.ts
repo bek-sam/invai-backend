@@ -3,7 +3,7 @@ import { betaZodOutputFormat, betaZodTool } from "@anthropic-ai/sdk/helpers/beta
 import { env } from "../../env";
 import { REFUSAL_FALLBACK, ROUTES } from "../models";
 import { stripPii } from "../pii";
-import { ASSISTANT_PROMPT, type PromptDef } from "../prompts";
+import { ASSISTANT_MAX_ITERATIONS, type PromptDef } from "../prompts";
 import {
   AiOutputError,
   type AiProvider,
@@ -70,6 +70,17 @@ async function structured<V, O>(prompt: PromptDef<V, O>, vars: V): Promise<Struc
   };
 }
 
+/**
+ * The assistant's system blocks: the cached prefix (identical for every shop, so one cache entry
+ * serves them all), then the shop context uncached after the breakpoint.
+ */
+export function assistantSystem(run: Pick<AssistantRun, "system" | "context">) {
+  return [
+    { type: "text" as const, text: run.system, cache_control: { type: "ephemeral" as const } },
+    ...(run.context ? [{ type: "text" as const, text: run.context }] : []),
+  ];
+}
+
 async function* assistant(
   run: AssistantRun,
   onUsage?: (usage: TokenUsage) => void,
@@ -92,11 +103,11 @@ async function* assistant(
   const runner = anthropic().beta.messages.toolRunner({
     model: route.model,
     max_tokens: route.maxTokens,
-    max_iterations: 8,
+    max_iterations: ASSISTANT_MAX_ITERATIONS,
     stream: true,
     thinking: { type: "adaptive" },
     output_config: { effort: route.effort },
-    system: [{ type: "text", text: ASSISTANT_PROMPT.system, cache_control: { type: "ephemeral" } }],
+    system: assistantSystem(run),
     messages: [
       ...run.history.map((m) => ({ role: m.role, content: stripPii(m.text) })),
       {

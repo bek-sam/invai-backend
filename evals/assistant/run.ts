@@ -2,8 +2,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ASSISTANT_PROMPT } from "../../src/ai/prompts";
 import { systemContext } from "../../src/api/context";
+import { withTenant } from "../../src/db/client";
 import { env } from "../../src/env";
 import { assistantTools } from "../../src/modules/ai/assistant-tools";
+import { shopContext } from "../../src/modules/ai/service";
 import type { EvalTenant } from "../lib/fixtures";
 import { callAssistant } from "../lib/gateway-run";
 import { loadCases } from "../lib/jsonl";
@@ -43,7 +45,15 @@ function containsAny(text: string, needles: string[] | undefined): boolean | nul
 }
 
 export async function runAssistantEvals(tenant: EvalTenant): Promise<RouteReport> {
-  const cases = loadCases<{ message: string; tenant?: "seeded" }, AssistantExpect>(
+  const cases = loadCases<
+    {
+      message: string;
+      tenant?: "seeded";
+      /** Earlier turns, as service.ts `ask` builds them (assistant turns start with the tool line). */
+      history?: { role: "user" | "assistant"; text: string }[];
+    },
+    AssistantExpect
+  >(
     path.join(dir, "cases.jsonl"),
   );
   const mode: RouteReport["mode"] = env.mocks.ai ? "mock" : "real";
@@ -58,6 +68,8 @@ export async function runAssistantEvals(tenant: EvalTenant): Promise<RouteReport
   for (const c of cases) {
     const who = c.vars.tenant === "seeded" && seeded ? seeded : tenant;
     const tools = assistantTools(systemContext(who.companyId));
+    const now = new Date();
+    const context = await withTenant(who.companyId, (tx) => shopContext(tx, who.companyId, now));
     const res = await callAssistant(
       {
         companyId: who.companyId,
@@ -68,10 +80,11 @@ export async function runAssistantEvals(tenant: EvalTenant): Promise<RouteReport
       },
       {
         system: ASSISTANT_PROMPT.system,
-        history: [],
+        context,
+        history: c.vars.history ?? [],
         message: c.vars.message,
         tools,
-        now: new Date(),
+        now,
       },
     );
     const base = {

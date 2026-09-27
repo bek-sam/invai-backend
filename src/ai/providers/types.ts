@@ -35,7 +35,13 @@ export type AssistantStreamEvent =
 export type AssistantFinal = { usage: TokenUsage; model: string; stopReason: string | null };
 
 export type AssistantRun = {
+  /** The byte-stable, cached system prefix (ASSISTANT_PROMPT.system). Never shop data. */
   system: string;
+  /**
+   * Per-shop context (time zone, today, connected channels, currency), sent as a second system
+   * block after the cached prefix so the prefix stays identical across shops.
+   */
+  context?: string;
   history: { role: "user" | "assistant"; text: string }[];
   message: string;
   tools: AssistantTool[];
