@@ -69,7 +69,8 @@ describe("production key guard", () => {
     expect(allowed.ok).toBe(true);
     expect(allowed.out).toContain("running production on MOCK providers");
     expect(allowed.out).toContain(
-      '"mocks":{"ai":true,"carrier":true,"shopify":true,"supplier":true,"billing":true,"mail":true}',
+      '"mocks":{"ai":true,"carrier":true,"shopify":true,"supplier":true,"billing":true,"mail":true,' +
+        '"census":true,"googleTrends":true,"pinterest":true,"jungleScout":true}',
     );
   });
 

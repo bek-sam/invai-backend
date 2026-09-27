@@ -92,6 +92,21 @@ const raw = createEnv({
     SS_ACTIVEWEAR_API_KEY: secret(z.string()),
     STRIPE_SECRET_KEY: secret(z.string()),
     STRIPE_WEBHOOK_SECRET: secret(z.string()),
+    /**
+     * Market-signal demand providers (T-18-2, wave 18). All optional and free/unpriced today
+     * (research 14 §1.2-1.3); none is in PRODUCTION_KEYS, so InvAI runs the mock market providers
+     * in production until a key is added, exactly like every other InvAI integration.
+     */
+    CENSUS_API_KEY: secret(z.string()),
+    GOOGLE_TRENDS_API_KEY: secret(z.string()),
+    PINTEREST_API_KEY: secret(z.string()),
+    JUNGLE_SCOUT_API_KEY: secret(z.string()),
+    /**
+     * Test-only outage switch (comma list of `SignalSource`s, e.g. "google_trends,pinterest_trends")
+     * that makes that mock market provider throw instead of returning data, so T-18-3 can test its
+     * "stale/no source" fallback. Ignored in production (`env.marketMockFail` is always empty there).
+     */
+    MARKET_MOCK_FAIL: secret(z.string()),
 
     /** Outgoing mail. Outside production both default to Mailpit (docker compose, UI on :8025). */
     SMTP_URL: secret(z.url()),
@@ -199,7 +214,24 @@ export const env = {
     billing: !raw.STRIPE_SECRET_KEY,
     /** Outside production a missing SMTP_URL means the local Mailpit sink. */
     mail: !raw.SMTP_URL,
+    census: !raw.CENSUS_API_KEY,
+    googleTrends: !raw.GOOGLE_TRENDS_API_KEY,
+    pinterest: !raw.PINTEREST_API_KEY,
+    jungleScout: !raw.JUNGLE_SCOUT_API_KEY,
   },
+  /**
+   * Sources a market mock should fail for right now (empty outside a deliberate test). Always
+   * empty in production, whatever MARKET_MOCK_FAIL is set to: it exists to test the "no compliant
+   * source" fallback, never to disable a real source in a real shop's account.
+   */
+  marketMockFail: new Set(
+    isProd
+      ? []
+      : (raw.MARKET_MOCK_FAIL ?? "")
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean),
+  ),
 } as const;
 
 export type Env = typeof env;
