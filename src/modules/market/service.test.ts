@@ -94,12 +94,15 @@ function weeklySeries(
 
 function demandProvider(
   source: DemandSeries["source"],
-  opts: { fail?: boolean; extra?: string } = {},
+  opts: { fail?: boolean; extra?: string; onQueries?: (queries: string[]) => void } = {},
 ): DemandProvider {
   return {
     source,
     mock: true,
     async series({ queries }) {
+      // S-34: record exactly the queries jobs.ts asked this provider to fetch, before any
+      // test-only extra is mixed in, so a test can assert it against the full taxonomy.
+      opts.onQueries?.([...queries]);
       if (opts.fail) throw new Error(`${source} is down`);
       const now = new Date();
       return [...queries, ...(opts.extra ? [opts.extra] : [])].map((q) =>
@@ -500,22 +503,46 @@ describe("global demand cache (ADR 0015)", () => {
   it("refreshDemand stores only taxonomy queries, is idempotent, and a failing source keeps its last good rows", async () => {
     freeze("2026-09-15T16:00:00Z");
     await clearCache();
+    // S-34: refreshDemand must fetch the whole fixed taxonomy every run, never a subset derived
+    // from which niches any tenant uses (that would let a cache row's presence/freshness leak a
+    // low-fidelity cross-tenant signal). Capture the exact `queries` each provider's `series()`
+    // is called with, so a future narrowing to tenant-used niches fails this test.
+    const fetchedQueries: Record<string, string[]> = {};
     useDeps({
       marketDemandProviders: () => [
-        demandProvider("google_trends", { extra: "N1ke brand tee" }),
-        demandProvider("census"),
+        demandProvider("google_trends", {
+          extra: "N1ke brand tee",
+          onQueries: (qs) => {
+            fetchedQueries.google_trends = qs;
+          },
+        }),
+        demandProvider("census", {
+          onQueries: (qs) => {
+            fetchedQueries.census = qs;
+          },
+        }),
       ],
     });
     const first = (await runJobInline(job("market.refreshDemand"), {})) as {
       sources: { source: string; refused?: number }[];
     };
     expect(first.sources.find((s) => s.source === "google_trends")?.refused).toBe(1);
+    // The fetched set must equal the taxonomy's exactly (not a subset and not a superset):
+    // census bypasses `series()` (jobs.ts calls `censusRetailSeries()` instead), so only
+    // google_trends' capture applies here.
+    expect(fetchedQueries.census).toBeUndefined();
+    expect(new Set(fetchedQueries.google_trends)).toEqual(CANONICAL_QUERIES);
     const qs = await withSystem((tx) =>
       tx
         .selectDistinct({ q: marketSeriesCache.query, s: marketSeriesCache.source })
         .from(marketSeriesCache),
     );
     for (const r of qs) if (r.s !== "census") expect(CANONICAL_QUERIES.has(r.q), r.q).toBe(true);
+    // Stored rows must also cover exactly the canonical set (not merely be a subset of it), so
+    // a narrowed fetch would be caught here too even if some other test doubled up the assertion.
+    expect(new Set(qs.filter((r) => r.s === "google_trends").map((r) => r.q))).toEqual(
+      CANONICAL_QUERIES,
+    );
     const n1 = (
       await withSystem((tx) => tx.select({ n: sql<number>`count(*)::int` }).from(marketSeriesCache))
     )[0]?.n;
