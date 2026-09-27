@@ -127,7 +127,16 @@ describe("screenMarketTerms", () => {
     ]);
     expect(r.allowed).toEqual(["teacher", "dog mom"]);
     expect(r.droppedCount).toBe(2);
-    expect(MARKET_TERM_MAX_RISK).toBe(25);
+    expect(MARKET_TERM_MAX_RISK).toBe(60);
+  });
+
+  it("keeps real niche terms that only fuzzily resemble a mark (St. Patrick's Day, easter bunny)", async () => {
+    const co = await createCompany();
+    const terms = ["St. Patrick's Day", "easter bunny shirt", "groomsmen shirt", "dad joke shirt"];
+    await expect(screenMarketTerms(co.id, terms)).resolves.toEqual({
+      allowed: terms,
+      droppedCount: 0,
+    });
   });
 
   it("empty input is a no-op", async () => {

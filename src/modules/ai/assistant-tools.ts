@@ -1088,11 +1088,15 @@ const fold = (s: string) =>
 
 /** Taxonomy key, or the trademark screen's verdict for a term that isn't one. */
 async function resolveNiche(companyId: string, raw: string, lang: Lang2): Promise<NicheResolution> {
-  const f = fold(raw)
-    .replace(/\bniche\b|\bnicho\b/g, "")
-    .trim();
-  const hit = market.NICHES.find(
-    (n) => fold(n.key) === f || fold(n.labelEn) === f || fold(n.labelEs) === f,
+  // "Teacher", "teachers" and "Dog moms" all name a niche whose label is plural.
+  const one = (x: string) => x.replace(/(?<=\w\w)s\b/g, "");
+  const f = one(
+    fold(raw)
+      .replace(/\bniche\b|\bnicho\b/g, "")
+      .trim(),
+  );
+  const hit = market.NICHES.find((n) =>
+    [n.key, n.labelEn, n.labelEs].some((x) => one(fold(x)) === f),
   );
   if (hit) return { kind: "key", key: hit.key, label: lang === "es" ? hit.labelEs : hit.labelEn };
   const { droppedCount } = await screenMarketTerms(companyId, [raw]);

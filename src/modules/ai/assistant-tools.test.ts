@@ -1213,6 +1213,14 @@ describe("market tools (T-18-4)", () => {
     expect((unknown.data as { reason: string }).reason).toBe("unknown_niche");
   });
 
+  it("niche names match singular or plural, key or label, any case", async () => {
+    for (const said of ["dog moms", "Dog Mom", "dog-mom", "Mamá de perro"]) {
+      m.getTrendSignal.mockClear();
+      await run(a.ctx, "get_market_trend", { niche: said });
+      expect(m.getTrendSignal.mock.calls[0]?.[2], said).toEqual({ niche: "dog-mom" });
+    }
+  });
+
   it("AC6: Etsy price position is unavailable with the fixed reason; Spanish copy when lang is es", async () => {
     m.getPricePosition.mockImplementation(async (_tx, _ctx, i) => ({
       subject: { designId: i.designId, designName: null, niche: null },

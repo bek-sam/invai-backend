@@ -81,10 +81,13 @@ export async function classifyDesignNiche(
 }
 
 /**
- * Risk score at or above which a market term is dropped: the trademark check's `medium` band
- * (25). A listing at medium needs a human review; a market term has no reviewer, so it is dropped.
+ * Risk score at or above which a market term is dropped: the trademark check's `high` band (60),
+ * the same threshold that blocks a listing outright (`assertTrademarkGate`). Measured on the 69-niche
+ * taxonomy (438 labels and queries): at 25 the screen dropped fuzzy false positives such as
+ * "St. Patrick's Day" (Patrick Star) and "easter bunny shirt"; at 60 it drops none of them, while
+ * exact marks ("Disney", "Mickey Mouse") still score 70-85.
  */
-export const MARKET_TERM_MAX_RISK = 25;
+export const MARKET_TERM_MAX_RISK = 60;
 
 /**
  * Drops market terms (niche labels, canonical queries, design ideas) whose trademark risk is at or
