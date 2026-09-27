@@ -121,6 +121,29 @@ export function sourceLine(s: { source: SignalSource; asOf: string; mock: boolea
   return lang === "es" ? `${label}, al ${date}${sample}` : `${label}, as of ${date}${sample}`;
 }
 
+/**
+ * R1 when nothing is missing on one side: the design is already on every connected channel (stock
+ * only), or its blank isn't known (list only). Same action, the empty half left out.
+ */
+export const R1_PARTIAL: Record<"stockOnly" | "listOnly" | "prepOnly", Copy> = {
+  stockOnly: {
+    en: "Stock {{blank}} for {{design}} before {{peak}}.",
+    es: "Surte {{blank}} para {{design}} antes de {{peak}}.",
+  },
+  listOnly: {
+    en: "List {{design}} on {{channels}} before {{peak}}.",
+    es: "Publica {{design}} en {{channels}} antes de {{peak}}.",
+  },
+  prepOnly: {
+    en: "Get {{design}} ready before {{peak}}.",
+    es: "Prepara {{design}} antes de {{peak}}.",
+  },
+};
+
+/** "1 week" / "3 weeks", "1 semana" / "3 semanas". */
+export const weeks = (n: number, lang: Lang) =>
+  `${n} ${lang === "es" ? (n === 1 ? "semana" : "semanas") : n === 1 ? "week" : "weeks"}`;
+
 /** The fixed action per rule (spec copy R1..R5). Placeholders are filled by code. */
 export const RULE_ACTION: Record<"R1" | "R2" | "R3" | "R4" | "R5", Copy> = {
   R1: {
@@ -156,6 +179,7 @@ export function allCopyText(): string {
     ...Object.values(MARKET_COPY),
     ...Object.values(BAND_COPY),
     ...Object.values(RULE_ACTION),
+    ...Object.values(R1_PARTIAL),
   ])
     parts.push(c.en, c.es);
   return parts.join("\n");

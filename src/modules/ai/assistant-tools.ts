@@ -15,8 +15,10 @@ import {
   MARKET_COPY,
   money,
   monthName,
+  R1_PARTIAL,
   RULE_ACTION,
   sourceLine,
+  weeks,
 } from "../../ai/market-copy";
 import type { AssistantTool, ToolOutput } from "../../ai/providers/types";
 import type { TenantContext } from "../../api/context";
@@ -1213,7 +1215,12 @@ function recLine(r: MarketRecommendation, lang: Lang2) {
   const p = r.params;
   const niche = p.niche ?? r.target.niche;
   const nicheLabelText = niche ? market.nicheLabel(niche, lang) : "";
-  const action = fill(RULE_ACTION[r.rule][lang], {
+  const hasChannels = (p.channels ?? []).length > 0;
+  const template =
+    r.rule === "R1" && !(hasChannels && p.blankName)
+      ? R1_PARTIAL[hasChannels ? "listOnly" : p.blankName ? "stockOnly" : "prepOnly"][lang]
+      : RULE_ACTION[r.rule][lang];
+  const action = fill(template, {
     design: p.designName ?? r.target.designName ?? "",
     channels: (p.channels ?? []).map(channelLabel).join(", "),
     blank: p.blankName ?? (lang === "es" ? "la prenda" : "the blank"),
@@ -1245,22 +1252,35 @@ async function recsFor(
   rules: MarketRecommendation["rule"][],
   subject: { designIds?: string[]; niche?: string },
 ) {
-  const all = await market.listRecommendations(tx, ctx, { minBand: "medium", limit: MAX_ROWS });
-  return all
-    .filter((r) => rules.includes(r.rule) && r.band !== "low")
-    .filter((r) => {
-      if (subject.niche) {
-        if ((r.params.niche ?? r.target.niche) === subject.niche) return true;
-        // R1 is per design (no niche on it): it answers a niche question when its peak month is
-        // one of the niche's peak months ("get ready for Halloween" → the October peaks).
-        const peaks = market.NICHES.find((n) => n.key === subject.niche)?.peakMonths ?? [];
-        return r.rule === "R1" && r.params.peakMonth != null && peaks.includes(r.params.peakMonth);
-      }
-      if (subject.designIds)
-        return r.target.designId != null && subject.designIds.includes(r.target.designId);
-      return true;
-    })
-    .slice(0, MARKET_REC_MAX);
+  // Read enough to filter from (the service caps the list at 200); at most 3 are shown.
+  const all = await market.listRecommendations(tx, ctx, { minBand: "medium", limit: 100 });
+  const niches = new Map<string, string[]>();
+  /** A design's niches (mapper or shop correction); R1..R3 and R5 are per design, not per niche. */
+  const nichesOf = async (designId: string) => {
+    if (!niches.has(designId))
+      niches.set(
+        designId,
+        await market
+          .getDesignNiches(tx, ctx, { designId })
+          .then((d) => d.niches)
+          .catch(() => []),
+      );
+    return niches.get(designId) ?? [];
+  };
+  const out: MarketRecommendation[] = [];
+  for (const r of all) {
+    if (out.length >= MARKET_REC_MAX) break;
+    if (!rules.includes(r.rule) || r.band === "low") continue;
+    const designId = r.target.designId;
+    const fits = subject.niche
+      ? (r.params.niche ?? r.target.niche) === subject.niche ||
+        (designId != null && (await nichesOf(designId)).includes(subject.niche))
+      : subject.designIds
+        ? designId != null && subject.designIds.includes(designId)
+        : true;
+    if (fits) out.push(r);
+  }
+  return out;
 }
 
 function marketOutput(
@@ -1512,7 +1532,7 @@ function marketTools(ctx: TenantContext): AssistantTool[] {
               ? `; ${lang === "es" ? "meses bajos" : "off months"}: ${months(r.offMonths)}`
               : "";
             const act = r.actBy
-              ? ` ${lang === "es" ? "Actúa antes del" : "Act by"} ${r.actBy.date}: ${Math.round(r.actBy.weeksToPeak)} ${lang === "es" ? "semanas al pico, tu tiempo de producción es" : "weeks to the peak, your lead time is"} ${Math.round(r.actBy.leadTimeWeeks)} ${lang === "es" ? "semanas" : "weeks"}.${r.actBy.actNow ? (lang === "es" ? " Hazlo ya." : " Act now.") : ""}`
+              ? ` ${lang === "es" ? "Actúa antes del" : "Act by"} ${r.actBy.date}: ${weeks(Math.round(r.actBy.weeksToPeak), lang)} ${lang === "es" ? "al pico, tu tiempo de producción es de" : "to the peak, your lead time is"} ${weeks(Math.round(r.actBy.leadTimeWeeks), lang)}.${r.actBy.actNow ? (lang === "es" ? " Hazlo ya." : " Act now.") : ""}`
               : "";
             return [
               `**${r.label}**: ${peak}${off} (${from}; ${src}; ${BAND_COPY[r.band][lang]}).${act}`,

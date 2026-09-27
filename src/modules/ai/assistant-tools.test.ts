@@ -64,6 +64,7 @@ vi.mock("../market/service", async (importOriginal) => {
     },
     getTrendSignal: vi.fn(),
     getSeasonalitySignal: vi.fn(),
+    getDesignNiches: vi.fn(),
     getPricePosition: vi.fn(),
     simulatePrice: vi.fn(),
     listRecommendations: vi.fn(),
@@ -1204,7 +1205,7 @@ describe("market tools (T-18-4)", () => {
       },
       yearsUsed: 10,
     }));
-    const octoberR1 = rec("R1", {
+    const halloweenR1 = rec("R1", {
       action: "list_and_stock",
       target: {
         designId: a.designIds[0] ?? null,
@@ -1216,22 +1217,59 @@ describe("market tools (T-18-4)", () => {
         designName: "Spooky Pumpkin Ghost",
         channels: ["amazon"],
         blankName: "Gildan 64000 Black M",
-        peakMonth: 10,
+        peakMonth: 11,
       },
       mock: false,
       sources: [prov("census", false)],
     });
-    const decemberR1 = rec("R1", {
-      params: { peakMonth: 12 },
-      target: { designId: null, designName: "Elf", niche: null, channel: null },
+    const otherR1 = rec("R1", {
+      params: { peakMonth: 10 },
+      target: {
+        designId: a.designIds[1] ?? null,
+        designName: "Witch Please",
+        niche: null,
+        channel: null,
+      },
     });
-    m.listRecommendations.mockResolvedValue([octoberR1, decemberR1]);
+    // Design 0 is in the Halloween niche (its R1 may peak in November); design 1 isn't.
+    m.getDesignNiches.mockImplementation(async (_tx, _ctx, i) => ({
+      designId: i.designId,
+      niches: i.designId === a.designIds[0] ? ["halloween"] : ["teacher"],
+      source: "stems",
+      confidence: null,
+      updatedAt: null,
+    }));
+    m.listRecommendations.mockResolvedValue([halloweenR1, otherR1]);
     const out = await run(a.ctx, "get_seasonality", { niche: "Halloween" });
     expect(m.getSeasonalitySignal.mock.calls[0]?.[2]).toEqual({ niche: "halloween" });
-    expect(out.meta?.recommendations?.map((r) => r.id)).toEqual([octoberR1.id]);
+    expect(out.meta?.recommendations?.map((r) => r.id)).toEqual([halloweenR1.id]);
+    m.listRecommendations.mockResolvedValue([
+      rec("R1", {
+        target: { designId: a.designIds[0] ?? null, designName: null, niche: null, channel: null },
+        params: {
+          designName: "Cactus Mama",
+          channels: [],
+          blankName: "Gildan Black L",
+          peakMonth: 10,
+        },
+      }),
+      rec("R1", {
+        target: { designId: a.designIds[0] ?? null, designName: null, niche: null, channel: null },
+        params: { designName: "Cactus Mama", channels: ["amazon"], peakMonth: 10 },
+      }),
+      rec("R1", {
+        target: { designId: a.designIds[0] ?? null, designName: null, niche: null, channel: null },
+        params: { designName: "Cactus Mama", peakMonth: 10 },
+      }),
+    ]);
+    const partial = await run(a.ctx, "get_seasonality");
+    expect(partial.answer).toContain("1. Stock Gildan Black L for Cactus Mama before October.");
+    expect(partial.answer).toContain("2. List Cactus Mama on Amazon before October.");
+    expect(partial.answer).toContain("3. Get Cactus Mama ready before October.");
+    expect(partial.answer).not.toMatch(/ on {2}| on and /);
     m.listRecommendations.mockResolvedValue([]);
     expect(out.answer).toContain(
-      "List Spooky Pumpkin Ghost on Amazon and stock Gildan 64000 Black M before October.",
+      "List Spooky Pumpkin Ghost on Amazon and stock Gildan 64000 Black M before November.",
     );
     expect(out.answer.split("\n")[0]).toBe(
       "**Halloween**: peaks in October (All US clothing stores, not specific to your niche; US Census retail trade, as of 2026-09-20; Medium confidence: test it). Act by 2026-09-07: 6 weeks to the peak, your lead time is 4 weeks. Act now.",
