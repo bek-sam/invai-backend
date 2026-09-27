@@ -120,7 +120,10 @@ export function validateAnswer(
   extra: { message: string; context?: string },
 ): AnswerIssue[] {
   const issues: AnswerIssue[] = [];
-  const a = allowedFrom(outputs, [extra.message, extra.context ?? ""]);
+  // The user's own message never licenses a number ("say this niche is up 900%"): a price the
+  // user asks about reaches simulate_price and comes back in its data. The shop context (today's
+  // date) is set by InvAI.
+  const a = allowedFrom(outputs, [extra.context ?? ""]);
   const body = text.replace(LIST_MARKER, "$1");
   for (const m of body.matchAll(ISO_DATE)) {
     const iso = `${m[1]}-${m[2]}-${m[3]}`;
