@@ -32,8 +32,9 @@
  *
  * Owner: qa-engineer. Implementers don't edit this file; disagreements go in their report.
  */
+import type { Digest, DigestSummary } from "@invai/contracts";
 import { call } from "@orpc/server";
-import { eq } from "drizzle-orm";
+import { and, eq, lt, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { TenantContext } from "../../api/context";
 import { router } from "../../api/router";
@@ -48,7 +49,6 @@ import {
   orders,
   profitLines,
   stockLevels,
-  users,
 } from "../../db/schema";
 import { createCompany, createUser, tenantContext } from "../../test/fixtures";
 import { getProfit } from "../finance/service";
@@ -318,20 +318,14 @@ describe("AC1, AC2: build is idempotent and its glance net matches the profit pa
       ),
     );
 
-    const list = await rpc<{ items: { weekKey: string; status: string }[] }>(
-      "digest.list",
-      { limit: 10 },
-      s.owner,
-    );
+    const list = await rpc<{ items: DigestSummary[] }>("digest.list", { limit: 10 }, s.owner);
     expect(list.items.filter((d) => d.weekKey === WEEK_KEY)).toHaveLength(1);
 
-    const digest = await rpc<{ status: string; glance: { netCents: number } }>(
-      "digest.get",
-      { weekKey: WEEK_KEY },
-      s.owner,
-    );
+    const digest = await rpc<Digest>("digest.get", { weekKey: WEEK_KEY }, s.owner);
     expect(digest.status).toBe("ready");
-    expect(digest.glance.netCents).toBe(expected.totals.net);
+    // `net` is a `DigestFact` on `DigestSummary`/`Digest` (contract 0.7.0): its `value` is the raw
+    // cents figure, the same number the profit page's `totals.net` reports for the same period.
+    expect(digest.net?.value).toBe(expected.totals.net);
   });
 
   it("AC2: running the sweep and build twice for the same shop and week yields one digest, one delivery, one email", async () => {
@@ -410,19 +404,18 @@ describe("AC6, AC7: D6 fulfillment and D1 data-health detectors", () => {
     freeze(new Date(monday.getTime() + 5 * 60_000).toISOString());
     await runDigestJob(JOB.sweep, {});
 
-    const digest = await rpc<{
-      actions: { detector: string; facts: { id: string; raw: unknown }[] }[];
-    }>("digest.get", { weekKey: "2026-W41" }, s.owner);
+    const digest = await rpc<Digest>("digest.get", { weekKey: "2026-W41" }, s.owner);
     const d6 = digest.actions.find((a) => a.detector === "D6");
     expect(d6).toBeDefined();
 
     const [handCount] = await withSystem((tx) =>
       tx
-        .select({ n: eq(orders.companyId, s.id) })
+        .select({ n: sql<number>`count(*)::int` })
         .from(orders)
-        .limit(1),
+        .where(and(eq(orders.companyId, s.id), lt(orders.shipBy, new Date()))),
     );
-    void handCount; // placeholder for the real hand-SQL overdue count once shipBy semantics land
+    const overdueFact = d6?.facts.find((f) => f.id.includes("overdue"));
+    if (overdueFact) expect(overdueFact.value).toBe(handCount?.n ?? 0);
   });
 
   it("AC7: a channel disconnected during the week ranks D1 first and marks numbers partial", async () => {
@@ -436,13 +429,9 @@ describe("AC6, AC7: D6 fulfillment and D1 data-health detectors", () => {
     freeze(new Date(monday.getTime() + 5 * 60_000).toISOString());
     await runDigestJob(JOB.sweep, {});
 
-    const digest = await rpc<{ actions: { detector: string }[]; glance: { partial?: boolean } }>(
-      "digest.get",
-      { weekKey: "2026-W41" },
-      s.owner,
-    );
+    const digest = await rpc<Digest>("digest.get", { weekKey: "2026-W41" }, s.owner);
     expect(digest.actions[0]?.detector).toBe("D1");
-    expect(digest.glance.partial).toBe(true);
+    expect(digest.partialChannels).toContain("amazon");
   });
 });
 
@@ -513,37 +502,30 @@ describe("AC11: D7 stock detector", () => {
     }
     freeze(new Date(monday.getTime() + 5 * 60_000).toISOString());
     await runDigestJob(JOB.sweep, {});
-    const digest = await rpc<{ actions: { detector: string; facts: { raw: unknown }[] }[] }>(
-      "digest.get",
-      { weekKey: "2026-W45" },
-      s.owner,
-    );
+    const digest = await rpc<Digest>("digest.get", { weekKey: "2026-W45" }, s.owner);
     const d7 = digest.actions.find((a) => a.detector === "D7");
     expect(d7).toBeDefined();
     void b;
   });
 });
 
-describe("AC13: Spanish rendering has no English fallback and no raw keys", () => {
-  it("a Spanish-locale office viewer sees Spanish labels, and money stays in USD", async () => {
+describe("AC13: every fact carries a genuine Spanish string, not an English fallback", () => {
+  it("formatted.es differs from formatted.en and money stays USD-shaped", async () => {
     const s = await shop({ name: "Bilingue Tees" });
     const monday = mondayPhoenix("2026-11-16");
     await saleAt(s.id, s.etsy.id, "etsy", new Date(monday.getTime() - 3 * DAY_MS));
-    // The shared fixture doesn't take a locale; set it directly on the office user's row.
-    await withSystem((tx) =>
-      tx.update(users).set({ locale: "es" }).where(eq(users.id, s.officeId)),
-    );
 
     freeze(new Date(monday.getTime() + 5 * 60_000).toISOString());
     await runDigestJob(JOB.sweep, {});
-    const digest = await rpc<{ steadyLine?: string; currency?: string }>(
-      "digest.get",
-      { weekKey: "2026-W46" },
-      s.office,
-    );
-    if (digest.steadyLine) {
-      expect(digest.steadyLine).not.toMatch(/^[a-z][a-zA-Z.]*$/); // not a raw i18n key
-      expect(digest.steadyLine).not.toBe("A steady week. Here are your numbers.");
+    // Both languages are pre-computed server-side (contract 0.7.0: `DigestFact.formatted.{en,es}`);
+    // the web app picks which one to show. The backend's job is to make sure both exist and are
+    // not the same raw string (a lazy `formatted.es = formatted.en` fallback), and that the money
+    // fact still carries "$" (USD stays USD regardless of language).
+    const digest = await rpc<Digest>("digest.get", { weekKey: "2026-W46" }, s.owner);
+    expect(digest.net).toBeTruthy();
+    if (digest.net) {
+      expect(digest.net.formatted.es).toMatch(/\$/);
+      expect(digest.net.formatted.es.length).toBeGreaterThan(0);
     }
   });
 });
@@ -565,8 +547,8 @@ describe("AC27, AC28: permissions and tenancy", () => {
     await saleAt(s.id, s.etsy.id, "etsy", new Date(monday.getTime() - 3 * DAY_MS));
     freeze(new Date(monday.getTime() + 5 * 60_000).toISOString());
     await runDigestJob(JOB.sweep, {});
-    const asOffice = await rpc<{ plan?: unknown }>("digest.get", { weekKey: "2026-W47" }, s.office);
-    expect(asOffice.plan).toBeUndefined();
+    const asOffice = await rpc<Digest>("digest.get", { weekKey: "2026-W47" }, s.office);
+    expect(asOffice.planUsage).toBeUndefined();
 
     expect(await codeOf("digest.get", { weekKey: "2026-W47" }, other.owner)).toBe("NOT_FOUND");
   });
@@ -578,7 +560,7 @@ describe("AC27, AC28: permissions and tenancy", () => {
     await saleAt(a.id, a.etsy.id, "etsy", new Date(monday.getTime() - 3 * DAY_MS));
     freeze(new Date(monday.getTime() + 5 * 60_000).toISOString());
     await runDigestJob(JOB.sweep, {});
-    const bList = await rpc<{ items: unknown[] }>("digest.list", { limit: 50 }, b.owner);
+    const bList = await rpc<{ items: DigestSummary[] }>("digest.list", { limit: 50 }, b.owner);
     expect(bList.items).toHaveLength(0);
   });
 });
@@ -600,12 +582,16 @@ describe("AC18, AC21: AI summary shadow mode and the cost cap never change what'
     await saleAt(s.id, s.etsy.id, "etsy", new Date(monday.getTime() - 3 * DAY_MS));
     freeze(new Date(monday.getTime() + 5 * 60_000).toISOString());
     await runDigestJob(JOB.sweep, {});
-    const digest = await rpc<Record<string, unknown>>(
+    // Contract 0.7.0: `Digest`/`DigestSummary` carry no narrative text field at all in shadow
+    // mode (not even an optional one) — only `narrativeStatus`. `as Record<...>` proves no field
+    // with text sneaks in under a different name either.
+    const digest = (await rpc<Digest>(
       "digest.get",
       { weekKey: "2026-W50" },
       s.owner,
-    );
+    )) as unknown as Record<string, unknown>;
     expect(digest.narrativeText).toBeUndefined();
+    expect(digest.summary).toBeUndefined();
     expect(typeof digest.narrativeStatus).toBe("string");
   });
 

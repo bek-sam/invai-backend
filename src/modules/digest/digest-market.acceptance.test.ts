@@ -6,12 +6,19 @@
  * (pushed, `src/modules/market/service.ts`: `listDigestMarketItems`, `voteRecommendation`,
  * `recordRecommendationsShown` are real, not stubs) — recommendations are seeded with a direct
  * insert into `market_recommendations` rather than through the market jobs, so the "wave 18
- * signals" half of each AC is exact and stable. The digest half (`digest.get`'s Market watch
- * selection, promotion into the top 3, the shared vote) still goes through the digest router,
- * which doesn't exist yet: expected red until T-19-3 lands.
+ * signals" half of each AC is exact and stable. The digest half (`digest.get`'s `marketWatch`
+ * selection, promotion into `actions`) still goes through the digest router, which doesn't exist
+ * yet: expected red until T-19-3 lands.
+ *
+ * Field names match the landed contract (0.7.0, `@invai/contracts`): `Digest.marketWatch` (not
+ * `market`), and a market item is a `DigestInsight` whose `recommendation` field is the underlying
+ * `MarketRecommendation` — per the schema's own doc comment, a Market watch vote goes through
+ * `market.recommendations.vote`, never `digest.feedback` (AC17 below calls the real, already-
+ * working wave 18 procedure directly).
  *
  * Owner: qa-engineer. Implementers don't edit this file; disagreements go in their report.
  */
+import type { Digest } from "@invai/contracts";
 import { call } from "@orpc/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { TenantContext } from "../../api/context";
@@ -26,7 +33,6 @@ const DAY_MS = 86_400_000;
 function freeze(at: string) {
   vi.useFakeTimers({ toFake: ["Date"] });
   vi.setSystemTime(new Date(at));
-  return new Date(at);
 }
 afterEach(() => {
   try {
@@ -50,10 +56,15 @@ function rpc<T>(path: string, input: unknown, context: TenantContext): Promise<T
 const JOBS = "./jobs";
 async function runDigestJob(name: string, input: unknown) {
   const { getJob, runJobInline } = await import("../../lib/queues");
-  (await await import(JOBS)) as unknown;
+  await import(JOBS);
   const job = getJob(name);
   if (!job) throw new Error(`job ${name} is not registered (T-19-3 jobs.ts)`);
   return runJobInline(job, input);
+}
+
+/** A Monday 00:00 UTC that stands in for shop-local Monday 00:00 for Phoenix (UTC-7, no DST). */
+function mondayPhoenix(dateIso: string) {
+  return new Date(`${dateIso}T07:00:00.000Z`);
 }
 
 type Shop = { id: string; owner: TenantContext; etsy: typeof channelConnections.$inferSelect };
@@ -118,6 +129,7 @@ async function recommendation(
 describe("AC14: Market watch shows a qualifying medium/high item and drops a low-band one", () => {
   it("shows the R1 item with source/date/band and 'Sample data'; the R4 low item is absent", async () => {
     const s = await shop("Watch Tees");
+    const monday = mondayPhoenix("2026-09-28");
     const halloween = await withSystem((tx) =>
       tx
         .insert(designs)
@@ -128,67 +140,57 @@ describe("AC14: Market watch shows a qualifying medium/high item and drops a low
     const r1 = await recommendation(s.id, { rule: "R1", band: "medium", designId: halloween.id });
     await recommendation(s.id, { rule: "R4", band: "low", designId: halloween.id });
 
-    freeze(new Date().toISOString());
+    freeze(new Date(monday.getTime() + 5 * 60_000).toISOString());
     await runDigestJob("digest.sweep", {});
-    const digest = await rpc<{ market: { id: string; rule: string; sample?: boolean }[] }>(
-      "digest.get",
-      { weekKey: "current" },
-      s.owner,
-    );
-    expect(digest.market.map((m) => m.id)).toContain(r1.id);
-    expect(digest.market.some((m) => m.rule === "R4")).toBe(false);
+    const digest = await rpc<Digest>("digest.get", { weekKey: "2026-W39" }, s.owner);
+    expect(digest.marketWatch.some((m) => m.recommendation?.id === r1.id)).toBe(true);
+    expect(digest.marketWatch.some((m) => m.recommendation?.rule === "R4")).toBe(false);
   });
 });
 
 describe("AC15: promotion into the top 3 actions", () => {
   it("an R1 item with a cross-listing gap may take a top-3 slot; an R2 item never does", async () => {
     const s = await shop("Promote Tees");
-    const r1 = await recommendation(s.id, { rule: "R1", band: "high" });
+    const monday = mondayPhoenix("2026-10-05");
+    await recommendation(s.id, { rule: "R1", band: "high" });
     const r2 = await recommendation(s.id, { rule: "R2", band: "high" });
-    freeze(new Date().toISOString());
+    freeze(new Date(monday.getTime() + 5 * 60_000).toISOString());
     await runDigestJob("digest.sweep", {});
-    const digest = await rpc<{ actions: { id: string; rule?: string }[] }>(
-      "digest.get",
-      { weekKey: "current" },
-      s.owner,
-    );
-    expect(digest.actions.some((a) => a.id === r2.id)).toBe(false);
-    void r1;
+    const digest = await rpc<Digest>("digest.get", { weekKey: "2026-W40" }, s.owner);
+    expect(digest.actions.some((a) => a.recommendation?.id === r2.id)).toBe(false);
   });
 });
 
 describe("AC16: a missing, stale or throwing market read never blocks the digest", () => {
   it("the digest still builds ready with no Market watch block when signals are stale", async () => {
     const s = await shop("Stale Tees");
+    const monday = mondayPhoenix("2026-10-12");
     await recommendation(s.id, {
       rule: "R1",
       band: "high",
-      createdAt: new Date(Date.now() - 90 * DAY_MS), // far past staleAfterDays: 30
+      createdAt: new Date(monday.getTime() - 90 * DAY_MS), // far past staleAfterDays: 30
     });
-    freeze(new Date().toISOString());
+    freeze(new Date(monday.getTime() + 5 * 60_000).toISOString());
     await runDigestJob("digest.sweep", {});
-    const digest = await rpc<{ status: string; market: unknown[] }>(
-      "digest.get",
-      { weekKey: "current" },
-      s.owner,
-    );
+    const digest = await rpc<Digest>("digest.get", { weekKey: "2026-W41" }, s.owner);
     expect(digest.status).toBe("ready");
-    expect(digest.market).toHaveLength(0);
+    expect(digest.marketWatch).toHaveLength(0);
   });
 });
 
 describe("AC17: a Market watch vote is the same market-recommendation vote", () => {
-  it("voting 'not useful' in the digest updates the one underlying recommendation record", async () => {
+  it("voting 'not useful' updates the one underlying recommendation record, via market.recommendations.vote", async () => {
     const s = await shop("Vote Tees");
+    const monday = mondayPhoenix("2026-10-19");
     const r1 = await recommendation(s.id, { rule: "R1", band: "high" });
-    freeze(new Date().toISOString());
+    freeze(new Date(monday.getTime() + 5 * 60_000).toISOString());
     await runDigestJob("digest.sweep", {});
-    const digest = await rpc<{ id: string; market: { id: string }[] }>(
-      "digest.get",
-      { weekKey: "current" },
-      s.owner,
-    );
-    await rpc("digest.feedback", { digestId: digest.id, insightId: r1.id, vote: "down" }, s.owner);
+    const digest = await rpc<Digest>("digest.get", { weekKey: "2026-W42" }, s.owner);
+    expect(digest.marketWatch.some((m) => m.recommendation?.id === r1.id)).toBe(true);
+
+    // Per the contract's own doc comment on `DigestInsight.recommendation`: Market watch items are
+    // voted through `market.recommendations.vote` (already real, wave 18), never `digest.feedback`.
+    await rpc("market.recommendations.vote", { id: r1.id, vote: "not_useful" }, s.owner);
     const marketVoted = await withSystem((tx) =>
       tx.query.marketRecommendations.findFirst({ where: (t, o) => o.eq(t.id, r1.id) }),
     );

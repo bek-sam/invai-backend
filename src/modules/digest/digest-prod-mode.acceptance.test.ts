@@ -5,10 +5,13 @@
  *
  * `env.isProd` is flipped to true (and `allowMocks` to false) for this file only, mirroring wave
  * 18's `market-prod-mode.acceptance.test.ts`: a real shop must see no mock-sourced item in
- * production, in Market watch or in a top-3 action slot.
+ * production, in Market watch or in a top-3 action slot. Field names match the landed contract
+ * (0.7.0): `Digest.marketWatch`, and the `mock` flag lives on `DigestInsight.recommendation.mock`
+ * (the underlying `MarketRecommendation`), not on the insight itself.
  *
  * Owner: qa-engineer. Implementers don't edit this file; disagreements go in their report.
  */
+import type { Digest } from "@invai/contracts";
 import { call } from "@orpc/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { TenantContext } from "../../api/context";
@@ -103,15 +106,12 @@ async function mockRecommendation(companyId: string) {
 describe("AC31: a real shop in production never shows a mock-sourced Market watch item", () => {
   it("Market watch is absent (no other qualifying item) and no top-3 action comes from the mock item", async () => {
     const s = await shop("Prod Real Tees");
+    const monday = new Date("2026-09-28T07:00:00.000Z"); // Monday 00:00 America/Phoenix (no DST)
     await mockRecommendation(s.id);
-    freeze(new Date().toISOString());
+    freeze(new Date(monday.getTime() + 5 * 60_000).toISOString());
     await runDigestJob("digest.sweep", {});
-    const digest = await rpc<{ market: unknown[]; actions: { mock?: boolean }[] }>(
-      "digest.get",
-      { weekKey: "current" },
-      s.owner,
-    );
-    expect(digest.market).toHaveLength(0);
-    expect(digest.actions.every((a) => !a.mock)).toBe(true);
+    const digest = await rpc<Digest>("digest.get", { weekKey: "2026-W39" }, s.owner);
+    expect(digest.marketWatch).toHaveLength(0);
+    expect(digest.actions.every((a) => !a.recommendation?.mock)).toBe(true);
   });
 });
