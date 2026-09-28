@@ -111,6 +111,34 @@ const raw = createEnv({
     /** Outgoing mail. Outside production both default to Mailpit (docker compose, UI on :8025). */
     SMTP_URL: secret(z.url()),
     MAIL_FROM: secret(z.string()),
+    /**
+     * Postal address printed in the footer of every person-facing email (CAN-SPAM). The default
+     * is an obvious placeholder until the owner answers OI-12; nothing real is sent before that.
+     */
+    MAIL_POSTAL_ADDRESS: z
+      .string()
+      .trim()
+      .min(1)
+      .default("InvAI, postal address pending (OI-12), USA"),
+
+    /**
+     * Weekly digest switches (wave 19, `specs/weekly-digest.md` pipeline 9-10; T-19-4 owns the
+     * names, T-19-2 and T-19-3 read them). None is a provider key, so none is in PRODUCTION_KEYS.
+     * `DIGEST_ENABLED=false` stops every digest build; `DIGEST_EMAIL_ENABLED=false` keeps digests
+     * in-app only (`sendUserEmail` answers `skipped: disabled`). `DIGEST_SUMMARY_MODE` is the AI
+     * summary's global mode: it stays `shadow` (built, stored, never shown or sent) until OI-8.
+     */
+    DIGEST_ENABLED: z
+      .enum(["true", "false"])
+      .default("true")
+      .transform((v) => v === "true"),
+    DIGEST_EMAIL_ENABLED: z
+      .enum(["true", "false"])
+      .default("true")
+      .transform((v) => v === "true"),
+    DIGEST_SUMMARY_MODE: z.enum(["off", "shadow", "on"]).default("shadow"),
+    /** Per-shop cap for the AI summary's model spend, in cents per week (estimate before the call). */
+    DIGEST_MAX_CENTS_PER_WEEK: z.coerce.number().int().min(0).default(10),
 
     /**
      * Production refuses to boot while any provider key is missing (it would run on a mock).

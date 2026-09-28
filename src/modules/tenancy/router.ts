@@ -4,6 +4,7 @@ import { authed, pub } from "../../api/orpc";
 import { auth } from "../../auth";
 import { withTenant } from "../../db/client";
 import { badRequest, forbidden, unauthorized } from "../../lib/errors";
+import { listEmailPreferencesTx, setEmailPreferenceTx } from "../../lib/notify";
 import { leaveDemo, resetDemo, startDemo } from "./demo";
 import { pinLogin, resolveStationToken, revokeFloorSession } from "./floor-auth";
 import * as svc from "./service";
@@ -37,6 +38,30 @@ export const meRouter = authed.me.router({
   updateOrg: authed.me.updateOrg.handler(({ input, context: { tenant } }) =>
     withTenant(tenant.companyId, (tx) => svc.updateOrg(tx, tenant, input)),
   ),
+  /**
+   * The caller's own email preferences, keyed by kind (wave 19, ADR 0016). `set` is always
+   * `source: settings`: the person is the only one who can turn a kind on (src/lib/notify.ts).
+   */
+  notifications: authed.me.notifications.router({
+    get: authed.me.notifications.get.handler(({ context: { tenant } }) => {
+      if (!tenant.userId) throw forbidden("none", "A user session is required");
+      const userId = tenant.userId;
+      return withTenant(tenant.companyId, async (tx) => ({
+        items: await listEmailPreferencesTx(tx, tenant.companyId, userId),
+      }));
+    }),
+    set: authed.me.notifications.set.handler(({ input, context: { tenant } }) => {
+      if (!tenant.userId) throw forbidden("none", "A user session is required");
+      const userId = tenant.userId;
+      return withTenant(tenant.companyId, async (tx) => {
+        await setEmailPreferenceTx(tx, tenant.companyId, userId, input.kind, {
+          on: input.on,
+          source: "settings",
+        });
+        return { items: await listEmailPreferencesTx(tx, tenant.companyId, userId) };
+      });
+    }),
+  }),
 });
 
 export const teamRouter = authed.team.router({

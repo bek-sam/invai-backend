@@ -17,7 +17,19 @@ const transport = env.SMTP_URL
   ? nodemailer.createTransport(env.SMTP_URL)
   : nodemailer.createTransport({ jsonTransport: true });
 
-export type Mail = { to: string; subject: string; text: string; html?: string; replyTo?: string };
+export type Mail = {
+  to: string;
+  subject: string;
+  text: string;
+  html?: string;
+  replyTo?: string;
+  /** A deterministic RFC 5322 `<local@domain>` id (person-facing mail, T-19-4); random when unset. */
+  messageId?: string;
+  /** Extra headers, e.g. RFC 8058 `List-Unsubscribe` / `List-Unsubscribe-Post` (T-19-4). */
+  headers?: Record<string, string>;
+};
+
+export type MailSkipReason = "sample_workspace" | "pin_only";
 
 /**
  * PIN-only floor staff get a synthetic `pin+<uuid>@floor.invai.internal` email because Better
@@ -38,14 +50,17 @@ export function isPlaceholderEmail(address: string) {
  */
 export type MailSender = CompanyScope | "account";
 
-export async function sendMail(mail: Mail, sender: MailSender): Promise<{ messageId: string }> {
+export async function sendMail(
+  mail: Mail,
+  sender: MailSender,
+): Promise<{ messageId: string; skipped?: MailSkipReason }> {
   if (sender !== "account" && (await isSampleWorkspace(sender.companyId))) {
     log.info("mail skipped: sample workspace", { subject: mail.subject });
-    return { messageId: "skipped:sample-workspace" };
+    return { messageId: "skipped:sample-workspace", skipped: "sample_workspace" };
   }
   if (isPlaceholderEmail(mail.to)) {
     log.info("mail skipped: PIN-only placeholder address", { subject: mail.subject });
-    return { messageId: "skipped:pin-only" };
+    return { messageId: "skipped:pin-only", skipped: "pin_only" };
   }
   const info = await transport.sendMail({ from: MAIL_FROM, ...mail });
   if (!env.SMTP_URL) {

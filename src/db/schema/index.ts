@@ -7,6 +7,7 @@ export * from "./channels";
 export * from "./finance";
 export * from "./inventory";
 export * from "./market";
+export * from "./notifications";
 export * from "./orders";
 export * from "./personalization";
 export * from "./privacy";
