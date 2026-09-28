@@ -20,6 +20,7 @@ import { s3Healthy } from "../lib/s3";
 import { buildContext } from "./context";
 import { events } from "./events";
 import { internal } from "./internal";
+import { links } from "./links";
 import { router } from "./router";
 import { webhooks } from "./webhooks";
 import { carrierWebhooks } from "./webhooks-carriers";
@@ -140,6 +141,9 @@ app.get("/readyz", async (c) => {
 
 // Internal-only DLQ/redrive routes (X-Internal-Token; 404 otherwise). See internal.ts.
 app.route("/internal", internal);
+
+// Public signed email links (one-click unsubscribe, clicks): no session, token-bound. See links.ts.
+app.route("/l", links);
 
 app.on(["GET", "POST"], "/api/auth/*", (c) => auth.handler(c.req.raw));
 

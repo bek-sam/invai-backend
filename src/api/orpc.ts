@@ -140,19 +140,28 @@ const guard = os.middleware(async ({ context, next, procedure, path }) => {
  * request whose token didn't resolve) -- nothing to key the bucket on.
  *
  * Bucket: `ai.*` procedures get the `ai` bucket (the AI gateway's own per-company spend breaker
- * covers cost; this covers request volume); `auth: "station"` procedures (floor PIN login, the
- * PIN-screen staff list) get `auth`; everything else is `reads` for GET, `writes` otherwise.
- * `RATE_LIMITED`'s `retryAfterSec` becomes both the error's `data` (already in COMMON_ERRORS) and
- * an HTTP `Retry-After` header, via `context.resHeaders` (`ResponseHeadersPlugin`, api/app.ts) --
- * that plugin merges headers set on `context.resHeaders` into the response even when the
- * middleware that set them goes on to throw.
+ * covers cost; this covers request volume), except the cheap reads in `AI_CHEAP_READS`, which
+ * never call a model and go to `reads` (B-133: the web's credit-balance polling used to drain the
+ * 20/min `ai` bucket and block the assistant's `ask`); `auth: "station"` procedures (floor PIN
+ * login, the PIN-screen staff list) get `auth`; everything else is `reads` for GET, `writes`
+ * otherwise. `RATE_LIMITED`'s `retryAfterSec` becomes both the error's `data` (already in
+ * COMMON_ERRORS) and an HTTP `Retry-After` header, via `context.resHeaders`
+ * (`ResponseHeadersPlugin`, api/app.ts) -- that plugin merges headers set on `context.resHeaders`
+ * into the response even when the middleware that set them goes on to throw.
  */
-function bucketFor(
+export const AI_CHEAP_READS: ReadonlySet<string> = new Set([
+  "ai.credits.balance",
+  "ai.credits.ledger",
+  "ai.assistant.conversations",
+  "ai.assistant.conversation",
+]);
+
+export function bucketFor(
   path: readonly string[],
   meta: ProcedureMeta,
   method: string | undefined,
 ): RateBucket {
-  if (path[0] === "ai") return "ai";
+  if (path[0] === "ai") return AI_CHEAP_READS.has(path.join(".")) ? "reads" : "ai";
   if (meta.auth === "station") return "auth";
   return method === "GET" ? "reads" : "writes";
 }

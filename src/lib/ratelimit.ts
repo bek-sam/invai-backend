@@ -80,7 +80,7 @@ export async function isRevoked(key: string): Promise<boolean> {
  * the rest of this file: a Redis timeout allows the request and logs a warning.
  */
 
-export type RateBucket = "auth" | "reads" | "writes" | "ai";
+export type RateBucket = "auth" | "reads" | "writes" | "ai" | "links";
 
 export type BucketLimits = { capacity: number; refillPerSec: number };
 
@@ -95,6 +95,8 @@ export const RATE_BUCKET_LIMITS: Record<RateBucket, BucketLimits> = {
   reads: perMinute(300),
   writes: perMinute(120),
   ai: perMinute(20), // the AI gateway has its own per-company spend breaker; this is request volume
+  // Public `/l/:token` email links (ADR 0016): no session, so keyed by IP, not company.
+  links: perMinute(60),
 };
 
 /**

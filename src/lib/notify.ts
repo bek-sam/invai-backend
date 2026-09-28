@@ -15,6 +15,7 @@ import {
   escapeHtml,
   isPlaceholderEmail,
   MAIL_FROM,
+  mailSkipReason,
   sendMail,
 } from "../integrations/vendors/mailer";
 import { conflict, forbidden } from "./errors";
@@ -78,6 +79,11 @@ export type SendUserEmailInput = {
 export type SendUserEmailResult =
   | { status: "sent"; messageId: string }
   | { status: "skipped"; reason: SkipReason };
+
+/** The skip reason of a result, or `"sent"`: for tests and delivery rows. */
+export function outcomeOf(result: SendUserEmailResult): SkipReason | "sent" {
+  return result.status === "skipped" ? result.reason : "sent";
+}
 
 /** A `pending` row older than this belongs to a crashed attempt and may be taken over. */
 const PENDING_STALE_MS = 10 * 60_000;
@@ -171,6 +177,11 @@ export async function setEmailPreferenceTx(
   if (!NOTIFICATION_KINDS.includes(kind)) throw conflict(`Unknown notification kind ${kind}`);
   if (input.on && input.source !== "settings")
     throw forbidden("none", "Only the person can turn their own email on");
+  // A repeat with the same outcome (a second one-click POST, a double tap) changes nothing, so
+  // `updatedAt` keeps pointing at the first change and the 24 h undo window stays anchored there.
+  const current = await getEmailPreferenceTx(tx, companyId, userId, kind);
+  if (current.source !== null && current.on === input.on && current.source === input.source)
+    return current;
   const [row] = await tx
     .insert(notificationPreferences)
     .values({ companyId, userId, kind, on: input.on, source: input.source })
@@ -474,8 +485,9 @@ export async function sendUserEmail(input: SendUserEmailInput): Promise<SendUser
       },
       { companyId: input.companyId },
     );
-    if (sent.skipped) {
-      const reason: SkipReason = sent.skipped === "pin_only" ? "placeholder" : "sample_workspace";
+    const mailerSkip = mailSkipReason(sent);
+    if (mailerSkip) {
+      const reason: SkipReason = mailerSkip === "pin_only" ? "placeholder" : "sample_workspace";
       await settle(input, claim.id, { status: "skipped", reason });
       log.info("user email skipped", { ...ctx, reason });
       return { status: "skipped", reason };

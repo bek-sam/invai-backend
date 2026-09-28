@@ -29,7 +29,18 @@ export type Mail = {
   headers?: Record<string, string>;
 };
 
-export type MailSkipReason = "sample_workspace" | "pin_only";
+/** `sendMail` answers these `messageId`s instead of sending; `mailSkipReason` reads them back. */
+export const MAIL_SKIPPED = {
+  sample_workspace: "skipped:sample-workspace",
+  pin_only: "skipped:pin-only",
+} as const;
+export type MailSkipReason = keyof typeof MAIL_SKIPPED;
+
+export function mailSkipReason(result: { messageId: string }): MailSkipReason | null {
+  for (const [reason, id] of Object.entries(MAIL_SKIPPED))
+    if (result.messageId === id) return reason as MailSkipReason;
+  return null;
+}
 
 /**
  * PIN-only floor staff get a synthetic `pin+<uuid>@floor.invai.internal` email because Better
@@ -50,17 +61,14 @@ export function isPlaceholderEmail(address: string) {
  */
 export type MailSender = CompanyScope | "account";
 
-export async function sendMail(
-  mail: Mail,
-  sender: MailSender,
-): Promise<{ messageId: string; skipped?: MailSkipReason }> {
+export async function sendMail(mail: Mail, sender: MailSender): Promise<{ messageId: string }> {
   if (sender !== "account" && (await isSampleWorkspace(sender.companyId))) {
     log.info("mail skipped: sample workspace", { subject: mail.subject });
-    return { messageId: "skipped:sample-workspace", skipped: "sample_workspace" };
+    return { messageId: MAIL_SKIPPED.sample_workspace };
   }
   if (isPlaceholderEmail(mail.to)) {
     log.info("mail skipped: PIN-only placeholder address", { subject: mail.subject });
-    return { messageId: "skipped:pin-only", skipped: "pin_only" };
+    return { messageId: MAIL_SKIPPED.pin_only };
   }
   const info = await transport.sendMail({ from: MAIL_FROM, ...mail });
   if (!env.SMTP_URL) {
