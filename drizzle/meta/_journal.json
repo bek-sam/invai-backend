@@ -204,6 +204,13 @@
       "when": 1790562160049,
       "tag": "0028_notifications",
       "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "7",
+      "when": 1790563857559,
+      "tag": "0029_digest",
+      "breakpoints": true
     }
   ]
 }

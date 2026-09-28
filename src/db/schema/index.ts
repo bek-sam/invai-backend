@@ -4,6 +4,7 @@ export * from "./billing";
 export * from "./carriers";
 export * from "./catalog";
 export * from "./channels";
+export * from "./digest";
 export * from "./finance";
 export * from "./inventory";
 export * from "./market";
