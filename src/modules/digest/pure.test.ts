@@ -4,7 +4,15 @@ import { d4Ads, d6Fulfillment, d7Stock, detect } from "./detectors";
 import { changeFact, fact } from "./facts";
 import { isPromotable, marketCandidates } from "./market-watch";
 import { rank } from "./rank";
-import { expand, type RenderModel, renderEmail, renderParts, TEMPLATES } from "./render";
+import {
+  actionPart,
+  expand,
+  type RenderInsight,
+  type RenderModel,
+  renderEmail,
+  renderParts,
+  TEMPLATES,
+} from "./render";
 import type { Candidate, History, Snapshot } from "./types";
 import { addDays, isoWeekKey, lastCompleteWeek, mondayOfWeekKey } from "./week";
 
@@ -317,37 +325,39 @@ describe("ranking", () => {
   });
 });
 
+const marketRec = (over: Record<string, unknown> = {}) =>
+  ({
+    id: "00000000-0000-4000-8000-0000000000aa",
+    rule: "R1",
+    action: "list_and_stock",
+    target: { designId: null, designName: "Cactus", niche: null, channel: null },
+    params: { channels: ["amazon"] },
+    confidence: 0.8,
+    band: "high",
+    mock: true,
+    sources: [
+      {
+        source: "google_trends",
+        licence: "official_api",
+        asOf: "2026-09-20T00:00:00.000Z",
+        fetchedAt: "2026-09-21T00:00:00.000Z",
+        mock: true,
+      },
+    ],
+    evidenceSignalIds: [],
+    stale: false,
+    shownIn: null,
+    shownAt: null,
+    vote: null,
+    votedAt: null,
+    adoptedAt: null,
+    outcome: null,
+    createdAt: "2026-09-27T00:00:00.000Z",
+    ...over,
+  }) as never;
+
 describe("Market watch mapping", () => {
-  const rec = (over: Record<string, unknown> = {}) =>
-    ({
-      id: "00000000-0000-4000-8000-0000000000aa",
-      rule: "R1",
-      action: "list_and_stock",
-      target: { designId: null, designName: "Cactus", niche: null, channel: null },
-      params: { channels: ["amazon"] },
-      confidence: 0.8,
-      band: "high",
-      mock: true,
-      sources: [
-        {
-          source: "google_trends",
-          licence: "official_api",
-          asOf: "2026-09-20T00:00:00.000Z",
-          fetchedAt: "2026-09-21T00:00:00.000Z",
-          mock: true,
-        },
-      ],
-      evidenceSignalIds: [],
-      stale: false,
-      shownIn: null,
-      shownAt: null,
-      vote: null,
-      votedAt: null,
-      adoptedAt: null,
-      outcome: null,
-      createdAt: "2026-09-27T00:00:00.000Z",
-      ...over,
-    }) as never;
+  const rec = marketRec;
 
   it("AC31: mock items are dropped when mocks may not show; low band and stale never show", () => {
     expect(marketCandidates([rec()], { mockAllowed: false })).toEqual([]);
@@ -365,6 +375,56 @@ describe("Market watch mapping", () => {
     expect(isPromotable(rec({ rule: "R3" }))).toBe(true);
     expect(isPromotable(rec({ rule: "R2", params: { channels: ["amazon"] } }))).toBe(false);
     expect(isPromotable(rec({ rule: "R4" }))).toBe(false);
+  });
+});
+
+describe("R1 channel-list fallback (T-19-3 round 2)", () => {
+  const insight = (recOver: Record<string, unknown> = {}): RenderInsight => ({
+    id: "i-r1",
+    detector: "market",
+    action: { kind: "market", params: {}, href: "/market/r1" },
+    facts: [],
+    recommendation: marketRec(recOver),
+  });
+
+  it("with several channels, lists each one, in en and es", () => {
+    const i = insight({ params: { channels: ["amazon", "etsy"], blankName: "3XL blank" } });
+    for (const lang of ["en", "es"] as const) {
+      const part = actionPart(i, lang);
+      expect(part.key).toBe("R1 action");
+      expect(part.vars.channels).toBe("Amazon, Etsy");
+      const text = expand(part, lang);
+      expect(text).not.toMatch(/ on {2}| en {2}/);
+    }
+  });
+
+  it("with exactly one channel, lists that channel, in en and es", () => {
+    const i = insight({ params: { channels: ["etsy"], blankName: "3XL blank" } });
+    for (const lang of ["en", "es"] as const) {
+      const part = actionPart(i, lang);
+      expect(part.vars.channels).toBe("Etsy");
+      expect(expand(part, lang)).not.toMatch(/ on {2}| en {2}/);
+    }
+  });
+
+  it("with no channel list and no target/params channel, falls back to plain wording, never an empty placeholder, in en and es", () => {
+    const i = insight({
+      target: { designId: null, designName: "Cactus", niche: null, channel: null },
+      params: { blankName: "3XL blank" },
+    });
+    const en = actionPart(i, "en");
+    expect(en.vars.channels).toBe("your connected channels");
+    expect(expand(en, "en")).toBe(
+      "List Cactus on your connected channels and stock 3XL blank before .",
+    );
+    const es = actionPart(i, "es");
+    expect(es.vars.channels).toBe("tus canales conectados");
+    expect(expand(es, "es")).toBe(
+      "Publica Cactus en tus canales conectados y surte 3XL blank antes de .",
+    );
+    for (const lang of ["en", "es"] as const) {
+      expect(expand(actionPart(i, lang), lang)).not.toMatch(/ on {2}| en {2}/);
+    }
   });
 });
 

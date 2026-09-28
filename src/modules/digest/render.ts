@@ -108,6 +108,13 @@ export const TEMPLATES = {
   },
   /** new: source and date under a market item. */
   "market.source": { en: "{{source}}, {{date}}", es: "{{source}}, {{date}}" },
+  /** new: R1's channel-list fallback when neither `params.channels` nor a single target/params
+   * channel is set (T-19-3 round 2 fix), matching web's `market.channels.connected`
+   * (invai-web/src/components/market/recommendation-copy.ts). */
+  "market.channels.connected": {
+    en: "your connected channels",
+    es: "tus canales conectados",
+  },
   "band.high": { en: "High confidence", es: "Confianza alta" },
   "band.medium": { en: "Medium confidence: test it", es: "Confianza media: pruébalo" },
   "badge.sample": { en: "Sample data", es: "Datos de muestra" },
@@ -279,7 +286,16 @@ function marketPart(i: RenderInsight, lang: Lang): Part {
     case "R1":
       return {
         key: "R1 action",
-        vars: { design, channels: channels || channel, blank: p.blankName ?? "", peak },
+        vars: {
+          design,
+          // Bug fix (T-19-3 round 2): `channel` is "" when neither `target.channel` nor
+          // `params.channel` is set, so falling back to it left the listing clause empty
+          // ("List X on  and stock ..."). Fall back to the same wording web uses
+          // (recommendation-copy.ts's `market.channels.connected`) instead.
+          channels: channels || TEMPLATES["market.channels.connected"][lang],
+          blank: p.blankName ?? "",
+          peak,
+        },
       };
     case "R2":
       return {
