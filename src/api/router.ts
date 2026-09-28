@@ -2,6 +2,7 @@ import { aiRouter } from "../modules/ai/router";
 import { billingRouter } from "../modules/billing/router";
 import { blanksRouter, designsRouter, productsRouter } from "../modules/catalog/router";
 import { channelsRouter, skuRulesRouter } from "../modules/channels/router";
+import { digestRouter } from "../modules/digest/router";
 import { filesRouter } from "../modules/files/router";
 import { financeRouter } from "../modules/finance/router";
 import { inventoryRouter } from "../modules/inventory/router";
@@ -57,6 +58,7 @@ export const router = os.router({
   billing: billingRouter,
   privacy: privacyRouter,
   market: marketRouter,
+  digest: digestRouter,
 });
 
 export type Router = typeof router;

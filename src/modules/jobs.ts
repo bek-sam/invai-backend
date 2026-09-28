@@ -19,3 +19,4 @@ import "./tenancy/jobs";
 import "./today/jobs";
 import "./privacy/jobs";
 import "./market/jobs";
+import "./digest/jobs";
