@@ -6,7 +6,12 @@
 
 export type Effort = "low" | "medium" | "high";
 
-export type AiRoute = "listing_copy" | "trademark_judge" | "assistant" | "market_niche";
+export type AiRoute =
+  | "listing_copy"
+  | "trademark_judge"
+  | "assistant"
+  | "market_niche"
+  | "digest_narrative";
 
 export type RouteConfig = {
   model: string;
@@ -30,6 +35,11 @@ export const ROUTES: Record<AiRoute, RouteConfig> = {
   // run by the nightly mapper only when stems don't match. Haiku per the wave plan (decision 0007
   // bulk-route rule); real-model eval pending OI-8. Output is `{niche, confidence}`, well under 512.
   market_niche: { model: HAIKU_MODEL, effort: null, maxTokens: 512 },
+  // Wave 19 (T-19-2, spec weekly-digest pipeline 8): one weekly single-shot summary per shop,
+  // shadow mode until OI-8. Low effort: it phrases ranked facts with placeholders, no reasoning
+  // over data. 2,000 caps thinking plus a headline and up to ~7 items of 280 chars, and keeps the
+  // worst-case estimate (about 6¢) under DIGEST_MAX_CENTS_PER_WEEK (10¢).
+  digest_narrative: { model: DEFAULT_MODEL, effort: "low", maxTokens: 2_000 },
 };
 
 /**

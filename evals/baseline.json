@@ -441,6 +441,106 @@
       "latencyMsMedian": 10,
       "latencyMsP95": 25,
       "cacheHitRate": 0
+    },
+    {
+      "route": "digest_narrative",
+      "mode": "mock",
+      "cases": 22,
+      "plumbingPass": 22,
+      "qualityPass": null,
+      "qualityAssessed": 0,
+      "byTag": {
+        "basic": {
+          "plumbingPass": 2,
+          "qualityPass": 0,
+          "total": 2
+        },
+        "en": {
+          "plumbingPass": 15,
+          "qualityPass": 0,
+          "total": 15
+        },
+        "spanish": {
+          "plumbingPass": 7,
+          "qualityPass": 0,
+          "total": 7
+        },
+        "glance": {
+          "plumbingPass": 2,
+          "qualityPass": 0,
+          "total": 2
+        },
+        "steady": {
+          "plumbingPass": 2,
+          "qualityPass": 0,
+          "total": 2
+        },
+        "data_health": {
+          "plumbingPass": 1,
+          "qualityPass": 0,
+          "total": 1
+        },
+        "injection": {
+          "plumbingPass": 4,
+          "qualityPass": 0,
+          "total": 4
+        },
+        "near_identical_channels": {
+          "plumbingPass": 2,
+          "qualityPass": 0,
+          "total": 2
+        },
+        "digits_temptation": {
+          "plumbingPass": 2,
+          "qualityPass": 0,
+          "total": 2
+        },
+        "market": {
+          "plumbingPass": 2,
+          "qualityPass": 0,
+          "total": 2
+        },
+        "market_fence": {
+          "plumbingPass": 1,
+          "qualityPass": 0,
+          "total": 1
+        },
+        "many_insights": {
+          "plumbingPass": 2,
+          "qualityPass": 0,
+          "total": 2
+        },
+        "oversize": {
+          "plumbingPass": 1,
+          "qualityPass": 0,
+          "total": 1
+        },
+        "pii": {
+          "plumbingPass": 1,
+          "qualityPass": 0,
+          "total": 1
+        },
+        "markup": {
+          "plumbingPass": 1,
+          "qualityPass": 0,
+          "total": 1
+        },
+        "win_only": {
+          "plumbingPass": 1,
+          "qualityPass": 0,
+          "total": 1
+        },
+        "promise_temptation": {
+          "plumbingPass": 1,
+          "qualityPass": 0,
+          "total": 1
+        }
+      },
+      "costCentsMedian": 0,
+      "costCentsP95": 0,
+      "latencyMsMedian": 6,
+      "latencyMsP95": 10,
+      "cacheHitRate": 0
     }
   ]
 }

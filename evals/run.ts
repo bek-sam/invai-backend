@@ -3,6 +3,7 @@ import { closeDb } from "../src/db/client";
 import { env } from "../src/env";
 import { closeQueues } from "../src/lib/queues";
 import { runAssistantEvals } from "./assistant/run";
+import { runDigestNarrative } from "./digest_narrative/run";
 import type { EvalTenant } from "./lib/fixtures";
 import { createEvalTenant } from "./lib/fixtures";
 import { printOverall, printRoute, type RouteSummary } from "./lib/report";
@@ -30,6 +31,7 @@ const ROUTES: Record<string, (tenant: EvalTenant) => Promise<RouteReport>> = {
   trademark_judge: runTrademarkJudge,
   assistant: runAssistantEvals,
   personalization_check: runPersonalizationCheck,
+  digest_narrative: runDigestNarrative,
 };
 
 /** Always closes the db pool and the redis client — ioredis/pg keep an open handle that stops

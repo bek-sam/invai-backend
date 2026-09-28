@@ -22,6 +22,8 @@ export const AI_JOB_KINDS = [
   "mockup",
   // Wave 18 (T-18-4): the Haiku niche fallback for the market mapper (enumText: no migration).
   "market_niche",
+  // Wave 19 (T-19-2): the weekly digest AI summary (enumText: no migration).
+  "digest_narrative",
 ] as const;
 export const AI_JOB_STATUSES = ["queued", "running", "done", "failed"] as const;
 
@@ -165,6 +167,7 @@ export const CREDIT_KINDS = [
   "assistant",
   "mockup",
   "market_niche", // contracts 0.6.1; the niche route still charges sku_suggestion until switched
+  "digest_narrative", // contracts 0.7.0 (T-19-1, A5); one charge per digest, ref = the digest
 ] as const;
 
 /** Per-company AI credit ledger: allowance/packs in (+), every job out (−). */

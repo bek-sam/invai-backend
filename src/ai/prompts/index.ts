@@ -205,6 +205,51 @@ Return only the JSON object.`,
   schema: NicheClassification,
 };
 
+/* ------------------------- weekly digest summary (T-19-2) ------------------------- */
+
+/**
+ * No length limits in the schema (structured outputs don't enforce them); the validator
+ * (validators/digest.ts) checks lengths on the substituted text.
+ */
+export const DigestNarrativeSchema = z.object({
+  lang: z.enum(["en", "es"]),
+  headline: z.string(),
+  items: z.array(z.object({ insightId: z.string(), text: z.string() })),
+});
+export type DigestNarrative = z.infer<typeof DigestNarrativeSchema>;
+
+export type DigestNarrativeVars = {
+  lang: "en" | "es";
+  insights: { id: string; kind: string; factIds: string[]; template: string | null }[];
+  /** Values already formatted in `lang`; shop-typed text (design names) among them. */
+  facts: { id: string; value: string }[];
+};
+
+export const digestNarrativePrompt: PromptDef<DigestNarrativeVars, DigestNarrative> = {
+  id: "digest_narrative",
+  version: 1,
+  route: "digest_narrative",
+  system: `You write the short summary at the top of a t-shirt shop's weekly business review. The review's facts are already computed and ranked; you only phrase them. Code replaces each placeholder {{factId}} with that fact's value after you answer, and a strict checker rejects the whole summary if any rule below is broken.
+
+Output: {"lang", "headline", "items": [{"insightId", "text"}]}.
+- lang: the lang given in the data block. Write every word in that language (en = English, es = Spanish using tú).
+- items: exactly one item per insight, in the same order, with the same insightId. Never add, drop, merge or reorder insights.
+- headline: one line of at most 90 characters (after values are filled in) that sums up the week.
+- Each item: one or two plain sentences, at most 280 characters after values are filled in. Keep the insight's meaning and its action; the insight's template shows what it says.
+- Placeholders: write {{factId}} exactly, with a fact id from the facts list. An item may only use fact ids listed in that insight's factIds. The headline may use any fact id.
+- Never write a digit or a number word ("two", "dos", "half", "double", "twice", "percent"). Every number, amount, percentage, date, count, name, channel, source and time span comes from a placeholder.
+- Never write a change word yourself ("up", "down", "rose", "fell", "increased", "better", "best", "subió", "bajó", "mejor"). To say something changed, use the placeholder whose value already says it.
+- Never promise or predict results ("guaranteed", "will increase", "sin duda"). No links, web addresses, emails, markdown or HTML.
+- Only items whose insight kind is "market" may talk about trends, searches, demand, seasons or the market, and each of those names its source and date with their placeholders.
+- Plain, friendly and short. No greetings, no sign-off, no exclamation marks.
+
+${DATA_RULE}
+
+Return only the JSON object.`,
+  user: (v) => ["Write this week's summary.", dataBlock("digest_facts", v)].join("\n\n"),
+  schema: DigestNarrativeSchema,
+};
+
 /* --------------------------------- assistant --------------------------------- */
 
 export const ASSISTANT_PROMPT = {
@@ -251,6 +296,7 @@ export const PROMPTS = {
   listing_copy: listingCopyPrompt,
   trademark_judge: trademarkJudgePrompt,
   market_niche: nicheClassifierPrompt,
+  digest_narrative: digestNarrativePrompt,
 } as const;
 
 export function promptRef(p: { id: string; version: number }) {

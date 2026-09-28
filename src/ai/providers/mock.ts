@@ -5,6 +5,8 @@ import { detectLang } from "../market-copy";
 import { MOCK_MODEL } from "../models";
 import { resolvePeriod } from "../periods";
 import type {
+  DigestNarrative,
+  DigestNarrativeVars,
   ListingCopy,
   ListingVars,
   NicheClassification,
@@ -280,6 +282,53 @@ export function mockNiche(v: NicheVars): NicheClassification {
   return best ? { niche: best.key, confidence: 0.8 } : { niche: null, confidence: 0.2 };
 }
 
+const DIGEST_LABELS: Record<"en" | "es", Record<string, string>> = {
+  en: {
+    data_health: "Check your data",
+    action: "To do",
+    win: "Nice work",
+    market: "Market watch",
+    glance: "At a glance",
+    steady: "A steady week",
+  },
+  es: {
+    data_health: "Revisa tus datos",
+    action: "Por hacer",
+    win: "Buen trabajo",
+    market: "Mercado",
+    glance: "De un vistazo",
+    steady: "Una semana estable",
+  },
+};
+
+/**
+ * Weekly digest summary without a model (T-19-2): a fixed label per insight kind, then that
+ * insight's own placeholders, as many as fit in 280 characters once filled. Deterministic and
+ * built to pass the digest validator, so the shadow path runs end to end with no key.
+ */
+export function mockDigestNarrative(v: DigestNarrativeVars): DigestNarrative {
+  const labels = DIGEST_LABELS[v.lang];
+  const value = new Map(v.facts.map((f) => [f.id, f.value]));
+  return {
+    lang: v.lang,
+    headline: v.lang === "es" ? "Tu semana en resumen" : "Your week in review",
+    items: v.insights.map((ins) => {
+      const label = labels[ins.kind] ?? labels.action ?? "";
+      let text = `${label}:`;
+      let shown = text.length;
+      const used: string[] = [];
+      for (const id of ins.factIds) {
+        const add = (value.get(id) ?? "").length + 2;
+        if (shown + add > 270) break;
+        used.push(`{{${id}}}`);
+        shown += add;
+      }
+      text = used.length ? `${label}: ${used.join(", ")}.` : `${label}.`;
+      return { insightId: ins.id, text };
+    }),
+  };
+}
+
 const NICHE_STOP = new Set([
   "the",
   "a",
@@ -545,6 +594,8 @@ export const mockProvider: AiProvider = {
         })),
       } satisfies TrademarkJudgement;
     } else if (prompt.id === "market_niche") output = mockNiche(vars as NicheVars);
+    else if (prompt.id === "digest_narrative")
+      output = mockDigestNarrative(vars as DigestNarrativeVars);
     else {
       // Unknown prompt id (a new route, or a typo): don't 500 the request — warn and hand back a
       // schema-valid placeholder so callers exercise the real path end to end (B-45 hardening).
