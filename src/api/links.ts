@@ -79,28 +79,34 @@ links.get("/:token", async (c) => {
     c.header("Retry-After", String(retryAfter));
     return c.json({ error: "too many requests" }, 429);
   }
-  const token = c.req.param("token");
-  const payload = await resolve(token);
   c.header("Cache-Control", NO_STORE["Cache-Control"]);
-  if (!payload) return c.redirect(invalidPage(), 302);
-
-  if (payload.k === "unsubscribe") {
-    if (!isNotificationKind(payload.r)) return c.redirect(invalidPage(), 302);
-    return c.redirect(confirmPage(token), 302);
-  }
-
-  const handler = getLinkHandler("click");
-  if (!handler) return c.redirect(`${env.WEB_ORIGIN}/`, 302);
+  const token = c.req.param("token");
+  // S-35: everything below is one try/catch. The token is the whole path (`/l/<token>`), so any
+  // unhandled exception here must never reach the framework's own error logging (which logs
+  // `path`) -- it's caught here first and only `{companyId, userId, kind}` (once known) is logged.
+  let payload: LinkPayload | null = null;
   try {
+    payload = await resolve(token);
+    if (!payload) return c.redirect(invalidPage(), 302);
+
+    if (payload.k === "unsubscribe") {
+      if (!isNotificationKind(payload.r)) return c.redirect(invalidPage(), 302);
+      return c.redirect(confirmPage(token), 302);
+    }
+
+    const handler = getLinkHandler("click");
+    if (!handler) return c.redirect(`${env.WEB_ORIGIN}/`, 302);
     const target = await handler({ companyId: payload.c, userId: payload.u, ref: payload.r });
     return c.redirect(`${env.WEB_ORIGIN}${safeWebPath(target?.path)}`, 302);
   } catch (err) {
-    log.error("click handler failed", {
-      companyId: payload.c,
-      userId: payload.u,
+    log.error("link request failed", {
+      ...(payload ? { companyId: payload.c, userId: payload.u, kind: payload.k } : {}),
       ...errorData(err),
     });
-    return c.redirect(`${env.WEB_ORIGIN}/`, 302);
+    // A resolved click link that then failed (e.g. the handler's own DB hiccup) still isn't an
+    // *invalid* link, so it gets the softer home redirect; a failure before resolve() completed
+    // (the token itself unverified) gets the same answer as a bad token.
+    return c.redirect(payload ? `${env.WEB_ORIGIN}/` : invalidPage(), 302);
   }
 });
 
@@ -125,26 +131,38 @@ links.post("/:token", async (c) => {
     return c.json({ error: "too many requests" }, 429);
   }
   c.header("Cache-Control", NO_STORE["Cache-Control"]);
-  const payload = await resolve(c.req.param("token"));
-  if (!payload) return c.json({ error: "invalid link" }, 400);
-  if (payload.k !== "unsubscribe") return c.json({ error: "method not allowed" }, 405);
-  if (!isNotificationKind(payload.r)) return c.json({ error: "invalid link" }, 400);
+  // S-35: same rule as the GET handler -- the token is the path, so any unhandled exception is
+  // caught here first, logged with ids only (never the token or `c.req.path`), and answered with a
+  // plain 500, never the framework's own error handler.
+  let payload: LinkPayload | null = null;
+  try {
+    payload = await resolve(c.req.param("token"));
+    if (!payload) return c.json({ error: "invalid link" }, 400);
+    if (payload.k !== "unsubscribe") return c.json({ error: "method not allowed" }, 405);
+    if (!isNotificationKind(payload.r)) return c.json({ error: "invalid link" }, 400);
 
-  const ids = { companyId: payload.c, userId: payload.u, kind: payload.r };
-  if (await wantsUndo(c)) {
-    const result = await undoUnsubscribe(payload.c, payload.u, payload.r);
-    if (result !== "restored") {
-      log.info("unsubscribe undo refused", { ...ids, result });
-      return c.json({ ok: false, error: result }, 409);
+    const ids = { companyId: payload.c, userId: payload.u, kind: payload.r };
+    if (await wantsUndo(c)) {
+      const result = await undoUnsubscribe(payload.c, payload.u, payload.r);
+      if (result !== "restored") {
+        log.info("unsubscribe undo refused", { ...ids, result });
+        return c.json({ ok: false, error: result }, 409);
+      }
+      log.info("unsubscribe undone", ids);
+      return c.json({ ok: true, undone: true }, 200);
     }
-    log.info("unsubscribe undone", ids);
-    return c.json({ ok: true, undone: true }, 200);
-  }
 
-  await setEmailPreference(payload.c, payload.u, payload.r, {
-    on: false,
-    source: "unsubscribe_link",
-  });
-  log.info("one-click unsubscribe", ids);
-  return c.json({ ok: true }, 200);
+    await setEmailPreference(payload.c, payload.u, payload.r, {
+      on: false,
+      source: "unsubscribe_link",
+    });
+    log.info("one-click unsubscribe", ids);
+    return c.json({ ok: true }, 200);
+  } catch (err) {
+    log.error("link request failed", {
+      ...(payload ? { companyId: payload.c, userId: payload.u, kind: payload.k } : {}),
+      ...errorData(err),
+    });
+    return c.json({ error: "internal error" }, 500);
+  }
 });

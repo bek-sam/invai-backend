@@ -1,3 +1,4 @@
+import { isIP } from "node:net";
 import { type Permission, ROLE_PERMISSIONS } from "@invai/contracts";
 import { and, eq } from "drizzle-orm";
 import { auth } from "../auth";
@@ -86,9 +87,27 @@ export function roleFits(orgType: CompanyType, role: Role): boolean {
   return orgType === "vendor" ? role === "vendor" : role !== "vendor";
 }
 
+/**
+ * The request's IP for audit and rate-limit keys. Same rule Better Auth's own IP resolution
+ * applies with no `advanced.ipAddress.trustedProxies` configured (we have none yet -- no real
+ * load balancer in front, locally or in a pilot deploy): a single, well-formed IP is trusted; a
+ * comma-separated chain or a non-IP string can't be attributed to a real hop, so it's ignored
+ * rather than blindly trusted as a fresh, distinct key (S-30/S-37). This closes the "any string
+ * becomes its own bucket" escape; the full trusted-proxy chain validation still needs a real ALB
+ * to resolve (tracked under S-30).
+ */
 export function clientIp(headers: Headers): string | null {
   const fwd = headers.get("x-forwarded-for");
-  return fwd?.split(",")[0]?.trim() ?? headers.get("x-real-ip") ?? null;
+  if (fwd !== null) {
+    const hops = fwd
+      .split(",")
+      .map((h) => h.trim())
+      .filter(Boolean);
+    const only = hops.length === 1 ? hops[0] : undefined;
+    return only !== undefined && isIP(only) !== 0 ? only : null;
+  }
+  const real = headers.get("x-real-ip");
+  return real !== null && isIP(real) !== 0 ? real : null;
 }
 
 /** The station token from `Authorization: Station <token>` (or `X-Station-Token`). */

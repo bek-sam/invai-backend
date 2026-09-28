@@ -31,7 +31,7 @@ async function boot(extra: Record<string, string>) {
         "--import",
         "tsx",
         "-e",
-        "import('./src/env.ts').then(({ env }) => console.log('BOOTED', JSON.stringify({ smtp: env.SMTP_URL ?? null, from: env.MAIL_FROM ?? null, mocks: env.mocks })))",
+        "import('./src/env.ts').then(({ env }) => console.log('BOOTED', JSON.stringify({ smtp: env.SMTP_URL ?? null, from: env.MAIL_FROM ?? null, mocks: env.mocks, digestEmailEnabled: env.DIGEST_EMAIL_ENABLED })))",
       ],
       { env: { ...BASE, ...extra }, cwd: process.cwd() },
     );
@@ -125,5 +125,38 @@ describe("production key guard", () => {
     expect(env.isTest).toBe(true);
     expect(env.SMTP_URL).toBeTruthy();
     expect(env.MAIL_FROM).toBeTruthy();
+  });
+});
+
+describe("DIGEST_EMAIL_ENABLED default (T-19-4 round 2)", () => {
+  it("defaults to false in production so no real digest email can go out before OI-12/13/14", async () => {
+    const res = await boot({ NODE_ENV: "production", ...ALL_KEYS, SMTP_URL: "smtp://mail:25" });
+    expect(res.ok).toBe(true);
+    expect(res.out).toContain('"digestEmailEnabled":false');
+  });
+
+  it("an explicit true in production still wins (a deliberate pilot switch-on)", async () => {
+    const res = await boot({
+      NODE_ENV: "production",
+      ...ALL_KEYS,
+      SMTP_URL: "smtp://mail:25",
+      DIGEST_EMAIL_ENABLED: "true",
+    });
+    expect(res.ok).toBe(true);
+    expect(res.out).toContain('"digestEmailEnabled":true');
+  });
+
+  it("defaults to true outside production (dev and test)", async () => {
+    const dev = await boot({ NODE_ENV: "development" });
+    expect(dev.ok).toBe(true);
+    expect(dev.out).toContain('"digestEmailEnabled":true');
+    expect(env.isProd).toBe(false);
+    expect(env.DIGEST_EMAIL_ENABLED).toBe(true);
+  });
+
+  it("an explicit false outside production is still honored", async () => {
+    const res = await boot({ NODE_ENV: "development", DIGEST_EMAIL_ENABLED: "false" });
+    expect(res.ok).toBe(true);
+    expect(res.out).toContain('"digestEmailEnabled":false');
   });
 });

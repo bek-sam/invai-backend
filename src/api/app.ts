@@ -180,8 +180,18 @@ app.route("/webhooks/easypost", carrierWebhooks);
 app.route("/webhooks", webhooks);
 app.route(REALTIME_SSE_PATH, events);
 
+/**
+ * `/l/:token`'s token *is* the path (S-35): a raw token in an error log is the same leak ADR 0016
+ * §2 forbids in a normal log line. `links.ts`'s own handlers already catch and log ids only, but
+ * this redacts the path here too, so a future unhandled error on that route (a body-parsing throw
+ * before the handler runs, say) still can't write a bearer token to the log.
+ */
+export function loggedPath(path: string): string {
+  return path.startsWith("/l/") ? "/l/[token]" : path;
+}
+
 app.notFound((c) => c.json({ error: "not found" }, 404));
 app.onError((err, c) => {
-  log.error("request failed", { path: c.req.path, ...errorData(err) });
+  log.error("request failed", { path: loggedPath(c.req.path), ...errorData(err) });
   return c.json({ error: "internal error" }, 500);
 });

@@ -125,17 +125,22 @@ const raw = createEnv({
      * Weekly digest switches (wave 19, `specs/weekly-digest.md` pipeline 9-10; T-19-4 owns the
      * names, T-19-2 and T-19-3 read them). None is a provider key, so none is in PRODUCTION_KEYS.
      * `DIGEST_ENABLED=false` stops every digest build; `DIGEST_EMAIL_ENABLED=false` keeps digests
-     * in-app only (`sendUserEmail` answers `skipped: disabled`). `DIGEST_SUMMARY_MODE` is the AI
-     * summary's global mode: it stays `shadow` (built, stored, never shown or sent) until OI-8.
+     * in-app only (`sendUserEmail` answers `skipped: disabled`). Its default is `false` in
+     * production and `true` everywhere else (tech lead decision, T-19-4 round 2), so a real digest
+     * email can't go out before OI-12/13/14 are answered even if `SMTP_URL` is later set for a
+     * pilot; setting it explicitly always wins. `DIGEST_SUMMARY_MODE` is the AI summary's global
+     * mode: it stays `shadow` (built, stored, never shown or sent) until OI-8.
      */
     DIGEST_ENABLED: z
       .enum(["true", "false"])
       .default("true")
       .transform((v) => v === "true"),
+    // No static default: production must default to *off* even if the schema alone can't see
+    // NODE_ENV yet, so this stays `undefined` when unset and is resolved below (`env.DIGEST_EMAIL_ENABLED`).
     DIGEST_EMAIL_ENABLED: z
       .enum(["true", "false"])
-      .default("true")
-      .transform((v) => v === "true"),
+      .transform((v) => v === "true")
+      .optional(),
     DIGEST_SUMMARY_MODE: z.enum(["off", "shadow", "on"]).default("shadow"),
     /** Per-shop cap for the AI summary's model spend, in cents per week (estimate before the call). */
     DIGEST_MAX_CENTS_PER_WEEK: z.coerce.number().int().min(0).default(10),
@@ -229,6 +234,13 @@ export const env = {
    */
   IMAGING_SHARED_SECRET:
     raw.IMAGING_SHARED_SECRET ?? (isProd ? undefined : "invai-imaging-dev-secret"),
+  /**
+   * Tech lead decision (T-19-4 round 2, wave 19): a real digest email must not be able to go out
+   * before OI-12/13/14 are answered, even if `SMTP_URL` is later set for a pilot. Off by default
+   * in production; on everywhere else (dev, test), matching the digest acceptance tests, which
+   * expect a send with no env override.
+   */
+  DIGEST_EMAIL_ENABLED: raw.DIGEST_EMAIL_ENABLED ?? !isProd,
   isDev: raw.NODE_ENV === "development",
   isTest,
   isProd,

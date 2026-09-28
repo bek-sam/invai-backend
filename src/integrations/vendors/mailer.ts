@@ -1,5 +1,6 @@
 import nodemailer from "nodemailer";
 import { env } from "../../env";
+import { sha256Hex } from "../../lib/crypto";
 import { logger } from "../../lib/log";
 import { type CompanyScope, isSampleWorkspace } from "../../modules/tenancy/demo-flag";
 
@@ -75,7 +76,14 @@ export async function sendMail(mail: Mail, sender: MailSender): Promise<{ messag
     log.warn("mail NOT sent: SMTP_URL is not set (ALLOW_MOCKS)", { subject: mail.subject });
     return { messageId: info.messageId };
   }
-  log.info("mail sent", { to: mail.to, subject: mail.subject, messageId: info.messageId });
+  // S-36: never log the address itself. `toHash` still lets a support ticket be correlated to a
+  // send without writing anyone's real email into the application log.
+  log.info("mail sent", {
+    companyId: sender === "account" ? undefined : sender.companyId,
+    toHash: sha256Hex(mail.to.trim().toLowerCase()).slice(0, 16),
+    subject: mail.subject,
+    messageId: info.messageId,
+  });
   return { messageId: info.messageId };
 }
 

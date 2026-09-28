@@ -1,5 +1,5 @@
 import { and, eq } from "drizzle-orm";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { withSystem } from "../db/client";
 import { members } from "../db/schema";
 import { env } from "../env";
@@ -8,6 +8,7 @@ import { getEmailPreference, setEmailPreference } from "../lib/notify";
 import { RATE_BUCKET_LIMITS, rateLimitKey, takeToken } from "../lib/ratelimit";
 import { createCompany, createUser } from "../test/fixtures";
 import { app } from "./app";
+import { clientIp } from "./context";
 
 /*
  * AC4/AC5 (spec AC24, AC25): the public `/l/:token` routes. Everything goes through the real Hono
@@ -202,5 +203,86 @@ describe("GET /l/:token (never mutates a preference)", () => {
       headers: { "x-forwarded-for": "198.51.100.7" },
     });
     expect(other.status).toBe(302);
+  });
+});
+
+describe("errors never leak the token or the raw path (S-35)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("a failure after the token is resolved logs ids only, never the token", async () => {
+    const { companyId, userId } = await optedIn();
+    const token = tokenOf(signLink({ kind: "unsubscribe", companyId, userId, ref: "digest" }));
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const notify = await import("../lib/notify");
+    vi.spyOn(notify, "setEmailPreference").mockRejectedValueOnce(new Error("db hiccup"));
+
+    const res = await app.request(`/l/${token}`, { method: "POST" });
+    expect(res.status).toBe(500);
+    expect(await res.json()).toEqual({ error: "internal error" });
+
+    const lines = errSpy.mock.calls.map((args) => args.join(" "));
+    // The bug this proves (S-35): before the fix, the handler had no try/catch, so this exception
+    // reached `app.onError`, which logged `{ path: c.req.path }` -- for `/l/:token` that path *is*
+    // the 400-day bearer token.
+    expect(lines.some((l) => l.includes(token))).toBe(false);
+    // "kind" here is the link's own kind ("unsubscribe" | "click"), the same field `resolve()`'s
+    // own "not an active member" warning already logs -- not the notification kind ("digest").
+    expect(
+      lines.some((l) => l.includes(companyId) && l.includes(userId) && l.includes("unsubscribe")),
+    ).toBe(true);
+  });
+
+  it("a failure before the token is resolved logs nothing identifying, and never the token", async () => {
+    const { companyId, userId } = await optedIn();
+    const token = tokenOf(signLink({ kind: "unsubscribe", companyId, userId, ref: "digest" }));
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const linksLib = await import("../lib/links");
+    vi.spyOn(linksLib, "verifyLinkToken").mockImplementationOnce(() => {
+      throw new Error("crypto blew up");
+    });
+
+    const res = await app.request(`/l/${token}`);
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe(`${env.WEB_ORIGIN}/unsubscribe?error=invalid`);
+
+    const lines = errSpy.mock.calls.map((args) => args.join(" "));
+    expect(lines.some((l) => l.includes(token))).toBe(false);
+    expect(lines.some((l) => l.includes(companyId) || l.includes(userId))).toBe(false);
+  });
+});
+
+describe("the per-IP links bucket keys on a validated IP, not a raw header (S-37)", () => {
+  it("a spoofed non-IP or multi-hop header can't buy its own bucket", () => {
+    // Before the fix, `clientIp` returned whatever string a caller sent, so each of these bought a
+    // fresh, private 60/min bucket -- the same escape as sending a new X-Forwarded-For per request.
+    // After the fix they all fall back to the one shared "unknown" key, same as no header at all.
+    const spoofed = [
+      "not-an-ip-at-all",
+      "1.2.3.4, 5.6.6.7", // a forged extra hop
+      "999.999.999.999",
+      "'; DROP TABLE users; --",
+    ];
+    for (const value of spoofed) {
+      expect(clientIp(new Headers({ "x-forwarded-for": value }))).toBeNull();
+    }
+    // A real, single, well-formed IP -- the shape a genuine client or proxy hop sends -- still gets
+    // its own key, exactly like the sign-in limiter's per-IP buckets.
+    expect(clientIp(new Headers({ "x-forwarded-for": "203.0.113.9" }))).toBe("203.0.113.9");
+    expect(clientIp(new Headers({ "x-forwarded-for": "  203.0.113.9  " }))).toBe("203.0.113.9");
+    expect(clientIp(new Headers({ "x-real-ip": "203.0.113.10" }))).toBe("203.0.113.10");
+    expect(clientIp(new Headers({ "x-real-ip": "not-an-ip" }))).toBeNull();
+    expect(clientIp(new Headers())).toBeNull();
+  });
+
+  it("spoofed values collapse into the same rate-limit key the app actually uses", () => {
+    const forSpoofed = rateLimitKey(
+      "links",
+      clientIp(new Headers({ "x-forwarded-for": "x" })) ?? "unknown",
+    );
+    const forNoHeader = rateLimitKey("links", clientIp(new Headers()) ?? "unknown");
+    expect(forSpoofed).toBe(forNoHeader);
+    expect(forSpoofed).toBe("tb:links:unknown");
   });
 });
