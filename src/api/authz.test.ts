@@ -126,10 +126,16 @@ describe("permission guard", () => {
     const reachable = procedures
       .filter((p) => p.meta.permission !== "none" && vendorPerms.has(p.meta.permission))
       .map((p) => p.path.split(".")[0]);
+    // "me" is reachable too: contract 0.7.0 put me.notifications.* on org.read (wave 19, A1) so
+    // any signed-in member, vendors included, can manage their own email preferences. That's by
+    // design (docs: invai-contracts/src/contract/tenancy.ts). Vendors still hold neither
+    // finance.read nor org.manage, so every digest.* procedure (all finance.read or org.manage)
+    // stays out of reach, checked explicitly below.
     expect([...new Set(reachable)].sort()).toEqual([
       "alerts",
       "files",
       "locations",
+      "me",
       "stations",
       "team",
       "vendorPortal",
@@ -145,6 +151,11 @@ describe("permission guard", () => {
     };
     for (const path of ["orders.list", "production.sheets.list", "finance.profit", "channels.list"])
       expect(await codeOf(path, vendorUser), path).toBe("FORBIDDEN");
+    // Digest content and settings are finance.read/org.manage; a vendor has neither, so it never
+    // reaches any digest procedure even though it can reach "me.notifications.*".
+    const digestPaths = procedures.filter((p) => p.path.startsWith("digest.")).map((p) => p.path);
+    expect(digestPaths.length).toBeGreaterThan(0);
+    for (const path of digestPaths) expect(await codeOf(path, vendorUser), path).toBe("FORBIDDEN");
   });
 
   it("a role that does not fit the org type carries no permissions", () => {
