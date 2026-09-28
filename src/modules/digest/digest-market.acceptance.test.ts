@@ -2,19 +2,22 @@
  * Wave 19 acceptance tests for the digest's Market watch block (spec AC14-AC17), written from
  * `invai-docs/specs/weekly-digest.md` before T-19-3 lands (`acceptance-tests-first`).
  *
- * Unlike `digest.acceptance.test.ts`, these tests run against wave 18's market service directly
- * (pushed, `src/modules/market/service.ts`: `listDigestMarketItems`, `voteRecommendation`,
- * `recordRecommendationsShown` are real, not stubs) — recommendations are seeded with a direct
- * insert into `market_recommendations` rather than through the market jobs, so the "wave 18
+ * Second pass, against landed backend HEAD (T-19-3 cadc338/bef6158): these tests run against wave
+ * 18's market service directly (pushed, `src/modules/market/service.ts`: `listDigestMarketItems`,
+ * `voteRecommendation`, `recordRecommendationsShown` are real) — recommendations are seeded with a
+ * direct insert into `market_recommendations` rather than through the market jobs, so the "wave 18
  * signals" half of each AC is exact and stable. The digest half (`digest.get`'s `marketWatch`
- * selection, promotion into `actions`) still goes through the digest router, which doesn't exist
- * yet: expected red until T-19-3 lands.
+ * selection, promotion into `actions`) now goes through the real digest router.
  *
  * Field names match the landed contract (0.7.0, `@invai/contracts`): `Digest.marketWatch` (not
  * `market`), and a market item is a `DigestInsight` whose `recommendation` field is the underlying
  * `MarketRecommendation` — per the schema's own doc comment, a Market watch vote goes through
  * `market.recommendations.vote`, never `digest.feedback` (AC17 below calls the real, already-
  * working wave 18 procedure directly).
+ *
+ * `mondayPhoenix` returns shop-local midnight (07:00Z), not 07:00 local: every freeze below was
+ * `+5min` (00:05 local, before the build window) and has been corrected to `+7h5m` (07:05 local),
+ * same fix as `digest.acceptance.test.ts` (T-19-3's report flagged the root cause).
  *
  * Owner: qa-engineer. Implementers don't edit this file; disagreements go in their report.
  */
@@ -24,7 +27,15 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { TenantContext } from "../../api/context";
 import { router } from "../../api/router";
 import { withSystem } from "../../db/client";
-import { type Channel, channelConnections, designs, marketRecommendations } from "../../db/schema";
+import {
+  type Channel,
+  channelConnections,
+  designs,
+  marketRecommendations,
+  orderItems,
+  orders,
+  profitLines,
+} from "../../db/schema";
 import { createCompany, createUser, tenantContext } from "../../test/fixtures";
 
 const uniq = () => crypto.randomUUID().slice(0, 12);
@@ -126,6 +137,56 @@ async function recommendation(
   return row;
 }
 
+/**
+ * A minimal sale inside the target week. Market watch items are only ever fetched for a non-quiet
+ * week (`build.ts`'s `isQuiet` gate skips `marketOf(...)` entirely for zero-order weeks), so every
+ * AC14-17 fixture needs at least one order — a fixture gap this file originally had (every shop was
+ * order-free, so every digest built `skipped_quiet` and Market watch was never evaluated).
+ */
+async function saleAt(companyId: string, connectionId: string, channel: Channel, placedAt: Date) {
+  return withSystem(async (tx) => {
+    const [order] = await tx
+      .insert(orders)
+      .values({
+        companyId,
+        connectionId,
+        channel,
+        channelOrderId: `ord-${uniq()}`,
+        orderNo: `T-${uniq()}`,
+        status: "new",
+        placedAt,
+        shipBy: new Date(placedAt.getTime() + 2 * DAY_MS),
+        subtotalCents: 2500,
+        totalCents: 2500,
+        itemCount: 1,
+      })
+      .returning();
+    if (!order) throw new Error("order insert failed");
+    const [item] = await tx
+      .insert(orderItems)
+      .values({
+        companyId,
+        orderId: order.id,
+        channelSku: `SKU-${uniq()}`,
+        title: "Fixture tee",
+        state: "packed",
+        shipBy: order.shipBy,
+      })
+      .returning();
+    if (!item) throw new Error("order item insert failed");
+    await tx.insert(profitLines).values({
+      companyId,
+      orderId: order.id,
+      orderItemId: item.id,
+      channel,
+      revenueCents: 2500,
+      netCents: 1200,
+      marginPct: 1200 / 2500,
+      placedAt,
+    });
+  });
+}
+
 describe("AC14: Market watch shows a qualifying medium/high item and drops a low-band one", () => {
   it("shows the R1 item with source/date/band and 'Sample data'; the R4 low item is absent", async () => {
     const s = await shop("Watch Tees");
@@ -137,10 +198,22 @@ describe("AC14: Market watch shows a qualifying medium/high item and drops a low
         .returning(),
     ).then((rows) => rows[0]);
     if (!halloween) throw new Error("design insert failed");
-    const r1 = await recommendation(s.id, { rule: "R1", band: "medium", designId: halloween.id });
-    await recommendation(s.id, { rule: "R4", band: "low", designId: halloween.id });
+    // `listDigestMarketItems` only shows items created within 7 days of the build instant
+    // (`asOf`): an explicit `createdAt` inside this week keeps the test deterministic regardless
+    // of the real wall-clock date the suite happens to run on (an earlier version relied on the
+    // default `new Date()`, which only worked by coincidence when "today" was near this week — see
+    // AC17, where the same default made the recommendation look "too old" and fail).
+    const createdAt = new Date(monday.getTime() - 2 * DAY_MS);
+    const r1 = await recommendation(s.id, {
+      rule: "R1",
+      band: "medium",
+      designId: halloween.id,
+      createdAt,
+    });
+    await recommendation(s.id, { rule: "R4", band: "low", designId: halloween.id, createdAt });
+    await saleAt(s.id, s.etsy.id, "etsy", new Date(monday.getTime() - 3 * DAY_MS));
 
-    freeze(new Date(monday.getTime() + 5 * 60_000).toISOString());
+    freeze(new Date(monday.getTime() + 7 * 60 * 60_000 + 5 * 60_000).toISOString());
     await runDigestJob("digest.sweep", {});
     const digest = await rpc<Digest>("digest.get", { weekKey: "2026-W39" }, s.owner);
     expect(digest.marketWatch.some((m) => m.recommendation?.id === r1.id)).toBe(true);
@@ -152,9 +225,11 @@ describe("AC15: promotion into the top 3 actions", () => {
   it("an R1 item with a cross-listing gap may take a top-3 slot; an R2 item never does", async () => {
     const s = await shop("Promote Tees");
     const monday = mondayPhoenix("2026-10-05");
-    await recommendation(s.id, { rule: "R1", band: "high" });
-    const r2 = await recommendation(s.id, { rule: "R2", band: "high" });
-    freeze(new Date(monday.getTime() + 5 * 60_000).toISOString());
+    const createdAt = new Date(monday.getTime() - 2 * DAY_MS); // deterministic: see AC14's comment
+    await recommendation(s.id, { rule: "R1", band: "high", createdAt });
+    const r2 = await recommendation(s.id, { rule: "R2", band: "high", createdAt });
+    await saleAt(s.id, s.etsy.id, "etsy", new Date(monday.getTime() - 3 * DAY_MS));
+    freeze(new Date(monday.getTime() + 7 * 60 * 60_000 + 5 * 60_000).toISOString());
     await runDigestJob("digest.sweep", {});
     const digest = await rpc<Digest>("digest.get", { weekKey: "2026-W40" }, s.owner);
     expect(digest.actions.some((a) => a.recommendation?.id === r2.id)).toBe(false);
@@ -170,7 +245,8 @@ describe("AC16: a missing, stale or throwing market read never blocks the digest
       band: "high",
       createdAt: new Date(monday.getTime() - 90 * DAY_MS), // far past staleAfterDays: 30
     });
-    freeze(new Date(monday.getTime() + 5 * 60_000).toISOString());
+    await saleAt(s.id, s.etsy.id, "etsy", new Date(monday.getTime() - 3 * DAY_MS));
+    freeze(new Date(monday.getTime() + 7 * 60 * 60_000 + 5 * 60_000).toISOString());
     await runDigestJob("digest.sweep", {});
     const digest = await rpc<Digest>("digest.get", { weekKey: "2026-W41" }, s.owner);
     expect(digest.status).toBe("ready");
@@ -182,8 +258,10 @@ describe("AC17: a Market watch vote is the same market-recommendation vote", () 
   it("voting 'not useful' updates the one underlying recommendation record, via market.recommendations.vote", async () => {
     const s = await shop("Vote Tees");
     const monday = mondayPhoenix("2026-10-19");
-    const r1 = await recommendation(s.id, { rule: "R1", band: "high" });
-    freeze(new Date(monday.getTime() + 5 * 60_000).toISOString());
+    const createdAt = new Date(monday.getTime() - 2 * DAY_MS); // deterministic: see AC14's comment
+    const r1 = await recommendation(s.id, { rule: "R1", band: "high", createdAt });
+    await saleAt(s.id, s.etsy.id, "etsy", new Date(monday.getTime() - 3 * DAY_MS));
+    freeze(new Date(monday.getTime() + 7 * 60 * 60_000 + 5 * 60_000).toISOString());
     await runDigestJob("digest.sweep", {});
     const digest = await rpc<Digest>("digest.get", { weekKey: "2026-W42" }, s.owner);
     expect(digest.marketWatch.some((m) => m.recommendation?.id === r1.id)).toBe(true);

@@ -2,33 +2,38 @@
  * Wave 19 acceptance tests for the digest module (T-19-3), written from
  * `invai-docs/specs/weekly-digest.md` before the build (`acceptance-tests-first`).
  *
- * First pass, expected red: `src/modules/digest/{router,jobs,service}.ts` don't exist yet (T-19-3
- * hasn't landed), and the contract (T-19-1, 0.7.0) hasn't landed either, so `digest.*` is not on
- * the router and there is no `DigestSummary` type to import. `./jobs` is loaded through `load()`
- * (a dynamic import on a path constant, same trick as wave 18's `market.acceptance.test.ts`) so
- * this file typechecks today; each test fails on the missing job/procedure with one clear reason.
- * The router procedures are looked up by path on the *existing* top-level router
- * (`../../api/router`), which already exists — they'll just be missing until T-19-3's grant lands.
+ * Second pass, against landed backend HEAD (T-19-1 contract 0.7.0, T-19-2 ed68608, T-19-3
+ * cadc338/bef6158, T-19-4 0af819a/776697b). `digest.*` is real on the router; `./jobs` is still
+ * loaded through `load()` (a dynamic import on a path constant) only for stylistic consistency
+ * with the other digest acceptance files, not because anything is missing now.
  *
- * Assumed from `waves/19/wave.md` "Agreed interfaces" and the T-19-3 card (implementers: tell QA
- * if a name differs, don't silently rename):
+ * Real interfaces (confirmed against `@invai/contracts` and T-19-3's report, not guessed):
  * - router: `digest.list(Page)`, `digest.get({weekKey})`, `digest.latest()`,
  *   `digest.feedback({digestId, insightId, vote, reason?})`, `digest.recordClick({digestId,
  *   insightId})`, `digest.settings.get/set/setRecipientEmail`, `digest.sendPreview()`.
- * - job names (not fixed by the wave doc; QA's best guess from the pipeline steps, "sweep" finds
- *   shops due, "build" builds one shop's week): `digest.sweep` (input `{}`), `digest.build` (input
- *   `{companyId, weekKey}` or similar — the acceptance test passes both and lets the job ignore
- *   what it doesn't need).
- * - `digest.get` output carries at least: `status`, `weekKey`, `glance.{netCents,...}`, `actions[]`
- *   (each `{id, detector, action:{href}}`), `win`, `market[]`, `narrativeStatus`, and
- *   `plan` present only when the caller has `billing.read`.
+ * - jobs: `digest.sweep` (input `{}`, all due shops) and `digest.build` (input `{companyId,
+ *   weekKey}`, the single-shop/forced path — used here wherever a test must build only one
+ *   company's digest without the sweep's side effect of also building every other due shop's own
+ *   (quiet) digest for the same week, see AC27/AC28/AC30 below).
+ * - `Digest`/`DigestSummary` carry a top-level `net`/`netChange` fact (`.value` in cents), not a
+ *   `glance.netCents` field; `glance` is an array of `DigestGlanceItem` rows, one per metric.
+ *
+ * `mondayPhoenix(dateIso)` returns shop-local **midnight** (00:00 America/Phoenix = 07:00Z), not
+ * 07:00. Every freeze that means "07:05 local, inside the default build window" must add 7h5m from
+ * that midnight, not 5min (T-19-3's report caught this: a bare `+5min` freezes at 00:05 local,
+ * before the 06:00-10:00 slot, so the sweep never builds and every `digest.get` after it was
+ * `NOT_FOUND` for the wrong reason). Fixed throughout this file in the second pass.
  *
  * Fixtures are built in this file (not `src/test/fixtures.ts`, which QA doesn't own): orders,
  * order items and profit lines are inserted directly with an explicit `placedAt`, because the
  * shared `createOrder` fixture hard-codes `placedAt: new Date()` (flagged to backend-foundation in
- * the spec review). Profit lines are inserted directly with a chosen `netCents` — never computed
- * through the real fee schedule — so the parity check in AC1 compares two reads of the same
- * numbers, not two independent calculations that happen to agree by luck.
+ * the spec review). `finance/profit.ts`'s `finalize()` computes net as revenue minus every cost
+ * bucket column — it never reads a profit line's cached `netCents` back for aggregation (the same
+ * rule that already bit the market module's fee signal) — so `saleAt`'s `netCents` is display-only
+ * and a test that needs a specific aggregate net sets `revenueCents`/`costCents` instead (see
+ * AC10). AC1's parity check still holds: both sides call the same `finalize()`/`sumBuckets()` over
+ * the same rows, so it proves the digest reuses the profit page's own function, not that any
+ * particular chosen number round-trips.
  *
  * Owner: qa-engineer. Implementers don't edit this file; disagreements go in their report.
  */
@@ -175,6 +180,13 @@ async function saleAt(
   input: {
     netCents?: number;
     revenueCents?: number;
+    /**
+     * A cost bucket (stored as `blankCostCents`). `finance/profit.ts`'s `finalize()` computes net
+     * as revenue minus every cost bucket column — it never reads the cached `netCents` field back
+     * out for aggregation (same rule the market module's fee signal already hit) — so a test that
+     * needs a specific aggregate net must set a real cost, not just `netCents`.
+     */
+    costCents?: number;
     designId?: string;
     isReprint?: boolean;
     shippedAt?: Date | null;
@@ -182,7 +194,8 @@ async function saleAt(
   } = {},
 ) {
   const revenueCents = input.revenueCents ?? 2500;
-  const netCents = input.netCents ?? 1200;
+  const costCents = input.costCents ?? 0;
+  const netCents = input.netCents ?? revenueCents - costCents;
   return withSystem(async (tx) => {
     const [order] = await tx
       .insert(orders)
@@ -223,6 +236,7 @@ async function saleAt(
         channel,
         designId: input.designId,
         revenueCents,
+        blankCostCents: costCents,
         netCents,
         marginPct: revenueCents ? netCents / revenueCents : null,
         isReprint: input.isReprint ?? false,
@@ -306,7 +320,7 @@ describe("AC1, AC2: build is idempotent and its glance net matches the profit pa
   }, 30_000);
 
   it("AC1: the sweep builds exactly one ready digest whose glance net equals the profit page's net", async () => {
-    freeze(new Date(MONDAY.getTime() + 5 * 60_000).toISOString()); // 07:05 local
+    freeze(new Date(MONDAY.getTime() + 7 * 60 * 60_000 + 5 * 60_000).toISOString()); // 07:05 local
     await runDigestJob(JOB.sweep, {});
 
     const from = new Date(MONDAY.getTime() - 7 * DAY_MS);
@@ -329,7 +343,7 @@ describe("AC1, AC2: build is idempotent and its glance net matches the profit pa
   });
 
   it("AC2: running the sweep and build twice for the same shop and week yields one digest, one delivery, one email", async () => {
-    freeze(new Date(MONDAY.getTime() + 5 * 60_000).toISOString());
+    freeze(new Date(MONDAY.getTime() + 7 * 60 * 60_000 + 5 * 60_000).toISOString());
     await rpc("me.notifications.set", { kind: "digest", on: true }, s.owner);
 
     await runDigestJob(JOB.sweep, {});
@@ -348,8 +362,13 @@ describe("AC1, AC2: build is idempotent and its glance net matches the profit pa
 });
 
 describe("AC3: DST — the digest builds in the shop's local 07:00 hour, not an hour off", () => {
-  it.fails("builds inside the 07:00-07:59 local window on the Monday after a US fall-back", async () => {
+  it("builds inside the 07:00-07:59 local window on the Monday after a US fall-back", async () => {
     const s = await shop({ name: "NY Fixture Tees", timezone: "America/New_York" });
+    // A sale inside the last complete week (2026-10-26 -> 2026-11-02 local), so the digest is
+    // `ready` rather than `skipped_quiet` — without this the test can't tell "DST off by an hour"
+    // from "no orders": it originally had no sale at all, which is why it reported `skipped_quiet`
+    // and looked like an unfixed DST bug when it was in fact this fixture's own gap.
+    await saleAt(s.id, s.etsy.id, "etsy", new Date("2026-10-30T12:00:00.000Z"));
     // First Monday after the 2026-11-01 US fall-back (2am -> 1am), frozen at 07:05 UTC-5 = 12:05Z.
     freeze("2026-11-02T12:05:00.000Z");
     await runDigestJob(JOB.sweep, {});
@@ -380,7 +399,7 @@ describe("AC4, AC5: catch-up, quiet hours and a non-default send hour", () => {
     await rpc("digest.settings.set", { hour: 9 }, s.owner);
     await saleAt(s.id, s.etsy.id, "etsy", new Date(monday.getTime() - 3 * DAY_MS));
 
-    freeze(new Date(monday.getTime() + 5 * 60_000).toISOString()); // 07:05
+    freeze(new Date(monday.getTime() + 7 * 60 * 60_000 + 5 * 60_000).toISOString()); // 07:05
     await runDigestJob(JOB.sweep, {});
     expect(await codeOf("digest.get", { weekKey: "2026-W40" }, s.owner)).toBe("NOT_FOUND");
 
@@ -401,7 +420,7 @@ describe("AC6, AC7: D6 fulfillment and D1 data-health detectors", () => {
     for (let i = 0; i < 3; i++) {
       await saleAt(s.id, s.etsy.id, "etsy", new Date(inWeek.getTime() - i * 3600_000));
     }
-    freeze(new Date(monday.getTime() + 5 * 60_000).toISOString());
+    freeze(new Date(monday.getTime() + 7 * 60 * 60_000 + 5 * 60_000).toISOString());
     await runDigestJob(JOB.sweep, {});
 
     const digest = await rpc<Digest>("digest.get", { weekKey: "2026-W41" }, s.owner);
@@ -426,7 +445,7 @@ describe("AC6, AC7: D6 fulfillment and D1 data-health detectors", () => {
     });
     await saleAt(s.id, s.etsy.id, "etsy", new Date(monday.getTime() - 3 * DAY_MS));
 
-    freeze(new Date(monday.getTime() + 5 * 60_000).toISOString());
+    freeze(new Date(monday.getTime() + 7 * 60 * 60_000 + 5 * 60_000).toISOString());
     await runDigestJob(JOB.sweep, {});
 
     const digest = await rpc<Digest>("digest.get", { weekKey: "2026-W41" }, s.owner);
@@ -442,7 +461,7 @@ describe("AC8, AC9: minimum-volume guard and the skip / paused rule", () => {
     for (let i = 0; i < 12; i++) {
       await saleAt(s.id, s.etsy.id, "etsy", new Date(monday.getTime() - (i + 1) * 3600_000));
     }
-    freeze(new Date(monday.getTime() + 5 * 60_000).toISOString());
+    freeze(new Date(monday.getTime() + 7 * 60 * 60_000 + 5 * 60_000).toISOString());
     await runDigestJob(JOB.sweep, {});
 
     const digest = await rpc<{ actions: { detector: string }[]; steady?: boolean }>(
@@ -456,13 +475,13 @@ describe("AC8, AC9: minimum-volume guard and the skip / paused rule", () => {
   it("AC9: zero orders two weeks running skips email and shows the paused line", async () => {
     const s = await shop({ name: "Quiet Tees" });
     const monday1 = mondayPhoenix("2026-10-19");
-    freeze(new Date(monday1.getTime() + 5 * 60_000).toISOString());
+    freeze(new Date(monday1.getTime() + 7 * 60 * 60_000 + 5 * 60_000).toISOString());
     await runDigestJob(JOB.sweep, {});
     const d1 = await rpc<{ status: string }>("digest.get", { weekKey: "2026-W42" }, s.owner);
     expect(d1.status).toBe("skipped_quiet");
 
     const monday2 = mondayPhoenix("2026-10-26");
-    freeze(new Date(monday2.getTime() + 5 * 60_000).toISOString());
+    freeze(new Date(monday2.getTime() + 7 * 60 * 60_000 + 5 * 60_000).toISOString());
     await runDigestJob(JOB.sweep, {});
     const latest = await rpc<{ paused: boolean }>("digest.latest", {}, s.owner);
     expect(latest.paused).toBe(true);
@@ -474,18 +493,23 @@ describe("AC10: cancelled-after-on_sheet and reprints in the snapshot", () => {
     const s = await shop({ name: "Cancel Reprint Tees" });
     const monday = mondayPhoenix("2026-11-02");
     const inWeek = new Date(monday.getTime() - 3 * DAY_MS);
-    await saleAt(s.id, s.etsy.id, "etsy", inWeek, { state: "cancelled", netCents: 9999 });
-    await saleAt(s.id, s.etsy.id, "etsy", inWeek, { isReprint: true, netCents: -500 });
+    await saleAt(s.id, s.etsy.id, "etsy", inWeek, { state: "cancelled", revenueCents: 9999 });
+    // A free reprint (no charge to the buyer) that still costs a blank: net = 0 - 500 = -500,
+    // computed by `finance/profit.ts`'s `finalize()` from the cost bucket, the same function the
+    // digest reuses — not read back from a chosen `netCents` (see `saleAt`'s doc comment above).
+    await saleAt(s.id, s.etsy.id, "etsy", inWeek, {
+      isReprint: true,
+      revenueCents: 0,
+      costCents: 500,
+    });
 
-    freeze(new Date(monday.getTime() + 5 * 60_000).toISOString());
+    freeze(new Date(monday.getTime() + 7 * 60 * 60_000 + 5 * 60_000).toISOString());
     await runDigestJob(JOB.sweep, {});
-    const digest = await rpc<{ glance: { netCents: number; orders: number } }>(
-      "digest.get",
-      { weekKey: "2026-W44" },
-      s.owner,
-    );
+    // `Digest` has no `glance.netCents`; the glance net is the top-level `net` fact (contract 0.7.0,
+    // same shape AC1 already checks), value in cents.
+    const digest = await rpc<Digest>("digest.get", { weekKey: "2026-W44" }, s.owner);
     // Only the reprint's -500 net should count; the cancelled item's 9999 must not appear.
-    expect(digest.glance.netCents).toBe(-500);
+    expect(digest.net?.value).toBe(-500);
   });
 });
 
@@ -500,7 +524,7 @@ describe("AC11: D7 stock detector", () => {
         designId: d.id,
       });
     }
-    freeze(new Date(monday.getTime() + 5 * 60_000).toISOString());
+    freeze(new Date(monday.getTime() + 7 * 60 * 60_000 + 5 * 60_000).toISOString());
     await runDigestJob(JOB.sweep, {});
     const digest = await rpc<Digest>("digest.get", { weekKey: "2026-W45" }, s.owner);
     const d7 = digest.actions.find((a) => a.detector === "D7");
@@ -515,7 +539,7 @@ describe("AC13: every fact carries a genuine Spanish string, not an English fall
     const monday = mondayPhoenix("2026-11-16");
     await saleAt(s.id, s.etsy.id, "etsy", new Date(monday.getTime() - 3 * DAY_MS));
 
-    freeze(new Date(monday.getTime() + 5 * 60_000).toISOString());
+    freeze(new Date(monday.getTime() + 7 * 60 * 60_000 + 5 * 60_000).toISOString());
     await runDigestJob(JOB.sweep, {});
     // Both languages are pre-computed server-side (contract 0.7.0: `DigestFact.formatted.{en,es}`);
     // the web app picks which one to show. The backend's job is to make sure both exist and are
@@ -545,8 +569,11 @@ describe("AC27, AC28: permissions and tenancy", () => {
 
     const monday = mondayPhoenix("2026-11-23");
     await saleAt(s.id, s.etsy.id, "etsy", new Date(monday.getTime() - 3 * DAY_MS));
-    freeze(new Date(monday.getTime() + 5 * 60_000).toISOString());
-    await runDigestJob(JOB.sweep, {});
+    freeze(new Date(monday.getTime() + 7 * 60 * 60_000 + 5 * 60_000).toISOString());
+    // Targeted build for `s` only (not the global sweep): the sweep also builds `other`'s own
+    // (quiet) digest for the same week key, which would make the NOT_FOUND check below false — a
+    // fixture bug flagged by T-19-3's report, fixed here rather than weakening the assertion.
+    await runDigestJob(JOB.build, { companyId: s.id, weekKey: "2026-W47" });
     const asOffice = await rpc<Digest>("digest.get", { weekKey: "2026-W47" }, s.office);
     expect(asOffice.planUsage).toBeUndefined();
 
@@ -558,8 +585,10 @@ describe("AC27, AC28: permissions and tenancy", () => {
     const b = await shop({ name: "Tenant B Tees" });
     const monday = mondayPhoenix("2026-11-30");
     await saleAt(a.id, a.etsy.id, "etsy", new Date(monday.getTime() - 3 * DAY_MS));
-    freeze(new Date(monday.getTime() + 5 * 60_000).toISOString());
-    await runDigestJob(JOB.sweep, {});
+    freeze(new Date(monday.getTime() + 7 * 60 * 60_000 + 5 * 60_000).toISOString());
+    // Targeted build for `a` only: the sweep would also build `b`'s own (quiet) digest for the
+    // same week, so `bList.items` would no longer be empty for a reason unrelated to isolation.
+    await runDigestJob(JOB.build, { companyId: a.id, weekKey: "2026-W48" });
     const bList = await rpc<{ items: DigestSummary[] }>("digest.list", { limit: 50 }, b.owner);
     expect(bList.items).toHaveLength(0);
   });
@@ -568,6 +597,12 @@ describe("AC27, AC28: permissions and tenancy", () => {
 describe("AC30: preview is rate-limited to the caller", () => {
   it("3 preview requests in a minute send one preview and refuse the rest", async () => {
     const s = await shop({ name: "Preview Tees" });
+    // A digest must exist first: with none built, `sendPreview` answers `NO_DIGEST` (not OK) every
+    // time and the rate limit is never exercised — a fixture bug, not a real "always refused" case.
+    const monday = mondayPhoenix("2026-12-14");
+    await saleAt(s.id, s.etsy.id, "etsy", new Date(monday.getTime() - 3 * DAY_MS));
+    freeze(new Date(monday.getTime() + 7 * 60 * 60_000 + 5 * 60_000).toISOString());
+    await runDigestJob(JOB.build, { companyId: s.id, weekKey: "2026-W50" });
     const codes = [];
     for (let i = 0; i < 3; i++) codes.push(await codeOf("digest.sendPreview", {}, s.owner));
     expect(codes.filter((c) => c === "OK")).toHaveLength(1);
@@ -580,14 +615,14 @@ describe("AC18, AC21: AI summary shadow mode and the cost cap never change what'
     const s = await shop({ name: "Shadow Tees" });
     const monday = mondayPhoenix("2026-12-07");
     await saleAt(s.id, s.etsy.id, "etsy", new Date(monday.getTime() - 3 * DAY_MS));
-    freeze(new Date(monday.getTime() + 5 * 60_000).toISOString());
+    freeze(new Date(monday.getTime() + 7 * 60 * 60_000 + 5 * 60_000).toISOString());
     await runDigestJob(JOB.sweep, {});
     // Contract 0.7.0: `Digest`/`DigestSummary` carry no narrative text field at all in shadow
     // mode (not even an optional one) — only `narrativeStatus`. `as Record<...>` proves no field
     // with text sneaks in under a different name either.
     const digest = (await rpc<Digest>(
       "digest.get",
-      { weekKey: "2026-W50" },
+      { weekKey: "2026-W49" }, // mondayPhoenix("2026-12-07")'s last complete week is W49, not W50
       s.owner,
     )) as unknown as Record<string, unknown>;
     expect(digest.narrativeText).toBeUndefined();
