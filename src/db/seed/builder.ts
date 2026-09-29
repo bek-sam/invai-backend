@@ -305,7 +305,8 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
         isDefault: false,
       },
     ]);
-    await tx.insert(inventorySettings).values({ companyId: shopId });
+    // Defaults only; the alert sweep's `loadSettings` may already have created this row.
+    await tx.insert(inventorySettings).values({ companyId: shopId }).onConflictDoNothing();
     await tx.insert(suppliers).values({
       companyId: shopId,
       supplier: "ssactivewear",
@@ -1519,7 +1520,8 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
         ),
       );
     if (low.length) {
-      await tx.insert(alerts).values(
+      await upsertAlerts(
+        tx,
         low.map((l) => ({
           companyId: shopId,
           kind: "stock_low",
@@ -1585,15 +1587,19 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
       .select({ n: sql<number>`count(*)`.mapWith(Number) })
       .from(shipments)
       .where(and(eq(shipments.companyId, shopId), sql`to_char(labeled_at, 'YYYY-MM') = ${period}`));
-    await tx.insert(usage).values({
-      companyId: shopId,
-      period,
+    // Counted from what is in the DB, so it is right even when a running worker's poll imported
+    // mock orders meanwhile and `recordUsage` (AI credits, sheets) created the period row first.
+    const usageRow = {
       ordersImported: ordersThisPeriod?.n ?? 0,
       labelsBought: labelsThisPeriod?.n ?? 0,
       labelFeesCents: (labelsThisPeriod?.n ?? 0) * 4,
       sheetsBuilt: sheetsCreated,
       aiCredits: 37,
-    });
+    };
+    await tx
+      .insert(usage)
+      .values({ companyId: shopId, period, ...usageRow })
+      .onConflictDoUpdate({ target: [usage.companyId, usage.period], set: usageRow });
     const atRisk = await tx
       .select({ id: orders.id, orderNo: orders.orderNo })
       .from(orders)
@@ -1606,7 +1612,8 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
       )
       .limit(6);
     if (atRisk.length) {
-      await tx.insert(alerts).values(
+      await upsertAlerts(
+        tx,
         atRisk.map((o) => ({
           companyId: shopId,
           kind: "order_at_risk",
@@ -1625,6 +1632,31 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
   log.info("outbox released", { events: released });
 
   return { locationId, stationToken, channels, sheets: sheetsCreated };
+}
+
+/**
+ * The seed's alerts, keyed like the 5-minute alert sweep's (`today.generateAlerts`:
+ * `stock_low:<variant>`, `order_at_risk:<order>`). A running worker's scheduled sweep does not
+ * go through the outbox, so it can raise the same keys for the half-built shop between two
+ * phases; the seed's values win, the way a plain insert would have written them (T-20-5).
+ */
+async function upsertAlerts(tx: Tx, rows: (typeof alerts.$inferInsert)[]) {
+  await tx
+    .insert(alerts)
+    .values(rows)
+    .onConflictDoUpdate({
+      target: [alerts.companyId, alerts.dedupeKey],
+      set: {
+        severity: sql`excluded.severity`,
+        title: sql`excluded.title`,
+        message: sql`excluded.message`,
+        data: sql`excluded.data`,
+        status: "open",
+        readAt: null,
+        resolvedAt: null,
+        updatedAt: sql`now()`,
+      },
+    });
 }
 
 /**

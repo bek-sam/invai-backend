@@ -52,23 +52,35 @@ export async function ensureDatabase(migrationDatabaseUrl: string, name: string)
  * untouched. Never FLUSHDB or KEYS. `force` also drops a job a running worker is on: after a reset
  * that row is gone anyway. Repeatable sweeps are re-registered when the worker restarts.
  * Returns the number of jobs removed per queue.
+ *
+ * `prefix` targets the same five queue names under another BullMQ key prefix (the default is
+ * BullMQ's `bull`): its test uses one of its own, so it never empties the queues a dev worker is
+ * working on in the same Redis DB.
  */
-export async function obliterateQueues(): Promise<Record<string, number>> {
+export async function obliterateQueues(opts: { prefix?: string } = {}) {
   if (process.env.NODE_ENV === "production") throw new Error("db:reset is not for production");
-  const { QUEUE_NAMES, queues } = await import("../lib/queues");
+  const { QUEUE_NAMES, queues, redis } = await import("../lib/queues");
+  const { Queue } = await import("bullmq");
+  const own = opts.prefix
+    ? QUEUE_NAMES.map((name) => new Queue(name, { connection: redis, prefix: opts.prefix }))
+    : null;
   const removed: Record<string, number> = {};
-  for (const name of QUEUE_NAMES) {
-    const queue = queues[name];
-    removed[name] = await queue.getJobCountByTypes(
-      "waiting",
-      "active",
-      "delayed",
-      "prioritized",
-      "waiting-children",
-      "completed",
-      "failed",
-    );
-    await queue.obliterate({ force: true });
+  try {
+    for (const [i, name] of QUEUE_NAMES.entries()) {
+      const queue = own?.[i] ?? queues[name];
+      removed[name] = await queue.getJobCountByTypes(
+        "waiting",
+        "active",
+        "delayed",
+        "prioritized",
+        "waiting-children",
+        "completed",
+        "failed",
+      );
+      await queue.obliterate({ force: true });
+    }
+  } finally {
+    for (const q of own ?? []) await q.close();
   }
   return removed;
 }

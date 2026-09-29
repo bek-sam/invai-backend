@@ -92,7 +92,9 @@ onEvent("shipment.labeled", pushTracking, (e) => ({ companyId: e.companyId, ship
 - A bulk builder that commits in phases (the seed, `tenancy.demo`) parks each phase's events with
   `holdOutbox(tx, companyId)` (`src/db/seed/outbox-hold.ts`) and releases them once at the end, so
   a running worker's jobs never write derived rows (`usage`, `stock_levels`, profit lines) for a
-  half-built company (B-106). Only rows carrying the held marker are released.
+  half-built company (B-106). Only rows carrying the held marker are released. Scheduled sweeps
+  (`upsertJobScheduler`) don't go through the outbox, so a bulk builder writes any row a sweep can
+  also create (alerts by dedupe key, `inventory_settings`, the period's `usage`) as an upsert.
 - User-visible progress: create a `jobs` row (contracts `Job`) and publish `job.progress` realtime events.
 - `runJobInline(job, input)` runs a handler in tests without Redis workers.
 
