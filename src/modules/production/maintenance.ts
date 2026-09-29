@@ -5,7 +5,7 @@ import type {
   MaintenanceStartResult,
   StationMaintenance,
 } from "@invai/contracts";
-import { and, desc, eq, gte, isNotNull, isNull, lte, type SQL } from "drizzle-orm";
+import { and, desc, eq, gt, gte, isNotNull, isNull, lte, or, type SQL } from "drizzle-orm";
 import type { TenantContext } from "../../api/context";
 import { afterCommit, type Tx } from "../../db/client";
 import { stationMaintenanceEvents, stations } from "../../db/schema";
@@ -19,7 +19,7 @@ import { publish } from "../../lib/realtime";
 /*
  * Station maintenance windows (B-35, T-22-4). A window is open while `endedAt` is null; while
  * it is open, `scan()` answers every transfer scan at that station with a blocked ScanResult
- * (`station_maintenance`). Start and end are idempotent by result shape (`started`/`ended`),
+ * (`station_maintenance`), and so it does for a replayed scan whose `scannedAt` fell inside a window. Start and end are idempotent by result shape (`started`/`ended`),
  * and only an effective change is audited, emitted and published.
  */
 
@@ -68,6 +68,32 @@ export async function openMaintenance(tx: Tx, stationId: string): Promise<Row | 
       and(
         eq(stationMaintenanceEvents.stationId, stationId),
         isNull(stationMaintenanceEvents.endedAt),
+      ),
+    )
+    .limit(1);
+  return row ?? null;
+}
+
+/**
+ * The window that blocks a scan made at `at`: one open now, or one that covered `at` (a scan made
+ * offline during a window and replayed after it ended). Leads with company_id so the lookup uses
+ * the (company_id, station_id, started_at) index.
+ */
+export async function blockingMaintenance(
+  tx: Tx,
+  companyId: string,
+  stationId: string,
+  at: Date,
+): Promise<Row | null> {
+  const t = stationMaintenanceEvents;
+  const [row] = await tx
+    .select()
+    .from(t)
+    .where(
+      and(
+        eq(t.companyId, companyId),
+        eq(t.stationId, stationId),
+        or(isNull(t.endedAt), and(lte(t.startedAt, at), gt(t.endedAt, at))),
       ),
     )
     .limit(1);

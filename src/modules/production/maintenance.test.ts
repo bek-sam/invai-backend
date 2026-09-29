@@ -11,6 +11,7 @@ import {
   companies,
   gangSheetBatches,
   gangSheets,
+  inventoryMovements,
   orderItems,
   outboxEvents,
   reprints,
@@ -135,7 +136,13 @@ async function shop() {
 const press = (
   ctx: Ctx,
   companyId: string,
-  input: { transferId: string; blankId: string; stationId: string; clientScanId?: string },
+  input: {
+    transferId: string;
+    blankId: string;
+    stationId: string;
+    clientScanId?: string;
+    scannedAt?: string;
+  },
 ) =>
   withTenant(companyId, (tx) =>
     svc.scan(tx, ctx, {
@@ -144,7 +151,7 @@ const press = (
       stationId: input.stationId,
       transferCode: `T:${input.transferId}`,
       blankCode: `B:${input.blankId}`,
-      scannedAt: new Date().toISOString(),
+      scannedAt: input.scannedAt ?? new Date().toISOString(),
     }),
   );
 
@@ -262,6 +269,65 @@ describe("station maintenance (B-35)", () => {
       stationId: station.id,
     });
     expect(ok).toMatchObject({ ok: true, mismatch: null, itemState: "pressed" });
+  });
+
+  it("blocks an offline scan replayed after the window ended when scannedAt fell inside it", async () => {
+    // Own shop: a closed window must not leak into the other tests' station state.
+    const t = await shop();
+    const hour = 3_600_000;
+    const now = Date.now();
+    await withTenant(t.companyId, (tx) =>
+      tx.insert(stationMaintenanceEvents).values({
+        companyId: t.companyId,
+        stationId: t.station.id,
+        reason: "calibration",
+        startedAt: new Date(now - 2 * hour),
+        endedAt: new Date(now - hour),
+      }),
+    );
+    const consumes = (itemId: string) =>
+      withTenant(t.companyId, (tx) =>
+        tx
+          .select({ id: inventoryMovements.id })
+          .from(inventoryMovements)
+          .where(and(eq(inventoryMovements.refId, itemId), eq(inventoryMovements.kind, "consume"))),
+      );
+    const stateOf = async (itemId: string) =>
+      (
+        await withTenant(t.companyId, (tx) =>
+          tx.select({ state: orderItems.state }).from(orderItems).where(eq(orderItems.id, itemId)),
+        )
+      )[0]?.state;
+
+    // Made at the window's midpoint while offline, synced now: blocked, unit and blank untouched.
+    const during = await t.unitsOnSheet(1);
+    const duringItem = during.items[0]?.id ?? "";
+    const blocked = await press(t.presser, t.companyId, {
+      transferId: during.transferIds[0] ?? "",
+      blankId: t.blank.id,
+      stationId: t.station.id,
+      scannedAt: new Date(now - 1.5 * hour).toISOString(),
+    });
+    expect(blocked).toMatchObject({
+      ok: false,
+      mismatch: "station_maintenance",
+      itemState: "transfer_in",
+    });
+    expect(await stateOf(duringItem)).toBe("transfer_in");
+    expect(await consumes(duringItem)).toHaveLength(0);
+
+    // Made after the window ended: presses and uses the blank.
+    const after = await t.unitsOnSheet(1);
+    const afterItem = after.items[0]?.id ?? "";
+    const pressed = await press(t.presser, t.companyId, {
+      transferId: after.transferIds[0] ?? "",
+      blankId: t.blank.id,
+      stationId: t.station.id,
+      scannedAt: new Date(now - 0.5 * hour).toISOString(),
+    });
+    expect(pressed).toMatchObject({ ok: true, mismatch: null, itemState: "pressed" });
+    expect(await stateOf(afterItem)).toBe("pressed");
+    expect(await consumes(afterItem)).toHaveLength(1);
   });
 
   it("ending with nothing ever open returns null; one open window per station", async () => {

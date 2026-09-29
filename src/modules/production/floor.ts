@@ -46,7 +46,7 @@ import { publish } from "../../lib/realtime";
 import { objectKey } from "../../lib/s3";
 import { type BlankLocation, consumeForItem, getBlankLocations } from "../inventory/service";
 import { recomputeOrderStatus, transitionItem } from "../orders/state-machine";
-import { openMaintenance } from "./maintenance";
+import { blockingMaintenance } from "./maintenance";
 import {
   type MatchOutcome,
   matchScan,
@@ -470,7 +470,9 @@ export async function scan(tx: Tx, ctx: TenantContext, input: ScanInput): Promis
   if (raced) return raced;
   const v = resolved.view;
   const second = await resolveSecond(tx, input.blankCode, v?.item.id ?? null);
-  const closed = stationId ? await openMaintenance(tx, stationId) : null;
+  const closed = stationId
+    ? await blockingMaintenance(tx, ctx.companyId, stationId, new Date(input.scannedAt))
+    : null;
   const outcome = closed
     ? maintenanceBlock(v)
     : matchScan({
