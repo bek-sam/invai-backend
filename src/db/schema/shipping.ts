@@ -210,3 +210,69 @@ export const labels = pgTable(
     tenantPolicy("labels"),
   ],
 ).enableRLS();
+
+/** `creating`: claimed and the carrier call made (or in flight); `created`: the carrier accepted it. */
+export const SCAN_FORM_STATUSES = ["creating", "created"] as const;
+
+/**
+ * USPS end-of-day SCAN forms (B-25, T-22-3). One per company + carrier + shop-local date
+ * (`create` is idempotent on it). `shipment_ids` lists the labels on the form; a shipment on any
+ * form is never put on another. The PDF has the shop's from-address and tracking numbers, no
+ * buyer data; it lives under the `label` key kind (shipping roles only). Kept like labels.
+ */
+export const scanForms = pgTable(
+  "scan_forms",
+  {
+    id: id(),
+    companyId: companyId(),
+    carrier: text(enumText(CARRIERS)).notNull(),
+    /** Pickup day, YYYY-MM-DD in the shop's timezone. */
+    date: text().notNull(),
+    status: text(enumText(SCAN_FORM_STATUSES)).notNull().default("creating"),
+    shipmentIds: uuid().array().notNull().default([]),
+    labelCount: integer().notNull().default(0),
+    /** EasyPost `sf_...`; null for the mock carrier. */
+    carrierFormId: text(),
+    /** S3 key of the form PDF; null until the carrier has rendered it. */
+    fileKey: text(),
+    /** When the carrier call in flight started; null while `creating` = outcome unknown (read back). */
+    attemptedAt: timestamp({ withTimezone: true }),
+    ...timestamps,
+  },
+  (t) => [
+    uniqueIndex().on(t.companyId, t.carrier, t.date),
+    index().on(t.companyId, t.createdAt),
+    tenantPolicy("scan_forms"),
+  ],
+).enableRLS();
+
+export const ADDRESS_CHECK_STATUSES = ["verified", "corrected", "failed"] as const;
+
+/**
+ * Last carrier address check per order (B-25, T-22-3). No address is stored: `address_hash` is
+ * a keyed HMAC of the ship-to, so a repeat reuses the result only while the address is unchanged,
+ * and the corrected address is fetched again rather than kept. `detail` is the carrier's reason
+ * ("Address not found"), never the address. Deleted with the order.
+ */
+export const addressVerifications = pgTable(
+  "address_verifications",
+  {
+    id: id(),
+    companyId: companyId(),
+    orderId: uuid().notNull(),
+    addressHash: text().notNull(),
+    status: text(enumText(ADDRESS_CHECK_STATUSES)).notNull(),
+    detail: text(),
+    verifiedAt: timestamp({ withTimezone: true }).notNull(),
+    ...timestamps,
+  },
+  (t) => [
+    uniqueIndex().on(t.companyId, t.orderId),
+    foreignKey({
+      name: "address_verifications_order_id_fk",
+      columns: [t.companyId, t.orderId],
+      foreignColumns: [orders.companyId, orders.id],
+    }).onDelete("cascade"),
+    tenantPolicy("address_verifications"),
+  ],
+).enableRLS();

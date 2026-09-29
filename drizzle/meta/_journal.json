@@ -225,6 +225,13 @@
       "when": 1790701787971,
       "tag": "0031_foundation_composite_fks_validate",
       "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "7",
+      "when": 1790701888944,
+      "tag": "0032_shipping_scan_forms",
+      "breakpoints": true
     }
   ]
 }
