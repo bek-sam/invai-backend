@@ -5,6 +5,7 @@ import { z } from "zod";
 import { withSystem, withTenant } from "../../db/client";
 import { gangSheetBatches, gangSheets, vendorAccess, vendorConnections } from "../../db/schema";
 import { DEFAULT_SHEET_SPEC } from "../../db/schema/vendors";
+import { runJobInline } from "../../lib/queues";
 import { createCompany, createUser, tenantContext } from "../../test/fixtures";
 
 const sent = vi.hoisted(() => [] as { to: string; subject: string; text: string }[]);
@@ -17,6 +18,7 @@ vi.mock("../../integrations/vendors/mailer", async (orig) => ({
 }));
 
 const svc = await import("./service");
+const { deliverSheetJob } = await import("./jobs");
 
 describe("vendors: delivery and the vendor portal", () => {
   let shopId: string;
@@ -79,6 +81,9 @@ describe("vendors: delivery and the vendor portal", () => {
     expect(grants).toEqual([
       expect.objectContaining({ vendorCompanyId: vendorOrgId, revokedAt: null }),
     ]);
+    // The notification goes out from the job after the commit (B-102, T-22-5).
+    expect(sent).toHaveLength(0);
+    await runJobInline(deliverSheetJob, { companyId: shopId, sheetId });
     expect(sent.at(-1)).toMatchObject({ to: "a@dtf.test" });
     expect(sent.at(-1)?.text).not.toContain("X-Amz-Signature"); // portal mail carries no file links
   });

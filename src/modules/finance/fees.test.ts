@@ -86,8 +86,9 @@ describe("referral fee schedules (verified 2026-09-25)", () => {
     );
     expect(flat.referralPerUnit).toBeNull();
     expect(flat.total).toBe(480);
-    // TikTok's contracts default (8) is stale: the verified 6% applies.
-    expect(CHANNEL_RULES.tiktok.fees.transactionPct).toBe(8);
+    // TikTok's contracts default is the verified 6% (B-164; TikTok Shop US Seller University
+    // "Referral fees", knowledge_id=5988482086864682, updated 2026-05-14, checked 2026-09-28).
+    expect(CHANNEL_RULES.tiktok.fees.transactionPct).toBe(6);
     expect(
       orderFees(defaultFeeTable("tiktok"), {
         revenueCents: 2500,

@@ -24,10 +24,9 @@ import {
   vendorConnections,
 } from "../../db/schema";
 import { env } from "../../env";
-import { vendorAdapter } from "../../integrations/vendors";
 import { type Actor, audit } from "../../lib/audit";
 import { randomToken } from "../../lib/crypto";
-import { badRequest, conflict, notFound, ORPCError, upstream } from "../../lib/errors";
+import { badRequest, conflict, notFound, ORPCError } from "../../lib/errors";
 import { logger } from "../../lib/log";
 import { emit } from "../../lib/outbox";
 import { keyset, type PageInput } from "../../lib/pagination";
@@ -48,6 +47,7 @@ import {
   sendInviteEmail,
   VENDOR_INVITE_DAYS,
 } from "../tenancy/invites";
+import { queueSheetDelivery } from "./delivery";
 
 const log = logger("vendors");
 
@@ -366,15 +366,9 @@ export async function removeConnection(tx: Tx, ctx: TenantContext, id: string) {
 /* --------------------------------- delivery -------------------------------- */
 
 /**
- * 24 hours: emailed links are bearer URLs to the shop's artwork, and with IAM-role credentials a
- * presigned URL cannot outlive the session anyway. Portal vendors re-sign on every download.
- */
-const EMAIL_LINK_TTL = 24 * 3600;
-
-/**
- * Send a ready sheet to a vendor: portal = `vendor_access` grant + notification, email = SMTP with
- * signed download links. Sheet ready -> sent; the delivery runs inside the transaction, so a
- * failed send leaves the sheet ready.
+ * Send a ready sheet to a vendor: portal = `vendor_access` grant, email = signed download links.
+ * Sheet ready -> sent in this transaction; the notification or email itself goes out from the
+ * `vendors.deliverSheet` job after the commit (B-102), once per delivery row (`delivery.ts`).
  */
 export async function sendSheetToVendor(
   tx: Tx,
@@ -414,44 +408,25 @@ export async function sendSheetToVendor(
         set: { revokedAt: null, grantedAt: new Date() },
       });
   }
-  const updated = await transitionSheet(tx, ctx.companyId, ctx.actor, sheet, "sent", {
+  await transitionSheet(tx, ctx.companyId, ctx.actor, sheet, "sent", {
     vendorConnectionId: conn.id,
     vendorNotes: input.note ?? null,
+  });
+  const delivery = portal ? "portal" : "email";
+  await queueSheetDelivery(tx, ctx, {
+    sheetId: sheet.id,
+    vendorConnectionId: conn.id,
+    delivery,
   });
   await emit(tx, ctx.companyId, "sheet.sent", {
     sheetId: sheet.id,
     vendorConnectionId: conn.id,
-    delivery: portal ? "portal" : "email",
+    delivery,
   });
-  const [shop] = await tx
-    .select({ name: companies.name })
-    .from(companies)
-    .where(eq(companies.id, ctx.companyId));
-  try {
-    await vendorAdapter(portal ? "portal" : "email").deliver({
-      companyId: ctx.companyId,
-      sheetId: sheet.id,
-      sheetName: sheet.name,
-      shopName: shop?.name ?? "InvAI shop",
-      vendor: { name: conn.name, email: conn.email, vendorCompanyId: conn.vendorCompanyId },
-      lengthIn: updated.lengthIn,
-      widthIn: updated.widthIn,
-      transferCount: updated.transferCount,
-      format: updated.pdfKey ? "pdf" : "png",
-      note: input.note ?? null,
-      links: portal
-        ? { png: null, pdf: null, preview: null, expiresAt: new Date().toISOString() }
-        : await sheetDownloadUrls(updated, EMAIL_LINK_TTL),
-    });
-  } catch (err) {
-    log.warn("sheet delivery failed", { sheetId: sheet.id, error: String(err) });
-    throw upstream(
-      portal ? "vendor notification" : "email",
-      String(err instanceof Error ? err.message : err),
-    );
-  }
   return getSheet(tx, ctx, sheet.id);
 }
+
+export { resendSheetEmail } from "./delivery";
 
 /* ------------------------------- vendor portal ------------------------------ */
 

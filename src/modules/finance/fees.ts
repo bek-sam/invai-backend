@@ -17,7 +17,8 @@ import type { FeeTable } from "./profit";
  *   (updated 2026-05-14) -- 6% referral for menswear, womenswear and kids' fashion (the fee
  *   covers every TikTok Shop fee but shipping and tax). Refunds return the referral fee less a
  *   20% refund administration fee, capped at $5 per SKU from 2025-05-15
- *   (knowledge_id=5982454398175018). The contracts default of 8% is stale (see the report).
+ *   (knowledge_id=5982454398175018). The contracts default is 6% since 0.8.0 (B-164); saved
+ *   cost settings still at the old 8% were moved to 6 by migration (T-22-5).
  *
  * The tiered schedule applies while the shop's saved `transactionPct` for the channel is still
  * the contracts default; once the shop types its own rate, that flat rate wins.
