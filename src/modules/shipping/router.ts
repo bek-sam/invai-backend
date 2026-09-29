@@ -1,4 +1,5 @@
-import { authed } from "../../api/orpc";
+import { contract } from "@invai/contracts";
+import { authed, stubRouter } from "../../api/orpc";
 import { afterCommit, withTenant } from "../../db/client";
 import { startBatchBuy } from "./batch";
 import { pushTrackingJob } from "./jobs";
@@ -41,6 +42,15 @@ export const shippingRouter = authed.shipping.router({
       }),
     ),
   },
+  // T-22-1 day-1 stubs (NOT_IMPLEMENTED): T-22-3 (integrations-engineer, by grant) fills them.
+  scanForms: stubRouter(authed.shipping.scanForms, contract.shipping.scanForms, [
+    "shipping",
+    "scanForms",
+  ]),
+  verifyAddress: stubRouter(authed.shipping.verifyAddress, contract.shipping.verifyAddress, [
+    "shipping",
+    "verifyAddress",
+  ]),
   queue: authed.shipping.queue.handler(({ input, context: { tenant } }) =>
     withTenant(tenant.companyId, (tx) => svc.shipQueue(tx, tenant, input)),
   ),

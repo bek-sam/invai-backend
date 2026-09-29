@@ -1,4 +1,5 @@
-import { authed } from "../../api/orpc";
+import { contract } from "@invai/contracts";
+import { authed, stubRouter } from "../../api/orpc";
 import { withTenant } from "../../db/client";
 import * as svc from "./service";
 
@@ -22,6 +23,8 @@ export const vendorsRouter = authed.vendors.router({
   remove: authed.vendors.remove.handler(({ input, context: { tenant } }) =>
     withTenant(tenant.companyId, (tx) => svc.removeConnection(tx, tenant, input.id)),
   ),
+  // T-22-1 day-1 stub (NOT_IMPLEMENTED): T-22-5 (backend-engineer, vendors) fills it.
+  sheets: stubRouter(authed.vendors.sheets, contract.vendors.sheets, ["vendors", "sheets"]),
 });
 
 /** Vendor org side. The service opens `withVendor()` (and the shop's tenant for status writes). */
