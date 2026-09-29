@@ -25,6 +25,7 @@ import {
   orders,
   reprints,
   scans,
+  stations,
   transfers,
   users,
 } from "../../db/schema";
@@ -43,11 +44,19 @@ import { emit } from "../../lib/outbox";
 import { keyset, type PageInput } from "../../lib/pagination";
 import { publish } from "../../lib/realtime";
 import { objectKey } from "../../lib/s3";
-import { consumeForItem } from "../inventory/service";
+import { type BlankLocation, consumeForItem, getBlankLocations } from "../inventory/service";
 import { recomputeOrderStatus, transitionItem } from "../orders/state-machine";
-import { type MatchOutcome, matchScan, type ScanAction, type SecondCode } from "./matcher";
+import { openMaintenance } from "./maintenance";
+import {
+  type MatchOutcome,
+  matchScan,
+  nextActionFor,
+  type ScanAction,
+  type SecondCode,
+} from "./matcher";
 import {
   blankRef,
+  DEFAULT_TRANSFER_AGE_WARN_DAYS,
   type ItemView,
   loadItemView,
   loadItemViews,
@@ -55,8 +64,10 @@ import {
   offsetCursor,
   openUnitsByOrder,
   placementOf,
+  type QueueExtras,
   toOrderItem,
   toQueueItem,
+  transferAge,
 } from "./views";
 
 /*
@@ -163,6 +174,41 @@ async function stationItemIds(tx: Tx, station: Station, orderId?: string): Promi
   return ids;
 }
 
+/**
+ * The org's transfer-age warning threshold in days (`me.updateOrg` `transferAgeWarnDays`,
+ * default 30). A tolerated read of the tenancy `companies` row, as `companyPrintsInHouse` does.
+ */
+async function transferAgeWarnDays(tx: Tx, companyId: string): Promise<number> {
+  const [c] = await tx
+    .select({ settings: companies.settings })
+    .from(companies)
+    .where(eq(companies.id, companyId));
+  const n = c?.settings?.transferAgeWarnDays;
+  return typeof n === "number" && n > 0 ? n : DEFAULT_TRANSFER_AGE_WARN_DAYS;
+}
+
+/** Blank location and transfer age for each view (pick and press lines, scan results). */
+async function floorExtras(
+  tx: Tx,
+  ctx: TenantContext,
+  views: ItemView[],
+  now = new Date(),
+): Promise<(v: ItemView) => QueueExtras> {
+  const blankIds = views.flatMap((v) => (v.blank ? [v.blank.variantId] : []));
+  const locations = blankIds.length
+    ? await getBlankLocations(tx, ctx, blankIds)
+    : new Map<string, BlankLocation>();
+  const warnDays = await transferAgeWarnDays(tx, ctx.companyId);
+  return (v) => {
+    const loc = v.blank ? locations.get(v.blank.variantId) : undefined;
+    return {
+      shelf: loc?.shelf ?? null,
+      blankBinCode: loc?.binCode ?? null,
+      age: transferAge(v.item.transferId ? v.sheetPrintedAt : null, warnDays, now),
+    };
+  };
+}
+
 export async function stationQueue(
   tx: Tx,
   ctx: TenantContext,
@@ -199,6 +245,7 @@ export async function stationQueue(
     tx,
     page.map((v) => v.item.orderId),
   );
+  const extrasOf = await floorExtras(tx, ctx, page);
   const since = await startOfToday(tx, ctx.companyId);
   const [done] = await tx
     .select({ n: sql<number>`count(distinct ${scans.orderItemId})`.mapWith(Number) })
@@ -208,7 +255,11 @@ export async function stationQueue(
     station: input.station,
     items: page.map((v) => {
       const o = open.get(v.item.orderId);
-      return toQueueItem(v, (input.station === "pack" ? o?.unshipped : o?.beforePacked) ?? 0);
+      return toQueueItem(
+        v,
+        (input.station === "pack" ? o?.unshipped : o?.beforePacked) ?? 0,
+        extrasOf(v),
+      );
     }),
     nextCursor: nextOffsetCursor(offset, page.length, views.length),
     counts: { waiting: views.length, doneToday: done?.n ?? 0 },
@@ -295,6 +346,11 @@ async function resolveSecond(
   return { kind: "blank", blank: blank ? blankRef(blank) : null };
 }
 
+async function stationExists(tx: Tx, id: string): Promise<boolean> {
+  const [row] = await tx.select({ id: stations.id }).from(stations).where(eq(stations.id, id));
+  return !!row;
+}
+
 /** Null: the station has no transfer-scan step (receiving uses its own procedures). */
 const DEFAULT_ACTION: Record<Station, ScanAction | null> = {
   pick: "pick",
@@ -318,6 +374,7 @@ function buildResult(
   second: SecondCode,
   outcome: MatchOutcome,
   after: { state: ItemView["item"]["state"] | null; openUnits: number | null },
+  extras?: QueueExtras,
 ): ScanResult {
   const v = r.view;
   return {
@@ -337,6 +394,7 @@ function buildResult(
           style: v.blank.style,
           color: v.blank.color,
           size: v.blank.size,
+          ...(extras ? { shelf: extras.shelf, binCode: extras.blankBinCode } : {}),
         }
       : null,
     scannedBlank:
@@ -355,6 +413,27 @@ function buildResult(
     itemState: after.state,
     nextAction: outcome.nextAction,
     orderOpenUnits: after.openUnits,
+    ...(extras
+      ? {
+          transferAgeDays: extras.age.transferAgeDays,
+          transferAgeWarning: extras.age.transferAgeWarning,
+        }
+      : {}),
+  };
+}
+
+/**
+ * The station is under maintenance (B-35): every transfer scan there is blocked with
+ * `station_maintenance` and nothing moves. `nextAction` is what the unit still needs
+ * (`press` for a transfer waiting at a press), to be done at an open station.
+ */
+function maintenanceBlock(v: ItemView | null): MatchOutcome {
+  return {
+    ok: false,
+    mismatch: "station_maintenance",
+    message: "This station is under maintenance. Use another station.",
+    nextAction: v ? nextActionFor(v.item.state) : "press",
+    moveTo: null,
   };
 }
 
@@ -382,35 +461,41 @@ export async function scan(tx: Tx, ctx: TenantContext, input: ScanInput): Promis
       openUnits: null,
     });
   const stationId = input.stationId ?? ctx.station?.id ?? null;
+  // A station id from the tablet is checked under the tenant (S-26): FK checks ignore RLS.
+  if (input.stationId && !(await stationExists(tx, input.stationId)))
+    throw notFound("station", input.stationId);
   const resolved = await resolveTransfer(tx, input.transferCode);
   // A concurrent replay may have committed while we waited for the row lock.
   const raced = await storedResult(tx, input.clientScanId);
   if (raced) return raced;
   const v = resolved.view;
   const second = await resolveSecond(tx, input.blankCode, v?.item.id ?? null);
-  const outcome = matchScan({
-    action,
-    scannedAt: new Date(input.scannedAt),
-    transfer: resolved.transfer
-      ? {
-          id: resolved.transfer.id,
-          scrapped: resolved.transfer.scrapped,
-          status: resolved.transfer.status,
-        }
-      : null,
-    item: v
-      ? {
-          id: v.item.id,
-          orderId: v.item.orderId,
-          state: v.item.state,
-          transferId: v.item.transferId,
-          designId: v.item.designId,
-          stateChangedAt: v.item.stateChangedAt,
-        }
-      : null,
-    expected: v?.blank ?? null,
-    second,
-  });
+  const closed = stationId ? await openMaintenance(tx, stationId) : null;
+  const outcome = closed
+    ? maintenanceBlock(v)
+    : matchScan({
+        action,
+        scannedAt: new Date(input.scannedAt),
+        transfer: resolved.transfer
+          ? {
+              id: resolved.transfer.id,
+              scrapped: resolved.transfer.scrapped,
+              status: resolved.transfer.status,
+            }
+          : null,
+        item: v
+          ? {
+              id: v.item.id,
+              orderId: v.item.orderId,
+              state: v.item.state,
+              transferId: v.item.transferId,
+              designId: v.item.designId,
+              stateChangedAt: v.item.stateChangedAt,
+            }
+          : null,
+        expected: v?.blank ?? null,
+        second,
+      });
 
   let state = v?.item.state ?? null;
   if (outcome.ok && v && resolved.transfer) {
@@ -441,7 +526,8 @@ export async function scan(tx: Tx, ctx: TenantContext, input: ScanInput): Promis
   const openUnits = v
     ? ((await openUnitsByOrder(tx, [v.item.orderId])).get(v.item.orderId)?.beforePacked ?? 0)
     : null;
-  const result = buildResult(input, resolved, second, outcome, { state, openUnits });
+  const extras = v ? (await floorExtras(tx, ctx, [v]))(v) : undefined;
+  const result = buildResult(input, resolved, second, outcome, { state, openUnits }, extras);
 
   const [row] = await tx
     .insert(scans)

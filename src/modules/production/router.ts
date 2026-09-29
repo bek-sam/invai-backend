@@ -1,5 +1,4 @@
-import { contract } from "@invai/contracts";
-import { authed, stubRouter } from "../../api/orpc";
+import { authed } from "../../api/orpc";
 import { withTenant } from "../../db/client";
 import { sendSheetToVendor } from "../vendors/service";
 import * as svc from "./service";
@@ -94,11 +93,18 @@ export const productionRouter = authed.production.router({
       withTenant(tenant.companyId, (tx) => svc.releaseBin(tx, tenant, input)),
     ),
   },
-  // T-22-1 day-1 stubs (NOT_IMPLEMENTED): T-22-4 (backend-engineer, production) fills them.
-  maintenance: stubRouter(authed.production.maintenance, contract.production.maintenance, [
-    "production",
-    "maintenance",
-  ]),
+  // Station maintenance windows (B-35, T-22-4): a closed station blocks its scans.
+  maintenance: {
+    start: authed.production.maintenance.start.handler(({ input, context: { tenant } }) =>
+      withTenant(tenant.companyId, (tx) => svc.startMaintenance(tx, tenant, input)),
+    ),
+    end: authed.production.maintenance.end.handler(({ input, context: { tenant } }) =>
+      withTenant(tenant.companyId, (tx) => svc.endMaintenance(tx, tenant, input)),
+    ),
+    list: authed.production.maintenance.list.handler(({ input, context: { tenant } }) =>
+      withTenant(tenant.companyId, (tx) => svc.listMaintenance(tx, tenant, input)),
+    ),
+  },
   queue: authed.production.queue.handler(({ input, context: { tenant } }) =>
     withTenant(tenant.companyId, (tx) => svc.stationQueue(tx, tenant, input)),
   ),

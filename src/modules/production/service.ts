@@ -23,6 +23,12 @@ export {
   toReprint,
 } from "./floor";
 export { createJobRow, getJobRow, type JobKind, toJob, updateJobRow } from "./job-rows";
+export {
+  endMaintenance,
+  listMaintenance,
+  openMaintenance,
+  startMaintenance,
+} from "./maintenance";
 export { compareBlank, matchScan, nextActionFor } from "./matcher";
 export {
   buildBatch,

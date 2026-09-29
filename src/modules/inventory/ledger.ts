@@ -385,3 +385,44 @@ export async function getShelvesForBlanks(
   for (const r of rows) if (r.shelf && !out.get(r.id)) out.set(r.id, r.shelf);
   return out;
 }
+
+export type BlankLocation = { shelf: string | null; binCode: string | null };
+
+/**
+ * Where each blank sits (pick list, B-32): the shelf label and, when the shop keeps it in a
+ * labelled bin, the bin code. The default location's row wins; otherwise the first location
+ * that has either set. Blanks with neither are absent from the map.
+ */
+export async function getBlankLocations(
+  tx: Tx,
+  ctx: Pick<TenantContext, "companyId">,
+  blankVariantIds: string[],
+): Promise<Map<string, BlankLocation>> {
+  const out = new Map<string, BlankLocation>();
+  const ids = [...new Set(blankVariantIds)];
+  if (!ids.length) return out;
+  const rows = await tx
+    .select({
+      id: stockLevels.blankVariantId,
+      locationId: stockLevels.locationId,
+      shelf: stockLevels.shelf,
+      binCode: stockLevels.binCode,
+    })
+    .from(stockLevels)
+    .where(
+      and(
+        eq(stockLevels.companyId, ctx.companyId),
+        inArray(stockLevels.blankVariantId, ids),
+        sql`(${stockLevels.shelf} is not null or ${stockLevels.binCode} is not null)`,
+      ),
+    )
+    .orderBy(stockLevels.locationId);
+  if (!rows.length) return out;
+  const defaultLoc = await tenancyDefaultLocationId(tx).catch(() => null);
+  for (const r of rows) {
+    const cur = out.get(r.id);
+    if (!cur || r.locationId === defaultLoc)
+      out.set(r.id, { shelf: r.shelf ?? null, binCode: r.binCode ?? null });
+  }
+  return out;
+}

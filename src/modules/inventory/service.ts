@@ -61,7 +61,9 @@ import { daysOfCover, effectiveReorderPoint, planReorder } from "./reorder";
  * ready/cancel, production consumes on press and reads shelves for the pick queue.
  */
 export {
+  type BlankLocation,
   consumeForItem,
+  getBlankLocations,
   getShelvesForBlanks,
   releaseForItems,
   reserveForItems,
@@ -443,12 +445,19 @@ export async function setReorderPoint(
   return getStock(tx, ctx, { blankVariantId: input.blankVariantId, locationId });
 }
 
-/** Set the shelf label for blanks (receiving screen / seed). */
+/** Set the shelf label (and optionally the bin code) for a blank (receiving screen / seed). */
 export async function setShelf(
   tx: Tx,
   ctx: Pick<Ctx, "companyId">,
-  input: { blankVariantId: string; locationId: string; shelf: string | null },
+  input: {
+    blankVariantId: string;
+    locationId: string;
+    shelf: string | null;
+    /** The blank's bin (B-32); omitted keeps the stored one. */
+    binCode?: string | null;
+  },
 ) {
+  const bin = input.binCode === undefined ? {} : { binCode: input.binCode };
   await tx
     .insert(stockLevels)
     .values({
@@ -456,10 +465,11 @@ export async function setShelf(
       blankVariantId: input.blankVariantId,
       locationId: input.locationId,
       shelf: input.shelf,
+      ...bin,
     })
     .onConflictDoUpdate({
       target: [stockLevels.companyId, stockLevels.blankVariantId, stockLevels.locationId],
-      set: { shelf: input.shelf },
+      set: { shelf: input.shelf, ...bin },
     });
 }
 

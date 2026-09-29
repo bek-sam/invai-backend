@@ -33,7 +33,40 @@ export type ItemView = {
   blank: BlankRef | null;
   binCode: string | null;
   sheetName: string | null;
+  /** The transfer's sheet printed time, else its received time (transfer age, B-35). */
+  sheetPrintedAt: Date | null;
 };
+
+/** Extras the floor adds to a queue line: the blank's location (B-32) and transfer age (B-35). */
+export type QueueExtras = {
+  shelf: string | null;
+  blankBinCode: string | null;
+  age: TransferAge;
+};
+
+export type TransferAge = {
+  transferPrintedAt: string | null;
+  transferAgeDays: number | null;
+  transferAgeWarning: boolean;
+};
+
+export const DEFAULT_TRANSFER_AGE_WARN_DAYS = 30;
+const DAY_MS = 86_400_000;
+
+/**
+ * Whole days since the transfer's sheet was printed (or received). The warning is set when
+ * the age is past `warnDays` (DTF transfers lose adhesion as they age); it never blocks.
+ */
+export function transferAge(printedAt: Date | null, warnDays: number, now: Date): TransferAge {
+  if (!printedAt)
+    return { transferPrintedAt: null, transferAgeDays: null, transferAgeWarning: false };
+  const days = Math.max(0, Math.floor((now.getTime() - printedAt.getTime()) / DAY_MS));
+  return {
+    transferPrintedAt: printedAt.toISOString(),
+    transferAgeDays: days,
+    transferAgeWarning: days > warnDays,
+  };
+}
 
 const binOfOrder = sql<
   string | null
@@ -65,6 +98,9 @@ async function selectViews(tx: Tx, where: ReturnType<typeof inArray>) {
       blank: blankVariants,
       binCode: binOfOrder,
       sheetName: gangSheets.name,
+      sheetPrintedAt: sql<
+        string | Date | null
+      >`coalesce(${gangSheets.printedAt}, ${gangSheets.receivedAt})`,
     })
     .from(orderItems)
     .innerJoin(orders, eq(orders.id, orderItems.orderId))
@@ -88,6 +124,7 @@ async function selectViews(tx: Tx, where: ReturnType<typeof inArray>) {
       blank: r.blank ? blankRef(r.blank) : null,
       binCode: r.binCode,
       sheetName: r.sheetName ?? null,
+      sheetPrintedAt: r.sheetPrintedAt ? new Date(r.sheetPrintedAt) : null,
     }),
   );
 }
@@ -149,7 +186,7 @@ const emptyBlank = (id: string | null) => ({
   size: "",
 });
 
-export function toQueueItem(v: ItemView, orderOpenUnits: number): QueueItem {
+export function toQueueItem(v: ItemView, orderOpenUnits: number, extras?: QueueExtras): QueueItem {
   const i = v.item;
   return {
     orderItemId: i.id,
@@ -170,6 +207,7 @@ export function toQueueItem(v: ItemView, orderOpenUnits: number): QueueItem {
           style: v.blank.style,
           color: v.blank.color,
           size: v.blank.size,
+          ...(extras ? { shelf: extras.shelf, binCode: extras.blankBinCode } : {}),
         }
       : emptyBlank(i.blankVariantId),
     artworkPreviewKey: i.artworkPreviewKey,
@@ -178,6 +216,7 @@ export function toQueueItem(v: ItemView, orderOpenUnits: number): QueueItem {
     sheetName: v.sheetName,
     binCode: v.binCode,
     orderOpenUnits,
+    ...(extras?.age ?? {}),
   };
 }
 
