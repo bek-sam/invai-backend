@@ -28,7 +28,23 @@ export type Mail = {
   messageId?: string;
   /** Extra headers, e.g. RFC 8058 `List-Unsubscribe` / `List-Unsubscribe-Post` (T-19-4). */
   headers?: Record<string, string>;
+  /**
+   * Stable name of the mail's template for logs (`"vendor.sheet"`, `"digest.weekly"`). Subjects
+   * can carry a shop name or weekly profit, so the log gets this key and a hash, never the text.
+   */
+  template?: string;
 };
+
+/**
+ * What the log may say about a subject (B-139): the template key when the caller gives one, and
+ * a short hash so repeated sends of the same subject can still be matched in a support ticket.
+ */
+export function subjectLogFields(mail: Pick<Mail, "subject" | "template">) {
+  return {
+    template: mail.template ?? null,
+    subjectHash: sha256Hex(mail.subject).slice(0, 16),
+  };
+}
 
 /** `sendMail` answers these `messageId`s instead of sending; `mailSkipReason` reads them back. */
 export const MAIL_SKIPPED = {
@@ -64,16 +80,17 @@ export type MailSender = CompanyScope | "account";
 
 export async function sendMail(mail: Mail, sender: MailSender): Promise<{ messageId: string }> {
   if (sender !== "account" && (await isSampleWorkspace(sender.companyId))) {
-    log.info("mail skipped: sample workspace", { subject: mail.subject });
+    log.info("mail skipped: sample workspace", subjectLogFields(mail));
     return { messageId: MAIL_SKIPPED.sample_workspace };
   }
   if (isPlaceholderEmail(mail.to)) {
-    log.info("mail skipped: PIN-only placeholder address", { subject: mail.subject });
+    log.info("mail skipped: PIN-only placeholder address", subjectLogFields(mail));
     return { messageId: MAIL_SKIPPED.pin_only };
   }
-  const info = await transport.sendMail({ from: MAIL_FROM, ...mail });
+  const { template: _template, ...message } = mail;
+  const info = await transport.sendMail({ from: MAIL_FROM, ...message });
   if (!env.SMTP_URL) {
-    log.warn("mail NOT sent: SMTP_URL is not set (ALLOW_MOCKS)", { subject: mail.subject });
+    log.warn("mail NOT sent: SMTP_URL is not set (ALLOW_MOCKS)", subjectLogFields(mail));
     return { messageId: info.messageId };
   }
   // S-36: never log the address itself. `toHash` still lets a support ticket be correlated to a
@@ -81,7 +98,7 @@ export async function sendMail(mail: Mail, sender: MailSender): Promise<{ messag
   log.info("mail sent", {
     companyId: sender === "account" ? undefined : sender.companyId,
     toHash: sha256Hex(mail.to.trim().toLowerCase()).slice(0, 16),
-    subject: mail.subject,
+    ...subjectLogFields(mail),
     messageId: info.messageId,
   });
   return { messageId: info.messageId };
