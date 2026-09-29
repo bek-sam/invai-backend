@@ -124,6 +124,56 @@ describe("import races (B-99)", () => {
     expect(await money(id2)).toHaveLength(3);
     expect(await unitPrices(id2)).toHaveLength(5);
   });
+
+  it("a second import on the same connection waits for the first (lock): a quantity edit adds one unit", async () => {
+    const { companyId: id3, ctx: ctx3 } = await shop("Race shop 3");
+    const conn = await createConnection(id3, "amazon");
+    await withTenant(id3, (tx) =>
+      importNormalizedOrders(tx, ctx3, conn, orderReport(), { source: "csv" }),
+    );
+    const edited = orderReport().map((o) =>
+      o.channelOrderId === "114-3310000-0000101"
+        ? { ...o, items: o.items.map((i) => ({ ...i, quantity: i.quantity + 1 })) }
+        : o,
+    );
+    const unitsOf101 = () =>
+      withTenant(id3, (tx) =>
+        tx
+          .select({ id: orderItems.id })
+          .from(orderItems)
+          .innerJoin(orders, eq(orders.id, orderItems.orderId))
+          .where(eq(orders.channelOrderId, "114-3310000-0000101")),
+      );
+    const before = (await unitsOf101()).length;
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    let firstDone: () => void = () => {};
+    const firstApplied = new Promise<void>((r) => {
+      firstDone = r;
+    });
+    // Tx 1 applies the edit (adds the unit) and holds its transaction open.
+    const first = withTenant(id3, async (tx) => {
+      const res = await importNormalizedOrders(tx, ctx3, conn, edited, { source: "csv" });
+      firstDone();
+      await gate;
+      return res;
+    });
+    await firstApplied;
+    // Tx 2, same connection: without the lock it reads the old quantity and adds the unit again.
+    const second = withTenant(id3, (tx) =>
+      importNormalizedOrders(tx, ctx3, conn, edited, { source: "csv" }),
+    );
+    await new Promise((r) => setTimeout(r, 200));
+    release();
+    const [r1, r2] = await Promise.all([first, second]);
+    expect(r1.errors).toEqual([]);
+    expect(r2.errors).toEqual([]);
+    expect(r1.updated).toBe(1);
+    expect(r2.updated).toBe(0);
+    expect(await unitsOf101()).toHaveLength(before + 1);
+  });
 });
 
 describe("Amazon Unshipped after Order Report keeps the money (B-197)", () => {

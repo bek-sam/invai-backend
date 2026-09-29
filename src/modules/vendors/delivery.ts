@@ -2,12 +2,13 @@ import { and, desc, eq, lt } from "drizzle-orm";
 import type { TenantContext } from "../../api/context";
 import { type Tx, withTenant } from "../../db/client";
 import { companies, gangSheets, vendorConnections, vendorSheetDeliveries } from "../../db/schema";
-import { vendorAdapter } from "../../integrations/vendors";
+import { type SheetDelivery, vendorAdapter } from "../../integrations/vendors";
 import { audit } from "../../lib/audit";
 import { badRequest, ORPCError } from "../../lib/errors";
 import { logger } from "../../lib/log";
 import { emit } from "../../lib/outbox";
 import { lockSheet, sheetDownloadUrls } from "../production/service";
+import { raiseAlert } from "../today/service";
 
 const log = logger("vendors.delivery");
 
@@ -16,13 +17,15 @@ const log = logger("vendors.delivery");
  * `vendor_sheet_deliveries` row (`pending`) and an outbox event; a job delivers it after the
  * commit, so a rolled-back send never emails and a slow SMTP server never holds the sheet lock.
  * Exactly-once in effect, per row:
- *   Tx 1  lock the row; `pending` -> `sending` (claim time, attempt count); commit.
+ *   Tx 1  lock the rows, pick the newest `pending` one, build the signed links (no tx), then
+ *         lock again and `pending` -> `sending` (claim time, attempt count) right before the send.
  *   send  no transaction open, raced against SEND_TIMEOUT_MS.
  *   Tx 2  `sending` -> `sent` with the message id.
  * A retry that finds `sending` older than STALE_CLAIM_MS (the attempt died between claim and
  * Tx 2: worker killed, timeout) marks it `unknown` and does not send again: SMTP has no
  * read-back, and a second copy is worse than a missing one the office can resend. An SMTP error
- * is a refusal (nothing was accepted), so it goes back to `pending` and the job retries.
+ * is a refusal (nothing was accepted), so it goes back to `pending` and the job retries. A row
+ * that ends `unknown` or `failed` raises one office alert (per row) to resend by hand.
  */
 
 /** A resend is refused inside this window after the last send or resend of the same sheet. */
@@ -162,7 +165,7 @@ export type DeliverOutcome =
 
 const noneLeft: DeliverOutcome = { status: "skipped", reason: "nothing_pending" };
 
-type Claimed = {
+type Picked = {
   row: DeliveryRow;
   sheet: typeof gangSheets.$inferSelect;
   conn: typeof vendorConnections.$inferSelect;
@@ -177,10 +180,90 @@ function errorCode(err: unknown): { code: string; permanent: boolean } {
   return { code: status ? `${code} ${status}` : code, permanent: status !== null && status >= 500 };
 }
 
+/*
+ * The office must hear about an email that didn't (or may not have) gone out: the sheet already
+ * says "sent". One open alert per delivery row (dedupe key), raised in the transaction that
+ * ends the row. No dedicated alert kind exists yet, and `sheet_stuck` is resolved by the
+ * 5-minute sweep whenever the sheet isn't 24 h late, so this uses the non-swept
+ * `tracking_push_failed`, as shipping's stuck-intent alerts do. Spanish rides in `data` until
+ * alerts carry both languages.
+ */
+async function alertLostDelivery(
+  tx: Tx,
+  companyId: string,
+  d: { id: string; sheetId: string; outcome: "unknown" | "failed"; reason: string },
+) {
+  const [info] = await tx
+    .select({ sheet: gangSheets.name, vendor: vendorConnections.name })
+    .from(vendorSheetDeliveries)
+    .innerJoin(gangSheets, eq(gangSheets.id, vendorSheetDeliveries.gangSheetId))
+    .innerJoin(
+      vendorConnections,
+      eq(vendorConnections.id, vendorSheetDeliveries.vendorConnectionId),
+    )
+    .where(eq(vendorSheetDeliveries.id, d.id))
+    .limit(1);
+  const sheet = info?.sheet ?? "";
+  const vendor = info?.vendor ?? "the vendor";
+  const copy =
+    d.outcome === "unknown"
+      ? {
+          title: `Sheet ${sheet}: the email to ${vendor} may not have gone out`,
+          message: "We couldn't confirm the email was sent. Open the sheet and resend the email.",
+          titleEs: `Hoja ${sheet}: puede que el correo a ${vendor} no se haya enviado`,
+          messageEs: "No pudimos confirmar el envío. Abre la hoja y reenvía el correo.",
+        }
+      : {
+          title: `Sheet ${sheet}: the email to ${vendor} didn't go out`,
+          message: "Check the vendor's email address, then open the sheet and resend the email.",
+          titleEs: `Hoja ${sheet}: el correo a ${vendor} no se envió`,
+          messageEs: "Revisa el correo del proveedor, luego abre la hoja y reenvía el correo.",
+        };
+  await raiseAlert(tx, companyId, {
+    kind: "tracking_push_failed",
+    severity: "warning",
+    title: copy.title,
+    message: copy.message,
+    entityType: "gang_sheet",
+    entityId: d.sheetId,
+    dedupeKey: `vendor-sheet-delivery-${d.id}`,
+    data: {
+      intent: "vendor_sheet_email",
+      deliveryId: d.id,
+      outcome: d.outcome,
+      reason: d.reason,
+      titleEs: copy.titleEs,
+      messageEs: copy.messageEs,
+    },
+  });
+}
+
+/** `sending` -> `unknown`/`failed`/`pending` (only if still `sending`), alerting on a lost one. */
+async function endAttempt(
+  companyId: string,
+  sheetId: string,
+  deliveryId: string,
+  to: "unknown" | "failed" | "pending",
+  reason: string,
+  from: "sending" | "pending" = "sending",
+) {
+  await withTenant(companyId, async (tx) => {
+    const [ended] = await tx
+      .update(vendorSheetDeliveries)
+      .set({ status: to, lastError: reason, ...(to === "unknown" ? {} : { claimedAt: null }) })
+      .where(and(eq(vendorSheetDeliveries.id, deliveryId), eq(vendorSheetDeliveries.status, from)))
+      .returning({ id: vendorSheetDeliveries.id });
+    if (ended && to !== "pending")
+      await alertLostDelivery(tx, companyId, { id: deliveryId, sheetId, outcome: to, reason });
+  });
+}
+
 /**
  * Deliver the newest pending delivery of a sheet (the job handler's body). Older pending rows
  * of the same sheet are superseded, so one run sends at most one message. `attempt`/`attempts`
- * come from BullMQ; the last failed attempt leaves the row `failed`.
+ * come from BullMQ; the last failed attempt leaves the row `failed`. The row is claimed only
+ * after the links are built, right before the SMTP call, so a worker that dies earlier leaves it
+ * `pending` and the retry sends the one email.
  */
 export async function deliverPendingSheet(
   companyId: string,
@@ -188,7 +271,7 @@ export async function deliverPendingSheet(
   run: { lastAttempt: boolean; now?: () => Date } = { lastAttempt: true },
 ): Promise<DeliverOutcome> {
   const now = run.now ?? (() => new Date());
-  const claimed = await withTenant(companyId, async (tx): Promise<Claimed | DeliverOutcome> => {
+  const picked = await withTenant(companyId, async (tx): Promise<Picked | DeliverOutcome> => {
     const rows = await tx
       .select()
       .from(vendorSheetDeliveries)
@@ -200,10 +283,17 @@ export async function deliverPendingSheet(
     if (sending) {
       if (at.getTime() - (sending.claimedAt?.getTime() ?? 0) < STALE_CLAIM_MS)
         return { status: "skipped", reason: "in_flight" };
+      const reason = "attempt ended without a result";
       await tx
         .update(vendorSheetDeliveries)
-        .set({ status: "unknown", lastError: "attempt ended without a result" })
+        .set({ status: "unknown", lastError: reason })
         .where(eq(vendorSheetDeliveries.id, sending.id));
+      await alertLostDelivery(tx, companyId, {
+        id: sending.id,
+        sheetId,
+        outcome: "unknown",
+        reason,
+      });
       log.warn("sheet delivery outcome unknown, not resending", {
         companyId,
         sheetId,
@@ -241,23 +331,46 @@ export async function deliverPendingSheet(
       .select({ name: companies.name })
       .from(companies)
       .where(eq(companies.id, companyId));
+    return { row, sheet, conn, shopName: shop?.name ?? "InvAI shop" };
+  });
+  if ("status" in picked) return picked;
+
+  const { sheet, conn, shopName } = picked;
+  const portal = picked.row.delivery === "portal";
+  let links: SheetDelivery["links"];
+  try {
+    links = portal
+      ? { png: null, pdf: null, preview: null, expiresAt: now().toISOString() }
+      : await sheetDownloadUrls(sheet, EMAIL_LINK_TTL);
+  } catch (err) {
+    // Nothing was claimed or sent: the row stays `pending` for the retry, `failed` on the last.
+    if (run.lastAttempt)
+      await endAttempt(companyId, sheetId, picked.row.id, "failed", "LINKS_FAILED", "pending");
+    throw err;
+  }
+
+  // Claim right before the send: still the newest `pending` row, and nobody else is sending.
+  const row = await withTenant(companyId, async (tx) => {
+    const rows = await tx
+      .select()
+      .from(vendorSheetDeliveries)
+      .where(eq(vendorSheetDeliveries.gangSheetId, sheetId))
+      .orderBy(desc(vendorSheetDeliveries.seq))
+      .for("update");
+    const mine = rows.find((r) => r.id === picked.row.id);
+    if (mine?.status !== "pending" || rows.some((r) => r.status === "sending")) return null;
     const [claim] = await tx
       .update(vendorSheetDeliveries)
-      .set({ status: "sending", claimedAt: at, attempts: row.attempts + 1 })
-      .where(eq(vendorSheetDeliveries.id, row.id))
+      .set({ status: "sending", claimedAt: now(), attempts: mine.attempts + 1 })
+      .where(eq(vendorSheetDeliveries.id, mine.id))
       .returning();
-    return { row: claim ?? row, sheet, conn, shopName: shop?.name ?? "InvAI shop" };
+    return claim ?? null;
   });
-  if ("status" in claimed) return claimed;
+  if (!row) return { status: "skipped", reason: "in_flight" };
 
-  const { row, sheet, conn, shopName } = claimed;
-  const portal = row.delivery === "portal";
   let timer: ReturnType<typeof setTimeout> | undefined;
   let result: { reference: string | null } | "timeout";
   try {
-    const links = portal
-      ? { png: null, pdf: null, preview: null, expiresAt: now().toISOString() }
-      : await sheetDownloadUrls(sheet, EMAIL_LINK_TTL);
     result = await Promise.race([
       vendorAdapter(row.delivery).deliver({
         companyId,
@@ -279,14 +392,7 @@ export async function deliverPendingSheet(
   } catch (err) {
     const { code, permanent } = errorCode(err);
     const failed = permanent || run.lastAttempt;
-    await withTenant(companyId, (tx) =>
-      tx
-        .update(vendorSheetDeliveries)
-        .set({ status: failed ? "failed" : "pending", lastError: code, claimedAt: null })
-        .where(
-          and(eq(vendorSheetDeliveries.id, row.id), eq(vendorSheetDeliveries.status, "sending")),
-        ),
-    );
+    await endAttempt(companyId, sheetId, row.id, failed ? "failed" : "pending", code);
     log.warn("sheet delivery failed", { companyId, sheetId, deliveryId: row.id, code, failed });
     throw Object.assign(new Error(`sheet delivery failed: ${code}`), { permanent });
   } finally {
@@ -294,14 +400,7 @@ export async function deliverPendingSheet(
   }
 
   if (result === "timeout") {
-    await withTenant(companyId, (tx) =>
-      tx
-        .update(vendorSheetDeliveries)
-        .set({ status: "unknown", lastError: "timed out" })
-        .where(
-          and(eq(vendorSheetDeliveries.id, row.id), eq(vendorSheetDeliveries.status, "sending")),
-        ),
-    );
+    await endAttempt(companyId, sheetId, row.id, "unknown", "timed out");
     log.warn("sheet delivery timed out, not resending", { companyId, sheetId, deliveryId: row.id });
     return { status: "unknown", deliveryId: row.id };
   }

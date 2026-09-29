@@ -6,6 +6,7 @@ import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { anonymousContext, type Context, permissionsFor } from "../../api/context";
 import { withSystem, withTenant } from "../../db/client";
 import {
+  alerts,
   gangSheetBatches,
   gangSheets,
   outboxEvents,
@@ -37,6 +38,24 @@ vi.mock("../../integrations/vendors/mailer", async (orig) => ({
     return { messageId: `<${mail.sent.length}@test>` };
   }),
 }));
+
+// A worker that dies while the links are built: the promise never settles (a test double for
+// production's unit, not ours).
+const links = vi.hoisted(() => ({ hang: false, reached: null as null | (() => void) }));
+vi.mock("../production/service", async (orig) => {
+  const real = await orig<typeof import("../production/service")>();
+  return {
+    ...real,
+    sheetDownloadUrls: vi.fn((...args: Parameters<typeof real.sheetDownloadUrls>) => {
+      if (links.hang) {
+        links.hang = false;
+        links.reached?.();
+        return new Promise<never>(() => {});
+      }
+      return real.sheetDownloadUrls(...args);
+    }),
+  };
+});
 
 const svc = await import("./service");
 const { deliverSheetJob } = await import("./jobs");
@@ -92,6 +111,9 @@ const deliveries = (sheetId: string) =>
       .orderBy(vendorSheetDeliveries.seq),
   );
 
+const alertsFor = (sheetId: string) =>
+  withSystem((tx) => tx.select().from(alerts).where(eq(alerts.entityId, sheetId)));
+
 const send = (sheetId: string, vendorConnectionId = emailConnId) =>
   withTenant(shopId, (tx) =>
     svc.sendSheetToVendor(tx, ownerCtx, { id: sheetId, vendorConnectionId }),
@@ -140,6 +162,8 @@ beforeAll(async () => {
 beforeEach(() => {
   mail.sent.length = 0;
   mail.failNext = null;
+  links.hang = false;
+  links.reached = null;
 });
 
 describe("sheet email after commit (B-102)", () => {
@@ -204,6 +228,53 @@ describe("sheet email after commit (B-102)", () => {
     expect(await deliver(sheetId)).toEqual({ status: "skipped", reason: "nothing_pending" });
     expect(mail.sent).toHaveLength(0);
     expect((await deliveries(sheetId))[0]?.status).toBe("unknown");
+
+    // The office hears about it: one open alert for this delivery, linking to the sheet.
+    const [alert, ...more] = await alertsFor(sheetId);
+    expect(more).toHaveLength(0);
+    expect(alert).toMatchObject({
+      status: "open",
+      entityType: "gang_sheet",
+      dedupeKey: `vendor-sheet-delivery-${row?.id}`,
+      data: expect.objectContaining({ outcome: "unknown", messageEs: expect.any(String) }),
+    });
+    expect(alert?.title).toContain("may not have gone out");
+    // Ending the same row again (a replayed stale claim) doesn't add a second alert.
+    await withSystem((tx) =>
+      tx
+        .update(vendorSheetDeliveries)
+        .set({ status: "sending", claimedAt: new Date(Date.now() - 5 * 60_000) })
+        .where(eq(vendorSheetDeliveries.id, row?.id as string)),
+    );
+    expect(await deliver(sheetId)).toMatchObject({ status: "unknown" });
+    expect(await alertsFor(sheetId)).toHaveLength(1);
+    // The resend stays limited: the unknown attempt may have reached the vendor.
+    await expect(
+      withTenant(shopId, (tx) => svc.resendSheetEmail(tx, ownerCtx, { sheetId })),
+    ).rejects.toMatchObject({ code: "RESEND_TOO_SOON", status: 429 });
+    expect(mail.sent).toHaveLength(0);
+  });
+
+  it("a worker killed before the send leaves the row pending; the retry sends exactly one", async () => {
+    const sheetId = await readySheet();
+    await send(sheetId);
+    const reached = new Promise<void>((resolve) => {
+      links.reached = resolve;
+    });
+    links.hang = true;
+    // The first attempt stops for good while building the links (worker killed): never awaited.
+    void deliver(sheetId);
+    await reached;
+    expect(await deliveries(sheetId)).toEqual([
+      expect.objectContaining({ status: "pending", attempts: 0, claimedAt: null }),
+    ]);
+    expect(await deliver(sheetId)).toMatchObject({ status: "sent" });
+    expect(await deliver(sheetId)).toEqual({ status: "skipped", reason: "nothing_pending" });
+    expect(mail.sent).toHaveLength(1);
+    expect(await deliveries(sheetId)).toEqual([
+      expect.objectContaining({ status: "sent", attempts: 1 }),
+    ]);
+    expect(await alertsFor(sheetId)).toHaveLength(0);
   });
 
   it("an SMTP refusal retries and sends once; a 5xx fails for good", async () => {
@@ -216,6 +287,7 @@ describe("sheet email after commit (B-102)", () => {
     expect((await deliveries(sheetId))[0]).toMatchObject({ status: "pending", attempts: 1 });
     expect(await deliver(sheetId, { attempt: 2, attempts: 5 })).toMatchObject({ status: "sent" });
     expect(mail.sent).toHaveLength(1);
+    expect(await alertsFor(sheetId)).toHaveLength(0); // a retried refusal isn't lost
 
     const bad = await readySheet();
     await send(bad);
@@ -226,10 +298,28 @@ describe("sheet email after commit (B-102)", () => {
     const [row] = await deliveries(bad);
     expect(row).toMatchObject({ status: "failed", lastError: "EENVELOPE 550" });
     expect(mail.sent).toHaveLength(1);
+    const failedAlerts = await alertsFor(bad);
+    expect(failedAlerts).toHaveLength(1);
+    expect(failedAlerts[0]).toMatchObject({
+      status: "open",
+      dedupeKey: `vendor-sheet-delivery-${row?.id}`,
+      data: expect.objectContaining({ outcome: "failed", reason: "EENVELOPE 550" }),
+    });
+    expect(failedAlerts[0]?.title).toContain("didn't go out");
     // Nothing went out, so a resend is allowed at once.
     await withTenant(shopId, (tx) => svc.resendSheetEmail(tx, ownerCtx, { sheetId: bad }));
     expect(await deliver(bad)).toMatchObject({ status: "sent" });
     expect(mail.sent).toHaveLength(2);
+    expect(await alertsFor(bad)).toHaveLength(1);
+
+    // A refusal on the last attempt also ends `failed`, with its own single alert.
+    const last = await readySheet();
+    await send(last);
+    mail.failNext = { code: "ECONNECTION" };
+    await expect(deliver(last, { attempt: 5, attempts: 5 })).rejects.toThrow("ECONNECTION");
+    expect((await deliveries(last))[0]).toMatchObject({ status: "failed" });
+    expect(await deliver(last)).toEqual({ status: "skipped", reason: "nothing_pending" });
+    expect(await alertsFor(last)).toHaveLength(1);
   });
 
   it("portal delivery also goes out from the job, once", async () => {
