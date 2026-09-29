@@ -184,7 +184,11 @@ async function main() {
     counts,
     seconds: Math.round((Date.now() - started) / 1000),
   };
-  writeFileSync("seed-output.json", `${JSON.stringify(output, null, 2)}\n`);
+  // SEED_OUTPUT_FILE lets a seed of a DB copy write elsewhere, so it never clobbers the shared file.
+  writeFileSync(
+    process.env.SEED_OUTPUT_FILE || "seed-output.json",
+    `${JSON.stringify(output, null, 2)}\n`,
+  );
   log.info("done", { ...counts, seconds: output.seconds });
   console.log(
     `\nLogins: owner@desertbloom.test / ${PASSWORD} (all shop roles use the same password)\n        vendor@suncitydtf.test / ${PASSWORD}\nPINs:   ${SHOP_USERS.map((u) => `${u.role}=${u.pin}`).join(" ")}\nPress 1 station token (also in seed-output.json):\n        ${stationToken}\n`,

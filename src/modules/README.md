@@ -89,6 +89,10 @@ onEvent("shipment.labeled", pushTracking, (e) => ({ companyId: e.companyId, ship
 - The outbox relay enqueues one job per subscription with `jobId = ${eventId}_${jobName}`; return
   `null` from the mapper to ignore an event. `job.enqueue(input)` works from anywhere, but prefer
   emitting an outbox event inside the transaction.
+- A bulk builder that commits in phases (the seed, `tenancy.demo`) parks each phase's events with
+  `holdOutbox(tx, companyId)` (`src/db/seed/outbox-hold.ts`) and releases them once at the end, so
+  a running worker's jobs never write derived rows (`usage`, `stock_levels`, profit lines) for a
+  half-built company (B-106). Only rows carrying the held marker are released.
 - User-visible progress: create a `jobs` row (contracts `Job`) and publish `job.progress` realtime events.
 - `runJobInline(job, input)` runs a handler in tests without Redis workers.
 

@@ -56,6 +56,7 @@ import {
   STREETS,
   TEMPLATES,
 } from "./data";
+import { holdOutbox, releaseOutbox } from "./outbox-hold";
 
 /*
  * The reusable shop-data builder behind `pnpm db:seed` (Desert Bloom Tees) and tenancy.demo (a
@@ -210,7 +211,15 @@ function ffdPack<T extends NestItemLike>(items: T[], spec: SheetSpec): SheetPlan
 }
 
 export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResult> {
-  const { companyId: shopId, random, run, profile, people, vendor } = opts;
+  const { companyId: shopId, random, profile, people, vendor } = opts;
+  // Each phase parks the outbox events it emitted before committing (see ./outbox-hold.ts), so a
+  // running worker can't act on a half-built company; the last step below releases them all.
+  const run: Runner = (fn) =>
+    opts.run(async (tx) => {
+      const out = await fn(tx);
+      await holdOutbox(tx, shopId);
+      return out;
+    });
   const ctx = systemContext(shopId);
   const ownerId = people.owner;
 
@@ -1611,6 +1620,9 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
       );
     }
   });
+
+  const released = await opts.run((tx) => releaseOutbox(tx, shopId));
+  log.info("outbox released", { events: released });
 
   return { locationId, stationToken, channels, sheets: sheetsCreated };
 }

@@ -44,7 +44,42 @@ export async function ensureDatabase(migrationDatabaseUrl: string, name: string)
   }
 }
 
+/**
+ * Remove every job the app's queues hold in the configured Redis DB (wave 19 gate issue 6: a
+ * worker started after a reset replayed jobs for rows that no longer existed). One
+ * `Queue.obliterate()` per name in QUEUE_NAMES, so only the `bull:<queue>:*` keys of our own
+ * queues go; rate-limit counters (`rl:*`), realtime streams (`rt:*`) and every other Redis DB are
+ * untouched. Never FLUSHDB or KEYS. `force` also drops a job a running worker is on: after a reset
+ * that row is gone anyway. Repeatable sweeps are re-registered when the worker restarts.
+ * Returns the number of jobs removed per queue.
+ */
+export async function obliterateQueues(): Promise<Record<string, number>> {
+  if (process.env.NODE_ENV === "production") throw new Error("db:reset is not for production");
+  const { QUEUE_NAMES, queues } = await import("../lib/queues");
+  const removed: Record<string, number> = {};
+  for (const name of QUEUE_NAMES) {
+    const queue = queues[name];
+    removed[name] = await queue.getJobCountByTypes(
+      "waiting",
+      "active",
+      "delayed",
+      "prioritized",
+      "waiting-children",
+      "completed",
+      "failed",
+    );
+    await queue.obliterate({ force: true });
+  }
+  return removed;
+}
+
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   const { env } = await import("../env");
   await resetDatabase(env.MIGRATION_DATABASE_URL);
+  const removed = await obliterateQueues();
+  console.log(
+    `[reset] queues obliterated in ${new URL(env.REDIS_URL).pathname || "/0"}: ${JSON.stringify(removed)} (restart the worker so its sweeps re-register)`,
+  );
+  const { closeQueues } = await import("../lib/queues");
+  await closeQueues();
 }

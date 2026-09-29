@@ -42,6 +42,15 @@ pnpm dev:api      # http://localhost:3000
 pnpm dev:worker
 ```
 
+`pnpm db:reset` drops the schema **and** obliterates the app's five BullMQ queues in the Redis DB
+of `REDIS_URL` (only `bull:<queue>:*`; rate-limit and realtime keys and other Redis DBs stay), so a
+worker started afterwards never replays jobs for rows that no longer exist. Restart a running
+worker after a reset so its repeatable sweeps re-register. The seed is safe with the worker
+running: each builder phase parks the outbox events it emitted and the last step releases them all
+(`src/db/seed/outbox-hold.ts`). Seeding a DB copy? Set `SEED_OUTPUT_FILE=<path>` so the copy's run
+doesn't overwrite the shared `seed-output.json`. `pnpm test` uses `REDIS_URL` as-is (only the database
+URLs switch to the test DB), so pin `REDIS_URL=redis://localhost:6379/<n>` when a worker runs on DB 0.
+
 No real API keys are needed: every integration (Claude, EasyPost, Shopify, S&S) falls back to a
 mock provider automatically when its env var is unset (`env.mocks.*` in `src/env.ts`). See
 `invai-docs/build/runbook.md` for the env var reference and the mock-to-real switches, and
