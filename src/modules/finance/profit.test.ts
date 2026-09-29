@@ -29,6 +29,20 @@ describe("profit math", () => {
     expect(orderFees(etsy, { revenueCents: 0, buyerTotalCents: 0, units: 0 }).total).toBe(0);
   });
 
+  it("charges TikTok Shop the verified 6% referral fee (B-164)", () => {
+    // Source: TikTok Shop US Seller University "Referral fees" (knowledge_id=5988482086864682,
+    // updated 2026-05-14, checked 2026-09-28): 6% for menswear, womenswear and kids' fashion.
+    const tiktok = defaultFeeTable("tiktok");
+    expect(tiktok.transactionPct).toBe(6);
+    const sale = { revenueCents: 3000, buyerTotalCents: 3240, units: 1 };
+    expect(orderFees(tiktok, sale).lines[0]).toEqual({ label: "Transaction 6%", amount: 180 });
+    expect(
+      orderFees(tiktok, { ...sale, unitSales: [{ cents: 3000, category: "apparel" }] }).lines[0],
+    ).toEqual({ label: "Referral 6%", amount: 180 });
+    // A shop that typed its own rate keeps it (flat, no schedule).
+    expect(orderFees({ ...tiktok, transactionPct: 8 }, sale).lines[0]?.amount).toBe(240);
+  });
+
   it("uses Amazon's referral fee only", () => {
     const fees = orderFees(defaultFeeTable("amazon"), {
       revenueCents: 2000,
