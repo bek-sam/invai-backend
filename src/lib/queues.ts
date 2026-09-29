@@ -28,6 +28,36 @@ export const QUEUE_CONCURRENCY: Record<QueueName, number> = {
   reports: 1,
 };
 
+export type StallSettings = {
+  /** ms a running job's lock lasts; renewed every lockDuration/2 while the handler runs. */
+  lockDuration: number;
+  /** ms between checks for jobs whose lock expired (a dead or frozen worker). */
+  stalledInterval: number;
+  /** Times a stalled job is put back to wait before it fails for good. */
+  maxStalledCount: number;
+};
+
+/**
+ * Stalled-job settings per queue (T-22-2, B-166), explicit instead of BullMQ's defaults
+ * (30 s / 30 s / 1). A job only stalls when its worker died or blocked its event loop for
+ * longer than `lockDuration`: the lock is renewed every `lockDuration / 2` while the handler
+ * runs, so a two-minute compose or a 60 s label buy never stalls on its own, whatever its p95.
+ * `lockDuration` therefore covers the longest *synchronous* stretch a handler can hold the
+ * event loop (CSV parsing of a big export, nesting bookkeeping) with room to spare, and
+ * `stalledInterval` sets how soon an orphaned job runs again: fast for the queues a person
+ * waits on, slower where a re-run is expensive. `maxStalledCount: 1` everywhere: a stalled job
+ * runs exactly once more; a second stall fails it into the failed set (`/internal/dlq`) instead
+ * of looping, because a job that freezes two workers in a row is a bug, not a blip. Every
+ * handler is idempotent at the DB level (`idempotent-job`), so the one re-run is safe.
+ */
+export const WORKER_STALL_SETTINGS: Record<QueueName, StallSettings> = {
+  sync: { lockDuration: 60_000, stalledInterval: 30_000, maxStalledCount: 1 },
+  render: { lockDuration: 120_000, stalledInterval: 60_000, maxStalledCount: 1 },
+  ship: { lockDuration: 60_000, stalledInterval: 30_000, maxStalledCount: 1 },
+  ai: { lockDuration: 90_000, stalledInterval: 30_000, maxStalledCount: 1 },
+  reports: { lockDuration: 300_000, stalledInterval: 60_000, maxStalledCount: 1 },
+};
+
 /**
  * Share of each retry delay that is randomized (BullMQ `jitter`): a delay of D lands anywhere in
  * [D * (1 - JITTER), D], so jobs that failed together (a provider blip) don't retry in lockstep.

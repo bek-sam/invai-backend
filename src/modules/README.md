@@ -26,6 +26,20 @@ modules/<name>/
    `emit(tx, companyId, "event.name", payload)` for anything a worker or another module reacts to.
    Realtime pushes go through `afterCommit(tx, () => publish(companyId, {...}))`.
 5. **Insert `companyId` explicitly** on every tenant row (RLS `WITH CHECK` rejects the wrong one).
+   **A reference from one tenant table to another is a composite FK** (T-22-2, S-26): the parent
+   has `tenantKey("<table>", t)` (a `(company_id, id)` unique key, `src/db/schema/_shared.ts`) and
+   the child declares
+   `foreignKey({ name: "<child>_<col>_fk", columns: [t.companyId, t.<col>], foreignColumns: [parent.companyId, parent.id] }).onDelete(...)`
+   instead of `.references(() => parent.id)`. FK checks ignore RLS, so a single-column FK would let
+   a row of shop B point at shop A's row from a job or the seed; `src/db/fk-coverage.test.ts`
+   fails on any single-column tenant-to-tenant FK. A nullable reference with `set null` needs
+   `ON DELETE SET NULL (<col>)` in the migration SQL (drizzle emits a plain `SET NULL`, which
+   would null `company_id`): edit the generated file before it is applied, as 0030 does.
+   References to `users` and `companies` stay single-column.
+   **Trigram indexes don't help `ilike '%q%'` under RLS:** `textlike`/`texticlike`/`similarity`
+   are not leakproof, and an RLS policy is a security barrier, so the planner never uses a
+   `gin_trgm_ops` index condition for `invai_app` (only `=`/`starts_with` are leakproof). Don't
+   add one expecting a plan change; search cost is a seq scan within the tenant's rows.
 6. **Errors:** throw the helpers in `src/lib/errors.ts` (`notFound`, `conflict`, `invalidTransition`,
    `upstream`, `planLimit`...). They map to the contract's `COMMON_ERRORS`.
 7. Money in cents, inches for sizes, ISO strings out (`row.createdAt.toISOString()`), UUIDs everywhere.

@@ -33,3 +33,43 @@ describe("org settings: printsInHouse", () => {
     expect(off.printsInHouse).toBe(false);
   });
 });
+
+/* Contracts 0.8.0 (T-22-2): shipsSaturday and transferAgeWarnDays are stored and returned. */
+describe("org settings: shipsSaturday and transferAgeWarnDays", () => {
+  it("are absent until set, round-trip through updateOrg and keep the other settings", async () => {
+    const company = await createCompany();
+    const owner = await createUser(company.id, "owner");
+    const ctx = tenantContext(company.id, owner.id, "owner");
+
+    const before = await withTenant(company.id, (tx) => updateOrg(tx, ctx, { name: "Fresh" }));
+    expect(before.shipsSaturday).toBeUndefined();
+    expect(before.transferAgeWarnDays).toBeUndefined();
+
+    const sat = await withTenant(company.id, (tx) =>
+      updateOrg(tx, ctx, { shipsSaturday: true, printsInHouse: true }),
+    );
+    expect(sat.shipsSaturday).toBe(true);
+    expect(sat.transferAgeWarnDays).toBeUndefined();
+
+    const days = await withTenant(company.id, (tx) =>
+      updateOrg(tx, ctx, { transferAgeWarnDays: 45 }),
+    );
+    expect(days).toMatchObject({
+      shipsSaturday: true,
+      transferAgeWarnDays: 45,
+      printsInHouse: true,
+    });
+    const [row] = await withSystem((tx) =>
+      tx.select().from(companies).where(eq(companies.id, company.id)),
+    );
+    expect(row?.settings).toMatchObject({
+      printsInHouse: true,
+      shipsSaturday: true,
+      transferAgeWarnDays: 45,
+    });
+
+    const off = await withTenant(company.id, (tx) => updateOrg(tx, ctx, { shipsSaturday: false }));
+    expect(off.shipsSaturday).toBe(false);
+    expect(off.transferAgeWarnDays).toBe(45);
+  });
+});

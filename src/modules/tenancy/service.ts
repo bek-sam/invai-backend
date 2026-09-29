@@ -51,6 +51,8 @@ function toOrg(row: typeof companies.$inferSelect): Org {
     demoOwned: row.demoOwnerUserId !== null,
     printsInHouse: row.settings?.printsInHouse === true,
     productionPartner: row.settings?.productionPartner ?? null,
+    shipsSaturday: row.settings?.shipsSaturday,
+    transferAgeWarnDays: row.settings?.transferAgeWarnDays,
     createdAt: row.createdAt.toISOString(),
   };
 }
@@ -125,12 +127,18 @@ export async function updateOrg(
     timezone?: string;
     printsInHouse?: boolean;
     productionPartner?: { name: string; etsyPartnerId: string | null } | null;
+    shipsSaturday?: boolean;
+    transferAgeWarnDays?: number;
   },
 ): Promise<Org> {
   const settingsPatch: Partial<CompanySettings> = {};
   if (input.printsInHouse !== undefined) settingsPatch.printsInHouse = input.printsInHouse;
   if (input.productionPartner !== undefined)
     settingsPatch.productionPartner = input.productionPartner;
+  // Contracts 0.8.0 (T-22-2): both live in the settings jsonb; absent means the default.
+  if (input.shipsSaturday !== undefined) settingsPatch.shipsSaturday = input.shipsSaturday;
+  if (input.transferAgeWarnDays !== undefined)
+    settingsPatch.transferAgeWarnDays = input.transferAgeWarnDays;
   const [row] = await db
     .update(companies)
     .set({

@@ -99,6 +99,10 @@ export type CompanySettings = {
   printsInHouse?: boolean;
   /** The outside shop that presses/ships for this org, if any (Etsy production-partner disclosure). */
   productionPartner?: { name: string; etsyPartnerId: string | null } | null;
+  /** B-162: Saturday counts as a ship day for ship-by math (contracts 0.8.0 `me.updateOrg`). */
+  shipsSaturday?: boolean;
+  /** B-35: days after printing at which a transfer gets the age warning (contracts default 30). */
+  transferAgeWarnDays?: number;
 };
 
 export const sessions = pgTable(

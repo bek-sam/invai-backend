@@ -11,6 +11,7 @@ import {
   QUEUE_CONCURRENCY,
   QUEUE_NAMES,
   redis,
+  WORKER_STALL_SETTINGS,
 } from "../lib/queues";
 import { withShutdownCap } from "../lib/shutdown-timeout";
 import { onJobFailed } from "./job-failures";
@@ -34,7 +35,8 @@ const workers = QUEUE_NAMES.map((queue) => {
     queue,
     // Dispatch by name; input that fails the job's schema fails it for good (no retries).
     fairProcessJob,
-    { connection: redis, concurrency: QUEUE_CONCURRENCY[queue] },
+    // Explicit stall settings per queue (T-22-2, B-166): see WORKER_STALL_SETTINGS.
+    { connection: redis, concurrency: QUEUE_CONCURRENCY[queue], ...WORKER_STALL_SETTINGS[queue] },
   );
   worker.on("failed", (job, err) => {
     log.error("job failed", {
