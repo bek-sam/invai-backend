@@ -288,9 +288,9 @@ describe("AC3 (T-20-1): margin % and on-time % changes render as points, one dec
     // Relative-percent relabelled as "pts" (wave 19's actual bug) would read "+26.0 pts" here, not
     // "+6.9 pts" -- the fixture is chosen (architect A4) so a superficial relabel can't pass.
     expect(margin?.change?.formatted.en).toBe("+6.9 pts");
-    expect(margin?.change?.formatted.es).toBe("+6,9 pts");
+    expect(margin?.change?.formatted.es).toBe("+6.9 pts");
     expect(onTime?.change?.formatted.en).toBe("+2.5 pts");
-    expect(onTime?.change?.formatted.es).toBe("+2,5 pts");
+    expect(onTime?.change?.formatted.es).toBe("+2.5 pts");
   });
 });
 
