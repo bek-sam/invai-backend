@@ -206,3 +206,39 @@ describe("mock carrier address fixtures", () => {
     );
   });
 });
+
+describe("mock carrier SCAN forms", () => {
+  it("manifests seeded labels (no carrier record) once, and refuses a second form for them", async () => {
+    const ids = [
+      `shp_seed_${crypto.randomUUID().slice(0, 8)}`,
+      `shp_seed_${crypto.randomUUID().slice(0, 8)}`,
+    ];
+    const formId = crypto.randomUUID();
+    const form = await mockCarrier.createScanForm({
+      companyId,
+      formId,
+      date: "2026-09-29",
+      carrierShipmentIds: ids,
+    });
+    expect(form).toEqual({
+      carrierFormId: null,
+      status: "created",
+      fileKey: `${companyId}/label/scanform-${formId}.pdf`,
+    });
+    expect((await getObject(form.fileKey as string)).subarray(0, 5).toString()).toBe("%PDF-");
+    expect(
+      await mockCarrier.scanFormOf({ companyId, formId, carrierShipmentId: ids[1] as string }),
+    ).toEqual(form);
+    await expect(
+      mockCarrier.createScanForm({
+        companyId,
+        formId: crypto.randomUUID(),
+        date: "2026-09-29",
+        carrierShipmentIds: ids,
+      }),
+    ).rejects.toMatchObject({
+      outcome: "not_done",
+      message: expect.stringMatching(/already on a SCAN form/),
+    });
+  });
+});

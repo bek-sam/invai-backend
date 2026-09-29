@@ -31,8 +31,6 @@ type MockRecord = {
   label: PurchasedLabel;
   refundStatus: string | null;
   boughtAt?: string;
-  /** The SCAN form this shipment was manifested on (a shipment goes on one form only). */
-  scanForm?: { formId: string; fileKey: string };
 };
 
 const recordKey = (companyId: string, carrierShipmentId: string) =>
@@ -48,6 +46,25 @@ async function writeRecord(companyId: string, carrierShipmentId: string, record:
   await putObject(
     recordKey(companyId, carrierShipmentId),
     Buffer.from(JSON.stringify(record)),
+    "application/json",
+  );
+}
+
+/** The SCAN form a carrier shipment is on: its own object, so seeded labels can have one too. */
+type MockScanForm = { formId: string; fileKey: string };
+const scanFormKey = (companyId: string, carrierShipmentId: string) =>
+  labelObjectKey(companyId, carrierShipmentId).replace(/\.pdf$/, ".scanform.json");
+
+async function readScanForm(companyId: string, carrierShipmentId: string) {
+  const key = scanFormKey(companyId, carrierShipmentId);
+  if (!(await headObject(key)).exists) return null;
+  return JSON.parse((await getObject(key)).toString("utf8")) as MockScanForm;
+}
+
+async function writeScanForm(companyId: string, carrierShipmentId: string, form: MockScanForm) {
+  await putObject(
+    scanFormKey(companyId, carrierShipmentId),
+    Buffer.from(JSON.stringify(form)),
     "application/json",
   );
 }
@@ -262,37 +279,30 @@ export const mockCarrier: CarrierAdapter & CarrierExtras = {
   },
 
   async createScanForm({ companyId, formId, date, carrierShipmentIds }) {
-    const records: [string, MockRecord][] = [];
+    const codes: string[] = [];
     for (const id of carrierShipmentIds) {
       const record = await readRecord(companyId, id);
-      // Like EasyPost: only bought, unrefunded shipments, each on one form only.
-      if (!record || record.refundStatus)
-        throw new CarrierError("mock", "upstream", `Shipment ${id} has no live label`, "not_done");
-      if (record.scanForm)
+      // Like EasyPost: never a refunded shipment, and each shipment on one form only. A shipment
+      // with no record is a label the demo seed wrote without the carrier: accepted.
+      if (record?.refundStatus)
+        throw new CarrierError("mock", "upstream", `Shipment ${id} was refunded`, "not_done");
+      if (await readScanForm(companyId, id))
         throw new CarrierError(
           "mock",
           "upstream",
           `Shipment ${id} is already on a SCAN form`,
           "not_done",
         );
-      records.push([id, record]);
+      codes.push(record?.label.trackingCode ?? id);
     }
     const fileKey = scanFormObjectKey(companyId, formId);
-    await putObject(
-      fileKey,
-      await mockScanFormPdf(
-        date,
-        records.map(([, r]) => r.label.trackingCode),
-      ),
-      "application/pdf",
-    );
-    for (const [id, record] of records)
-      await writeRecord(companyId, id, { ...record, scanForm: { formId, fileKey } });
+    await putObject(fileKey, await mockScanFormPdf(date, codes), "application/pdf");
+    for (const id of carrierShipmentIds) await writeScanForm(companyId, id, { formId, fileKey });
     return { carrierFormId: null, status: "created", fileKey };
   },
 
   async scanFormOf({ companyId, carrierShipmentId }) {
-    const form = (await readRecord(companyId, carrierShipmentId))?.scanForm;
+    const form = await readScanForm(companyId, carrierShipmentId);
     return form ? { carrierFormId: null, status: "created", fileKey: form.fileKey } : null;
   },
 };
