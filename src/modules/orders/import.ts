@@ -99,6 +99,12 @@ export async function importNormalizedOrders(
     itemsNeedingMapping: 0,
     errors: [],
   };
+  // B-99: one import per connection at a time (CSV chunk, poll and webhook can overlap). The
+  // lock ends with the transaction; ON CONFLICT in createOrder covers two connections of one
+  // channel importing the same order.
+  await tx.execute(
+    sql`select pg_advisory_xact_lock(hashtextextended(${`order_import:${connection.id}`}, 0))`,
+  );
   const [company] = await tx
     .select({ tz: companies.timezone, settings: companies.settings })
     .from(companies)
@@ -139,39 +145,48 @@ export async function importNormalizedOrders(
     // helper, applied once here, right after validation and before the first raw insert/update of
     // this order's text (T-8-6; a NUL byte in `buyerNote` used to crash the `orders` insert).
     const n = sanitizeDeep(parsed.data);
-    const [existing] = await tx
-      .select()
-      .from(orders)
-      .where(and(eq(orders.channel, channel), eq(orders.channelOrderId, n.channelOrderId)))
-      .limit(1);
-    if (existing) {
-      const changed = await updateExisting(tx, ctx, connection, existing, n, run);
-      if (changed === "stale") {
-        result.stale++;
-        result.skipped++;
-        result.staleOrderIds.push(existing.id);
-        result.orderIds.push(existing.id);
+    const find = async () =>
+      (
+        await tx
+          .select()
+          .from(orders)
+          .where(and(eq(orders.channel, channel), eq(orders.channelOrderId, n.channelOrderId)))
+          .limit(1)
+      )[0];
+    let existing = await find();
+    if (!existing) {
+      const created = await createOrder(tx, ctx, connection, n, run);
+      if (created) {
+        result.imported++;
+        result.itemsNeedingMapping += created.needsMapping;
+        result.orderIds.push(created.orderId);
         continue;
       }
-      if (changed) {
-        result.updated++;
-        await audit(tx, {
-          companyId: ctx.companyId,
-          actor: ctx.actor,
-          action: "order.synced",
-          entityType: "order",
-          entityId: existing.id,
-          summary: `Updated from ${opts.source === "csv" ? "CSV import" : "channel sync"}: ${changed.join(", ")}`,
-        });
-        await emit(tx, ctx.companyId, "order.updated", { orderId: existing.id });
-      } else result.skipped++;
+      // Another transaction created it after our read (ON CONFLICT waited for its commit).
+      existing = await find();
+      if (!existing) throw new Error(`order ${n.channelOrderId} conflicted but is not visible`);
+    }
+    const changed = await updateExisting(tx, ctx, connection, existing, n, run);
+    if (changed === "stale") {
+      result.stale++;
+      result.skipped++;
+      result.staleOrderIds.push(existing.id);
       result.orderIds.push(existing.id);
       continue;
     }
-    const { orderId, needsMapping } = await createOrder(tx, ctx, connection, n, run);
-    result.imported++;
-    result.itemsNeedingMapping += needsMapping;
-    result.orderIds.push(orderId);
+    if (changed) {
+      result.updated++;
+      await audit(tx, {
+        companyId: ctx.companyId,
+        actor: ctx.actor,
+        action: "order.synced",
+        entityType: "order",
+        entityId: existing.id,
+        summary: `Updated from ${opts.source === "csv" ? "CSV import" : "channel sync"}: ${changed.join(", ")}`,
+      });
+      await emit(tx, ctx.companyId, "order.updated", { orderId: existing.id });
+    } else result.skipped++;
+    result.orderIds.push(existing.id);
   }
 
   for (const channelOrderId of opts.cancelledChannelOrderIds ?? []) {
@@ -232,8 +247,9 @@ async function createOrder(
       itemCount: units,
       importRunId: opts.importRunId,
     })
+    .onConflictDoNothing({ target: [orders.companyId, orders.channel, orders.channelOrderId] })
     .returning();
-  if (!order) throw new Error("order insert failed");
+  if (!order) return null;
 
   await tx.insert(buyerPii).values(piiValues(ctx.companyId, order.id, n));
 
@@ -394,13 +410,7 @@ async function updateExisting(
     return "stale";
   const changed: string[] = [];
   const set: Partial<typeof orders.$inferInsert> = {};
-  const totals = {
-    subtotalCents: n.totals.subtotal,
-    shippingCents: n.totals.shipping,
-    taxCents: n.totals.tax,
-    discountCents: n.totals.discount,
-    totalCents: n.totals.total,
-  };
+  const totals = mergeTotals(o, n);
   if (Object.entries(totals).some(([k, v]) => o[k as keyof typeof totals] !== v)) {
     Object.assign(set, totals);
     changed.push("totals");
@@ -450,6 +460,27 @@ async function updateExisting(
   if (sourceAt && (!o.channelUpdatedAt || sourceAt.getTime() > o.channelUpdatedAt.getTime()))
     await tx.update(orders).set({ channelUpdatedAt: sourceAt }).where(eq(orders.id, o.id));
   return changed.length ? changed : null;
+}
+
+/** A payload with no prices at all (Amazon's Unshipped Orders report has no price columns). */
+const isPriceless = (n: NormalizedOrder) =>
+  n.totals.subtotal === 0 && n.totals.total === 0 && n.items.every((i) => i.unitPrice === 0);
+
+/**
+ * B-197: a re-import never replaces known money with 0 or blank. Item subtotal, shipping, tax
+ * and total keep their stored value when the payload says 0 (a report without that column, not
+ * a real change: a refund is recorded as a refund, not a new total); a discount keeps its value
+ * only when the payload carries no prices at all. Anything non-zero is applied as sent.
+ */
+function mergeTotals(o: OrderRow, n: NormalizedOrder) {
+  const keep = (incoming: number, stored: number) => (incoming === 0 ? stored : incoming);
+  return {
+    subtotalCents: keep(n.totals.subtotal, o.subtotalCents),
+    shippingCents: keep(n.totals.shipping, o.shippingCents),
+    taxCents: keep(n.totals.tax, o.taxCents),
+    discountCents: isPriceless(n) ? o.discountCents : n.totals.discount,
+    totalCents: keep(n.totals.total, o.totalCents),
+  };
 }
 
 /* ------------------------------ line edits (T-7-4, B-12) ------------------------------ */
@@ -539,6 +570,7 @@ async function applyLineEdits(
     line: NormalizedOrder["items"][number],
     lineNo: number,
     unitNo: number,
+    knownPriceCents = 0,
   ): typeof orderItems.$inferInsert => ({
     companyId: ctx.companyId,
     orderId: o.id,
@@ -550,7 +582,8 @@ async function applyLineEdits(
     channelListingId: line.channelListingId,
     title: line.title,
     variantTitle: line.variantTitle,
-    unitPriceCents: line.unitPrice,
+    // B-197: a price-less file adding a unit to a known line keeps the line's price.
+    unitPriceCents: line.unitPrice || knownPriceCents,
     personalization: line.personalization,
     state: "imported" as const,
     shipBy: o.shipBy,
@@ -641,7 +674,9 @@ async function applyLineEdits(
       toCancel.push(...took);
       if (took.length || dropped) changed.add("quantity");
     }
-    for (let k = 0; k < replacements; k++) toAdd.push(newUnit(line, ex.lineNo, ++unitNo));
+    const linePrice = ex.units.find((u) => u.unitPriceCents > 0)?.unitPriceCents ?? 0;
+    for (let k = 0; k < replacements; k++)
+      toAdd.push(newUnit(line, ex.lineNo, ++unitNo, linePrice));
     if (active.some((u) => u.unitsInLine !== line.quantity))
       await tx
         .update(orderItems)
