@@ -84,12 +84,12 @@ export function fact(id: string, unit: FactUnit, value: number | string | null):
 const UNCHANGED: Record<Lang, string> = { en: "unchanged", es: "sin cambio" };
 
 /**
- * A signed point difference, one decimal ("+6.9 pts", es "+6,9 pts"; spec copy `change.pts`).
- * The approved Spanish wording uses a decimal comma, which `es-US` doesn't, hence plain `es`.
+ * A signed point difference, one decimal ("+6.9 pts" in both languages; spec copy `change.pts`).
+ * Uses `es-US` like every other digest number, so Spanish keeps the decimal point (PM decision,
+ * specs/weekly-digest.md).
  */
-const PTS_LOCALE: Record<Lang, string> = { en: "en-US", es: "es" };
 const signedPts = (lang: Lang, p: number) =>
-  `${new Intl.NumberFormat(PTS_LOCALE[lang], {
+  `${new Intl.NumberFormat(LOCALE[lang], {
     minimumFractionDigits: 1,
     maximumFractionDigits: 1,
     signDisplay: "exceptZero",

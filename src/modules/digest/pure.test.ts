@@ -617,7 +617,7 @@ describe("a digest rendered on 2026-09-28 (wave 20, T-20-1 AC6)", () => {
       expect(text[lang]).not.toContain("Old Ghost");
     }
     expect(text.en).toContain("Margin: 33.4% (+6.9 pts vs last week)");
-    expect(text.es).toContain("(+6,9 pts vs. la semana pasada)");
+    expect(text.es).toContain("(+6.9 pts vs. la semana pasada)");
     expect(text.en).toContain("Orders: 40 (unchanged vs last week)");
     expect(text.es).toContain("Pedidos: 40 (sin cambio vs. la semana pasada)");
     expect(text.en).toContain("The Halloween season is on now. Make sure Spirit Tee is listed");
@@ -634,7 +634,7 @@ describe("a digest rendered on 2026-09-28 (wave 20, T-20-1 AC6)", () => {
       }),
     );
     const margin = down.find((g) => g.metric === "marginPct");
-    expect(margin?.change?.formatted).toEqual({ en: "-6.9 pts", es: "-6,9 pts" });
+    expect(margin?.change?.formatted).toEqual({ en: "-6.9 pts", es: "-6.9 pts" });
     expect(margin?.changePct).toBe(-6.9);
     expect(down.find((g) => g.metric === "revenue")?.change?.formatted.en).toBe("+20%");
   });
