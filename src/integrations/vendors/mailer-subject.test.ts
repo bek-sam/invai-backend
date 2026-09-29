@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { env } from "../../env";
+import { hmacHex, sha256Hex } from "../../lib/crypto";
 import { createCompany } from "../../test/fixtures";
 import { sendMail, subjectLogFields } from "./mailer";
 
@@ -38,5 +40,20 @@ describe("sendMail subject logging (B-139)", () => {
     expect(a.subjectHash).toMatch(/^[0-9a-f]{16}$/);
     expect(a.template).toBeNull();
     expect(subjectLogFields({ subject: "other" }).subjectHash).not.toBe(a.subjectHash);
+  });
+
+  it("keys the hash (S-38): not the plain sha256 of the subject, and doesn't move the template key", () => {
+    const subject = "Your week at Desert Bloom Tees: net profit $1,428.55 (+12%)";
+    const fields = subjectLogFields({ subject, template: "digest.weekly" });
+    // An unkeyed sha256Hex is reversible in seconds for a low-entropy template like this one
+    // (S-38): the stored hash must not equal it, so brute-forcing the subject needs the secret too.
+    expect(fields.subjectHash).not.toBe(sha256Hex(subject).slice(0, 16));
+    expect(fields.subjectHash).toMatch(/^[0-9a-f]{16}$/);
+    expect(fields.template).toBe("digest.weekly");
+    // Keying is per-secret: the same subject hashed with a different key must differ, proving the
+    // hash depends on BETTER_AUTH_SECRET and not just on the subject text.
+    expect(fields.subjectHash).not.toBe(
+      hmacHex(`${env.BETTER_AUTH_SECRET}-different`, subject).slice(0, 16),
+    );
   });
 });

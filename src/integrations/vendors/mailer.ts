@@ -1,6 +1,6 @@
 import nodemailer from "nodemailer";
 import { env } from "../../env";
-import { sha256Hex } from "../../lib/crypto";
+import { hmacHex, sha256Hex } from "../../lib/crypto";
 import { logger } from "../../lib/log";
 import { type CompanyScope, isSampleWorkspace } from "../../modules/tenancy/demo-flag";
 
@@ -38,11 +38,14 @@ export type Mail = {
 /**
  * What the log may say about a subject (B-139): the template key when the caller gives one, and
  * a short hash so repeated sends of the same subject can still be matched in a support ticket.
+ * S-38: keyed with `BETTER_AUTH_SECRET` (the `addressHash` pattern in shipping/service.ts), never
+ * a plain `sha256Hex`. Digest subjects (`"Your week at {{shop}}: net profit {{net}} ({{change}})"`)
+ * have too little entropy for an unkeyed hash: it's brute-forceable in seconds.
  */
 export function subjectLogFields(mail: Pick<Mail, "subject" | "template">) {
   return {
     template: mail.template ?? null,
-    subjectHash: sha256Hex(mail.subject).slice(0, 16),
+    subjectHash: hmacHex(env.BETTER_AUTH_SECRET, mail.subject).slice(0, 16),
   };
 }
 
