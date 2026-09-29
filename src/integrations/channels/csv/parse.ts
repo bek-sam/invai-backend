@@ -477,11 +477,16 @@ function parseEtsy(text: string): ParsedCsv {
 /* ------------------------------------ Amazon ------------------------------------ */
 
 /**
- * Amazon "Unshipped Orders" / "New Orders" report (tab-delimited): order-id, order-item-id,
- * purchase-date, promise-date (latest ship date), buyer-email, buyer-name, sku, product-name,
- * quantity-purchased / quantity-to-ship, ship-service-level, recipient-name, ship-address-1..3,
- * ship-city, ship-state, ship-postal-code, ship-country, item-price, item-tax, shipping-price,
- * is-prime, customized-url.
+ * Amazon order flat files (tab-delimited). Column lists checked 2026-09-29 against
+ * https://developer-docs.amazon/sp-api/docs/report-type-values-order (page updated 2026-09-09):
+ * - "Order Report" (GET_FLAT_FILE_ORDER_REPORT_DATA_SHIPPING, 36 columns): carries currency,
+ *   item-price, item-tax, shipping-price, shipping-tax and latest-ship-date. `shipping-price` is
+ *   the buyer's shipping credit per line; summed per order it becomes `orders.shipping_cents`.
+ * - "Unshipped Orders" (GET_FLAT_FILE_ACTIONABLE_ORDER_DATA_SHIPPING, 27 columns): no price or
+ *   shipping columns at all, so its orders import with item and shipping amounts of 0 (B-183).
+ *   promise-date is the ship-by.
+ * Neither report has ship-promotion-discount (only the All Orders report, which lacks the
+ * ship-to address and isn't accepted here).
  */
 function parseAmazon(text: string): ParsedCsv {
   const { headers, rows } = readTable(text);
