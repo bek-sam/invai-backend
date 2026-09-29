@@ -624,7 +624,15 @@ describe("T-18-3 happy path on a fixture shop (spec AC1, AC3)", () => {
     expect(r1?.params.blankName).toMatch(/G640|Softstyle/);
     expect(r1?.params.blankBelowReorderPoint).toBe(true); // on hand 4 < reorder point 24
     expect(r1?.params.peakMonth === 9 || r1?.params.peakMonth === 10).toBe(true);
-    expect(r1?.params.actByDate).toBe(season.actBy?.date);
+    // R1 timing (wave 20 wording rule, market-signals.md "R1 timing"): on 2026-09-01, a September
+    // peak is already under way (no act-by date shown, the "season is on now" wording driven by
+    // params.niche), while an October peak hasn't started yet (act-by date still shown).
+    if (r1?.params.peakMonth === 9) {
+      expect(r1?.params.actByDate).toBeUndefined();
+      expect(r1?.params.niche).toBe("halloween"); // drives the "season is on now" wording
+    } else {
+      expect(r1?.params.actByDate).toBe(season.actBy?.date);
+    }
     expect(r1?.band).not.toBe("low");
     expect(r1?.target.designId).toBe(pumpkin.id);
   });
