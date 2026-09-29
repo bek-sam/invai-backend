@@ -1,6 +1,7 @@
 import { sql } from "drizzle-orm";
 import {
   boolean,
+  foreignKey,
   index,
   integer,
   pgTable,
@@ -19,6 +20,7 @@ import {
   timestamps,
   vendorReadPolicy,
 } from "./_shared";
+import { gangSheets } from "./production";
 import { companies, companyId } from "./tenancy";
 
 /** The vendor's output spec; drives imaging /nest and /compose (contracts `SheetSpec`). */
@@ -123,3 +125,47 @@ export const vendorHasSheetAccess = (table: string, sheetIdColumn: string) =>
   sql.raw(
     `${table}.${sheetIdColumn} in (select va.gang_sheet_id from vendor_access va where va.company_id = ${table}.company_id and va.vendor_company_id = nullif(current_setting('app.vendor_org_id', true), '')::uuid and va.revoked_at is null)`,
   );
+
+export const SHEET_DELIVERY_STATUSES = ["pending", "sending", "sent", "failed", "unknown"] as const;
+export type SheetDeliveryStatus = (typeof SHEET_DELIVERY_STATUSES)[number];
+
+/**
+ * One delivery of a sent gang sheet to its vendor (B-102, T-22-5): `seq` 1 is the send, 2.. are
+ * resends. The row is written in the sending transaction and a job delivers it after commit
+ * (`pending` -> `sending` -> `sent`). A row left in `sending` by a crash becomes `unknown` and is
+ * never sent again automatically (the mail may have gone out); the office can resend. Holds no
+ * address or mail text: the vendor's email stays on the connection.
+ */
+export const vendorSheetDeliveries = pgTable(
+  "vendor_sheet_deliveries",
+  {
+    id: id(),
+    companyId: companyId(),
+    gangSheetId: uuid().notNull(),
+    vendorConnectionId: uuid().notNull(),
+    delivery: text(enumText(["portal", "email"] as const)).notNull(),
+    seq: integer().notNull(),
+    status: text(enumText(SHEET_DELIVERY_STATUSES)).notNull().default("pending"),
+    attempts: integer().notNull().default(0),
+    requestedBy: uuid(),
+    claimedAt: timestamp({ withTimezone: true }),
+    sentAt: timestamp({ withTimezone: true }),
+    messageId: text(),
+    lastError: text(),
+    ...timestamps,
+  },
+  (t) => [
+    uniqueIndex().on(t.companyId, t.gangSheetId, t.seq),
+    foreignKey({
+      name: "vendor_sheet_deliveries_gang_sheet_id_fk",
+      columns: [t.companyId, t.gangSheetId],
+      foreignColumns: [gangSheets.companyId, gangSheets.id],
+    }).onDelete("cascade"),
+    foreignKey({
+      name: "vendor_sheet_deliveries_vendor_connection_id_fk",
+      columns: [t.companyId, t.vendorConnectionId],
+      foreignColumns: [vendorConnections.companyId, vendorConnections.id],
+    }).onDelete("cascade"),
+    tenantPolicy("vendor_sheet_deliveries"),
+  ],
+).enableRLS();
