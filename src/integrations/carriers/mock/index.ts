@@ -1,16 +1,21 @@
 import { createHash } from "node:crypto";
+import { PDFDocument, StandardFonts } from "pdf-lib";
+import type { Address } from "../../../db/schema";
 import { getObject, headObject, putObject } from "../../../lib/s3";
 import { imaging } from "../../imaging/client";
 import type { TrackerUpdate, TrackingAdapter } from "../tracking";
 import {
+  type AddressCheck,
   type CarrierAdapter,
   CarrierError,
+  type CarrierExtras,
   type CarrierLookup,
   type CarrierRate,
   labelObjectKey,
   type Parcel,
   type PurchasedLabel,
   type RateRequest,
+  scanFormObjectKey,
 } from "../types";
 
 /*
@@ -22,7 +27,13 @@ import {
  */
 
 /** `boughtAt` is missing on records written before tracking existed. */
-type MockRecord = { label: PurchasedLabel; refundStatus: string | null; boughtAt?: string };
+type MockRecord = {
+  label: PurchasedLabel;
+  refundStatus: string | null;
+  boughtAt?: string;
+  /** The SCAN form this shipment was manifested on (a shipment goes on one form only). */
+  scanForm?: { formId: string; fileKey: string };
+};
 
 const recordKey = (companyId: string, carrierShipmentId: string) =>
   labelObjectKey(companyId, carrierShipmentId).replace(/\.pdf$/, ".json");
@@ -128,7 +139,62 @@ function validate(to: RateRequest["to"], parcel: Parcel) {
     throw new CarrierError("mock", "upstream", "Parcel over 70 lb", "not_done");
 }
 
-export const mockCarrier: CarrierAdapter = {
+/*
+ * Address check fixtures (deterministic, like the rates):
+ *   failed    ZIP not 5 or 9 digits, or a 000xx ZIP (no USPS ZIP starts with 000);
+ *   corrected street1 ends in a spelled-out suffix (Street, Avenue, Road, Drive, Boulevard,
+ *             Lane): the suggestion is the USPS-standardized, upper-case form (ST, AVE, ...);
+ *   verified  anything else.
+ */
+const USPS_SUFFIXES: Record<string, string> = {
+  street: "ST",
+  avenue: "AVE",
+  road: "RD",
+  drive: "DR",
+  boulevard: "BLVD",
+  lane: "LN",
+};
+
+export function mockVerifyAddress(a: Address): AddressCheck {
+  const zip = a.zip.trim();
+  if (!a.street1.trim() || !/^\d{5}(-?\d{4})?$/.test(zip) || zip.startsWith("000"))
+    return { status: "failed", suggestion: null, detail: "Address not found" };
+  const words = a.street1.trim().split(/\s+/);
+  const suffix = USPS_SUFFIXES[(words.at(-1) ?? "").toLowerCase().replace(/\.$/, "")];
+  if (!suffix) return { status: "verified", suggestion: null, detail: null };
+  const upper = (v: string | null) => (v ? v.toUpperCase() : v);
+  return {
+    status: "corrected",
+    suggestion: {
+      ...a,
+      street1: [...words.slice(0, -1), suffix].join(" ").toUpperCase(),
+      street2: upper(a.street2),
+      city: a.city.toUpperCase(),
+      state: a.state.toUpperCase(),
+      zip: zip.slice(0, 5),
+    },
+    detail: null,
+  };
+}
+
+/** A one-page sandbox SCAN form: date, count and tracking codes (no buyer data). */
+async function mockScanFormPdf(date: string, trackingCodes: string[]) {
+  const doc = await PDFDocument.create();
+  const font = await doc.embedFont(StandardFonts.Helvetica);
+  const page = doc.addPage([612, 792]);
+  const lines = [
+    "USPS SCAN FORM (sandbox, not valid for pickup)",
+    `Date: ${date}   Packages: ${trackingCodes.length}`,
+    "",
+    ...trackingCodes,
+  ];
+  lines.slice(0, 50).forEach((text, i) => {
+    page.drawText(text, { x: 48, y: 740 - i * 14, size: i === 0 ? 14 : 10, font });
+  });
+  return Buffer.from(await doc.save());
+}
+
+export const mockCarrier: CarrierAdapter & CarrierExtras = {
   provider: "mock",
 
   async rate(req) {
@@ -189,6 +255,45 @@ export const mockCarrier: CarrierAdapter = {
     if (record && !record.refundStatus)
       await writeRecord(companyId, carrierShipmentId, { ...record, refundStatus: "refunded" });
     return { ok: true, pending: false };
+  },
+
+  async verifyAddress({ address }) {
+    return mockVerifyAddress(address);
+  },
+
+  async createScanForm({ companyId, formId, date, carrierShipmentIds }) {
+    const records: [string, MockRecord][] = [];
+    for (const id of carrierShipmentIds) {
+      const record = await readRecord(companyId, id);
+      // Like EasyPost: only bought, unrefunded shipments, each on one form only.
+      if (!record || record.refundStatus)
+        throw new CarrierError("mock", "upstream", `Shipment ${id} has no live label`, "not_done");
+      if (record.scanForm)
+        throw new CarrierError(
+          "mock",
+          "upstream",
+          `Shipment ${id} is already on a SCAN form`,
+          "not_done",
+        );
+      records.push([id, record]);
+    }
+    const fileKey = scanFormObjectKey(companyId, formId);
+    await putObject(
+      fileKey,
+      await mockScanFormPdf(
+        date,
+        records.map(([, r]) => r.label.trackingCode),
+      ),
+      "application/pdf",
+    );
+    for (const [id, record] of records)
+      await writeRecord(companyId, id, { ...record, scanForm: { formId, fileKey } });
+    return { carrierFormId: null, status: "created", fileKey };
+  },
+
+  async scanFormOf({ companyId, carrierShipmentId }) {
+    const form = (await readRecord(companyId, carrierShipmentId))?.scanForm;
+    return form ? { carrierFormId: null, status: "created", fileKey: form.fileKey } : null;
   },
 };
 

@@ -52,6 +52,33 @@ export function labelObjectKey(companyId: string, carrierShipmentId: string) {
   return `${companyId}/label/${carrierShipmentId.replace(/[^A-Za-z0-9_-]/g, "_")}.pdf`;
 }
 
+/** Where a SCAN form PDF is stored: under `label` so only shipping roles can download it. */
+export function scanFormObjectKey(companyId: string, formRef: string) {
+  return `${companyId}/label/scanform-${formRef.replace(/[^A-Za-z0-9_-]/g, "_")}.pdf`;
+}
+
+/**
+ * A carrier address check. `corrected` carries the carrier's standardized address; `detail` is
+ * the carrier's reason for `failed` and never contains the address. Both are buyer PII-adjacent:
+ * return them to the caller, never log them.
+ */
+export type AddressCheck = {
+  status: "verified" | "corrected" | "failed";
+  suggestion: Address | null;
+  detail: string | null;
+};
+
+/**
+ * A SCAN form the carrier made. `status: "creating"` means the carrier accepted it and is still
+ * rendering the PDF (EasyPost is async): `fileKey` stays null until a `scanFormOf` read-back
+ * finds the finished file.
+ */
+export type CarrierScanForm = {
+  carrierFormId: string | null;
+  status: "creating" | "created";
+  fileKey: string | null;
+};
+
 /**
  * One carrier provider (EasyPost or the mock). Normalizes rates to cents and stores the label
  * PDF in S3 itself, so the shipping service only deals in keys.
@@ -77,6 +104,32 @@ export interface CarrierAdapter {
     carrierShipmentId: string;
     trackingCode: string;
   }): Promise<VoidResult>;
+}
+
+/**
+ * Carrier calls beyond rate/buy/void (B-25): address checks and USPS SCAN forms. Separate from
+ * `CarrierAdapter` so the many test fakes of the buy path don't have to implement them.
+ */
+export interface CarrierExtras {
+  /** Check a ship-to address. Never charges; safe to repeat. */
+  verifyAddress(input: { companyId: string; address: Address }): Promise<AddressCheck>;
+  /**
+   * Manifest bought labels on one SCAN form (USPS). A carrier shipment can be on one form only,
+   * so a repeat after an unknown outcome must read back with `scanFormOf` first.
+   */
+  createScanForm(input: {
+    companyId: string;
+    /** Our form id: names the stored PDF. */
+    formId: string;
+    date: string;
+    carrierShipmentIds: string[];
+  }): Promise<CarrierScanForm>;
+  /** Read-back: the form a carrier shipment is already on, or null. */
+  scanFormOf(input: {
+    companyId: string;
+    formId: string;
+    carrierShipmentId: string;
+  }): Promise<CarrierScanForm | null>;
 }
 
 /**

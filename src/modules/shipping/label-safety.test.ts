@@ -390,7 +390,9 @@ describe("label buy safety", () => {
       expect(fake.calls.buy + fake.calls.lookup).toBe(0);
     });
 
-    it("an expired quote is refused before any carrier call", async () => {
+    // T-22-3 (B-25): an expired quote is re-rated before any buy; only an unchanged price is
+    // bought (a moved price is RATE_EXPIRED, covered in rate-ttl.test.ts).
+    it("an expired quote is re-rated before the carrier buys", async () => {
       const { shipmentId, rateId } = await rated();
       await withSystem((tx) =>
         tx
@@ -398,11 +400,15 @@ describe("label buy safety", () => {
           .set({ ratedAt: new Date(Date.now() - 25 * 3600_000) })
           .where(eq(shipments.id, shipmentId)),
       );
-      await expect(svc.buyLabel(ctx, { shipmentId, rateId })).rejects.toMatchObject({
-        code: "RATE_EXPIRED",
-      });
-      expect(fake.calls.buy).toBe(0);
-      expect((await row(shipmentId)).status).toBe("rated");
+      const ratesBefore = fake.calls.rate;
+      let ratesAtBuy = -1;
+      fake.onBuy = async () => {
+        ratesAtBuy = fake.calls.rate;
+      };
+      await svc.buyLabel(ctx, { shipmentId, rateId });
+      expect(ratesAtBuy).toBe(ratesBefore + 1);
+      expect(fake.calls.buy).toBe(1);
+      expect((await row(shipmentId)).status).toBe("labeled");
     });
 
     it("the database holds one purchased label per shipment", async () => {

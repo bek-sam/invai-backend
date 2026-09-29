@@ -1,0 +1,44 @@
+{
+  "id": "adr_00000000000000000000000000000001",
+  "object": "Address",
+  "created_at": "2026-09-29T15:00:00+00:00",
+  "updated_at": "2026-09-29T15:00:00+00:00",
+  "name": null,
+  "company": null,
+  "email": null,
+  "phone": null,
+  "mode": "test",
+  "residential": true,
+  "street1": "1 NOWHERE LN",
+  "street2": "",
+  "city": "PHOENIX",
+  "state": "AZ",
+  "zip": "85003",
+  "country": "US",
+  "verifications": {
+    "zip4": {
+      "success": false,
+      "errors": [
+        {
+          "code": "E.ADDRESS.NOT_FOUND",
+          "field": "address",
+          "message": "Address not found",
+          "suggestion": null
+        }
+      ],
+      "details": null
+    },
+    "delivery": {
+      "success": false,
+      "errors": [
+        {
+          "code": "E.ADDRESS.NOT_FOUND",
+          "field": "address",
+          "message": "Address not found",
+          "suggestion": null
+        }
+      ],
+      "details": {}
+    }
+  }
+}

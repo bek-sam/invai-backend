@@ -48,6 +48,7 @@ import {
   carrierAdapter,
   type Parcel,
   type PurchasedLabel,
+  rateExpiresAt,
   type VoidResult,
 } from "../../integrations/carriers";
 import {
@@ -87,8 +88,6 @@ type TrackingPushStatus = z.infer<typeof TrackingPushStatusSchema>;
 type SettingsInput = z.infer<typeof ShippingSettingsInputSchema>;
 type Strategy = "cheapest" | "fastest" | "cheapest_on_time";
 
-/** Quotes older than this must be fetched again before buying. */
-const RATE_TTL_MS = 24 * 3600_000;
 /** Days after delivery before buyer PII is purged. */
 const PII_RETENTION_DAYS = 30;
 /** Mock carrier: hours from label to "in transit" and to "delivered". */
@@ -519,7 +518,7 @@ export async function shipQueue(
 
 /* ----------------------------------- rates --------------------------------- */
 
-function markRates(rates: CarrierRate[]): RatesResult["rates"] {
+function markRates(rates: CarrierRate[], ratedAt: Date): RatesResult["rates"] {
   const cheapest = Math.min(...rates.map((r) => r.rateCents));
   const fastest = Math.min(...rates.map((r) => r.deliveryDays ?? 99));
   return rates
@@ -533,6 +532,7 @@ function markRates(rates: CarrierRate[]): RatesResult["rates"] {
       estimatedDeliveryAt: r.estimatedDeliveryAt,
       cheapest: r.rateCents === cheapest,
       fastest: (r.deliveryDays ?? 99) === fastest,
+      expiresAt: rateExpiresAt(r.carrier, ratedAt).toISOString(),
     }))
     .sort((a, b) => a.rate - b.rate);
 }
@@ -690,7 +690,7 @@ export async function rateOrder(ctx: TenantContext, input: RatesInput): Promise<
   return {
     shipmentId: plan.shipmentId,
     parcel: plan.parcel,
-    rates: markRates(rates),
+    rates: markRates(rates, ratedAt),
     ratedAt: ratedAt.toISOString(),
   };
 }
@@ -705,7 +705,44 @@ export const BUY_IN_FLIGHT_MS = 2 * 60_000;
 
 type BuyPlan =
   | { kind: "done" }
+  | { kind: "rerate"; orderId: string; quote: RateQuote; parcel: Parcel; presetId: string | null }
   | { kind: "call"; resume: boolean; expired: boolean; quote: RateQuote; req: BuyRequest };
+
+/**
+ * B-25: a buy on an expired quote (past its TTL or across a carrier price change) rates again
+ * first. The same service at the same price is bought on the fresh quote; a moved price or a
+ * vanished service answers RATE_EXPIRED with the new quotes stored, so nobody is charged a new
+ * price they didn't see.
+ */
+async function rerateThenBuy(
+  ctx: TenantContext,
+  plan: Extract<BuyPlan, { kind: "rerate" }>,
+): Promise<Shipment> {
+  const fresh = await rateOrder(ctx, {
+    orderId: plan.orderId,
+    parcel: plan.parcel,
+    ...(plan.presetId ? { packagePresetId: plan.presetId } : {}),
+  });
+  const same = fresh.rates.find(
+    (r) => r.carrier === plan.quote.carrier && r.service === plan.quote.service,
+  );
+  if (!same || same.rate !== plan.quote.rate) {
+    log.info("rate changed on re-rate; buy stopped", {
+      companyId: ctx.companyId,
+      shipmentId: fresh.shipmentId,
+      service: plan.quote.service,
+      oldCents: plan.quote.rate,
+      newCents: same?.rate ?? null,
+    });
+    throw new ORPCError("RATE_EXPIRED", {
+      status: 409,
+      message: same
+        ? "The price for this service changed. Check the new rates and buy again."
+        : "This service is no longer offered. Check the new rates and buy again.",
+    });
+  }
+  return buyLabel(ctx, { shipmentId: fresh.shipmentId, rateId: same.rateId }, { rerated: true });
+}
 
 /** Ends a buy that bought nothing (`not_done`, back to `rated`) or whose outcome is unknown. */
 async function settleBuy(ctx: TenantContext, shipmentId: string, outcome: "not_done" | "unknown") {
@@ -731,8 +768,12 @@ async function settleBuy(ctx: TenantContext, shipmentId: string, outcome: "not_d
 export async function buyLabel(
   ctx: TenantContext,
   input: { shipmentId: string; rateId: string },
-  /** `readBackOnly`: finish a pending buy from the carrier's records, never buy (cancel job). */
-  opts: { readBackOnly?: boolean } = {},
+  /**
+   * `readBackOnly`: finish a pending buy from the carrier's records, never buy (cancel job).
+   * `rerated`: this call follows a re-rate (B-25), so an expired quote now is an error, not
+   * another re-rate.
+   */
+  opts: { readBackOnly?: boolean; rerated?: boolean } = {},
 ): Promise<Shipment> {
   const plan = await withTenant(ctx.companyId, async (tx): Promise<BuyPlan> => {
     const [s] = await tx
@@ -759,8 +800,22 @@ export async function buyLabel(
     if (!resume) await assertPaidActionAllowed(tx, ctx);
     const quote = s.rateQuotes.find((q) => q.rateId === input.rateId);
     if (!quote || !s.ratedAt || !s.carrierShipmentId) throw rateExpired();
-    const expired = Date.now() - s.ratedAt.getTime() > RATE_TTL_MS;
-    if (expired && !resume) throw rateExpired();
+    const expired = Date.now() >= rateExpiresAt(quote.carrier, s.ratedAt).getTime();
+    if (expired && !resume) {
+      if (opts.rerated || opts.readBackOnly) throw rateExpired();
+      return {
+        kind: "rerate",
+        orderId: s.orderId,
+        quote,
+        parcel: {
+          lengthIn: s.lengthIn,
+          widthIn: s.widthIn,
+          heightIn: s.heightIn,
+          weightOz: s.weightOz,
+        },
+        presetId: s.packagePresetId,
+      };
+    }
     const [order] = await tx.select().from(orders).where(eq(orders.id, s.orderId)).limit(1);
     if (!order) throw notFound("order", s.orderId);
     if (!resume) {
@@ -806,6 +861,7 @@ export async function buyLabel(
   });
   if (plan.kind === "done")
     return withTenant(ctx.companyId, (tx) => getShipment(tx, ctx, input.shipmentId));
+  if (plan.kind === "rerate") return rerateThenBuy(ctx, plan);
 
   // No transaction and no row lock while the carrier is called.
   const adapter = await carrierAdapter(ctx);

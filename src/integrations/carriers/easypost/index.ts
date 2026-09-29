@@ -4,12 +4,16 @@ import { logger } from "../../../lib/log";
 import { putObject } from "../../../lib/s3";
 import { type EpTracker, normalizeEasypostTracker, type TrackingAdapter } from "../tracking";
 import {
+  type AddressCheck,
   type CarrierAdapter,
   type CarrierCode,
   CarrierError,
+  type CarrierExtras,
   type CarrierRate,
+  type CarrierScanForm,
   labelObjectKey,
   type PurchasedLabel,
+  scanFormObjectKey,
 } from "../types";
 
 /*
@@ -21,6 +25,13 @@ import {
  *   POST /v2/shipments/{id}/refund   -> refund_status (submitted | refunded | rejected)
  *   GET  /v2/trackers/{id}           tracker status + scan history (daily fallback poll)
  *   POST /v2/trackers                create, or get back the existing tracker for the code
+ *   POST /v2/addresses               { address, verify: true } -> verifications.delivery
+ *                                    (https://docs.easypost.com/docs/addresses; checked 2026-09-29)
+ *   POST /v2/scan_forms              { shipments: [{ id }] } -> sf_..., status creating|created|
+ *                                    failed, form_url (https://docs.easypost.com/docs/scan-form;
+ *                                    checked 2026-09-29). Same origin address, same carrier
+ *                                    account; a shipment goes on one form only and forms are
+ *                                    immutable, so a repeat reads back `scan_form` on the shipment.
  * Errors (https://docs.easypost.com/guides/errors-guide): only rate codes that mean "fetch new
  * rates" map to `rate_expired`. 429 has no Retry-After (rate-limiting guide): reads back off
  * with jitter; a buy or refund is never re-sent automatically.
@@ -50,6 +61,24 @@ type EpShipment = {
   tracker?: (EpTracker & { public_url?: string | null }) | null;
   refund_status?: string | null;
   messages?: { carrier: string; message: string }[];
+  scan_form?: EpScanForm | null;
+};
+type EpScanForm = {
+  id: string;
+  status?: string | null;
+  form_url?: string | null;
+  message?: string | null;
+};
+type EpAddress = {
+  street1?: string | null;
+  street2?: string | null;
+  city?: string | null;
+  state?: string | null;
+  zip?: string | null;
+  country?: string | null;
+  verifications?: {
+    delivery?: { success?: boolean; errors?: { code?: string; message?: string }[] } | null;
+  } | null;
 };
 type EpError = { error?: { code?: string; message?: string } };
 
@@ -224,7 +253,105 @@ async function ensureTracker(apiKey: string, bought: EpShipment, carrier: string
   }
 }
 
-export function createEasypostCarrier(apiKey: string): CarrierAdapter {
+/** SCAN form PDFs come from EasyPost's own file hosts (research 12 §1.7: allowlisted hosts only). */
+export function isEasypostFileUrl(raw: string) {
+  try {
+    const u = new URL(raw);
+    const h = u.hostname.toLowerCase();
+    return (
+      u.protocol === "https:" &&
+      (h === "easypost.com" ||
+        h.endsWith(".easypost.com") ||
+        (h.startsWith("easypost-files.") && h.endsWith(".amazonaws.com")))
+    );
+  } catch {
+    return false;
+  }
+}
+
+const FORM_MAX_BYTES = 10 * 1024 * 1024;
+
+/** Copy a finished SCAN form PDF into our bucket; null while EasyPost is still rendering it. */
+async function storeScanForm(
+  companyId: string,
+  formId: string,
+  form: EpScanForm,
+): Promise<string | null> {
+  if (!form.form_url) return null;
+  if (!isEasypostFileUrl(form.form_url)) {
+    log.warn("easypost scan form url on an unexpected host; not downloaded", {
+      scanFormId: form.id,
+      host: new URL(form.form_url).hostname,
+    });
+    return null;
+  }
+  const res = await fetch(form.form_url, {
+    redirect: "manual",
+    signal: AbortSignal.timeout(30_000),
+  }).catch((err) => {
+    throw new CarrierError("easypost", "upstream", `scan form download: ${String(err)}`, "unknown");
+  });
+  const size = Number(res.headers.get("content-length") ?? 0);
+  if (!res.ok || size > FORM_MAX_BYTES) {
+    await res.body?.cancel().catch(() => {});
+    log.warn("easypost scan form download refused", { scanFormId: form.id, status: res.status });
+    return null;
+  }
+  const bytes = Buffer.from(await res.arrayBuffer());
+  if (bytes.length > FORM_MAX_BYTES) return null;
+  const key = scanFormObjectKey(companyId, formId);
+  await putObject(key, bytes, "application/pdf");
+  return key;
+}
+
+function toCarrierScanForm(form: EpScanForm, fileKey: string | null): CarrierScanForm {
+  return {
+    carrierFormId: form.id,
+    status: form.status === "created" && fileKey ? "created" : "creating",
+    fileKey,
+  };
+}
+
+const norm = (v: string | null | undefined) =>
+  (v ?? "").toUpperCase().replace(/[.,#]/g, "").replace(/\s+/g, " ").trim();
+
+/**
+ * Map EasyPost's delivery verification to our three results. A ZIP+4 added to a matching
+ * address is still `verified`; any other change is `corrected` with EasyPost's standardized
+ * fields (the name, company, phone and email stay the order's own).
+ */
+export function toAddressCheck(input: Address, ep: EpAddress): AddressCheck {
+  const delivery = ep.verifications?.delivery;
+  if (!delivery?.success) {
+    const detail =
+      (delivery?.errors ?? [])
+        .map((e) => e.message)
+        .filter(Boolean)
+        .join("; ")
+        .slice(0, 200) || "Address not found";
+    return { status: "failed", suggestion: null, detail };
+  }
+  const suggestion: Address = {
+    ...input,
+    street1: ep.street1 ?? input.street1,
+    street2: ep.street2 ? ep.street2 : null,
+    city: ep.city ?? input.city,
+    state: ep.state ?? input.state,
+    zip: ep.zip ?? input.zip,
+    country: ep.country ?? input.country,
+  };
+  const same =
+    norm(suggestion.street1) === norm(input.street1) &&
+    norm(suggestion.street2) === norm(input.street2) &&
+    norm(suggestion.city) === norm(input.city) &&
+    norm(suggestion.state) === norm(input.state) &&
+    norm(suggestion.zip).slice(0, 5) === norm(input.zip).slice(0, 5);
+  return same
+    ? { status: "verified", suggestion: null, detail: null }
+    : { status: "corrected", suggestion, detail: null };
+}
+
+export function createEasypostCarrier(apiKey: string): CarrierAdapter & CarrierExtras {
   return {
     provider: "easypost",
 
@@ -301,6 +428,48 @@ export function createEasypostCarrier(apiKey: string): CarrierAdapter {
         return { ok: false, detail: `refund ${res.refund_status}` };
       return { ok: true, pending: res.refund_status !== "refunded" };
     },
+
+    async verifyAddress({ address }) {
+      // Creating an address charges nothing, so a 429 is retried with backoff.
+      const ep = await call<EpAddress>(
+        apiKey,
+        "/addresses",
+        { address: epAddress(address), verify: true },
+        "POST",
+        true,
+      );
+      return toAddressCheck(address, ep);
+    },
+
+    async createScanForm({ companyId, formId, carrierShipmentIds }) {
+      // Never re-sent automatically: a shipment can be on one form only (read back instead).
+      const form = await call<EpScanForm>(apiKey, "/scan_forms", {
+        shipments: carrierShipmentIds.map((id) => ({ id })),
+      });
+      if (form.status === "failed")
+        throw new CarrierError(
+          "easypost",
+          "upstream",
+          form.message || "SCAN form failed",
+          "not_done",
+        );
+      return toCarrierScanForm(form, await storeScanForm(companyId, formId, form));
+    },
+
+    async scanFormOf({ companyId, formId, carrierShipmentId }) {
+      const shipment = await call<EpShipment>(
+        apiKey,
+        `/shipments/${carrierShipmentId}`,
+        undefined,
+        "GET",
+      );
+      const form = shipment.scan_form;
+      if (!form?.id) return null;
+      // The shipment embeds the form; fetch it for the current status and file URL.
+      const fresh = await call<EpScanForm>(apiKey, `/scan_forms/${form.id}`, undefined, "GET");
+      if (fresh.status === "failed") return null;
+      return toCarrierScanForm(fresh, await storeScanForm(companyId, formId, fresh));
+    },
   };
 }
 
@@ -342,6 +511,6 @@ export const easypostTracking: TrackingAdapter | null = env.EASYPOST_API_KEY
   ? createEasypostTracking(env.EASYPOST_API_KEY)
   : null;
 
-export const easypostCarrier: CarrierAdapter | null = env.EASYPOST_API_KEY
+export const easypostCarrier: (CarrierAdapter & CarrierExtras) | null = env.EASYPOST_API_KEY
   ? createEasypostCarrier(env.EASYPOST_API_KEY)
   : null;

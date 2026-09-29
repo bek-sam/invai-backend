@@ -1,0 +1,13 @@
+{
+  "id": "sf_00000000000000000000000000000001",
+  "object": "ScanForm",
+  "status": "created",
+  "message": null,
+  "form_url": "https://easypost-files.s3.us-west-2.amazonaws.com/files/scan_form/20260929/sf_test.pdf",
+  "form_file_type": null,
+  "batch_id": "batch_00000000000000000000000000000001",
+  "confirmation": null,
+  "tracking_codes": ["9400100000000000000001", "9400100000000000000002"],
+  "created_at": "2026-09-29T22:00:00Z",
+  "updated_at": "2026-09-29T22:00:01Z"
+}
