@@ -1,5 +1,6 @@
 import type { DigestActionParams, MarketRecommendation } from "@invai/contracts";
-import { fact } from "./facts";
+import { r1PastPeak } from "../market/rules";
+import { fact, shortDateFact } from "./facts";
 import type { Candidate } from "./types";
 
 /*
@@ -40,13 +41,20 @@ function citedSource(r: MarketRecommendation) {
   return [...pool].sort((a, b) => b.asOf.localeCompare(a.asOf))[0] ?? null;
 }
 
+/**
+ * `weekEnd` (the digest week's exclusive end, YYYY-MM-DD) drops an R1 item whose act-by date is
+ * before it, or whose "peak under way" month is over (wave 20 R1 timing): the digest never says
+ * "before September" once September is here.
+ */
 export function marketCandidates(
   recs: MarketRecommendation[],
-  opts: { mockAllowed: boolean },
+  opts: { mockAllowed: boolean; weekEnd?: string },
 ): Candidate[] {
+  const weekEnd = opts.weekEnd;
   return recs
     .filter((r) => !r.stale && (r.band === "high" || r.band === "medium"))
     .filter((r) => opts.mockAllowed || !r.mock)
+    .filter((r) => !weekEnd || !r1PastPeak(r, weekEnd))
     .map((r) => {
       const src = citedSource(r);
       const params: DigestActionParams = {
@@ -73,7 +81,7 @@ export function marketCandidates(
         facts: [
           fact(`market.${r.id}.band`, "text", r.band),
           fact(`market.${r.id}.source`, "text", src?.source ?? null),
-          fact(`market.${r.id}.asOf`, "date", src ? src.asOf.slice(0, 10) : null),
+          shortDateFact(`market.${r.id}.asOf`, src ? src.asOf.slice(0, 10) : null),
           fact(`market.${r.id}.sample`, "text", r.mock ? "sample" : null),
         ],
         recommendation: r,

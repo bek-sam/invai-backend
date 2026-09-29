@@ -55,6 +55,10 @@ export type DesignFacts = {
   channels: ChannelFacts[];
   /** Shop-local calendar month now, 1..12. */
   currentMonth: number;
+  /** Shop-local date now (YYYY-MM-DD): R1 never emits an act-by date before it (wave 20). */
+  today: string;
+  /** The design's own primary niche key, for R1's "peak under way" copy (`params.niche`). */
+  niche: string | null;
 };
 
 export type NicheFacts = {
@@ -105,12 +109,35 @@ function weakest(...parts: Scored[]): { confidence: number; band: ConfidenceBand
 
 const R = MARKET_CONFIG.rules;
 
+/**
+ * R1 timing on read (wave 20): an R1 item is past its peak on `refYmd` (shop-local today, or the
+ * digest week's end) when its act-by date is before it, or, for a "peak under way" item (no
+ * act-by date), when `refYmd` is no longer in the peak month. Other rules are never past peak.
+ */
+export function r1PastPeak(
+  r: { rule: MarketRule; params: Pick<RecommendationParams, "actByDate" | "peakMonth"> },
+  refYmd: string,
+): boolean {
+  if (r.rule !== "R1") return false;
+  if (r.params.actByDate) return r.params.actByDate < refYmd;
+  return r.params.peakMonth !== undefined && r.params.peakMonth !== Number(refYmd.slice(5, 7));
+}
+
 export function designRules(f: DesignFacts): RecommendationDraft[] {
   const out: RecommendationDraft[] = [];
 
-  // R1 seasonal prep: a peak ≤ 10 weeks away with seasonality at medium or better.
+  // R1 seasonal prep: a peak ≤ 10 weeks away with seasonality at medium or better. Timing
+  // (wave 20, market-signals.md "R1 timing"): while today is inside the peak month the peak is
+  // under way (no act-by date, "season is on now" copy); otherwise an act-by date already
+  // before today means the design missed that peak, and R1 stays silent.
   const s = f.season;
-  if (s?.actBy && s.actBy.weeksToPeak <= R.r1PeakWeeks && bandAtLeast(s.band, "medium")) {
+  const underWay = s?.actBy?.peakMonth === f.currentMonth;
+  if (
+    s?.actBy &&
+    s.actBy.weeksToPeak <= R.r1PeakWeeks &&
+    bandAtLeast(s.band, "medium") &&
+    (underWay || s.actBy.date >= f.today)
+  ) {
     const listed = new Set(f.listedChannels);
     const m = merge(s);
     out.push({
@@ -131,7 +158,8 @@ export function designRules(f: DesignFacts): RecommendationDraft[] {
             }
           : {}),
         peakMonth: s.actBy.peakMonth,
-        actByDate: s.actBy.date,
+        ...(underWay ? {} : { actByDate: s.actBy.date }),
+        ...(f.niche ? { niche: f.niche } : {}),
         expectedUnits: s.expectedUnits,
       },
       confidence: s.confidence,

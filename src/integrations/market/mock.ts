@@ -173,6 +173,19 @@ function periodsEnding(granularity: "week" | "month", count: number, end: Date):
 }
 
 /**
+ * A UTC instant inside the last *complete* period before `now` (wave 20, gate issue 4): the
+ * Sunday that ends the previous ISO week, or the last day of the previous month. The series, and
+ * so its `asOf`, never covers the current partial period, so `asOf` is never after `now`.
+ */
+function lastCompletePeriodEnd(granularity: "week" | "month", now: Date): Date {
+  const midnight = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+  if (granularity === "month")
+    return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 0));
+  const isoDow = now.getUTCDay() || 7; // Monday=1 .. Sunday=7
+  return new Date(midnight - isoDow * 86_400_000);
+}
+
+/**
  * One deterministic demand series for `query` from `source` (AC1). Seasonal when `query` is a
  * real taxonomy query whose niche has `peakMonths` (round 2b); otherwise a hash-picked rising,
  * falling or flat trend, so every direction stays available on mocks.
@@ -188,7 +201,7 @@ export function mockDemandSeries(
   const peakMonths = QUERY_PEAK_MONTHS.get(query);
   const base = 20 + (hashInt(`${source}:${query}:base`) % 60);
   const count = Math.max(1, Math.round(years * (granularity === "month" ? 12 : 52)));
-  const periods = periodsEnding(granularity, count, new Date());
+  const periods = periodsEnding(granularity, count, lastCompletePeriodEnd(granularity, new Date()));
 
   let points: SeriesPoint[];
   if (peakMonths && peakMonths.length > 0) {

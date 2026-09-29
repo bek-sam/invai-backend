@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { glanceOf } from "./build";
 import { DIGEST_CONFIG as C } from "./config";
 import { d4Ads, d6Fulfillment, d7Stock, detect } from "./detectors";
 import { changeFact, fact } from "./facts";
@@ -536,5 +537,105 @@ describe("templates (AC13, AC18, P1)", () => {
     const evil = renderEmail({ ...model, shopName: '<img src=x onerror="1">' }, "en");
     expect(evil.html).not.toContain("<img");
     expect(evil.html).toContain("&lt;img");
+  });
+});
+
+describe("a digest rendered on 2026-09-28 (wave 20, T-20-1 AC6)", () => {
+  const WEEK_END = "2026-09-28";
+  const src = {
+    source: "google_trends",
+    licence: "official_api",
+    asOf: "2026-09-27T23:59:59.999Z",
+    fetchedAt: "2026-09-28T07:00:00.000Z",
+    mock: true,
+  };
+  const recs = [
+    // Missed: act-by Aug 1 is before the week's end. Must never show.
+    marketRec({
+      id: "00000000-0000-4000-8000-0000000000b1",
+      target: { designId: null, designName: "Old Ghost", niche: null, channel: null },
+      params: { designName: "Old Ghost", peakMonth: 9, actByDate: "2026-08-01" },
+      sources: [src],
+    }),
+    // Under way: the September peak, no act-by date.
+    marketRec({
+      id: "00000000-0000-4000-8000-0000000000b2",
+      target: { designId: null, designName: "Spirit Tee", niche: null, channel: null },
+      params: { designName: "Spirit Tee", peakMonth: 9, niche: "halloween" },
+      sources: [src],
+    }),
+  ];
+  const s = snapshot({
+    current: { ...snapshot().current, orders: 40, marginPct: 33.4 },
+    previous: { ...snapshot().previous, orders: 40, marginPct: 26.5 },
+  });
+  const glance = glanceOf(s);
+  const candidates = marketCandidates(recs, { mockAllowed: true, weekEnd: WEEK_END });
+  const model: RenderModel = {
+    shopName: "Desert Fixture Tees",
+    weekStart: "2026-09-21",
+    weekEnd: WEEK_END,
+    glance,
+    net: null,
+    netChange: null,
+    steady: false,
+    incompleteOrders: 0,
+    partialChannels: [],
+    actions: [],
+    win: null,
+    marketWatch: candidates.map((c, n) => ({
+      id: `m${n}`,
+      detector: "market",
+      action: c.action,
+      facts: c.facts,
+      recommendation: c.recommendation,
+    })),
+    unsubscribeUrl: "http://localhost:3000/l/tok",
+    manageUrl: "http://localhost:5173/settings/notifications",
+  };
+
+  it("drops the past-peak item and keeps the under-way one", () => {
+    expect(candidates.map((c) => c.recommendation?.id)).toEqual([
+      "00000000-0000-4000-8000-0000000000b2",
+    ]);
+  });
+
+  it("en and es: no past month after 'before', no 'Mon,', margin in points, 'unchanged' orders", () => {
+    const months = (lang: "en" | "es") =>
+      Array.from({ length: 9 }, (_, m) =>
+        new Intl.DateTimeFormat(lang === "es" ? "es-US" : "en-US", {
+          month: "long",
+          timeZone: "UTC",
+        }).format(new Date(Date.UTC(2026, m, 1))),
+      );
+    const text = { en: renderEmail(model, "en").text, es: renderEmail(model, "es").text };
+    for (const m of months("en")) expect(text.en).not.toMatch(new RegExp(`before ${m}`, "i"));
+    for (const m of months("es")) expect(text.es).not.toMatch(new RegExp(`antes de ${m}`, "i"));
+    expect(text.es).not.toContain("Mon,");
+    for (const lang of ["en", "es"] as const) {
+      expect(text[lang]).not.toMatch(/\(0%|\(\+26%|\+26\.0 pts/);
+      expect(text[lang]).not.toContain("Old Ghost");
+    }
+    expect(text.en).toContain("Margin: 33.4% (+6.9 pts vs last week)");
+    expect(text.es).toContain("(+6,9 pts vs. la semana pasada)");
+    expect(text.en).toContain("Orders: 40 (unchanged vs last week)");
+    expect(text.es).toContain("Pedidos: 40 (sin cambio vs. la semana pasada)");
+    expect(text.en).toContain("The Halloween season is on now. Make sure Spirit Tee is listed");
+    expect(text.es).toContain("La temporada de Halloween ya empezó.");
+    expect(text.en).toContain("Google Trends, week ending Sep 27");
+    expect(text.es).toContain("Google Trends, semana al 27 sep");
+  });
+
+  it("a negative point change and a relative change keep their own formats", () => {
+    const down = glanceOf(
+      snapshot({
+        current: { ...snapshot().current, revenue: 36_000, marginPct: 26.5 },
+        previous: { ...snapshot().previous, revenue: 30_000, marginPct: 33.4 },
+      }),
+    );
+    const margin = down.find((g) => g.metric === "marginPct");
+    expect(margin?.change?.formatted).toEqual({ en: "-6.9 pts", es: "-6,9 pts" });
+    expect(margin?.changePct).toBe(-6.9);
+    expect(down.find((g) => g.metric === "revenue")?.change?.formatted.en).toBe("+20%");
   });
 });

@@ -50,6 +50,7 @@ import {
   candidatePrices,
   completeWeeks,
   floorPriceCents,
+  localYmd,
   marginPctAt,
   netAt,
   priceEnding,
@@ -613,6 +614,14 @@ export type RecommendationListInput = PageInput & {
   minBand?: ConfidenceBand;
 };
 
+/** SQL twin of `r1PastPeak` (rules.ts), negated: keeps every row that isn't a past-peak R1. */
+function notPastPeakSql(today: string) {
+  const p = marketRecommendations.params;
+  return sql`not (${marketRecommendations.rule} = 'R1' and case
+    when ${p}->>'actByDate' is not null then (${p}->>'actByDate') < ${today}
+    else coalesce((${p}->>'peakMonth')::int <> ${Number(today.slice(5, 7))}, false) end)`;
+}
+
 /** The shop's stored recommendations, newest first (cursor page). Mock ones only where allowed. */
 export async function listRecommendationsPage(
   tx: Tx,
@@ -620,6 +629,9 @@ export async function listRecommendationsPage(
   input: RecommendationListInput,
 ): Promise<{ items: MarketRecommendation[]; nextCursor: string | null }> {
   const allowed = await mockSourcesAllowed(ctx.companyId);
+  const now = new Date();
+  const { timeZone } = await companyInfo(tx, ctx.companyId);
+  const today = localYmd(now, timeZone);
   const limit = Math.min(input.limit, 200);
   const page = keyset(marketRecommendations.createdAt, marketRecommendations.id, {
     ...input,
@@ -639,12 +651,14 @@ export async function listRecommendationsPage(
           ? inArray(marketRecommendations.band, BANDS_AT_LEAST[input.minBand])
           : undefined,
         allowed ? undefined : eq(marketRecommendations.mock, false),
+        // R1 timing (wave 20): a past-peak R1 item is never listed. Lookups by id (a stored
+        // assistant message re-reading its own cards) still return it, so a vote can bind.
+        input.ids?.length ? undefined : notPastPeakSql(today),
         page.where,
       ),
     )
     .orderBy(...page.orderBy)
     .limit(limit + 1);
-  const now = new Date();
   const out = page.result(
     rows.map((r) => ({ ...r, createdAt: r.rec.createdAt, id: r.rec.id })),
     (r) => toRecommendation(r.rec, r.designName ?? null, now),

@@ -38,7 +38,12 @@ export type BuildResult =
 
 const WEEKDAY_INDEX = { mon: 0, tue: 1, wed: 2, thu: 3, fri: 4, sat: 5, sun: 6 } as const;
 
-/** The glance block (spec step 6): five metrics with this week, last week and the change. */
+/**
+ * The glance block (spec step 6): five metrics with this week, last week and the change. Money
+ * and counts change as a relative percent; margin and on-time rate, which are percents
+ * themselves, change in points (`cur - prev`, wave 20 / architect A4), so a 26.5% → 33.4% margin
+ * reads "+6.9 pts", not "+26%". For those two, `changePct` carries the point difference.
+ */
 export function glanceOf(s: Snapshot): StoredContent["glance"] {
   const row = (
     metric: StoredContent["glance"][number]["metric"],
@@ -46,13 +51,22 @@ export function glanceOf(s: Snapshot): StoredContent["glance"] {
     cur: number | null,
     prev: number | null,
   ) => {
-    const changePct = cur === null ? null : pctChange(cur, prev);
+    const points = unit === "pct" || unit === "ratio";
+    const scale = unit === "ratio" ? 100 : 1;
+    const change =
+      cur === null
+        ? null
+        : points
+          ? prev === null
+            ? null
+            : (cur - prev) * scale
+          : pctChange(cur, prev);
     return {
       metric,
       current: fact(`glance.${metric}`, unit, cur),
       previous: prev === null ? null : fact(`glance.${metric}.previous`, unit, prev),
-      changePct: changePct === null ? null : Math.round(changePct * 10) / 10,
-      change: changeFact(`glance.${metric}.change`, changePct),
+      changePct: change === null ? null : Math.round(change * 10) / 10 || 0,
+      change: changeFact(`glance.${metric}.change`, change, points ? "points" : "relative"),
     };
   };
   const hadPrevious = s.previous.orders > 0 || s.previous.revenue !== 0;
@@ -179,11 +193,16 @@ async function historyOf(tx: Tx, companyId: string, weekStart: string): Promise<
 }
 
 /** Market watch candidates; a missing, stale or throwing market read gives none (AC16). */
-async function marketOf(tx: Tx, companyId: string, asOf: Date): Promise<Candidate[]> {
+async function marketOf(
+  tx: Tx,
+  companyId: string,
+  asOf: Date,
+  weekEnd: string,
+): Promise<Candidate[]> {
   try {
     // A savepoint, so a failed market query can't abort the digest's own transaction.
     const recs = await tx.transaction((sp) => listDigestMarketItems(sp, { companyId }, { asOf }));
-    return marketCandidates(recs, { mockAllowed: !env.isProd });
+    return marketCandidates(recs, { mockAllowed: !env.isProd, weekEnd });
   } catch (err) {
     log.warn("market watch unavailable; block left out", { companyId, ...errorData(err) });
     return [];
@@ -272,7 +291,9 @@ async function buildLocked(
     );
     const quiet = isQuiet(snapshot);
     const history = await historyOf(tx, companyId, row.weekStart);
-    const candidates = quiet ? [] : [...detect(snapshot), ...(await marketOf(tx, companyId, at))];
+    const candidates = quiet
+      ? []
+      : [...detect(snapshot), ...(await marketOf(tx, companyId, at, row.weekEnd))];
     const ranked = rank(candidates, history);
     const content = contentFor(snapshot, ranked);
     const status = quiet ? ("skipped_quiet" as const) : ("ready" as const);

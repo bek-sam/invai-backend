@@ -289,7 +289,13 @@ async function resolveStale(tx: Tx, companyId: string, kinds: string[], keep: Se
  */
 export async function generateAlerts(tx: Tx, ctx: Ctx) {
   const cid = ctx.companyId;
-  const { settings } = await companyInfo(tx, cid);
+  const { settings, timezone } = await companyInfo(tx, cid);
+  // "Sep 26" in the shop's time zone (B-137): alert text never shows a raw ISO timestamp.
+  const shopDate = new Intl.DateTimeFormat("en-US", {
+    month: "short",
+    day: "numeric",
+    timeZone: timezone,
+  });
   const riskHours = settings.riskWindowHours ?? DEFAULTS.riskWindowHours;
   const keep = new Set<string>();
   let created = 0;
@@ -313,7 +319,7 @@ export async function generateAlerts(tx: Tx, ctx: Ctx) {
         kind: "order_overdue",
         severity: "critical",
         title: `Order ${o.order_no} is past its ship-by`,
-        message: `Ship-by was ${shipBy.toISOString()} and no label has been bought.`,
+        message: `Ship-by was ${shopDate.format(shipBy)} and no label has been bought.`,
         entityType: "order",
         entityId: o.id,
         dedupeKey: `order_overdue:${o.id}`,

@@ -2,7 +2,14 @@ import { describe, expect, it } from "vitest";
 import { agreement, band, combine, freshness, isStale, sampleFactor } from "./confidence";
 import { designTokens, mapDesign, stemMatches, stemNiches } from "./mapper";
 import { CANONICAL_QUERIES, NICHES, nicheLabel } from "./niches";
-import { type DesignFacts, designRules, type NicheFacts, nicheRules, type Scored } from "./rules";
+import {
+  type DesignFacts,
+  designRules,
+  type NicheFacts,
+  nicheRules,
+  r1PastPeak,
+  type Scored,
+} from "./rules";
 import {
   actBy,
   breakEvenCents,
@@ -395,6 +402,8 @@ function facts(over: Partial<DesignFacts> = {}, conf = 0.8): DesignFacts {
       },
     ],
     currentMonth: 9,
+    today: "2026-09-01",
+    niche: "halloween",
     ...over,
   };
 }
@@ -406,6 +415,43 @@ describe("rules R1–R5", () => {
     expect(r1?.params.channels).toEqual(["amazon"]);
     expect(r1?.params.blankBelowReorderPoint).toBe(true);
     expect(r1?.params.actByDate).toBe("2026-09-03");
+  });
+
+  it("R1 timing (wave 20): a past act-by date emits nothing; a peak under way drops the act-by date", () => {
+    const season = facts().season;
+    if (!season?.actBy) throw new Error("fixture has no season");
+    // Sep 28, October peak, act-by Sep 3 already passed: the design missed this peak.
+    const missed = designRules(facts({ today: "2026-09-28" }));
+    expect(missed.some((r) => r.rule === "R1")).toBe(false);
+    // Oct 2, the October peak is under way: R1 still fires, with no act-by date and the niche.
+    const underWay = designRules(
+      facts({
+        today: "2026-10-02",
+        currentMonth: 10,
+        season: { ...season, actBy: { ...season.actBy, date: "2026-09-03", weeksToPeak: 0 } },
+      }),
+    ).find((r) => r.rule === "R1");
+    expect(underWay).toBeDefined();
+    expect(underWay?.params.actByDate).toBeUndefined();
+    expect(underWay?.params.peakMonth).toBe(10);
+    expect(underWay?.params.niche).toBe("halloween");
+    // Act-by date equal to today still counts (not before today).
+    const lastDay = designRules(facts({ today: "2026-09-03" })).find((r) => r.rule === "R1");
+    expect(lastDay?.params.actByDate).toBe("2026-09-03");
+  });
+
+  it("r1PastPeak: act-by before the reference day, or a finished under-way month, is past", () => {
+    const r1 = (params: { actByDate?: string; peakMonth?: number }) => ({
+      rule: "R1" as const,
+      params,
+    });
+    expect(r1PastPeak(r1({ actByDate: "2026-08-01", peakMonth: 9 }), "2026-09-28")).toBe(true);
+    expect(r1PastPeak(r1({ actByDate: "2026-09-28", peakMonth: 10 }), "2026-09-28")).toBe(false);
+    expect(r1PastPeak(r1({ peakMonth: 9 }), "2026-09-28")).toBe(false);
+    expect(r1PastPeak(r1({ peakMonth: 9 }), "2026-10-01")).toBe(true);
+    expect(r1PastPeak({ rule: "R2", params: { actByDate: "2020-01-01" } }, "2026-09-28")).toBe(
+      false,
+    );
   });
 
   it("R2 tests p0 × 1.05..1.10 capped at the comparables' median; mock comparables flag it", () => {

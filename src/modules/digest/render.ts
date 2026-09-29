@@ -6,6 +6,7 @@ import {
   type DigestGlanceItem,
   type MarketRecommendation,
 } from "@invai/contracts";
+import { nicheLabel } from "../market/niches";
 import type { Lang } from "./facts";
 
 /*
@@ -90,6 +91,12 @@ export const TEMPLATES = {
     en: "List {{design}} on {{channels}} and stock {{blank}} before {{peak}}.",
     es: "Publica {{design}} en {{channels}} y surte {{blank}} antes de {{peak}}.",
   },
+  /** R1 while today is inside the peak month (wave 20; market-signals.md "R1 action (peak
+   * under way)"): no act-by date, no "before". */
+  "R1 action.underWay": {
+    en: "The {{niche}} season is on now. Make sure {{design}} is listed and in stock.",
+    es: "La temporada de {{niche}} ya empezó. Asegúrate de que {{design}} esté publicado y con inventario.",
+  },
   "R2 action": {
     en: "Test a price of {{price}} on {{channel}} for 2 weeks.",
     es: "Prueba un precio de {{price}} en {{channel}} por 2 semanas.",
@@ -106,8 +113,11 @@ export const TEMPLATES = {
     en: "Pause ads on {{design}} and move it down your list.",
     es: "Pausa los anuncios de {{design}} y bájalo en tu lista.",
   },
-  /** new: source and date under a market item. */
-  "market.source": { en: "{{source}}, {{date}}", es: "{{source}}, {{date}}" },
+  /** Source and date under a market item; the date is `source.weekEnding` (wave 20). */
+  "market.source": {
+    en: "{{source}}, week ending {{date}}",
+    es: "{{source}}, semana al {{date}}",
+  },
   /** new: R1's channel-list fallback when neither `params.channels` nor a single target/params
    * channel is set (T-19-3 round 2 fix), matching web's `market.channels.connected`
    * (invai-web/src/components/market/recommendation-copy.ts). */
@@ -284,6 +294,12 @@ function marketPart(i: RenderInsight, lang: Lang): Part {
   const peak = p.peakMonth ? monthName(lang, p.peakMonth) : "";
   switch (r?.rule) {
     case "R1":
+      // A peak under way carries its peak month but no act-by date (wave 20 R1 timing).
+      if (p.peakMonth && !p.actByDate)
+        return {
+          key: "R1 action.underWay",
+          vars: { niche: p.niche ? nicheLabel(p.niche, lang) : peak, design },
+        };
       return {
         key: "R1 action",
         vars: {

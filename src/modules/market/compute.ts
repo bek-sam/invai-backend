@@ -1009,6 +1009,8 @@ async function computeInTx(tx: Tx, companyId: string, now: Date, run: RunCtx) {
           };
         }),
       currentMonth,
+      today,
+      niche: primary,
     };
     drafts.push(...designRules(facts));
   }
