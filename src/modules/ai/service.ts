@@ -364,6 +364,21 @@ async function productionPartner(tx: Tx, companyId: string) {
   return row?.settings?.productionPartner ?? null;
 }
 
+/**
+ * ADR 0017: the model's `{ key, value }[]` (structured-output transport) folds into the one
+ * stored and returned shape, a string map, here and nowhere else. Keys are trimmed, an empty key
+ * is dropped, and on a repeated key the first one wins.
+ */
+export function foldAttributes(list: { key: string; value: string }[]): Record<string, string> {
+  const out = new Map<string, string>();
+  for (const { key, value } of list) {
+    const k = key.trim();
+    if (k && !out.has(k)) out.set(k, value);
+  }
+  // fromEntries defines own properties, so a "__proto__" key stays a plain key.
+  return Object.fromEntries(out);
+}
+
 function toContent(
   copy: ListingCopy,
   price: number | null,
@@ -374,7 +389,7 @@ function toContent(
     description: copy.description,
     tags: copy.tags,
     bullets: copy.bullets,
-    attributes: Object.fromEntries(copy.attributes.map((a) => [a.key, a.value])),
+    attributes: foldAttributes(copy.attributes),
     price,
     disclosures: [],
     productionPartner: productionPartner?.name ?? null,
