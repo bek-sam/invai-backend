@@ -102,6 +102,8 @@ export const stockLevels = pgTable(
     reorderQty: integer(),
     /** Shelf / bin label where this blank sits, e.g. "A-03-2" (shown on the pick queue). */
     shelf: text(),
+    /** Bin code when the shop keeps this blank in a labelled bin (B-32); shown on the pick list. */
+    binCode: text(),
     updatedAt: timestamp({ withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [

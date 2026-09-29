@@ -232,6 +232,13 @@
       "when": 1790701888944,
       "tag": "0032_shipping_scan_forms",
       "breakpoints": true
+    },
+    {
+      "idx": 33,
+      "version": "7",
+      "when": 1790707919225,
+      "tag": "0033_production_station_maintenance",
+      "breakpoints": true
     }
   ]
 }

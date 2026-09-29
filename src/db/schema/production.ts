@@ -1,3 +1,5 @@
+import { MAINTENANCE_REASONS } from "@invai/contracts";
+import { isNull } from "drizzle-orm";
 import {
   boolean,
   doublePrecision,
@@ -312,6 +314,9 @@ export const REPRINT_REASONS = [
   "customer_request",
   "lost",
   "other",
+  // QC fail reasons from research 10 §DTF (B-35, T-22-4), mirroring the contract.
+  "under_cure",
+  "cracking",
 ] as const;
 
 export const REPRINT_STATUSES = ["requested", "on_sheet", "done", "cancelled"] as const;
@@ -345,5 +350,41 @@ export const reprints = pgTable(
       foreignColumns: [orderItems.companyId, orderItems.id],
     }).onDelete("cascade"),
     tenantPolicy("reprints"),
+  ],
+).enableRLS();
+
+/**
+ * A station maintenance window (B-35, T-22-4): open while `endedAt` is null. While one is open,
+ * scans at that station return a blocked ScanResult (`station_maintenance`). At most one open
+ * window per station (partial unique index), which makes a concurrent or replayed `start` a no-op.
+ * Kept for the shop's history (same retention as the station); deleted with the station.
+ */
+export const stationMaintenanceEvents = pgTable(
+  "station_maintenance_events",
+  {
+    id: id(),
+    companyId: companyId(),
+    stationId: uuid().notNull(),
+    reason: text(enumText(MAINTENANCE_REASONS)).notNull(),
+    note: text(),
+    endNote: text(),
+    startedAt: timestamp({ withTimezone: true }).notNull().defaultNow(),
+    startedBy: uuid(),
+    endedAt: timestamp({ withTimezone: true }),
+    endedBy: uuid(),
+    ...timestamps,
+  },
+  (t) => [
+    uniqueIndex("station_maintenance_events_open_unique")
+      .on(t.companyId, t.stationId)
+      .where(isNull(t.endedAt)),
+    index().on(t.companyId, t.stationId, t.startedAt),
+    index().on(t.companyId, t.startedAt),
+    foreignKey({
+      name: "station_maintenance_events_station_id_fk",
+      columns: [t.companyId, t.stationId],
+      foreignColumns: [stations.companyId, stations.id],
+    }).onDelete("cascade"),
+    tenantPolicy("station_maintenance_events"),
   ],
 ).enableRLS();
