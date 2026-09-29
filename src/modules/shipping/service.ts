@@ -1,8 +1,10 @@
 import type {
+  AddressVerification,
   BatchBuyResult as BatchBuyResultSchema,
   Channel,
   RatesInput as RatesInputSchema,
   RatesResult as RatesResultSchema,
+  ScanForm,
   Shipment,
   ShippingSettings,
   ShippingSettingsInput as ShippingSettingsInputSchema,
@@ -31,21 +33,28 @@ import type { TenantContext } from "../../api/context";
 import { afterCommit, type Tx, withTenant } from "../../db/client";
 import type { Address, RateQuote, ShipmentState } from "../../db/schema";
 import {
+  addressVerifications,
   bins,
   blankVariants,
   buyerPii,
+  companies,
   labels,
   orderItems,
   orders,
   packagePresets,
+  scanForms,
   shipments,
   shippingSettings,
 } from "../../db/schema";
+import { env } from "../../env";
 import {
+  type AddressCheck,
   type BuyRequest,
   CarrierError,
   type CarrierRate,
+  type CarrierScanForm,
   carrierAdapter,
+  carrierExtras,
   type Parcel,
   type PurchasedLabel,
   rateExpiresAt,
@@ -57,6 +66,7 @@ import {
   type TrackingExportRow,
 } from "../../integrations/channels/exports/tracking";
 import { type Actor, audit } from "../../lib/audit";
+import { hmacHex } from "../../lib/crypto";
 import { badRequest, conflict, notFound, ORPCError, upstream } from "../../lib/errors";
 import { logger } from "../../lib/log";
 import { emit } from "../../lib/outbox";
@@ -65,6 +75,7 @@ import { publish } from "../../lib/realtime";
 import { getObject, objectKey, presignGet, putObject } from "../../lib/s3";
 import { assertPaidActionAllowed, getPlan } from "../billing/service";
 import { pushTrackingForShipment } from "../channels/service";
+import { todayRange } from "../orders/shipby";
 import { transitionItem } from "../orders/state-machine";
 import { createJobRow, updateJobRow } from "../production/service";
 
@@ -1958,4 +1969,409 @@ export async function exportTracking(
 
   log.info("tracking exported", { channel: input.channel, count: ids.length, key });
   return { key, count: ids.length };
+}
+
+/* ------------------------- SCAN forms and address checks (B-25) ------------------------- */
+
+type ScanFormRow = typeof scanForms.$inferSelect;
+
+/** A SCAN form create whose carrier call started this recently may still be in flight. */
+export const SCAN_FORM_IN_FLIGHT_MS = 2 * 60_000;
+/** Labels in these states can go on the day's form (in transit: the mock moves fast). */
+const MANIFESTABLE: ShipmentState[] = ["labeled", "in_transit"];
+
+function toScanForm(r: ScanFormRow): ScanForm {
+  return {
+    id: r.id,
+    carrier: r.carrier as ScanForm["carrier"],
+    date: r.date,
+    labelCount: r.labelCount,
+    shipmentIds: r.shipmentIds,
+    carrierFormId: r.carrierFormId,
+    fileKey: r.fileKey,
+    createdAt: r.createdAt.toISOString(),
+  };
+}
+
+async function shopTimeZone(tx: Tx, companyId: string) {
+  // Tolerated read of the tenancy table (precedent: modules/today/service.ts companyInfo).
+  const [c] = await tx
+    .select({ timezone: companies.timezone })
+    .from(companies)
+    .where(eq(companies.id, companyId))
+    .limit(1);
+  return c?.timezone ?? "America/Phoenix";
+}
+
+/** YYYY-MM-DD in the shop's timezone. */
+export function shopDate(timeZone: string, now = new Date()) {
+  return new Intl.DateTimeFormat("en-CA", { timeZone }).format(now);
+}
+
+/** The shop-local day `date` as instants. Noon UTC falls on the same calendar day in every US zone. */
+function dayRange(timeZone: string, date: string) {
+  return todayRange(timeZone, new Date(`${date}T12:00:00Z`));
+}
+
+const scanFormRejected = (detail: string) =>
+  new ORPCError("SCAN_FORM_REJECTED", {
+    status: 502,
+    message: "Carrier refused the SCAN form",
+    data: { detail },
+  });
+
+type ScanFormPlan =
+  | { kind: "done"; form: ScanForm }
+  | { kind: "call"; resume: boolean; row: ScanFormRow; carrierShipmentIds: string[] };
+
+/**
+ * Manifest the day's labels for one carrier on one SCAN form (B-25), never twice. Tx 1 claims
+ * (company, carrier, date) with a `creating` row listing the shipments and commits. The carrier
+ * is called with no transaction open. Tx 2 stores the carrier's form id and PDF key. A repeat
+ * returns the stored form; a repeat after an unknown outcome reads the first shipment back
+ * (`scanFormOf`) before creating, because a shipment can be on one form only.
+ */
+export async function createScanForm(
+  ctx: TenantContext,
+  input: { carrier: ScanForm["carrier"]; date?: string | undefined },
+): Promise<ScanForm> {
+  const plan = await withTenant(ctx.companyId, async (tx): Promise<ScanFormPlan> => {
+    const tz = await shopTimeZone(tx, ctx.companyId);
+    const date = input.date ?? shopDate(tz);
+    const [existing] = await tx
+      .select()
+      .from(scanForms)
+      .where(and(eq(scanForms.carrier, input.carrier), eq(scanForms.date, date)))
+      .for("update");
+    if (existing?.status === "created") return { kind: "done", form: toScanForm(existing) };
+    if (existing) {
+      const since = existing.attemptedAt ? Date.now() - existing.attemptedAt.getTime() : null;
+      if (since !== null && since < SCAN_FORM_IN_FLIGHT_MS)
+        throw conflict("This SCAN form is being created right now. Check again in a minute.");
+      await tx
+        .update(scanForms)
+        .set({ attemptedAt: new Date() })
+        .where(eq(scanForms.id, existing.id));
+      const ids = await carrierIdsFor(tx, existing.shipmentIds);
+      return { kind: "call", resume: true, row: existing, carrierShipmentIds: ids };
+    }
+    const { start, end } = dayRange(tz, date);
+    const eligible = await tx
+      .select({ id: shipments.id, carrierShipmentId: shipments.carrierShipmentId })
+      .from(shipments)
+      .where(
+        and(
+          eq(shipments.carrier, input.carrier),
+          inArray(shipments.status, MANIFESTABLE),
+          isNotNull(shipments.carrierShipmentId),
+          gte(shipments.labeledAt, start),
+          lte(shipments.labeledAt, end),
+          // Labels already on a form (any date) never go on a second one.
+          sql`not exists (select 1 from ${scanForms} f where f.company_id = ${shipments.companyId} and ${shipments.id} = any(f.shipment_ids))`,
+        ),
+      )
+      .orderBy(asc(shipments.labeledAt));
+    if (!eligible.length)
+      throw new ORPCError("NO_LABELS_TO_MANIFEST", {
+        status: 409,
+        message: "No labels for this carrier and day are waiting for a SCAN form",
+      });
+    const [row] = await tx
+      .insert(scanForms)
+      .values({
+        companyId: ctx.companyId,
+        carrier: input.carrier,
+        date,
+        status: "creating",
+        shipmentIds: eligible.map((e) => e.id),
+        labelCount: eligible.length,
+        attemptedAt: new Date(),
+      })
+      .onConflictDoNothing()
+      .returning();
+    if (!row) throw conflict("This SCAN form is being created right now. Check again in a minute.");
+    return {
+      kind: "call",
+      resume: false,
+      row,
+      carrierShipmentIds: eligible.map((e) => e.carrierShipmentId as string),
+    };
+  });
+  if (plan.kind === "done") return plan.form;
+
+  // No transaction and no row lock while the carrier is called.
+  const carrier = await carrierExtras(ctx);
+  let made: CarrierScanForm;
+  try {
+    const first = plan.carrierShipmentIds[0];
+    const found =
+      plan.resume && first
+        ? await carrier.scanFormOf({
+            companyId: ctx.companyId,
+            formId: plan.row.id,
+            carrierShipmentId: first,
+          })
+        : null;
+    made =
+      found ??
+      (await carrier.createScanForm({
+        companyId: ctx.companyId,
+        formId: plan.row.id,
+        date: plan.row.date,
+        carrierShipmentIds: plan.carrierShipmentIds,
+      }));
+  } catch (err) {
+    const unknown = !(err instanceof CarrierError) || err.outcome === "unknown";
+    const detail = err instanceof Error ? err.message : String(err);
+    log.warn("scan form failed", {
+      companyId: ctx.companyId,
+      scanFormId: plan.row.id,
+      unknown,
+      detail,
+    });
+    await withTenant(ctx.companyId, (tx) =>
+      unknown
+        ? // Unknown: keep the claim, clear the in-flight mark so the next call reads back.
+          tx.update(scanForms).set({ attemptedAt: null }).where(eq(scanForms.id, plan.row.id))
+        : // Refused: nothing was made; free the (carrier, date) key for a corrected retry.
+          tx.delete(scanForms).where(eq(scanForms.id, plan.row.id)),
+    );
+    if (unknown)
+      throw new ORPCError("UPSTREAM_FAILED", {
+        status: 502,
+        message:
+          "We couldn't confirm the SCAN form with the carrier. Try again to check; it won't be made twice.",
+        data: { service: "carrier", detail },
+      });
+    throw scanFormRejected(detail);
+  }
+
+  return withTenant(ctx.companyId, async (tx) => {
+    const [row] = await tx
+      .update(scanForms)
+      .set({
+        status: "created",
+        carrierFormId: made.carrierFormId,
+        fileKey: made.fileKey,
+        attemptedAt: null,
+      })
+      .where(eq(scanForms.id, plan.row.id))
+      .returning();
+    if (!row) throw notFound("scan form", plan.row.id);
+    await audit(tx, {
+      companyId: ctx.companyId,
+      actor: ctx.actor,
+      action: "scan_form.created",
+      entityType: "scan_form",
+      entityId: row.id,
+      summary: `SCAN form for ${row.carrier.toUpperCase()} on ${row.date}: ${row.labelCount} labels`,
+    });
+    return toScanForm(row);
+  });
+}
+
+async function carrierIdsFor(tx: Tx, shipmentIds: string[]) {
+  if (!shipmentIds.length) return [];
+  const rows = await tx
+    .select({ id: shipments.id, carrierShipmentId: shipments.carrierShipmentId })
+    .from(shipments)
+    .where(inArray(shipments.id, shipmentIds));
+  const byId = new Map(rows.map((r) => [r.id, r.carrierShipmentId]));
+  return shipmentIds.map((id) => byId.get(id)).filter((v): v is string => !!v);
+}
+
+export async function listScanForms(
+  tx: Tx,
+  _ctx: TenantContext,
+  input: PageInput & { carrier?: ScanForm["carrier"]; from?: string; to?: string },
+) {
+  const page = keyset(scanForms.createdAt, scanForms.id, input);
+  const rows = await tx
+    .select()
+    .from(scanForms)
+    .where(
+      and(
+        page.where,
+        eq(scanForms.status, "created"),
+        input.carrier ? eq(scanForms.carrier, input.carrier) : undefined,
+        input.from ? gte(scanForms.date, input.from) : undefined,
+        input.to ? lte(scanForms.date, input.to) : undefined,
+      ),
+    )
+    .orderBy(...page.orderBy)
+    .limit(page.limit + 1);
+  return page.result(rows, toScanForm);
+}
+
+/**
+ * One form. EasyPost renders the PDF after answering; while `fileKey` is null, this reads the
+ * carrier back once (no transaction open) and stores the file when it's ready.
+ */
+export async function getScanForm(ctx: TenantContext, id: string): Promise<ScanForm> {
+  const row = await withTenant(ctx.companyId, async (tx) => {
+    const [r] = await tx
+      .select()
+      .from(scanForms)
+      .where(and(eq(scanForms.id, id), eq(scanForms.status, "created")))
+      .limit(1);
+    if (!r) throw notFound("scan form", id);
+    const first = r.fileKey ? null : (await carrierIdsFor(tx, r.shipmentIds.slice(0, 1)))[0];
+    return { r, first };
+  });
+  if (row.r.fileKey || !row.first) return toScanForm(row.r);
+  const found = await (await carrierExtras(ctx))
+    .scanFormOf({ companyId: ctx.companyId, formId: row.r.id, carrierShipmentId: row.first })
+    .catch((err) => {
+      log.warn("scan form read-back failed", {
+        companyId: ctx.companyId,
+        scanFormId: row.r.id,
+        detail: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    });
+  if (!found?.fileKey) return toScanForm(row.r);
+  return withTenant(ctx.companyId, async (tx) => {
+    const [r] = await tx
+      .update(scanForms)
+      .set({ fileKey: found.fileKey, carrierFormId: found.carrierFormId ?? row.r.carrierFormId })
+      .where(eq(scanForms.id, id))
+      .returning();
+    return toScanForm(r ?? row.r);
+  });
+}
+
+/* ------------------------------ address check ------------------------------ */
+
+/** Keyed hash of the ship-to, so a stored result is reused only while the address is unchanged. */
+function addressHash(companyId: string, a: Address) {
+  const norm = (v: string | null | undefined) =>
+    (v ?? "").toUpperCase().replace(/\s+/g, " ").trim();
+  const text = [a.name, a.company, a.street1, a.street2, a.city, a.state, a.zip, a.country]
+    .map(norm)
+    .join("|");
+  return hmacHex(env.BETTER_AUTH_SECRET, `address-check:v1:${companyId}:${text}`);
+}
+
+/**
+ * Carrier address check on an order's ship-to (B-25). The result (status, reason, time) is stored
+ * per order with a keyed hash of the address; a repeat on the same address returns it without a
+ * carrier call. The corrected address is never stored or logged: a repeat of a `corrected`
+ * result asks the carrier again (free) for the suggestion. `failed` puts the order on the
+ * `address_check` hold, unless it is already held, shipped or cancelled.
+ */
+export async function verifyAddress(
+  ctx: TenantContext,
+  input: { orderId: string },
+): Promise<AddressVerification> {
+  const pre = await withTenant(ctx.companyId, async (tx) => {
+    const [order] = await tx
+      .select({ id: orders.id })
+      .from(orders)
+      .where(eq(orders.id, input.orderId))
+      .limit(1);
+    if (!order) throw notFound("order", input.orderId);
+    const to = await shipTo(tx, order.id);
+    if (!to?.street1.trim())
+      throw new ORPCError("NO_SHIP_TO", {
+        status: 409,
+        message: "This order has no ship-to address",
+      });
+    const hash = addressHash(ctx.companyId, to);
+    const [stored] = await tx
+      .select()
+      .from(addressVerifications)
+      .where(eq(addressVerifications.orderId, order.id))
+      .limit(1);
+    return { to, hash, stored: stored?.addressHash === hash ? stored : null };
+  });
+  if (pre.stored && pre.stored.status !== "corrected")
+    return {
+      orderId: input.orderId,
+      status: pre.stored.status,
+      suggestion: null,
+      detail: pre.stored.detail,
+      verifiedAt: pre.stored.verifiedAt.toISOString(),
+    };
+
+  // No transaction open while the carrier is called.
+  let check: AddressCheck;
+  try {
+    check = await (await carrierExtras(ctx)).verifyAddress({
+      companyId: ctx.companyId,
+      address: pre.to,
+    });
+  } catch (err) {
+    log.warn("address check failed", {
+      companyId: ctx.companyId,
+      orderId: input.orderId,
+      detail: err instanceof CarrierError ? err.code : "error",
+    });
+    carrierFailure(err);
+  }
+  if (pre.stored)
+    return {
+      orderId: input.orderId,
+      status: pre.stored.status,
+      suggestion: check.suggestion,
+      detail: pre.stored.detail,
+      verifiedAt: pre.stored.verifiedAt.toISOString(),
+    };
+
+  const verifiedAt = new Date();
+  await withTenant(ctx.companyId, async (tx) => {
+    await tx
+      .insert(addressVerifications)
+      .values({
+        companyId: ctx.companyId,
+        orderId: input.orderId,
+        addressHash: pre.hash,
+        status: check.status,
+        detail: check.detail,
+        verifiedAt,
+      })
+      .onConflictDoUpdate({
+        target: [addressVerifications.companyId, addressVerifications.orderId],
+        set: { addressHash: pre.hash, status: check.status, detail: check.detail, verifiedAt },
+      });
+    if (check.status !== "failed") return;
+    const [order] = await tx
+      .select({ holdReason: orders.holdReason, status: orders.status })
+      .from(orders)
+      .where(eq(orders.id, input.orderId))
+      .for("update");
+    if (!order || order.holdReason || ["shipped", "delivered", "cancelled"].includes(order.status))
+      return;
+    // Loaded here: orders/service imports this module (guardShipmentsForItems).
+    const { holdOrder } = await import("../orders/service");
+    // A savepoint: if the hold is refused (a label is being bought right now), the stored
+    // result still commits and the caller still sees `failed`.
+    await tx
+      .transaction((sp) =>
+        holdOrder(sp, ctx, {
+          id: input.orderId,
+          reason: "address_check",
+          note: "The carrier could not verify the ship-to address. Fix the address to release it.",
+        }),
+      )
+      .catch((err) => {
+        if (!(err instanceof ORPCError)) throw err;
+        log.warn("address check failed but the order was not held", {
+          companyId: ctx.companyId,
+          orderId: input.orderId,
+          code: err.code,
+        });
+      });
+  });
+  log.info("address checked", {
+    companyId: ctx.companyId,
+    orderId: input.orderId,
+    status: check.status,
+  });
+  return {
+    orderId: input.orderId,
+    status: check.status,
+    suggestion: check.suggestion,
+    detail: check.detail,
+    verifiedAt: verifiedAt.toISOString(),
+  };
 }
