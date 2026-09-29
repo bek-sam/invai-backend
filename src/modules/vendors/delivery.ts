@@ -119,7 +119,12 @@ export async function resendSheetEmail(
       status: 409,
       message: "This vendor gets sheets in the portal, not by email",
     });
-  const lastAt = last ? (last.sentAt ?? last.createdAt) : sheet.sentAt;
+  // A delivery that failed for good sent nothing, so it doesn't start the window.
+  const lastAt = last
+    ? last.status === "failed"
+      ? null
+      : (last.sentAt ?? last.createdAt)
+    : sheet.sentAt;
   if (lastAt) {
     const age = (now.getTime() - lastAt.getTime()) / 1000;
     if (age < RESEND_WINDOW_SEC) throw resendTooSoon(Math.ceil(RESEND_WINDOW_SEC - age), lastAt);

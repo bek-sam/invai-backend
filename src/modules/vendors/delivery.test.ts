@@ -226,6 +226,10 @@ describe("sheet email after commit (B-102)", () => {
     const [row] = await deliveries(bad);
     expect(row).toMatchObject({ status: "failed", lastError: "EENVELOPE 550" });
     expect(mail.sent).toHaveLength(1);
+    // Nothing went out, so a resend is allowed at once.
+    await withTenant(shopId, (tx) => svc.resendSheetEmail(tx, ownerCtx, { sheetId: bad }));
+    expect(await deliver(bad)).toMatchObject({ status: "sent" });
+    expect(mail.sent).toHaveLength(2);
   });
 
   it("portal delivery also goes out from the job, once", async () => {
