@@ -3,6 +3,7 @@ import {
   bigint,
   boolean,
   doublePrecision,
+  foreignKey,
   index,
   integer,
   jsonb,
@@ -17,6 +18,7 @@ import {
   enumText,
   id,
   jsonObject,
+  tenantKey,
   tenantPolicy,
   timestamps,
   updatedAt,
@@ -258,7 +260,7 @@ export const locations = pgTable(
     isDefault: boolean().notNull().default(false),
     ...timestamps,
   },
-  (t) => [index().on(t.companyId), tenantPolicy("locations")],
+  (t) => [tenantKey("locations", t), index().on(t.companyId), tenantPolicy("locations")],
 ).enableRLS();
 
 export const STATION_KINDS = ["pick", "press", "qc", "pack", "receiving"] as const;
@@ -270,9 +272,7 @@ export const stations = pgTable(
   {
     id: id(),
     companyId: companyId(),
-    locationId: uuid()
-      .notNull()
-      .references(() => locations.id, { onDelete: "restrict" }),
+    locationId: uuid().notNull(),
     name: text().notNull(),
     kind: text(enumText(STATION_KINDS)),
     active: boolean().notNull().default(true),
@@ -280,7 +280,16 @@ export const stations = pgTable(
     lastSeenAt: timestamp({ withTimezone: true }),
     ...timestamps,
   },
-  (t) => [index().on(t.companyId), tenantPolicy("stations")],
+  (t) => [
+    tenantKey("stations", t),
+    index().on(t.companyId),
+    foreignKey({
+      name: "stations_location_id_fk",
+      columns: [t.companyId, t.locationId],
+      foreignColumns: [locations.companyId, locations.id],
+    }).onDelete("restrict"),
+    tenantPolicy("stations"),
+  ],
 ).enableRLS();
 
 /** A long random token issued to one tablet; only its hash is stored. */
@@ -289,9 +298,7 @@ export const stationTokens = pgTable(
   {
     id: id(),
     companyId: companyId(),
-    stationId: uuid()
-      .notNull()
-      .references(() => stations.id, { onDelete: "cascade" }),
+    stationId: uuid().notNull(),
     tokenHash: text().notNull().unique(),
     /** First 8 chars, so an admin can tell tokens apart. */
     tokenPrefix: text().notNull(),
@@ -300,7 +307,15 @@ export const stationTokens = pgTable(
     revokedAt: timestamp({ withTimezone: true }),
     createdAt: createdAt(),
   },
-  (t) => [index().on(t.companyId, t.stationId), tenantPolicy("station_tokens")],
+  (t) => [
+    index().on(t.companyId, t.stationId),
+    foreignKey({
+      name: "station_tokens_station_id_fk",
+      columns: [t.companyId, t.stationId],
+      foreignColumns: [stations.companyId, stations.id],
+    }).onDelete("cascade"),
+    tenantPolicy("station_tokens"),
+  ],
 ).enableRLS();
 
 /** 4–6 digit PIN per user per company (HMAC hashed; the station token is the first factor). */

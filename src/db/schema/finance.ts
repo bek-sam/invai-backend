@@ -2,6 +2,7 @@ import {
   boolean,
   date,
   doublePrecision,
+  foreignKey,
   index,
   integer,
   pgTable,
@@ -72,11 +73,9 @@ export const refundEvents = pgTable(
   {
     id: id(),
     companyId: companyId(),
-    orderId: uuid()
-      .notNull()
-      .references(() => orders.id, { onDelete: "cascade" }),
+    orderId: uuid().notNull(),
     /** null = order-level (e.g. a shipping refund), not tied to one item. */
-    orderItemId: uuid().references(() => orderItems.id, { onDelete: "cascade" }),
+    orderItemId: uuid(),
     channel: text(enumText(CHANNELS)).notNull(),
     source: text(enumText(["shopify", "csv", "manual"] as const)).notNull(),
     amountCents: integer().notNull(),
@@ -95,6 +94,16 @@ export const refundEvents = pgTable(
     uniqueIndex().on(t.companyId, t.channel, t.channelRefundId),
     index().on(t.companyId, t.orderId),
     index().on(t.companyId, t.refundedAt),
+    foreignKey({
+      name: "refund_events_order_id_fk",
+      columns: [t.companyId, t.orderId],
+      foreignColumns: [orders.companyId, orders.id],
+    }).onDelete("cascade"),
+    foreignKey({
+      name: "refund_events_order_item_id_fk",
+      columns: [t.companyId, t.orderItemId],
+      foreignColumns: [orderItems.companyId, orderItems.id],
+    }).onDelete("cascade"),
     tenantPolicy("refund_events"),
   ],
 ).enableRLS();
@@ -113,12 +122,8 @@ export const profitLines = pgTable(
   {
     id: id(),
     companyId: companyId(),
-    orderId: uuid()
-      .notNull()
-      .references(() => orders.id, { onDelete: "cascade" }),
-    orderItemId: uuid()
-      .notNull()
-      .references(() => orderItems.id, { onDelete: "cascade" }),
+    orderId: uuid().notNull(),
+    orderItemId: uuid().notNull(),
     channel: text(enumText(CHANNELS)).notNull(),
     designId: uuid(),
     blankVariantId: uuid(),
@@ -149,6 +154,16 @@ export const profitLines = pgTable(
     index().on(t.companyId, t.designId),
     index().on(t.companyId, t.channel, t.placedAt),
     index().on(t.companyId, t.styleCode),
+    foreignKey({
+      name: "profit_lines_order_id_fk",
+      columns: [t.companyId, t.orderId],
+      foreignColumns: [orders.companyId, orders.id],
+    }).onDelete("cascade"),
+    foreignKey({
+      name: "profit_lines_order_item_id_fk",
+      columns: [t.companyId, t.orderItemId],
+      foreignColumns: [orderItems.companyId, orderItems.id],
+    }).onDelete("cascade"),
     tenantPolicy("profit_lines"),
   ],
 ).enableRLS();

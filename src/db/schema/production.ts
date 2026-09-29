@@ -1,6 +1,7 @@
 import {
   boolean,
   doublePrecision,
+  foreignKey,
   index,
   integer,
   jsonb,
@@ -14,6 +15,7 @@ import {
   enumText,
   id,
   jsonObject,
+  tenantKey,
   tenantPolicy,
   timestamps,
   vendorReadPolicy,
@@ -41,7 +43,7 @@ export const gangSheetBatches = pgTable(
     name: text().notNull(),
     status: text(enumText(BATCH_STATUSES)).notNull().default("building"),
     dueBefore: timestamp({ withTimezone: true }),
-    vendorConnectionId: uuid().references(() => vendorConnections.id, { onDelete: "set null" }),
+    vendorConnectionId: uuid(),
     options: jsonObject<Record<string, unknown>>(),
     itemCount: integer().notNull().default(0),
     sheetCount: integer().notNull().default(0),
@@ -50,7 +52,16 @@ export const gangSheetBatches = pgTable(
     createdBy: uuid(),
     ...timestamps,
   },
-  (t) => [index().on(t.companyId, t.status, t.createdAt), tenantPolicy("gang_sheet_batches")],
+  (t) => [
+    tenantKey("gang_sheet_batches", t),
+    index().on(t.companyId, t.status, t.createdAt),
+    foreignKey({
+      name: "gang_sheet_batches_vendor_connection_id_fk",
+      columns: [t.companyId, t.vendorConnectionId],
+      foreignColumns: [vendorConnections.companyId, vendorConnections.id],
+    }).onDelete("set null"),
+    tenantPolicy("gang_sheet_batches"),
+  ],
 ).enableRLS();
 
 /** Sheet lifecycle (contracts SHEET_STATES / SHEET_TRANSITIONS). */
@@ -75,13 +86,11 @@ export const gangSheets = pgTable(
   {
     id: id(),
     companyId: companyId(),
-    batchId: uuid()
-      .notNull()
-      .references(() => gangSheetBatches.id, { onDelete: "cascade" }),
+    batchId: uuid().notNull(),
     sheetNo: integer().notNull().default(1),
     /** Human name printed on the sheet, e.g. "2026-09-24 #1". */
     name: text().notNull(),
-    vendorConnectionId: uuid().references(() => vendorConnections.id, { onDelete: "set null" }),
+    vendorConnectionId: uuid(),
     widthIn: doublePrecision().notNull().default(22),
     lengthIn: doublePrecision().notNull().default(0),
     utilization: doublePrecision().notNull().default(0),
@@ -104,9 +113,20 @@ export const gangSheets = pgTable(
     ...timestamps,
   },
   (t) => [
+    tenantKey("gang_sheets", t),
     uniqueIndex().on(t.companyId, t.name),
     index().on(t.companyId, t.status, t.createdAt),
     index().on(t.companyId, t.batchId),
+    foreignKey({
+      name: "gang_sheets_batch_id_fk",
+      columns: [t.companyId, t.batchId],
+      foreignColumns: [gangSheetBatches.companyId, gangSheetBatches.id],
+    }).onDelete("cascade"),
+    foreignKey({
+      name: "gang_sheets_vendor_connection_id_fk",
+      columns: [t.companyId, t.vendorConnectionId],
+      foreignColumns: [vendorConnections.companyId, vendorConnections.id],
+    }).onDelete("set null"),
     tenantPolicy("gang_sheets"),
     vendorReadPolicy("gang_sheets", vendorHasSheetAccess("gang_sheets", "id")),
     vendorUpdatePolicy("gang_sheets", vendorHasSheetAccess("gang_sheets", "id")),
@@ -130,12 +150,8 @@ export const transfers = pgTable(
   {
     id: id(),
     companyId: companyId(),
-    gangSheetId: uuid()
-      .notNull()
-      .references(() => gangSheets.id, { onDelete: "cascade" }),
-    orderItemId: uuid()
-      .notNull()
-      .references(() => orderItems.id, { onDelete: "cascade" }),
+    gangSheetId: uuid().notNull(),
+    orderItemId: uuid().notNull(),
     xIn: doublePrecision().notNull().default(0),
     yIn: doublePrecision().notNull().default(0),
     widthIn: doublePrecision().notNull(),
@@ -150,8 +166,19 @@ export const transfers = pgTable(
     ...timestamps,
   },
   (t) => [
+    tenantKey("transfers", t),
     index().on(t.companyId, t.gangSheetId),
     index().on(t.companyId, t.orderItemId),
+    foreignKey({
+      name: "transfers_gang_sheet_id_fk",
+      columns: [t.companyId, t.gangSheetId],
+      foreignColumns: [gangSheets.companyId, gangSheets.id],
+    }).onDelete("cascade"),
+    foreignKey({
+      name: "transfers_order_item_id_fk",
+      columns: [t.companyId, t.orderItemId],
+      foreignColumns: [orderItems.companyId, orderItems.id],
+    }).onDelete("cascade"),
     tenantPolicy("transfers"),
     vendorReadPolicy("transfers", vendorHasSheetAccess("transfers", "gang_sheet_id")),
   ],
@@ -169,14 +196,14 @@ export const scans = pgTable(
     id: id(),
     companyId: companyId(),
     clientScanId: uuid().notNull(),
-    stationId: uuid().references(() => stations.id, { onDelete: "set null" }),
+    stationId: uuid(),
     station: text().notNull(),
     action: text(enumText(SCAN_ACTIONS)).notNull(),
     userId: uuid(),
     transferCode: text().notNull(),
     blankCode: text(),
-    transferId: uuid().references(() => transfers.id, { onDelete: "set null" }),
-    orderItemId: uuid().references(() => orderItems.id, { onDelete: "set null" }),
+    transferId: uuid(),
+    orderItemId: uuid(),
     ok: boolean().notNull(),
     mismatch: text(),
     /** The full contracts ScanResult, returned verbatim on replay. */
@@ -189,6 +216,21 @@ export const scans = pgTable(
     index().on(t.companyId, t.scannedAt),
     index().on(t.companyId, t.orderItemId),
     index().on(t.companyId, t.station, t.createdAt),
+    foreignKey({
+      name: "scans_station_id_fk",
+      columns: [t.companyId, t.stationId],
+      foreignColumns: [stations.companyId, stations.id],
+    }).onDelete("set null"),
+    foreignKey({
+      name: "scans_transfer_id_fk",
+      columns: [t.companyId, t.transferId],
+      foreignColumns: [transfers.companyId, transfers.id],
+    }).onDelete("set null"),
+    foreignKey({
+      name: "scans_order_item_id_fk",
+      columns: [t.companyId, t.orderItemId],
+      foreignColumns: [orderItems.companyId, orderItems.id],
+    }).onDelete("set null"),
     tenantPolicy("scans"),
   ],
 ).enableRLS();
@@ -199,18 +241,28 @@ export const bins = pgTable(
   {
     id: id(),
     companyId: companyId(),
-    locationId: uuid().references(() => locations.id, { onDelete: "set null" }),
+    locationId: uuid(),
     code: text().notNull(),
     // T-6-2 (wave 6 stub 4): turns the bin from pure occupancy state into a manageable entity.
     name: text(),
     archivedAt: timestamp({ withTimezone: true }),
-    orderId: uuid().references(() => orders.id, { onDelete: "set null" }),
+    orderId: uuid(),
     station: text(),
     ...timestamps,
   },
   (t) => [
     uniqueIndex().on(t.companyId, t.code),
     index().on(t.companyId, t.orderId),
+    foreignKey({
+      name: "bins_location_id_fk",
+      columns: [t.companyId, t.locationId],
+      foreignColumns: [locations.companyId, locations.id],
+    }).onDelete("set null"),
+    foreignKey({
+      name: "bins_order_id_fk",
+      columns: [t.companyId, t.orderId],
+      foreignColumns: [orders.companyId, orders.id],
+    }).onDelete("set null"),
     tenantPolicy("bins"),
   ],
 ).enableRLS();
@@ -229,7 +281,7 @@ export const floorRequests = pgTable(
     companyId: companyId(),
     kind: text(enumText(FLOOR_REQUEST_KINDS)).notNull(),
     idempotencyKey: text().notNull(),
-    orderId: uuid().references(() => orders.id, { onDelete: "cascade" }),
+    orderId: uuid(),
     request: jsonObject<Record<string, unknown>>(),
     result: jsonb().$type<Record<string, unknown>>().notNull(),
     userId: uuid(),
@@ -238,6 +290,11 @@ export const floorRequests = pgTable(
   (t) => [
     uniqueIndex().on(t.companyId, t.kind, t.idempotencyKey),
     index().on(t.companyId, t.orderId),
+    foreignKey({
+      name: "floor_requests_order_id_fk",
+      columns: [t.companyId, t.orderId],
+      foreignColumns: [orders.companyId, orders.id],
+    }).onDelete("cascade"),
     tenantPolicy("floor_requests"),
   ],
 ).enableRLS();
@@ -265,9 +322,7 @@ export const reprints = pgTable(
   {
     id: id(),
     companyId: companyId(),
-    orderItemId: uuid()
-      .notNull()
-      .references(() => orderItems.id, { onDelete: "cascade" }),
+    orderItemId: uuid().notNull(),
     reason: text(enumText(REPRINT_REASONS)).notNull(),
     note: text(),
     status: text(enumText(REPRINT_STATUSES)).notNull().default("requested"),
@@ -284,6 +339,11 @@ export const reprints = pgTable(
     index().on(t.companyId, t.requestedAt),
     index().on(t.companyId, t.orderItemId),
     index().on(t.companyId, t.status),
+    foreignKey({
+      name: "reprints_order_item_id_fk",
+      columns: [t.companyId, t.orderItemId],
+      foreignColumns: [orderItems.companyId, orderItems.id],
+    }).onDelete("cascade"),
     tenantPolicy("reprints"),
   ],
 ).enableRLS();

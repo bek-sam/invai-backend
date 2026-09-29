@@ -1,5 +1,6 @@
 import {
   doublePrecision,
+  foreignKey,
   index,
   integer,
   pgTable,
@@ -8,7 +9,15 @@ import {
   uniqueIndex,
   uuid,
 } from "drizzle-orm/pg-core";
-import { enumText, id, jsonArray, jsonObject, tenantPolicy, timestamps } from "./_shared";
+import {
+  enumText,
+  id,
+  jsonArray,
+  jsonObject,
+  tenantKey,
+  tenantPolicy,
+  timestamps,
+} from "./_shared";
 import { orderItems } from "./orders";
 import { companyId } from "./tenancy";
 
@@ -49,7 +58,11 @@ export const personalizationTemplates = pgTable(
     slots: jsonArray<TemplateSlot>(),
     ...timestamps,
   },
-  (t) => [index().on(t.companyId), tenantPolicy("personalization_templates")],
+  (t) => [
+    tenantKey("personalization_templates", t),
+    index().on(t.companyId),
+    tenantPolicy("personalization_templates"),
+  ],
 ).enableRLS();
 
 export const ARTWORK_STATUSES = ["pending", "rendered", "flagged", "approved", "failed"] as const;
@@ -67,12 +80,8 @@ export const itemArtwork = pgTable(
   {
     id: id(),
     companyId: companyId(),
-    orderItemId: uuid()
-      .notNull()
-      .references(() => orderItems.id, { onDelete: "cascade" }),
-    templateId: uuid()
-      .notNull()
-      .references(() => personalizationTemplates.id, { onDelete: "restrict" }),
+    orderItemId: uuid().notNull(),
+    templateId: uuid().notNull(),
     /** Slot name -> text. Starts from the buyer's answers; edited by staff. */
     values: jsonObject<Record<string, string>>(),
     fileKey: text(),
@@ -90,6 +99,16 @@ export const itemArtwork = pgTable(
   (t) => [
     uniqueIndex().on(t.companyId, t.orderItemId),
     index().on(t.companyId, t.status),
+    foreignKey({
+      name: "item_artwork_order_item_id_fk",
+      columns: [t.companyId, t.orderItemId],
+      foreignColumns: [orderItems.companyId, orderItems.id],
+    }).onDelete("cascade"),
+    foreignKey({
+      name: "item_artwork_template_id_fk",
+      columns: [t.companyId, t.templateId],
+      foreignColumns: [personalizationTemplates.companyId, personalizationTemplates.id],
+    }).onDelete("restrict"),
     tenantPolicy("item_artwork"),
   ],
 ).enableRLS();

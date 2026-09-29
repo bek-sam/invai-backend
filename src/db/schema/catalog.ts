@@ -1,5 +1,6 @@
 import {
   doublePrecision,
+  foreignKey,
   index,
   integer,
   pgTable,
@@ -8,7 +9,7 @@ import {
   uniqueIndex,
   uuid,
 } from "drizzle-orm/pg-core";
-import { enumText, id, jsonArray, tenantPolicy, timestamps } from "./_shared";
+import { enumText, id, jsonArray, tenantKey, tenantPolicy, timestamps } from "./_shared";
 import { companyId } from "./tenancy";
 
 export const PLACEMENTS = ["front", "back", "left_chest", "sleeve_left", "sleeve_right"] as const;
@@ -35,6 +36,7 @@ export const designs = pgTable(
     ...timestamps,
   },
   (t) => [
+    tenantKey("designs", t),
     uniqueIndex().on(t.companyId, t.code),
     index().on(t.companyId, t.status),
     tenantPolicy("designs"),
@@ -53,9 +55,7 @@ export const designFiles = pgTable(
   {
     id: id(),
     companyId: companyId(),
-    designId: uuid()
-      .notNull()
-      .references(() => designs.id, { onDelete: "cascade" }),
+    designId: uuid().notNull(),
     placement: text(enumText(PLACEMENTS)).notNull().default("front"),
     fileKey: text().notNull(),
     previewKey: text(),
@@ -69,7 +69,15 @@ export const designFiles = pgTable(
     qaCheckedAt: timestamp({ withTimezone: true }),
     ...timestamps,
   },
-  (t) => [uniqueIndex().on(t.companyId, t.designId, t.placement), tenantPolicy("design_files")],
+  (t) => [
+    uniqueIndex().on(t.companyId, t.designId, t.placement),
+    foreignKey({
+      name: "design_files_design_id_fk",
+      columns: [t.companyId, t.designId],
+      foreignColumns: [designs.companyId, designs.id],
+    }).onDelete("cascade"),
+    tenantPolicy("design_files"),
+  ],
 ).enableRLS();
 
 export const SUPPLIERS = ["ssactivewear", "sanmar", "other"] as const;
@@ -104,6 +112,7 @@ export const blankVariants = pgTable(
     ...timestamps,
   },
   (t) => [
+    tenantKey("blank_variants", t),
     uniqueIndex().on(t.companyId, t.brand, t.styleCode, t.colorCode, t.sizeCode),
     uniqueIndex().on(t.companyId, t.sku),
     index().on(t.companyId, t.styleCode),
@@ -120,9 +129,7 @@ export const products = pgTable(
   {
     id: id(),
     companyId: companyId(),
-    designId: uuid()
-      .notNull()
-      .references(() => designs.id, { onDelete: "restrict" }),
+    designId: uuid().notNull(),
     brand: text().notNull(),
     styleCode: text().notNull(),
     name: text().notNull(),
@@ -136,6 +143,11 @@ export const products = pgTable(
   (t) => [
     index().on(t.companyId, t.designId),
     index().on(t.companyId, t.styleCode),
+    foreignKey({
+      name: "products_design_id_fk",
+      columns: [t.companyId, t.designId],
+      foreignColumns: [designs.companyId, designs.id],
+    }).onDelete("restrict"),
     tenantPolicy("products"),
   ],
 ).enableRLS();

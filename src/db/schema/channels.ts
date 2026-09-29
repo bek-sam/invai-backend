@@ -1,6 +1,7 @@
 import { sql } from "drizzle-orm";
 import {
   boolean,
+  foreignKey,
   index,
   integer,
   pgTable,
@@ -10,7 +11,15 @@ import {
   uuid,
 } from "drizzle-orm/pg-core";
 import { encryptedText } from "../../lib/crypto";
-import { enumText, id, jsonArray, jsonObject, tenantPolicy, timestamps } from "./_shared";
+import {
+  enumText,
+  id,
+  jsonArray,
+  jsonObject,
+  tenantKey,
+  tenantPolicy,
+  timestamps,
+} from "./_shared";
 import { companyId } from "./tenancy";
 
 export const CHANNELS = ["etsy", "amazon", "shopify", "tiktok", "walmart", "ebay", "csv"] as const;
@@ -71,6 +80,7 @@ export const channelConnections = pgTable(
     ...timestamps,
   },
   (t) => [
+    tenantKey("channel_connections", t),
     index().on(t.companyId, t.channel),
     uniqueIndex().on(t.companyId, t.channel, t.externalShopId),
     // A marketplace store is connected to at most one company (webhooks route by it).
@@ -88,9 +98,7 @@ export const listings = pgTable(
   {
     id: id(),
     companyId: companyId(),
-    connectionId: uuid()
-      .notNull()
-      .references(() => channelConnections.id, { onDelete: "cascade" }),
+    connectionId: uuid().notNull(),
     channel: text(enumText(CHANNELS)).notNull(),
     channelListingId: text().notNull(),
     title: text().notNull(),
@@ -103,8 +111,14 @@ export const listings = pgTable(
     ...timestamps,
   },
   (t) => [
+    tenantKey("listings", t),
     uniqueIndex().on(t.companyId, t.connectionId, t.channelListingId),
     index().on(t.companyId, t.designId),
+    foreignKey({
+      name: "listings_connection_id_fk",
+      columns: [t.companyId, t.connectionId],
+      foreignColumns: [channelConnections.companyId, channelConnections.id],
+    }).onDelete("cascade"),
     tenantPolicy("listings"),
   ],
 ).enableRLS();
@@ -114,9 +128,7 @@ export const listingVariants = pgTable(
   {
     id: id(),
     companyId: companyId(),
-    listingId: uuid()
-      .notNull()
-      .references(() => listings.id, { onDelete: "cascade" }),
+    listingId: uuid().notNull(),
     channelVariantId: text().notNull(),
     channelSku: text(),
     title: text(),
@@ -133,6 +145,11 @@ export const listingVariants = pgTable(
     uniqueIndex().on(t.companyId, t.listingId, t.channelVariantId),
     index().on(t.companyId, t.channelSku),
     index().on(t.companyId, t.blankVariantId),
+    foreignKey({
+      name: "listing_variants_listing_id_fk",
+      columns: [t.companyId, t.listingId],
+      foreignColumns: [listings.companyId, listings.id],
+    }).onDelete("cascade"),
     tenantPolicy("listing_variants"),
   ],
 ).enableRLS();
@@ -154,7 +171,7 @@ export const skuRules = pgTable(
     patternType: text(enumText(SKU_PATTERN_TYPES)).notNull().default("exact"),
     pattern: text().notNull(),
     channel: text(enumText(CHANNELS)),
-    connectionId: uuid().references(() => channelConnections.id, { onDelete: "cascade" }),
+    connectionId: uuid(),
     target: jsonObject<SkuRuleTarget>().default({ kind: "resolve", defaults: {} }),
     priority: integer().notNull().default(0),
     active: boolean().notNull().default(true),
@@ -166,6 +183,11 @@ export const skuRules = pgTable(
   (t) => [
     uniqueIndex().on(t.companyId, t.channel, t.connectionId, t.pattern),
     index().on(t.companyId, t.patternType, t.priority),
+    foreignKey({
+      name: "sku_rules_connection_id_fk",
+      columns: [t.companyId, t.connectionId],
+      foreignColumns: [channelConnections.companyId, channelConnections.id],
+    }).onDelete("cascade"),
     tenantPolicy("sku_rules"),
   ],
 ).enableRLS();
@@ -181,9 +203,7 @@ export const importRuns = pgTable(
   {
     id: id(),
     companyId: companyId(),
-    connectionId: uuid()
-      .notNull()
-      .references(() => channelConnections.id, { onDelete: "cascade" }),
+    connectionId: uuid().notNull(),
     format: text(enumText(CSV_FORMATS)).notNull().default("generic"),
     fileKey: text().notNull().default(""),
     status: text(enumText(IMPORT_STATUSES)).notNull().default("pending"),
@@ -200,5 +220,13 @@ export const importRuns = pgTable(
     finishedAt: timestamp({ withTimezone: true }),
     ...timestamps,
   },
-  (t) => [index().on(t.companyId, t.startedAt), tenantPolicy("import_runs")],
+  (t) => [
+    index().on(t.companyId, t.startedAt),
+    foreignKey({
+      name: "import_runs_connection_id_fk",
+      columns: [t.companyId, t.connectionId],
+      foreignColumns: [channelConnections.companyId, channelConnections.id],
+    }).onDelete("cascade"),
+    tenantPolicy("import_runs"),
+  ],
 ).enableRLS();

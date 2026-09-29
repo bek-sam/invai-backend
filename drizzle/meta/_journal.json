@@ -211,6 +211,20 @@
       "when": 1790563857559,
       "tag": "0029_digest",
       "breakpoints": true
+    },
+    {
+      "idx": 30,
+      "version": "7",
+      "when": 1790701787587,
+      "tag": "0030_foundation_composite_fks",
+      "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1790701787971,
+      "tag": "0031_foundation_composite_fks_validate",
+      "breakpoints": true
     }
   ]
 }

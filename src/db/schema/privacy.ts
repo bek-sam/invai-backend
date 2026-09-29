@@ -1,4 +1,12 @@
-import { index, pgTable, text, timestamp, uniqueIndex, uuid } from "drizzle-orm/pg-core";
+import {
+  foreignKey,
+  index,
+  pgTable,
+  text,
+  timestamp,
+  uniqueIndex,
+  uuid,
+} from "drizzle-orm/pg-core";
 import { enumText, id, jsonObject, tenantPolicy } from "./_shared";
 import { CHANNELS, channelConnections } from "./channels";
 import { companyId } from "./tenancy";
@@ -34,7 +42,7 @@ export const privacyRequests = pgTable(
   {
     id: id(),
     companyId: companyId(),
-    connectionId: uuid().references(() => channelConnections.id, { onDelete: "set null" }),
+    connectionId: uuid(),
     channel: text(enumText(CHANNELS)).notNull(),
     topic: text(enumText(PRIVACY_TOPICS)).notNull(),
     /** The webhook delivery id (`X-Shopify-Webhook-Id`): one request per delivery and company. */
@@ -56,6 +64,11 @@ export const privacyRequests = pgTable(
     uniqueIndex().on(t.companyId, t.channel, t.deliveryId),
     index().on(t.companyId, t.status, t.dueAt),
     index().on(t.status, t.dueAt),
+    foreignKey({
+      name: "privacy_requests_connection_id_fk",
+      columns: [t.companyId, t.connectionId],
+      foreignColumns: [channelConnections.companyId, channelConnections.id],
+    }).onDelete("set null"),
     tenantPolicy("privacy_requests"),
   ],
 ).enableRLS();

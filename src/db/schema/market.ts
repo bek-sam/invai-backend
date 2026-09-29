@@ -1,6 +1,7 @@
 import {
   boolean,
   doublePrecision,
+  foreignKey,
   index,
   integer,
   jsonb,
@@ -81,9 +82,7 @@ export const marketDesignNiches = pgTable(
   {
     id: id(),
     companyId: companyId(),
-    designId: uuid()
-      .notNull()
-      .references(() => designs.id, { onDelete: "cascade" }),
+    designId: uuid().notNull(),
     niches: text().array().notNull().default([]),
     source: text(enumText(NICHE_SOURCES)).notNull().default("unclassified"),
     /** The model's confidence when `source` is `model`. */
@@ -91,7 +90,15 @@ export const marketDesignNiches = pgTable(
     correctedBy: uuid(),
     ...timestamps,
   },
-  (t) => [uniqueIndex().on(t.companyId, t.designId), tenantPolicy("market_design_niches")],
+  (t) => [
+    uniqueIndex().on(t.companyId, t.designId),
+    foreignKey({
+      name: "market_design_niches_design_id_fk",
+      columns: [t.companyId, t.designId],
+      foreignColumns: [designs.companyId, designs.id],
+    }).onDelete("cascade"),
+    tenantPolicy("market_design_niches"),
+  ],
 ).enableRLS();
 
 export type PriceObservationRow = {
@@ -110,9 +117,7 @@ export const marketPriceSnapshots = pgTable(
   {
     id: id(),
     companyId: companyId(),
-    designId: uuid()
-      .notNull()
-      .references(() => designs.id, { onDelete: "cascade" }),
+    designId: uuid().notNull(),
     channel: text(enumText(CHANNELS)).notNull(),
     source: text(enumText(MARKET_SOURCES)).notNull(),
     granularity: text(enumText(["day", "month"] as const)).notNull(),
@@ -136,6 +141,11 @@ export const marketPriceSnapshots = pgTable(
   (t) => [
     uniqueIndex().on(t.companyId, t.designId, t.channel, t.source, t.granularity, t.period),
     index().on(t.companyId, t.granularity, t.period),
+    foreignKey({
+      name: "market_price_snapshots_design_id_fk",
+      columns: [t.companyId, t.designId],
+      foreignColumns: [designs.companyId, designs.id],
+    }).onDelete("cascade"),
     tenantPolicy("market_price_snapshots"),
   ],
 ).enableRLS();
@@ -231,7 +241,7 @@ export const marketRecommendations = pgTable(
     action: text(enumText(MARKET_ACTION_KEYS)).notNull(),
     dedupeKey: text().notNull(),
     createdOn: text().notNull(),
-    designId: uuid().references(() => designs.id, { onDelete: "cascade" }),
+    designId: uuid(),
     niche: text(),
     channel: text(enumText(CHANNELS)),
     params: jsonObject<Record<string, unknown>>(),
@@ -260,6 +270,11 @@ export const marketRecommendations = pgTable(
     uniqueIndex().on(t.companyId, t.dedupeKey, t.createdOn),
     index().on(t.companyId, t.createdAt),
     index().on(t.companyId, t.designId),
+    foreignKey({
+      name: "market_recommendations_design_id_fk",
+      columns: [t.companyId, t.designId],
+      foreignColumns: [designs.companyId, designs.id],
+    }).onDelete("cascade"),
     tenantPolicy("market_recommendations"),
   ],
 ).enableRLS();

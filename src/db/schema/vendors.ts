@@ -14,6 +14,7 @@ import {
   enumText,
   id,
   jsonObject,
+  tenantKey,
   tenantPolicy,
   timestamps,
   vendorReadPolicy,
@@ -77,6 +78,7 @@ export const vendorConnections = pgTable(
     ...timestamps,
   },
   (t) => [
+    tenantKey("vendor_connections", t),
     uniqueIndex().on(t.companyId, t.vendorCompanyId),
     index().on(t.vendorCompanyId),
     tenantPolicy("vendor_connections"),

@@ -1,6 +1,7 @@
 import {
   boolean,
   doublePrecision,
+  foreignKey,
   index,
   integer,
   jsonb,
@@ -11,7 +12,15 @@ import {
   uuid,
 } from "drizzle-orm/pg-core";
 import { encryptedText } from "../../lib/crypto";
-import { enumText, id, jsonArray, jsonObject, tenantPolicy, timestamps } from "./_shared";
+import {
+  enumText,
+  id,
+  jsonArray,
+  jsonObject,
+  tenantKey,
+  tenantPolicy,
+  timestamps,
+} from "./_shared";
 import { CHANNELS, channelConnections } from "./channels";
 import { companyId } from "./tenancy";
 
@@ -71,9 +80,7 @@ export const orders = pgTable(
   {
     id: id(),
     companyId: companyId(),
-    connectionId: uuid()
-      .notNull()
-      .references(() => channelConnections.id, { onDelete: "restrict" }),
+    connectionId: uuid().notNull(),
     channel: text(enumText(CHANNELS)).notNull(),
     channelOrderId: text().notNull(),
     /** Display number as the buyer sees it (Etsy receipt id, Shopify #1001). */
@@ -116,11 +123,17 @@ export const orders = pgTable(
     ...timestamps,
   },
   (t) => [
+    tenantKey("orders", t),
     uniqueIndex().on(t.companyId, t.channel, t.channelOrderId),
     index().on(t.companyId, t.status, t.shipBy),
     index().on(t.companyId, t.placedAt),
     index().on(t.companyId, t.orderNo),
     index().on(t.companyId, t.connectionId),
+    foreignKey({
+      name: "orders_connection_id_fk",
+      columns: [t.companyId, t.connectionId],
+      foreignColumns: [channelConnections.companyId, channelConnections.id],
+    }).onDelete("restrict"),
     tenantPolicy("orders"),
   ],
 ).enableRLS();
@@ -165,9 +178,7 @@ export const orderItems = pgTable(
   {
     id: id(),
     companyId: companyId(),
-    orderId: uuid()
-      .notNull()
-      .references(() => orders.id, { onDelete: "cascade" }),
+    orderId: uuid().notNull(),
     lineNo: integer().notNull().default(1),
     unitNo: integer().notNull().default(1),
     unitsInLine: integer().notNull().default(1),
@@ -205,6 +216,7 @@ export const orderItems = pgTable(
     ...timestamps,
   },
   (t) => [
+    tenantKey("order_items", t),
     index().on(t.companyId, t.state, t.shipBy),
     index().on(t.companyId, t.orderId),
     index().on(t.companyId, t.designId),
@@ -212,6 +224,11 @@ export const orderItems = pgTable(
     index().on(t.companyId, t.channelSku),
     index().on(t.companyId, t.transferId),
     index().on(t.companyId, t.shipmentId),
+    foreignKey({
+      name: "order_items_order_id_fk",
+      columns: [t.companyId, t.orderId],
+      foreignColumns: [orders.companyId, orders.id],
+    }).onDelete("cascade"),
     tenantPolicy("order_items"),
   ],
 ).enableRLS();
@@ -221,9 +238,7 @@ export const orderItemTransitions = pgTable(
   {
     id: id(),
     companyId: companyId(),
-    orderItemId: uuid()
-      .notNull()
-      .references(() => orderItems.id, { onDelete: "cascade" }),
+    orderItemId: uuid().notNull(),
     orderId: uuid().notNull(),
     fromState: text(enumText(ORDER_ITEM_STATES)),
     toState: text(enumText(ORDER_ITEM_STATES)).notNull(),
@@ -238,6 +253,11 @@ export const orderItemTransitions = pgTable(
     index().on(t.companyId, t.orderItemId, t.createdAt),
     index().on(t.companyId, t.orderId, t.createdAt),
     index().on(t.companyId, t.createdAt),
+    foreignKey({
+      name: "order_item_transitions_order_item_id_fk",
+      columns: [t.companyId, t.orderItemId],
+      foreignColumns: [orderItems.companyId, orderItems.id],
+    }).onDelete("cascade"),
     tenantPolicy("order_item_transitions"),
   ],
 ).enableRLS();
@@ -251,9 +271,7 @@ export const buyerPii = pgTable(
   {
     id: id(),
     companyId: companyId(),
-    orderId: uuid()
-      .notNull()
-      .references(() => orders.id, { onDelete: "cascade" }),
+    orderId: uuid().notNull(),
     name: encryptedText().notNull(),
     email: encryptedText(),
     phone: encryptedText(),
@@ -271,6 +289,11 @@ export const buyerPii = pgTable(
   (t) => [
     uniqueIndex().on(t.companyId, t.orderId),
     index().on(t.purgeAfter),
+    foreignKey({
+      name: "buyer_pii_order_id_fk",
+      columns: [t.companyId, t.orderId],
+      foreignColumns: [orders.companyId, orders.id],
+    }).onDelete("cascade"),
     tenantPolicy("buyer_pii"),
   ],
 ).enableRLS();

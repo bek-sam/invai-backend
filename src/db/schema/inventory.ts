@@ -1,5 +1,6 @@
 import {
   boolean,
+  foreignKey,
   index,
   integer,
   pgTable,
@@ -9,7 +10,7 @@ import {
   uuid,
 } from "drizzle-orm/pg-core";
 import { encryptedText } from "../../lib/crypto";
-import { enumText, id, jsonArray, tenantPolicy, timestamps } from "./_shared";
+import { enumText, id, jsonArray, tenantKey, tenantPolicy, timestamps } from "./_shared";
 import { blankVariants, SUPPLIERS } from "./catalog";
 import { companyId, locations } from "./tenancy";
 
@@ -52,12 +53,8 @@ export const inventoryMovements = pgTable(
   {
     id: id(),
     companyId: companyId(),
-    blankVariantId: uuid()
-      .notNull()
-      .references(() => blankVariants.id, { onDelete: "restrict" }),
-    locationId: uuid()
-      .notNull()
-      .references(() => locations.id, { onDelete: "restrict" }),
+    blankVariantId: uuid().notNull(),
+    locationId: uuid().notNull(),
     kind: text(enumText(MOVEMENT_KINDS)).notNull(),
     qty: integer().notNull(),
     unitCostCents: integer(),
@@ -75,6 +72,16 @@ export const inventoryMovements = pgTable(
     index().on(t.companyId, t.blankVariantId, t.createdAt),
     index().on(t.companyId, t.refType, t.refId),
     index().on(t.companyId, t.createdAt),
+    foreignKey({
+      name: "inventory_movements_blank_variant_id_fk",
+      columns: [t.companyId, t.blankVariantId],
+      foreignColumns: [blankVariants.companyId, blankVariants.id],
+    }).onDelete("restrict"),
+    foreignKey({
+      name: "inventory_movements_location_id_fk",
+      columns: [t.companyId, t.locationId],
+      foreignColumns: [locations.companyId, locations.id],
+    }).onDelete("restrict"),
     tenantPolicy("inventory_movements"),
   ],
 ).enableRLS();
@@ -85,12 +92,8 @@ export const stockLevels = pgTable(
   {
     id: id(),
     companyId: companyId(),
-    blankVariantId: uuid()
-      .notNull()
-      .references(() => blankVariants.id, { onDelete: "cascade" }),
-    locationId: uuid()
-      .notNull()
-      .references(() => locations.id, { onDelete: "cascade" }),
+    blankVariantId: uuid().notNull(),
+    locationId: uuid().notNull(),
     onHand: integer().notNull().default(0),
     reserved: integer().notNull().default(0),
     available: integer().notNull().default(0),
@@ -104,6 +107,16 @@ export const stockLevels = pgTable(
   (t) => [
     uniqueIndex().on(t.companyId, t.blankVariantId, t.locationId),
     index().on(t.companyId, t.available),
+    foreignKey({
+      name: "stock_levels_blank_variant_id_fk",
+      columns: [t.companyId, t.blankVariantId],
+      foreignColumns: [blankVariants.companyId, blankVariants.id],
+    }).onDelete("cascade"),
+    foreignKey({
+      name: "stock_levels_location_id_fk",
+      columns: [t.companyId, t.locationId],
+      foreignColumns: [locations.companyId, locations.id],
+    }).onDelete("cascade"),
     tenantPolicy("stock_levels"),
   ],
 ).enableRLS();
@@ -159,9 +172,7 @@ export const purchaseOrders = pgTable(
     id: id(),
     companyId: companyId(),
     supplier: text(enumText(SUPPLIERS)).notNull(),
-    locationId: uuid()
-      .notNull()
-      .references(() => locations.id, { onDelete: "restrict" }),
+    locationId: uuid().notNull(),
     poNo: text().notNull(),
     status: text(enumText(PO_STATUSES)).notNull().default("draft"),
     subtotalCents: integer().notNull().default(0),
@@ -181,8 +192,14 @@ export const purchaseOrders = pgTable(
     ...timestamps,
   },
   (t) => [
+    tenantKey("purchase_orders", t),
     uniqueIndex().on(t.companyId, t.poNo),
     index().on(t.companyId, t.status),
+    foreignKey({
+      name: "purchase_orders_location_id_fk",
+      columns: [t.companyId, t.locationId],
+      foreignColumns: [locations.companyId, locations.id],
+    }).onDelete("restrict"),
     tenantPolicy("purchase_orders"),
   ],
 ).enableRLS();
@@ -192,18 +209,27 @@ export const purchaseOrderLines = pgTable(
   {
     id: id(),
     companyId: companyId(),
-    purchaseOrderId: uuid()
-      .notNull()
-      .references(() => purchaseOrders.id, { onDelete: "cascade" }),
-    blankVariantId: uuid()
-      .notNull()
-      .references(() => blankVariants.id, { onDelete: "restrict" }),
+    purchaseOrderId: uuid().notNull(),
+    blankVariantId: uuid().notNull(),
     qty: integer().notNull(),
     receivedQty: integer().notNull().default(0),
     unitCostCents: integer().notNull().default(0),
     ...timestamps,
   },
-  (t) => [index().on(t.companyId, t.purchaseOrderId), tenantPolicy("purchase_order_lines")],
+  (t) => [
+    index().on(t.companyId, t.purchaseOrderId),
+    foreignKey({
+      name: "purchase_order_lines_purchase_order_id_fk",
+      columns: [t.companyId, t.purchaseOrderId],
+      foreignColumns: [purchaseOrders.companyId, purchaseOrders.id],
+    }).onDelete("cascade"),
+    foreignKey({
+      name: "purchase_order_lines_blank_variant_id_fk",
+      columns: [t.companyId, t.blankVariantId],
+      foreignColumns: [blankVariants.companyId, blankVariants.id],
+    }).onDelete("restrict"),
+    tenantPolicy("purchase_order_lines"),
+  ],
 ).enableRLS();
 
 /**
@@ -215,13 +241,9 @@ export const purchaseOrderReceipts = pgTable(
   {
     id: id(),
     companyId: companyId(),
-    purchaseOrderId: uuid()
-      .notNull()
-      .references(() => purchaseOrders.id, { onDelete: "cascade" }),
+    purchaseOrderId: uuid().notNull(),
     idempotencyKey: text().notNull(),
-    locationId: uuid()
-      .notNull()
-      .references(() => locations.id, { onDelete: "restrict" }),
+    locationId: uuid().notNull(),
     lines: jsonArray<{ lineId: string; qty: number }>(),
     createdBy: uuid(),
     createdAt: timestamp({ withTimezone: true }).notNull().defaultNow(),
@@ -229,6 +251,16 @@ export const purchaseOrderReceipts = pgTable(
   (t) => [
     uniqueIndex().on(t.companyId, t.idempotencyKey),
     index().on(t.companyId, t.purchaseOrderId),
+    foreignKey({
+      name: "purchase_order_receipts_purchase_order_id_fk",
+      columns: [t.companyId, t.purchaseOrderId],
+      foreignColumns: [purchaseOrders.companyId, purchaseOrders.id],
+    }).onDelete("cascade"),
+    foreignKey({
+      name: "purchase_order_receipts_location_id_fk",
+      columns: [t.companyId, t.locationId],
+      foreignColumns: [locations.companyId, locations.id],
+    }).onDelete("restrict"),
     tenantPolicy("purchase_order_receipts"),
   ],
 ).enableRLS();

@@ -1,4 +1,5 @@
 import {
+  foreignKey,
   index,
   integer,
   jsonb,
@@ -8,7 +9,15 @@ import {
   uniqueIndex,
   uuid,
 } from "drizzle-orm/pg-core";
-import { enumText, id, jsonObject, publicReadPolicy, tenantPolicy, timestamps } from "./_shared";
+import {
+  enumText,
+  id,
+  jsonObject,
+  publicReadPolicy,
+  tenantKey,
+  tenantPolicy,
+  timestamps,
+} from "./_shared";
 import { CHANNELS } from "./channels";
 import { companyId, users } from "./tenancy";
 
@@ -56,6 +65,7 @@ export const aiJobs = pgTable(
     ...timestamps,
   },
   (t) => [
+    tenantKey("ai_jobs", t),
     index().on(t.companyId, t.kind, t.createdAt),
     index().on(t.companyId, t.entityType, t.entityId),
     tenantPolicy("ai_jobs"),
@@ -94,7 +104,7 @@ export const listingDrafts = pgTable(
     channel: text(enumText(CHANNELS)).notNull(),
     connectionId: uuid(),
     productId: uuid(),
-    aiJobId: uuid().references(() => aiJobs.id, { onDelete: "set null" }),
+    aiJobId: uuid(),
     status: text(enumText(LISTING_DRAFT_STATES)).notNull().default("generating"),
     content: jsonObject<ListingContent>().default({
       title: "",
@@ -128,6 +138,11 @@ export const listingDrafts = pgTable(
   (t) => [
     index().on(t.companyId, t.designId, t.channel),
     index().on(t.companyId, t.status, t.createdAt),
+    foreignKey({
+      name: "listing_drafts_ai_job_id_fk",
+      columns: [t.companyId, t.aiJobId],
+      foreignColumns: [aiJobs.companyId, aiJobs.id],
+    }).onDelete("set null"),
     tenantPolicy("listing_drafts"),
   ],
 ).enableRLS();
@@ -182,7 +197,7 @@ export const aiCreditLedger = pgTable(
     tokensIn: integer(),
     tokensOut: integer(),
     cacheReadTokens: integer(),
-    aiJobId: uuid().references(() => aiJobs.id, { onDelete: "set null" }),
+    aiJobId: uuid(),
     refType: text(),
     refId: uuid(),
     userId: uuid(),
@@ -193,6 +208,11 @@ export const aiCreditLedger = pgTable(
   (t) => [
     index().on(t.companyId, t.period),
     index().on(t.companyId, t.createdAt),
+    foreignKey({
+      name: "ai_credit_ledger_ai_job_id_fk",
+      columns: [t.companyId, t.aiJobId],
+      foreignColumns: [aiJobs.companyId, aiJobs.id],
+    }).onDelete("set null"),
     tenantPolicy("ai_credit_ledger"),
   ],
 ).enableRLS();
@@ -206,7 +226,11 @@ export const assistantConversations = pgTable(
     title: text().notNull().default("New conversation"),
     ...timestamps,
   },
-  (t) => [index().on(t.companyId, t.userId, t.updatedAt), tenantPolicy("assistant_conversations")],
+  (t) => [
+    tenantKey("assistant_conversations", t),
+    index().on(t.companyId, t.userId, t.updatedAt),
+    tenantPolicy("assistant_conversations"),
+  ],
 ).enableRLS();
 
 export const assistantMessages = pgTable(
@@ -214,9 +238,7 @@ export const assistantMessages = pgTable(
   {
     id: id(),
     companyId: companyId(),
-    conversationId: uuid()
-      .notNull()
-      .references(() => assistantConversations.id, { onDelete: "cascade" }),
+    conversationId: uuid().notNull(),
     role: text(enumText(["user", "assistant"] as const)).notNull(),
     text: text().notNull(),
     toolCalls: jsonObject<Record<string, unknown>>(),
@@ -225,6 +247,11 @@ export const assistantMessages = pgTable(
   },
   (t) => [
     index().on(t.companyId, t.conversationId, t.createdAt),
+    foreignKey({
+      name: "assistant_messages_conversation_id_fk",
+      columns: [t.companyId, t.conversationId],
+      foreignColumns: [assistantConversations.companyId, assistantConversations.id],
+    }).onDelete("cascade"),
     tenantPolicy("assistant_messages"),
   ],
 ).enableRLS();

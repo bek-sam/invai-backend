@@ -1,5 +1,13 @@
 import { sql } from "drizzle-orm";
-import { jsonb, pgPolicy, pgRole, timestamp, uuid } from "drizzle-orm/pg-core";
+import {
+  jsonb,
+  type PgColumn,
+  pgPolicy,
+  pgRole,
+  timestamp,
+  unique,
+  uuid,
+} from "drizzle-orm/pg-core";
 
 /** The role the app connects as. Not the table owner, no BYPASSRLS. Created by infra, not migrations. */
 export const appRole = pgRole("invai_app").existing();
@@ -38,6 +46,17 @@ export function vendorUpdatePolicy(table: string, using: ReturnType<typeof sql>)
     withCheck: using,
   });
 }
+
+/**
+ * The `(company_id, id)` key a composite tenant foreign key points at (S-26, B-30, T-22-2). A
+ * tenant table that another tenant table references adds `tenantKey("<table>", t)` to its
+ * extras; the child then declares
+ * `foreignKey({ name: "<child>_<col>_fk", columns: [t.companyId, t.<col>], foreignColumns: [parent.companyId, parent.id] })`
+ * instead of `.references(() => parent.id)`. FK checks ignore RLS, so a single-column FK would
+ * let a row of shop B point at shop A's row; `src/db/fk-coverage.test.ts` fails on any such FK.
+ */
+export const tenantKey = (table: string, t: { companyId: PgColumn; id: PgColumn }) =>
+  unique(`${table}_company_id_id_unique`).on(t.companyId, t.id);
 
 /** Global (non-tenant) tables readable by every company, e.g. trademark marks, plans. */
 export function publicReadPolicy(table: string) {

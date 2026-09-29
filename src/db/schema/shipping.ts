@@ -2,6 +2,7 @@ import { sql } from "drizzle-orm";
 import {
   boolean,
   doublePrecision,
+  foreignKey,
   index,
   integer,
   jsonb,
@@ -11,7 +12,7 @@ import {
   uniqueIndex,
   uuid,
 } from "drizzle-orm/pg-core";
-import { enumText, id, jsonArray, tenantPolicy, timestamps } from "./_shared";
+import { enumText, id, jsonArray, tenantKey, tenantPolicy, timestamps } from "./_shared";
 import { orders } from "./orders";
 import { type Address, companyId } from "./tenancy";
 
@@ -74,7 +75,11 @@ export const packagePresets = pgTable(
     isDefault: boolean().notNull().default(false),
     ...timestamps,
   },
-  (t) => [index().on(t.companyId), tenantPolicy("package_presets")],
+  (t) => [
+    tenantKey("package_presets", t),
+    index().on(t.companyId),
+    tenantPolicy("package_presets"),
+  ],
 ).enableRLS();
 
 /** One row per company; created with defaults on first read (contracts `ShippingSettings`). */
@@ -100,9 +105,7 @@ export const shipments = pgTable(
   {
     id: id(),
     companyId: companyId(),
-    orderId: uuid()
-      .notNull()
-      .references(() => orders.id, { onDelete: "cascade" }),
+    orderId: uuid().notNull(),
     orderItemIds: uuid().array().notNull().default([]),
     status: text(enumText(SHIPMENT_STATES)).notNull().default("pending"),
     carrier: text(enumText(CARRIERS)),
@@ -115,7 +118,7 @@ export const shipments = pgTable(
     postageCents: integer().notNull().default(0),
     /** Platform per-label fee (billing). */
     labelFeeCents: integer().notNull().default(0),
-    packagePresetId: uuid().references(() => packagePresets.id, { onDelete: "set null" }),
+    packagePresetId: uuid(),
     lengthIn: doublePrecision().notNull().default(10),
     widthIn: doublePrecision().notNull().default(8),
     heightIn: doublePrecision().notNull().default(1),
@@ -152,9 +155,20 @@ export const shipments = pgTable(
     ...timestamps,
   },
   (t) => [
+    tenantKey("shipments", t),
     index().on(t.companyId, t.orderId),
     index().on(t.companyId, t.status),
     uniqueIndex().on(t.companyId, t.trackingCode),
+    foreignKey({
+      name: "shipments_order_id_fk",
+      columns: [t.companyId, t.orderId],
+      foreignColumns: [orders.companyId, orders.id],
+    }).onDelete("cascade"),
+    foreignKey({
+      name: "shipments_package_preset_id_fk",
+      columns: [t.companyId, t.packagePresetId],
+      foreignColumns: [packagePresets.companyId, packagePresets.id],
+    }).onDelete("set null"),
     tenantPolicy("shipments"),
   ],
 ).enableRLS();
@@ -167,9 +181,7 @@ export const labels = pgTable(
   {
     id: id(),
     companyId: companyId(),
-    shipmentId: uuid()
-      .notNull()
-      .references(() => shipments.id, { onDelete: "cascade" }),
+    shipmentId: uuid().notNull(),
     carrier: text(enumText(CARRIERS)).notNull(),
     service: text().notNull(),
     trackingCode: text().notNull(),
@@ -190,6 +202,11 @@ export const labels = pgTable(
     uniqueIndex("labels_one_purchased_per_shipment")
       .on(t.companyId, t.shipmentId)
       .where(sql`status = 'purchased'`),
+    foreignKey({
+      name: "labels_shipment_id_fk",
+      columns: [t.companyId, t.shipmentId],
+      foreignColumns: [shipments.companyId, shipments.id],
+    }).onDelete("cascade"),
     tenantPolicy("labels"),
   ],
 ).enableRLS();
