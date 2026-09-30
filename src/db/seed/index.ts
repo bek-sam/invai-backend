@@ -8,6 +8,7 @@ import type { Role } from "../schema";
 import { companies, members, plans, subscriptions, users } from "../schema";
 import { buildShopData, DESERT_BLOOM_PROFILE, FULL_VOLUME } from "./builder";
 import { rng } from "./data";
+import { buildWeeklyDigest } from "./weekly-digest";
 
 /*
  * Demo seed: "Desert Bloom Tees" (v1-plan 5.4). Runs as the owner role. Idempotent-ish: it
@@ -150,6 +151,11 @@ async function main() {
     volume: FULL_VOLUME,
     render: { designs: true, artwork: true, sheets: true },
   });
+
+  // B-207: build this week's digest now, the same way the hourly sweep would once the shop's
+  // local clock reaches its send slot, so a fresh seed already has one (gate digest specs).
+  const digest = await buildWeeklyDigest(shopId, shop.timezone);
+  log.info("digest", digest);
 
   const [counts] = await systemDb
     .select({
