@@ -28,7 +28,11 @@ import { systemActor } from "../lib/audit";
 let counter = 0;
 const uniq = () => `${Date.now().toString(36)}${(counter++).toString(36)}`;
 
-/** Truncate every table except the global catalogs. Call in `beforeAll` when a file needs a clean slate. */
+/**
+ * Truncate every table except the global catalogs. `global-setup.ts` calls this once at the start
+ * of every `vitest` run (B-205 AC6), so a file's own `beforeAll` only needs it for a slate clean of
+ * whatever earlier tests *in the same run* left behind.
+ */
 export async function truncateAll() {
   await withSystem(async (tx) => {
     const rows = await tx.execute<{ tablename: string }>(
