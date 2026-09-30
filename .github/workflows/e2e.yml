@@ -1,0 +1,190 @@
+name: E2E
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    # Postgres (pgvector) and Valkey as GH Actions services; MinIO is started with `docker run`
+    # in a later step (same reason as ci.yml: Docker Hub's minio/minio is gone and quay.io
+    # refuses shared runners). Mailpit is not started: AC2 lists Postgres, Valkey, MinIO and
+    # imaging only, and nothing on the golden path needs outgoing mail.
+    services:
+      postgres:
+        image: pgvector/pgvector@sha256:cf134a767f474095eeba57e0117be8e568e011a63f33fbf252f14c9b760f8e6f # pg17
+        env:
+          POSTGRES_USER: invai
+          POSTGRES_PASSWORD: invai
+          POSTGRES_DB: invai
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U invai -d invai"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      valkey:
+        image: valkey/valkey@sha256:640c5e62cea04b6d6f2084232651d0cc70362d31f4f805e7be94dbed6855e8f2 # 8
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "valkey-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      NODE_ENV: development
+      MIGRATION_DATABASE_URL: postgres://invai:invai@localhost:5432/invai
+      DATABASE_URL: postgres://invai_app:invai@localhost:5432/invai
+      REDIS_URL: redis://localhost:6379
+      S3_BUCKET: invai-ci
+      S3_ENDPOINT: http://localhost:9000
+      S3_REGION: us-east-1
+      S3_ACCESS_KEY_ID: invai
+      S3_SECRET_ACCESS_KEY: invai-secret
+      S3_FORCE_PATH_STYLE: "true"
+      IMAGING_URL: http://localhost:8000
+      BETTER_AUTH_SECRET: ci-only-secret-32-chars-minimum-xxxx
+      BETTER_AUTH_URL: http://localhost:3000
+      WEB_ORIGIN: http://localhost:5173
+      FLOOR_ORIGIN: http://localhost:5174
+      # <keyId>:<base64 32 bytes> — a fixed CI-only dummy key, never a real secret.
+      FIELD_ENCRYPTION_KEY: ci:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+      VITE_API_URL: http://localhost:3000
+      MOCK_CARRIER_TRANSIT_HOURS: "0.001"
+    steps:
+      - name: Check out invai-backend
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: invai-backend
+
+      # Every sibling below is a private repo (bek-sam/*), checked out at main with no token.
+      # All work happens on main (CLAUDE.md: no feature branches, no PRs), so there is only ever
+      # one ref to check out. Each step fails the job until its repo is made readable to this
+      # workflow — see this card's report ("owner steps") for the read token the owner would
+      # need to add; no secret is added here (decision 0019, this card's AC3).
+      - name: Check out invai-contracts (sibling, main)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: bek-sam/invai-contracts
+          ref: main
+          path: invai-contracts
+      - name: Check out invai-ui (sibling, main)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: bek-sam/invai-ui
+          ref: main
+          path: invai-ui
+      - name: Check out invai-web (sibling, main)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: bek-sam/invai-web
+          ref: main
+          path: invai-web
+      - name: Check out invai-floor (sibling, main)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: bek-sam/invai-floor
+          ref: main
+          path: invai-floor
+      - name: Check out invai-imaging (sibling, main)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: bek-sam/invai-imaging
+          ref: main
+          path: invai-imaging
+      - name: Check out invai-infra (sibling, main; shared CI start-up script)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: bek-sam/invai-infra
+          ref: main
+          path: invai-infra
+
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          package_json_file: invai-backend/package.json
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: invai-backend/.nvmrc
+          cache: pnpm
+          cache-dependency-path: |
+            invai-contracts/pnpm-lock.yaml
+            invai-ui/pnpm-lock.yaml
+            invai-backend/pnpm-lock.yaml
+            invai-web/pnpm-lock.yaml
+            invai-floor/pnpm-lock.yaml
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+
+      - name: Install Node dependencies (contracts, ui, backend, web, floor)
+        run: |
+          set -e
+          (cd invai-contracts && pnpm install --frozen-lockfile)
+          (cd invai-ui && pnpm install --frozen-lockfile)
+          (cd invai-backend && pnpm install --frozen-lockfile)
+          (cd invai-web && pnpm install --frozen-lockfile)
+          (cd invai-floor && pnpm install --frozen-lockfile)
+
+      - name: Install imaging dependencies (uv sync)
+        run: cd invai-imaging && uv sync --all-groups
+
+      - name: Install Playwright browsers
+        run: |
+          set -e
+          (cd invai-web && node_modules/.bin/playwright install --with-deps chromium)
+          (cd invai-floor && node_modules/.bin/playwright install --with-deps chromium)
+
+      # MinIO checks presigned signatures, which uploads and gang-sheet output rely on.
+      # Chainguard's image: Docker Hub's minio/minio is gone, quay.io refuses shared runners.
+      - name: Start MinIO (S3 for uploads, imaging output)
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=invai -e MINIO_ROOT_PASSWORD=invai-secret \
+            cgr.dev/chainguard/minio@sha256:71674988a1c7ddd5724928633199152b11e4ddefd6c6ce2d60772ff4a8f22ca9 server /data
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:9000/minio/health/live && exit 0
+            sleep 1
+          done
+          echo "MinIO did not start" && docker logs minio && exit 1
+
+      - name: Create invai_app role and extensions (mirrors invai-infra/local/init.sql)
+        env:
+          PGPASSWORD: invai
+        run: |
+          psql -h localhost -U invai -d invai -v ON_ERROR_STOP=1 <<'SQL'
+          CREATE ROLE invai_app LOGIN PASSWORD 'invai';
+          GRANT ALL ON DATABASE invai TO invai_app;
+          GRANT USAGE ON SCHEMA public TO invai_app;
+          CREATE EXTENSION IF NOT EXISTS pg_trgm;
+          CREATE EXTENSION IF NOT EXISTS vector;
+          CREATE EXTENSION IF NOT EXISTS pgcrypto;
+          CREATE EXTENSION IF NOT EXISTS citext;
+          ALTER DEFAULT PRIVILEGES FOR ROLE invai IN SCHEMA public
+            GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO invai_app;
+          ALTER DEFAULT PRIVILEGES FOR ROLE invai IN SCHEMA public
+            GRANT USAGE, SELECT ON SEQUENCES TO invai_app;
+          SQL
+
+      # Brings up imaging, api, worker, migrates, seeds, brings up web + floor, then runs the
+      # API golden path, the browser suite (golden path + screens smoke) and the floor suite
+      # (T-23-7 AC2). Shared with invai-web/e2e.yml and invai-floor/e2e.yml so the three
+      # workflows can't drift (invai-infra/scripts/ci/run-e2e.sh).
+      - name: Run the E2E stack and all three suites
+        run: bash invai-infra/scripts/ci/run-e2e.sh
+
+      - name: Upload E2E traces and logs on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: e2e-evidence
+          if-no-files-found: ignore
+          retention-days: 7
+          path: |
+            .ci-e2e-logs/**
+            invai-web/e2e/.report/**
+            invai-web/e2e/.results/**
+            invai-floor/e2e/.report/**
+            invai-floor/e2e/.results/**

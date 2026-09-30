@@ -3,6 +3,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -14,7 +19,7 @@ jobs:
     # invai-infra/local/init.sql, which this job doesn't have checked out).
     services:
       postgres:
-        image: pgvector/pgvector:pg17
+        image: pgvector/pgvector@sha256:cf134a767f474095eeba57e0117be8e568e011a63f33fbf252f14c9b760f8e6f # pg17
         env:
           POSTGRES_USER: invai
           POSTGRES_PASSWORD: invai
@@ -26,7 +31,7 @@ jobs:
           --health-timeout 5s
           --health-retries 10
       valkey:
-        image: valkey/valkey:8
+        image: valkey/valkey@sha256:640c5e62cea04b6d6f2084232651d0cc70362d31f4f805e7be94dbed6855e8f2 # 8
         ports: ["6379:6379"]
         options: >-
           --health-cmd "valkey-cli ping"
@@ -52,30 +57,24 @@ jobs:
       # <keyId>:<base64 32 bytes> — a fixed CI-only dummy key, never a real secret.
       FIELD_ENCRYPTION_KEY: ci:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           path: invai-backend
-      # Private sibling repo linked via link:../invai-contracts. Needs secret CONTRACTS_DEPLOY_KEY
-      # (private half of a read-only deploy key on bek-sam/invai-contracts).
-      # Same branch name as this PR/push when invai-contracts has it (cross-repo changes land together), else main.
-      - uses: actions/checkout@v4
-        id: contracts_branch
-        continue-on-error: true
+      # invai-contracts is a private sibling repo (bek-sam/invai-contracts, linked via
+      # link:../invai-contracts) checked out at main with no token. All work happens on main
+      # (CLAUDE.md: no feature branches, no PRs), so there is only ever one ref to check out.
+      # This step fails the job until the repo is made readable to this workflow — see this
+      # card's report ("owner steps") for the read token the owner would need to add.
+      - name: Check out invai-contracts (sibling, main)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: bek-sam/invai-contracts
+          ref: main
           path: invai-contracts
-          ref: ${{ github.head_ref || github.ref_name }}
-          ssh-key: ${{ secrets.CONTRACTS_DEPLOY_KEY }}
-      - uses: actions/checkout@v4
-        if: steps.contracts_branch.outcome == 'failure'
-        with:
-          repository: bek-sam/invai-contracts
-          path: invai-contracts
-          ssh-key: ${{ secrets.CONTRACTS_DEPLOY_KEY }}
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           package_json_file: invai-backend/package.json
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version-file: invai-backend/.nvmrc
           cache: pnpm
@@ -108,7 +107,7 @@ jobs:
         run: |
           docker run -d --name minio -p 9000:9000 \
             -e MINIO_ROOT_USER=invai -e MINIO_ROOT_PASSWORD=invai-secret \
-            cgr.dev/chainguard/minio:latest server /data
+            cgr.dev/chainguard/minio@sha256:71674988a1c7ddd5724928633199152b11e4ddefd6c6ce2d60772ff4a8f22ca9 server /data
           for i in $(seq 1 30); do
             curl -sf http://localhost:9000/minio/health/live && exit 0
             sleep 1
