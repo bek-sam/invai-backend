@@ -362,6 +362,8 @@ type ShipOrder = {
   weight: number;
   charged: number;
   label: number;
+  /** `shipments.dest_zone` (1-9), or null when not set (labeled before T-A4, or zone lookup missed). */
+  zone: number | null;
 };
 
 function shipTotals(list: ShipOrder[]) {
@@ -394,12 +396,14 @@ export async function shippingMargin(
       with lab as (
         select sh.order_id, sum(sh.postage_cents + sh.label_fee_cents) as label_cents,
           min(sh.carrier || '/' || coalesce(sh.service, '')) as service,
-          sum(sh.weight_oz) as weight_oz, count(*) as shipments
+          sum(sh.weight_oz) as weight_oz, count(*) as shipments,
+          max(sh.dest_zone) as dest_zone
         from shipments sh
         where sh.company_id = ${ctx.companyId} and sh.voided_at is null
           and sh.labeled_at >= ${w.from}::timestamptz and sh.labeled_at < ${w.to}::timestamptz
         group by 1)
-      select o.channel, lab.service, lab.weight_oz, lab.label_cents, o.shipping_cents
+      select o.channel, lab.service, lab.weight_oz, lab.label_cents, o.shipping_cents,
+        lab.dest_zone
       from lab join orders o on o.id = lab.order_id and o.company_id = ${ctx.companyId}
       ${c ? sql`where o.channel = ${c}` : sql``}`,
     )
@@ -409,22 +413,24 @@ export async function shippingMargin(
     weight: n(r.weight_oz),
     charged: n(r.shipping_cents),
     label: n(r.label_cents),
+    zone: r.dest_zone == null ? null : n(r.dest_zone),
   }));
 
-  // Zone rows need `shipments.dest_zone`, which T-A4 adds at label time. Until then every
-  // labeled shipment in the window is "without zone" and no zone row is made up.
+  // `zone` rows come only from labeled shipments with `shipments.dest_zone` set (T-A4 fills it at
+  // label time). A labeled order whose shipment(s) carry no zone (labeled before T-A4, or the zone
+  // lookup missed) is counted in `shipmentsWithoutZone` and left out of `rows`, per the contract
+  // (`ShippingMargin.shipmentsWithoutZone`) -- never turned into a made-up row.
   let shipmentsWithoutZone = 0;
   const groups = new Map<string, ShipOrder[]>();
   if (input.groupBy === "zone") {
-    const [z] = await rows(
-      tx,
-      sql`select count(*)::int as n from shipments sh
-        join orders o on o.id = sh.order_id and o.company_id = ${ctx.companyId}
-        where sh.company_id = ${ctx.companyId} and sh.voided_at is null
-          and sh.labeled_at >= ${w.from}::timestamptz and sh.labeled_at < ${w.to}::timestamptz
-          ${c ? sql`and o.channel = ${c}` : sql``}`,
-    );
-    shipmentsWithoutZone = n(z?.n);
+    for (const o of list) {
+      if (o.zone == null) {
+        shipmentsWithoutZone++;
+        continue;
+      }
+      const key = String(o.zone);
+      groups.set(key, [...(groups.get(key) ?? []), o]);
+    }
   } else {
     for (const o of list) {
       const key =
@@ -449,7 +455,11 @@ export async function shippingMargin(
     ...shipTotals(l),
   }));
   out.sort((a, b) =>
-    input.groupBy === "weightBand" ? bandOrder(a.key) - bandOrder(b.key) : a.margin - b.margin,
+    input.groupBy === "weightBand"
+      ? bandOrder(a.key) - bandOrder(b.key)
+      : input.groupBy === "zone"
+        ? Number(a.key) - Number(b.key)
+        : a.margin - b.margin,
   );
   return {
     period: input.period,

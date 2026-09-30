@@ -5,12 +5,12 @@ import { beforeAll, describe, expect, it, vi } from "vitest";
 import { anonymousContext, permissionsFor } from "../../api/context";
 import { router } from "../../api/router";
 import { withSystem, withTenant } from "../../db/client";
-import { outboxEvents } from "../../db/schema";
+import { outboxEvents, shipments } from "../../db/schema";
 import { createCompany, createUser, tenantContext } from "../../test/fixtures";
 import { lastCompleteWeek, localMidnights } from "../digest/week";
 import * as financeSvc from "../finance/service";
 import * as svc from "./finance-service";
-import { addOrder, addShipment, buildScenario } from "./finance-testkit";
+import { addOrder, addShipment, buildScenario, localPeriod } from "./finance-testkit";
 import * as shared from "./shared";
 
 // Count calls to the one shared net function from every importer (finance and analytics alike).
@@ -202,6 +202,66 @@ describe("finance analytics (T-A3)", () => {
     );
     expect(none.totals.labeledOrders).toBe(0);
     expect(none.totals.marginPerOrder).toBeNull();
+  });
+
+  it("T-A3 follow-up (review note 2): shippingMargin groups by dest_zone and counts a null zone, not a made-up row", async () => {
+    const z = (await createCompany()).id;
+    const period = await localPeriod(z, "2026-09-01", "2026-09-08");
+    const orderIds: string[] = [];
+    for (let i = 0; i < 4; i++) {
+      const { order } = await addOrder(z, {
+        channel: "etsy",
+        placedAt: new Date("2026-09-02T18:00:00Z"),
+        subtotal: 2800,
+        shipping: 500,
+        lines: [{ revenue: 2800, label: 450 }],
+      });
+      orderIds.push(order.id);
+    }
+    // Zones 2, 2, 7, and one shipment with no zone (labeled before T-A4, or the lookup missed).
+    const destZones: (number | null)[] = [2, 2, 7, null];
+    await withSystem((tx) =>
+      tx.insert(shipments).values(
+        orderIds.map((orderId, i) => ({
+          companyId: z,
+          orderId,
+          status: "labeled" as const,
+          carrier: "usps" as const,
+          service: "GroundAdvantage",
+          postageCents: 450,
+          labelFeeCents: 4,
+          weightOz: 6,
+          labeledAt: new Date("2026-09-03T17:00:00Z"),
+          destZone: destZones[i],
+        })),
+      ),
+    );
+    const ctxZ = tenantContext(z, null, "owner");
+    const zone = await run(z, (tx) => svc.shippingMargin(tx, ctxZ, { period, groupBy: "zone" }));
+    expect(zone.rows.map((r) => r.key)).toEqual(["2", "7"]);
+    const two = zone.rows.find((r) => r.key === "2");
+    expect(two?.labeledOrders).toBe(2);
+    expect(two?.charged).toBe(1000);
+    expect(two?.labelCost).toBe(2 * 454);
+    expect(two?.margin).toBe(1000 - 2 * 454);
+    const seven = zone.rows.find((r) => r.key === "7");
+    expect(seven?.labeledOrders).toBe(1);
+    expect(seven?.charged).toBe(500);
+    expect(seven?.labelCost).toBe(454);
+    // The null-zone shipment is counted, not turned into a made-up row.
+    expect(zone.shipmentsWithoutZone).toBe(1);
+    expect(zone.rows.reduce((t, r) => t + r.labeledOrders, 0)).toBe(3);
+    // Other groupings on the same data still work (dest_zone doesn't leak into their totals).
+    const channel = await run(z, (tx) =>
+      svc.shippingMargin(tx, ctxZ, { period, groupBy: "channel" }),
+    );
+    expect(channel.totals.labeledOrders).toBe(4);
+    // Tenant isolation: company B, which has none of these shipments, sees nothing for the period.
+    const isolated = await run(b, (tx) =>
+      svc.shippingMargin(tx, ctxB, { period, groupBy: "zone" }),
+    );
+    expect(isolated.rows).toEqual([]);
+    expect(isolated.shipmentsWithoutZone).toBe(0);
   });
 
   it("AC-A5: volume + rate = total change, and the top mover is design Y (new this week)", async () => {
