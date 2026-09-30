@@ -7,6 +7,7 @@ import {
   integer,
   jsonb,
   pgTable,
+  smallint,
   text,
   timestamp,
   uniqueIndex,
@@ -152,6 +153,11 @@ export const shipments = pgTable(
      * distinct, re-settable timestamp that a re-export simply overwrites.
      */
     exportedAt: timestamp({ withTimezone: true }),
+    /**
+     * T-A4: carrier zone 1-9 from origin and destination ZIP3, set once at label purchase
+     * (`shipping/zone.ts`). The ZIPs are read in memory only; no ZIP or address is stored here.
+     */
+    destZone: smallint(),
     ...timestamps,
   },
   (t) => [
