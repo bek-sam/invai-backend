@@ -41,6 +41,8 @@ export const costSettings = pgTable(
     adsAllocation: text(enumText(["revenue_share", "per_order"] as const))
       .notNull()
       .default("revenue_share"),
+    /** Fixed monthly costs (rent, software, salaries) for break-even; null = not set. */
+    fixedMonthlyCents: integer(),
     ...timestamps,
   },
   (t) => [uniqueIndex().on(t.companyId), tenantPolicy("cost_settings")],

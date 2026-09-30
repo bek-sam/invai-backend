@@ -1,0 +1,1 @@
+ALTER TABLE "cost_settings" ADD COLUMN "fixed_monthly_cents" integer;
