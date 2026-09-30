@@ -156,7 +156,10 @@ export async function updateCostSettings(
     data: input as Record<string, unknown>,
   });
   // Fixed monthly costs feed break-even only, never a profit line: no recompute for them alone.
-  const affectsLines = Object.keys(input).some((k) => k !== "fixedMonthlyCents");
+  // (The parsed input can carry every key with `undefined`, so look at values, not keys.)
+  const affectsLines = Object.entries(input).some(
+    ([k, v]) => k !== "fixedMonthlyCents" && v !== undefined,
+  );
   if (ctx.userId && affectsLines)
     await emit(tx, ctx.companyId, "cost_settings.changed", { userId: ctx.userId });
   return toCostSettings(row);

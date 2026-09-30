@@ -407,15 +407,25 @@ describe("finance analytics (T-A3)", () => {
       }
     });
 
-    it("the other five analytics procedures are still NOT_IMPLEMENTED stubs", async () => {
-      const u = await createUser(a, "owner");
-      await expect(
-        call(
-          router.analytics.operations,
-          { period: s.current },
-          { context: routerContext(a, u, "owner") },
-        ),
-      ).rejects.toMatchObject({ code: "NOT_IMPLEMENTED" });
+    it("finance.costSettings.update through the router stores fixed costs without a profit recompute", async () => {
+      // The router's parsed input carries every CostSettingsInput key (undefined ones too).
+      const c = (await createCompany()).id;
+      const u = await createUser(c, "owner");
+      const ctx = routerContext(c, u, "owner");
+      const before = await countCostEvents(c);
+      for (let i = 0; i < 2; i++) {
+        const out = await call(
+          router.finance.costSettings.update,
+          { fixedMonthlyCents: 250_000 },
+          { context: ctx },
+        );
+        expect(out.fixedMonthlyCents).toBe(250_000);
+      }
+      expect(await countCostEvents(c)).toBe(before);
+      const got = await call(router.finance.costSettings.get, {}, { context: ctx });
+      expect(got.fixedMonthlyCents).toBe(250_000);
+      await call(router.finance.costSettings.update, { laborMinutesPerItem: 5 }, { context: ctx });
+      expect(await countCostEvents(c)).toBe(before + 1);
     });
   });
 });
