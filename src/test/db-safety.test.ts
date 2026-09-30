@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { assertTestDatabase } from "./db-safety";
 
+const DEV_DB = "postgres://invai:invai@localhost:5432/invai";
+
 describe("assertTestDatabase", () => {
   afterEach(() => {
     delete process.env.TEST_DATABASE_URL;
@@ -17,13 +19,17 @@ describe("assertTestDatabase", () => {
   });
 
   it("refuses the dev database", () => {
-    expect(() => assertTestDatabase("postgres://invai:invai@localhost:5432/invai")).toThrow(
-      /doesn't look like a test database/,
-    );
+    expect(() => assertTestDatabase(DEV_DB)).toThrow(/doesn't look like a test database/);
   });
 
   it("refuses a database with no name in the URL", () => {
     expect(() => assertTestDatabase("postgres://invai:invai@localhost:5432/")).toThrow(
+      /doesn't look like a test database/,
+    );
+  });
+
+  it('refuses a name that merely contains the letters "test", like invai_latest', () => {
+    expect(() => assertTestDatabase("postgres://invai:invai@localhost:5432/invai_latest")).toThrow(
       /doesn't look like a test database/,
     );
   });
@@ -42,8 +48,55 @@ describe("assertTestDatabase", () => {
 
   it("does not trust an unrelated TEST_DATABASE_URL pin for a different, non-test URL", () => {
     process.env.TEST_DATABASE_URL = "postgres://invai:invai@localhost:5432/invai_scratch_test";
-    expect(() => assertTestDatabase("postgres://invai:invai@localhost:5432/invai")).toThrow(
-      /doesn't look like a test database/,
-    );
+    expect(() => assertTestDatabase(DEV_DB)).toThrow(/doesn't look like a test database/);
+  });
+
+  // Round 3 finding: db-safety.ts:18-20 trusted any URL that exactly matched
+  // TEST_DATABASE_URL/TEST_MIGRATION_DATABASE_URL, so pinning the dev URL by mistake let the
+  // truncate reach the shared dev database. Pinning the dev URL must never be trusted.
+  it("refuses the dev database even when pinned via TEST_DATABASE_URL", () => {
+    process.env.TEST_DATABASE_URL = DEV_DB;
+    expect(() => assertTestDatabase(DEV_DB)).toThrow(/doesn't look like a test database/);
+  });
+
+  it("refuses the dev database even when pinned via TEST_MIGRATION_DATABASE_URL", () => {
+    process.env.TEST_MIGRATION_DATABASE_URL = DEV_DB;
+    expect(() => assertTestDatabase(DEV_DB)).toThrow(/doesn't look like a test database/);
+  });
+
+  it("refuses whatever database the raw, un-redirected DATABASE_URL points at, pinned or not", () => {
+    const original = process.env.DATABASE_URL;
+    const url = "postgres://invai_app:invai@localhost:5432/some_shop_prod";
+    process.env.DATABASE_URL = url;
+    process.env.TEST_DATABASE_URL = url;
+    try {
+      expect(() => assertTestDatabase(url)).toThrow(/doesn't look like a test database/);
+    } finally {
+      process.env.DATABASE_URL = original;
+    }
+  });
+
+  it("refuses whatever database the raw, un-redirected MIGRATION_DATABASE_URL points at, pinned or not", () => {
+    const original = process.env.MIGRATION_DATABASE_URL;
+    const url = "postgres://invai:invai@localhost:5432/some_shop_prod";
+    process.env.MIGRATION_DATABASE_URL = url;
+    process.env.TEST_MIGRATION_DATABASE_URL = url;
+    try {
+      expect(() => assertTestDatabase(url)).toThrow(/doesn't look like a test database/);
+    } finally {
+      process.env.MIGRATION_DATABASE_URL = original;
+    }
+  });
+
+  it('still allows a pinned non-dev scratch DB whose name doesn\'t contain "test"', () => {
+    const url = "postgres://invai:invai@localhost:5432/invai_rev_t230";
+    process.env.TEST_DATABASE_URL = url;
+    expect(() => assertTestDatabase(url)).not.toThrow();
+  });
+
+  it('still allows a scratch DB with "test" in its name, unpinned', () => {
+    expect(() =>
+      assertTestDatabase("postgres://invai:invai@localhost:5432/invai_rev_t230_test"),
+    ).not.toThrow();
   });
 });

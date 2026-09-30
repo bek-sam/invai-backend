@@ -56,18 +56,14 @@ and moves to DB 15, so a dev or CI worker on DB 0 never sees test jobs or stream
 yourself (a DB written that way is kept as-is, never redirected) — the pattern to use when several
 agents run the suite at once. `TEST_REDIS_URL` itself must be a pinned non-zero DB the same way;
 one written as DB 0 fails the boot with a clear error rather than silently running on DB 0. `pnpm
-test` also truncates every tenant table in `invai_test` once, at the very start of the run (B-205
-AC6), so a shared `invai_test` that other runs (or other agents) have left full of rows never
-changes what a test sees: an unscoped, cross-tenant read like `findStuckIntents()`'s `LIMIT 200`
-sweep only ever sees this run's own rows. The truncate refuses to run against anything whose
-database name doesn't contain "test" and isn't exactly `TEST_DATABASE_URL`/`TEST_MIGRATION_DATABASE_URL`
-(`src/test/db-safety.ts`), so it can never reach the dev database even if `TEST_DATABASE_URL` is
-unset or misconfigured. A single test file that needs a mid-run clean slate (several tests in the
-same file colliding) still calls `truncateAll()` itself (`src/test/fixtures.ts`). This raises the
-cost of two agents sharing plain `invai_test` at once beyond the existing row-count and
-unique-constraint collisions: a run that starts partway through another now wipes its
-in-progress rows too. Pin your own `TEST_DATABASE_URL`/`TEST_MIGRATION_DATABASE_URL` (per
-`team/agent-brief.md`) whenever `invai_test` might already be busy.
+test` also truncates every tenant table in `invai_test` once, at the start of the run (B-205 AC6),
+so a shared, row-polluted `invai_test` never changes what a test sees. `assertTestDatabase`
+(`src/test/db-safety.ts`) guards the truncate: it refuses a name that isn't a whole `test` segment
+(`invai_test`, not `invai_latest`), and it refuses the dev database — literally named `invai`, or
+whatever `DATABASE_URL`/`MIGRATION_DATABASE_URL` raw point at — even if pinned via
+`TEST_DATABASE_URL`/`TEST_MIGRATION_DATABASE_URL` by mistake. Sharing plain `invai_test` with
+another agent still means a run wipes the other's in-progress rows; pin your own
+`TEST_DATABASE_URL`/`TEST_MIGRATION_DATABASE_URL` (per `team/agent-brief.md`) when it's busy.
 
 No real API keys are needed: every integration (Claude, EasyPost, Shopify, S&S) falls back to a
 mock provider automatically when its env var is unset (`env.mocks.*` in `src/env.ts`). See
