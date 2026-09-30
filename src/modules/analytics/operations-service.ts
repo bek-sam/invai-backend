@@ -138,7 +138,9 @@ async function reprintCost(
       acc.cost += num(r.cost);
       m.set(key, acc);
     }
-    return [...m.values()].sort((a, b) => b.cost - a.cost || b.reprints - a.reprints);
+    return [...m.values()].sort(
+      (a, b) => b.cost - a.cost || b.reprints - a.reprints || a.key.localeCompare(b.key),
+    );
   };
   const reprints = list.length;
   return {
@@ -176,7 +178,7 @@ async function filmWaste(tx: Tx, ctx: Ctx, from: Date, to: Date): Promise<Operat
         from gang_sheets g
         left join vendor_connections vc on vc.company_id = g.company_id and vc.id = g.vendor_connection_id
         where ${where}
-        group by 1, 2 order by waste desc`,
+        group by 1, 2 order by waste desc, coalesce(g.vendor_connection_id::text, '')`,
   );
   const sheets = num(total?.sheets);
   return {
@@ -281,7 +283,7 @@ async function pressMinutes(
         left join order_items oi on oi.company_id = ${ctx.companyId} and oi.id = s.order_item_id
         left join orders o on o.company_id = ${ctx.companyId} and o.id = oi.order_id
         where true ${channel}
-        group by 1, 2 order by 2`,
+        group by 1, 2 order by 2, 1`,
   );
   return list.map((r) => {
     const timedUnits = num(r.timed_units);

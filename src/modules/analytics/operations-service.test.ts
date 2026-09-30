@@ -273,6 +273,52 @@ describe("analytics.operations (T-A4)", () => {
     ]);
   });
 
+  it("reprint byReason keeps a stable order when two reasons tie (review r1)", async () => {
+    // The underlying reprints query has no ORDER BY, so a genuine tie on cost and reprint count
+    // used to come back in whatever order Postgres happened to scan the rows in (flaky ~1/3 runs).
+    // "color_off" and "ghosting" both cost 0 here (no transfer, blank not consumed) with one
+    // reprint each; the key tiebreak must always put "color_off" first.
+    const company = await createCompany();
+    await withSystem((tx) =>
+      tx.update(companies).set({ timezone: "UTC" }).where(eq(companies.id, company.id)),
+    );
+    const owner = await createUser(company.id, "owner");
+    const ctx = tenantContext(company.id, owner.id, "owner");
+    const connectionId = (await createConnection(company.id, "csv")).id;
+    const { items } = await createOrder(company.id, connectionId, {
+      units: 2,
+      state: "shipped",
+      channel: "etsy",
+    });
+    const [x0, x1] = items;
+    if (!x0 || !x1) throw new Error("items missing");
+    await withSystem((tx) =>
+      tx.insert(reprints).values([
+        {
+          companyId: company.id,
+          orderItemId: x0.id,
+          reason: "ghosting",
+          blankConsumed: false,
+          requestedAt: at(12),
+        },
+        {
+          companyId: company.id,
+          orderItemId: x1.id,
+          reason: "color_off",
+          blankConsumed: false,
+          requestedAt: at(12),
+        },
+      ]),
+    );
+    for (let i = 0; i < 4; i++) {
+      const o = await withTenant(company.id, (tx) => getOperations(tx, ctx, { period: PERIOD }));
+      expect(o.reprintCost.byReason).toEqual([
+        { key: "color_off", label: "Color off", reprints: 1, cost: 0 },
+        { key: "ghosting", label: "Ghosting", reprints: 1, cost: 0 },
+      ]);
+    }
+  });
+
   it("film waste and film use, total and by vendor (AC-B1)", async () => {
     const f = (await ops(a)).filmWaste;
     expect(f).toMatchObject({ sheets: 13, wasteCost: 10100, filmUsePct: 78.8 });
