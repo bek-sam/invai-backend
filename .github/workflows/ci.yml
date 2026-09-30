@@ -60,17 +60,19 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           path: invai-backend
+          persist-credentials: false
       # invai-contracts is a private sibling repo (bek-sam/invai-contracts, linked via
-      # link:../invai-contracts) checked out at main with no token. All work happens on main
-      # (CLAUDE.md: no feature branches, no PRs), so there is only ever one ref to check out.
-      # This step fails the job until the repo is made readable to this workflow — see this
-      # card's report ("owner steps") for the read token the owner would need to add.
+      # link:../invai-contracts), read with the existing read-only deploy key. All work happens
+      # on main (CLAUDE.md: no feature branches, no PRs), so there is only ever one ref to check
+      # out.
       - name: Check out invai-contracts (sibling, main)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           repository: bek-sam/invai-contracts
           ref: main
           path: invai-contracts
+          ssh-key: ${{ secrets.CONTRACTS_DEPLOY_KEY }}
+          persist-credentials: false
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           package_json_file: invai-backend/package.json
