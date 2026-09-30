@@ -8,6 +8,7 @@ import type { Role } from "../schema";
 import { companies, members, plans, subscriptions, users } from "../schema";
 import { buildShopData, DESERT_BLOOM_PROFILE, FULL_VOLUME } from "./builder";
 import { rng } from "./data";
+import { seedMarketDemand } from "./market-demand";
 import { buildWeeklyDigest } from "./weekly-digest";
 
 /*
@@ -156,6 +157,12 @@ async function main() {
   // local clock reaches its send slot, so a fresh seed already has one (gate digest specs).
   const digest = await buildWeeklyDigest(shopId, shop.timezone);
   log.info("digest", digest);
+
+  // T-23-10: refresh the global demand cache and compute this shop's market signals now, the
+  // way the hourly market sweep would (`src/db/seed/market-demand.ts`), so `market.spec.ts`'s
+  // "Sample data" badge has outside demand data to show right after a fresh seed.
+  const market = await seedMarketDemand(shopId);
+  log.info("market", { demand: market.demand.sources.length, ...market.signals });
 
   const [counts] = await systemDb
     .select({
