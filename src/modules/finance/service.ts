@@ -9,27 +9,13 @@ import {
   type OrderProfit,
   type ProfitSummary,
 } from "@invai/contracts";
-import {
-  and,
-  asc,
-  eq,
-  gte,
-  inArray,
-  isNotNull,
-  isNull,
-  lt,
-  lte,
-  ne,
-  type SQL,
-  sql,
-} from "drizzle-orm";
+import { and, asc, eq, gte, inArray, isNotNull, lt, lte, ne, type SQL, sql } from "drizzle-orm";
 import type { z } from "zod";
 import type { TenantContext } from "../../api/context";
 import { afterCommit, type Tx } from "../../db/client";
 import {
   adSpend,
   blankVariants,
-  companies,
   costSettings,
   designFiles,
   designs,
@@ -38,7 +24,6 @@ import {
   orderItems,
   orders,
   profitLines,
-  refundEvents,
   shipments,
   transfers,
 } from "../../db/schema";
@@ -49,6 +34,7 @@ import { emit } from "../../lib/outbox";
 import { keyset, type PageInput } from "../../lib/pagination";
 import { publish } from "../../lib/realtime";
 import { getObject, objectKey, putObject } from "../../lib/s3";
+import { companyTimezone, computeNet } from "../analytics/shared";
 import { feeCategoryOf } from "./fees";
 import {
   allocate,
@@ -122,6 +108,7 @@ function toCostSettings(row: CostSettingsRow): CostSettings {
     laborRatePerHour: row.laborRatePerHourCents,
     laborMinutesPerItem: row.laborMinutesPerItem,
     adsAllocation: row.adsAllocation,
+    fixedMonthlyCents: row.fixedMonthlyCents,
     updatedAt: row.updatedAt.toISOString(),
   };
 }
@@ -151,6 +138,9 @@ export async function updateCostSettings(
       laborRatePerHourCents: input.laborRatePerHour ?? current.laborRatePerHourCents,
       laborMinutesPerItem: input.laborMinutesPerItem ?? current.laborMinutesPerItem,
       adsAllocation: input.adsAllocation ?? current.adsAllocation,
+      // null clears it (break-even goes back to "add your fixed costs"); undefined keeps it.
+      fixedMonthlyCents:
+        input.fixedMonthlyCents === undefined ? current.fixedMonthlyCents : input.fixedMonthlyCents,
       updatedAt: new Date(),
     })
     .where(eq(costSettings.companyId, ctx.companyId))
@@ -165,7 +155,10 @@ export async function updateCostSettings(
     summary: `Updated ${Object.keys(input).join(", ")}`,
     data: input as Record<string, unknown>,
   });
-  if (ctx.userId) await emit(tx, ctx.companyId, "cost_settings.changed", { userId: ctx.userId });
+  // Fixed monthly costs feed break-even only, never a profit line: no recompute for them alone.
+  const affectsLines = Object.keys(input).some((k) => k !== "fixedMonthlyCents");
+  if (ctx.userId && affectsLines)
+    await emit(tx, ctx.companyId, "cost_settings.changed", { userId: ctx.userId });
   return toCostSettings(row);
 }
 
@@ -345,14 +338,6 @@ export async function importAdSpendCsv(tx: Tx, ctx: Ctx, fileKey: string) {
 }
 
 /* ------------------------------ profit recompute ----------------------------- */
-
-async function companyTimezone(tx: Tx, companyId: string): Promise<string> {
-  const [row] = await tx
-    .select({ tz: companies.timezone })
-    .from(companies)
-    .where(eq(companies.id, companyId));
-  return row?.tz ?? "America/Phoenix";
-}
 
 export function localDay(at: Date, timeZone: string): string {
   return new Intl.DateTimeFormat("en-CA", {
@@ -866,68 +851,20 @@ export type ProfitInput = {
   sort?: "net" | "revenue" | "marginPct" | "units" | "key";
 };
 
-const sums = {
-  revenue: sql<number>`coalesce(sum(${profitLines.revenueCents}), 0)::int`,
-  channelFees: sql<number>`coalesce(sum(${profitLines.channelFeesCents}), 0)::int`,
-  blankCost: sql<number>`coalesce(sum(${profitLines.blankCostCents}), 0)::int`,
-  transferCost: sql<number>`coalesce(sum(${profitLines.transferCostCents}), 0)::int`,
-  labelCost: sql<number>`coalesce(sum(${profitLines.labelCostCents}), 0)::int`,
-  packagingCost: sql<number>`coalesce(sum(${profitLines.packagingCostCents}), 0)::int`,
-  laborCost: sql<number>`coalesce(sum(${profitLines.laborCostCents}), 0)::int`,
-  adsCost: sql<number>`coalesce(sum(${profitLines.adsCostCents}), 0)::int`,
-  refunds: sql<number>`coalesce(sum(${profitLines.refundsCents}), 0)::int`,
-  orders: sql<number>`count(distinct ${profitLines.orderId})::int`,
-  units: sql<number>`(count(*) filter (where not ${profitLines.isReprint} and ${profitLines.refundsCents} = 0))::int`,
-  computedAt: sql<Date | null>`max(${profitLines.computedAt})`,
-};
-
 /** True profit grouped by one dimension over a period (placed-at in the period). */
 export async function getProfit(
   tx: Tx,
   ctx: Pick<TenantContext, "companyId">,
   input: ProfitInput,
 ): Promise<ProfitSummary> {
-  const from = new Date(input.period.from);
-  const to = new Date(input.period.to);
-  const tz = await companyTimezone(tx, ctx.companyId);
-  const filters: SQL[] = [
-    eq(profitLines.companyId, ctx.companyId),
-    gte(profitLines.placedAt, from),
-    lt(profitLines.placedAt, to),
-  ];
-  if (input.channel) filters.push(eq(profitLines.channel, input.channel));
-  if (input.designId) filters.push(eq(profitLines.designId, input.designId));
-
-  const keyExpr: Record<ProfitInput["dimension"], SQL<string>> = {
-    order: sql<string>`${profitLines.orderId}::text`,
-    design: sql<string>`coalesce(${profitLines.designId}::text, 'unmapped')`,
-    blank: sql<string>`coalesce(${profitLines.styleCode}, 'unmapped')`,
-    channel: sql<string>`${profitLines.channel}`,
-    day: sql<string>`to_char(${profitLines.placedAt} at time zone ${tz}, 'YYYY-MM-DD')`,
-  };
-  const key = keyExpr[input.dimension];
-  const labelExpr: Record<ProfitInput["dimension"], SQL<string | null>> = {
-    order: sql<string | null>`max(${orders.orderNo})`,
-    design: sql<string | null>`max(${designs.name})`,
-    blank: sql<
-      string | null
-    >`max(${blankVariants.brand} || ' ' || ${blankVariants.styleCode} || coalesce(' ' || ${blankVariants.styleName}, ''))`,
-    channel: sql<string | null>`null`,
-    day: sql<string | null>`null`,
-  };
-
-  let q = tx
-    .select({ key, label: labelExpr[input.dimension], ...sums })
-    .from(profitLines)
-    .$dynamic();
-  if (input.dimension === "order") q = q.leftJoin(orders, eq(orders.id, profitLines.orderId));
-  if (input.dimension === "design") q = q.leftJoin(designs, eq(designs.id, profitLines.designId));
-  if (input.dimension === "blank")
-    q = q.leftJoin(blankVariants, eq(blankVariants.id, profitLines.blankVariantId));
-  // GROUP BY the first select column: the day key binds the time zone as a parameter, and
-  // Postgres won't match `$1` in the select list to `$5` in GROUP BY (500 on the day view).
-  const groups = await q.where(and(...filters)).groupBy(sql`1`);
-  mergeRefunds(groups, await refundGroups(tx, ctx.companyId, input, tz));
+  // The shared net calculation (analytics/shared.ts): the same function behind
+  // analytics.unitEconomics, so the Profit page's Net equals CM3 to the cent (AC-G1).
+  const net = await computeNet(tx, ctx, input.period, {
+    dimension: input.dimension,
+    channel: input.channel,
+    designId: input.designId,
+  });
+  const groups = net.groups;
 
   const rows = groups.map((g) => {
     const b = finalize(g);
@@ -948,123 +885,14 @@ export async function getProfit(
     const vb = sort === "marginPct" ? (b.marginPct ?? -Infinity) : b[sort];
     return vb - va;
   });
-  const totals = sumBuckets(groups);
-
-  // Incomplete: orders in the period with items but no profit line yet.
-  const [missing] = await tx
-    .select({ n: sql<number>`count(*)::int` })
-    .from(orders)
-    .where(
-      and(
-        eq(orders.companyId, ctx.companyId),
-        gte(orders.placedAt, from),
-        lt(orders.placedAt, to),
-        input.channel ? eq(orders.channel, input.channel) : undefined,
-        sql`exists (select 1 from order_items oi where oi.order_id = ${orders.id})`,
-        sql`not exists (select 1 from profit_lines pl where pl.order_id = ${orders.id})`,
-      ),
-    );
-  const computedAt = groups.reduce<Date | null>((m, g) => {
-    const d = g.computedAt ? new Date(g.computedAt) : null;
-    return d && (!m || d > m) ? d : m;
-  }, null);
   return {
     dimension: input.dimension,
     period: input.period,
     rows: rows.slice(0, input.limit ?? 200),
-    totals,
-    incomplete: (missing?.n ?? 0) > 0,
-    computedAt: (computedAt ?? new Date()).toISOString(),
+    totals: net.totals,
+    incomplete: net.ordersWithoutProfitLine > 0,
+    computedAt: (net.computedAt ?? new Date()).toISOString(),
   };
-}
-
-/**
- * T-7-2: refunds and the channel fee they give back, per dimension key, dated by the refund's
- * own `refundedAt` (not the order's placed-at), so a refund lands in its own period.
- */
-async function refundGroups(tx: Tx, companyId: string, input: ProfitInput, tz: string) {
-  const r = refundEvents;
-  const keyExpr: Record<ProfitInput["dimension"], SQL<string>> = {
-    order: sql<string>`${r.orderId}::text`,
-    design: sql<string>`coalesce(${orderItems.designId}::text, 'unmapped')`,
-    blank: sql<string>`coalesce(${blankVariants.styleCode}, 'unmapped')`,
-    channel: sql<string>`${r.channel}`,
-    day: sql<string>`to_char(${r.refundedAt} at time zone ${tz}, 'YYYY-MM-DD')`,
-  };
-  const labelExpr: Record<ProfitInput["dimension"], SQL<string | null>> = {
-    order: sql<string | null>`max(${orders.orderNo})`,
-    design: sql<string | null>`max(${designs.name})`,
-    blank: sql<
-      string | null
-    >`max(${blankVariants.brand} || ' ' || ${blankVariants.styleCode} || coalesce(' ' || ${blankVariants.styleName}, ''))`,
-    channel: sql<string | null>`null`,
-    day: sql<string | null>`null`,
-  };
-  const key = keyExpr[input.dimension];
-  return tx
-    .select({
-      key,
-      label: labelExpr[input.dimension],
-      amount: sql<number>`coalesce(sum(${r.amountCents}), 0)::int`,
-      recovered: sql<number>`coalesce(sum(${r.feeRecoveredCents}), 0)::int`,
-    })
-    .from(r)
-    .innerJoin(orders, eq(orders.id, r.orderId))
-    .leftJoin(orderItems, eq(orderItems.id, r.orderItemId))
-    .leftJoin(designs, eq(designs.id, orderItems.designId))
-    .leftJoin(blankVariants, eq(blankVariants.id, orderItems.blankVariantId))
-    .where(
-      and(
-        eq(r.companyId, companyId),
-        isNull(r.voidedAt),
-        gte(r.refundedAt, new Date(input.period.from)),
-        lt(r.refundedAt, new Date(input.period.to)),
-        input.channel ? eq(r.channel, input.channel) : undefined,
-        input.designId ? eq(orderItems.designId, input.designId) : undefined,
-      ),
-    )
-    .groupBy(sql`1`);
-}
-
-type ProfitGroup = Omit<Buckets, "net" | "marginPct"> & {
-  key: string;
-  label: string | null;
-  orders: number;
-  units: number;
-  computedAt: Date | null;
-};
-
-/** Add refund events into the profit groups: refunds up, channel fees down by what came back. */
-export function mergeRefunds(
-  groups: ProfitGroup[],
-  refunds: { key: string; label: string | null; amount: number; recovered: number }[],
-): void {
-  const byKey = new Map(groups.map((g) => [g.key, g]));
-  for (const r of refunds) {
-    let g = byKey.get(r.key);
-    if (!g) {
-      g = {
-        key: r.key,
-        label: r.label,
-        revenue: 0,
-        channelFees: 0,
-        blankCost: 0,
-        transferCost: 0,
-        labelCost: 0,
-        packagingCost: 0,
-        laborCost: 0,
-        adsCost: 0,
-        refunds: 0,
-        orders: 0,
-        units: 0,
-        computedAt: null,
-      };
-      groups.push(g);
-      byKey.set(r.key, g);
-    }
-    g.refunds += r.amount;
-    g.channelFees -= r.recovered;
-  }
 }
 
 /* ------------------------------ export csv ----------------------------------- */
