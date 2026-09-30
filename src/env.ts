@@ -36,6 +36,8 @@ const raw = createEnv({
     TEST_MIGRATION_DATABASE_URL: z.url().optional(),
 
     REDIS_URL: z.url(),
+    /** Test Redis DB (`REDIS_URL`'s DB index is redirected to a non-zero one when unset). */
+    TEST_REDIS_URL: z.url().optional(),
 
     S3_BUCKET: z.string(),
     S3_REGION: z.string().default("us-east-1"),
@@ -164,6 +166,27 @@ function withDatabase(url: string, database: string): string {
   return u.toString();
 }
 
+/** Default Redis DB for tests (B-205): never 0, the dev/CI worker's DB. */
+const TEST_REDIS_DB = 15;
+
+/** Redis DB index encoded in the URL path (`/14` -> 14); no path or `/0` reads as 0 (unset). */
+function redisDbIndex(url: string): number {
+  const path = new URL(url).pathname.replace(/^\//, "");
+  return path === "" ? 0 : Number(path);
+}
+
+/**
+ * Redirects a Redis URL to `TEST_REDIS_DB` (B-205), unless the caller already picked a non-zero
+ * DB (`REDIS_URL=redis://localhost:6379/14`, the pattern `team/agent-brief.md` tells agents to
+ * use): that explicit choice always wins, so two agents pinning different DBs never collide.
+ */
+function withTestRedisDb(url: string): string {
+  if (redisDbIndex(url) !== 0) return url;
+  const u = new URL(url);
+  u.pathname = `/${TEST_REDIS_DB}`;
+  return u.toString();
+}
+
 const isTest = raw.NODE_ENV === "test";
 const isProd = raw.NODE_ENV === "production";
 
@@ -224,6 +247,13 @@ export const env = {
   MIGRATION_DATABASE_URL: isTest
     ? (raw.TEST_MIGRATION_DATABASE_URL ?? withDatabase(raw.MIGRATION_DATABASE_URL, "invai_test"))
     : raw.MIGRATION_DATABASE_URL,
+  /**
+   * Under test, redirected to a non-zero DB so the suite never shares BullMQ queues or realtime
+   * streams with a dev worker on DB 0 (B-205), mirroring how DATABASE_URL redirects to invai_test.
+   * `TEST_REDIS_URL` wins when set; otherwise an already non-zero `REDIS_URL` DB is kept as-is;
+   * otherwise it redirects to `TEST_REDIS_DB` (15).
+   */
+  REDIS_URL: isTest ? (raw.TEST_REDIS_URL ?? withTestRedisDb(raw.REDIS_URL)) : raw.REDIS_URL,
   FLOOR_TOKEN_SECRET: raw.FLOOR_TOKEN_SECRET ?? raw.BETTER_AUTH_SECRET,
   /** Undefined only in production with ALLOW_MOCKS=true; the mailer then logs instead of sending. */
   SMTP_URL: raw.SMTP_URL ?? (isProd ? undefined : "smtp://localhost:1025"),

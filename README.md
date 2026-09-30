@@ -48,8 +48,11 @@ worker started afterwards never replays jobs for rows that no longer exist. Rest
 worker after a reset so its repeatable sweeps re-register. The seed is safe with the worker
 running: each builder phase parks the outbox events it emitted and the last step releases them all
 (`src/db/seed/outbox-hold.ts`). Seeding a DB copy? Set `SEED_OUTPUT_FILE=<path>` so the copy's run
-doesn't overwrite the shared `seed-output.json`. `pnpm test` uses `REDIS_URL` as-is (only the database
-URLs switch to the test DB), so pin `REDIS_URL=redis://localhost:6379/<n>` when a worker runs on DB 0.
+doesn't overwrite the shared `seed-output.json`. `pnpm test` redirects `REDIS_URL` the same way it
+redirects the database URLs (B-205): a DB 0 (or unspecified) `REDIS_URL` moves to DB 15, so a dev or
+CI worker on DB 0 never sees test jobs or streams. Set `TEST_REDIS_URL` to pick a different test DB,
+or pin `REDIS_URL=redis://localhost:6379/<n>` yourself (a non-zero DB you set is kept as-is, never
+redirected) — the pattern to use when several agents run the suite at once.
 
 No real API keys are needed: every integration (Claude, EasyPost, Shopify, S&S) falls back to a
 mock provider automatically when its env var is unset (`env.mocks.*` in `src/env.ts`). See
