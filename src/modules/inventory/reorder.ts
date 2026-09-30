@@ -5,6 +5,49 @@
 
 export type ReorderReason = "below_reorder_point" | "low_cover" | "top_up_to_free_freight";
 
+/** One size's share of the trailing sales curve for a style x color (size_mix_gap.md). */
+export type SizeShare = { blankVariantId: string; size: string; salesShare: number };
+
+export type SizeSplitLine = { blankVariantId: string; size: string; qty: number };
+
+/**
+ * T-A5 (spec AC-C1, AC-C3): splits a total suggested reorder quantity for a style x color across
+ * its sizes in proportion to the trailing sales curve, not the current stock curve -- the whole
+ * point of a size-split suggestion is to correct a stock mix that has drifted from what actually
+ * sells (`invai-docs/metrics/definitions/size_mix_gap.md`). A size with zero sales share gets
+ * zero units unless every size has zero share, in which case the total is split evenly so the
+ * suggestion still has somewhere to put the units. Uses the largest-remainder method so the
+ * split always sums to exactly `totalQty` (a plain per-line round() can drift by a unit or two
+ * against the total). A pure function: it only proposes quantities on a line the shop still
+ * edits before submitting; nothing here writes, submits or creates a PO.
+ */
+export function splitBySizeCurve(totalQty: number, shares: SizeShare[]): SizeSplitLine[] {
+  if (shares.length === 0) return [];
+  const qty = Math.max(0, Math.round(totalQty));
+  if (qty === 0)
+    return shares.map((s) => ({ blankVariantId: s.blankVariantId, size: s.size, qty: 0 }));
+  const shareOf = (s: SizeShare) => Math.max(0, s.salesShare);
+  const sumShare = shares.reduce((sum, s) => sum + shareOf(s), 0);
+  const weights =
+    sumShare > 0 ? shares.map((s) => shareOf(s) / sumShare) : shares.map(() => 1 / shares.length);
+  const raw = weights.map((w) => w * qty);
+  const floors = raw.map(Math.floor);
+  const remainder = qty - floors.reduce((sum, f) => sum + f, 0);
+  const order = raw
+    .map((r, i) => ({ i, frac: r - (floors[i] ?? 0) }))
+    .sort((a, b) => b.frac - a.frac || a.i - b.i);
+  const out = [...floors];
+  for (let k = 0; k < remainder; k++) {
+    const idx = order[k]?.i;
+    if (idx !== undefined) out[idx] = (out[idx] ?? 0) + 1;
+  }
+  return shares.map((s, i) => ({
+    blankVariantId: s.blankVariantId,
+    size: s.size,
+    qty: out[i] ?? 0,
+  }));
+}
+
 export type ReorderCandidate = {
   blankVariantId: string;
   supplier: string;
