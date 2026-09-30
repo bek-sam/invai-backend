@@ -160,10 +160,10 @@
     {
       "route": "assistant",
       "mode": "mock",
-      "cases": 30,
-      "plumbingPass": 30,
-      "qualityPass": 17,
-      "qualityAssessed": 17,
+      "cases": 42,
+      "plumbingPass": 42,
+      "qualityPass": 28,
+      "qualityAssessed": 28,
       "byTag": {
         "profit": {
           "plumbingPass": 1,
@@ -216,9 +216,9 @@
           "total": 1
         },
         "injection": {
-          "plumbingPass": 8,
+          "plumbingPass": 9,
           "qualityPass": 1,
-          "total": 8
+          "total": 9
         },
         "t82_injection_set": {
           "plumbingPass": 7,
@@ -231,9 +231,9 @@
           "total": 2
         },
         "seeded": {
-          "plumbingPass": 9,
-          "qualityPass": 6,
-          "total": 9
+          "plumbingPass": 15,
+          "qualityPass": 11,
+          "total": 15
         },
         "ad_performance": {
           "plumbingPass": 3,
@@ -251,9 +251,9 @@
           "total": 2
         },
         "spanish": {
-          "plumbingPass": 2,
-          "qualityPass": 0,
-          "total": 2
+          "plumbingPass": 4,
+          "qualityPass": 2,
+          "total": 4
         },
         "follow_up": {
           "plumbingPass": 1,
@@ -264,18 +264,43 @@
           "plumbingPass": 2,
           "qualityPass": 0,
           "total": 2
+        },
+        "explain_profit_change": {
+          "plumbingPass": 4,
+          "qualityPass": 3,
+          "total": 4
+        },
+        "unit_economics": {
+          "plumbingPass": 2,
+          "qualityPass": 2,
+          "total": 2
+        },
+        "operations_health": {
+          "plumbingPass": 2,
+          "qualityPass": 2,
+          "total": 2
+        },
+        "inventory_health": {
+          "plumbingPass": 2,
+          "qualityPass": 2,
+          "total": 2
+        },
+        "shipping_insights": {
+          "plumbingPass": 2,
+          "qualityPass": 2,
+          "total": 2
         }
       },
       "costCentsMedian": 0,
       "costCentsP95": 0,
-      "latencyMsMedian": 8,
-      "latencyMsP95": 21,
+      "latencyMsMedian": 10,
+      "latencyMsP95": 19,
       "cacheHitRate": 0
     },
     {
       "route": "personalization_check",
       "mode": "skipped",
-      "skippedReason": "route not implemented yet (backlog B-101) \u2014 13 cases staged in evals/personalization_check/cases.jsonl for when it ships",
+      "skippedReason": "route not implemented yet (backlog B-101) — 13 cases staged in evals/personalization_check/cases.jsonl for when it ships",
       "cases": 0,
       "plumbingPass": 0,
       "qualityPass": null,

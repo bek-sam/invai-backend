@@ -650,8 +650,14 @@ describe("ai module", () => {
       return tenantContext(co.id, owner.id, "owner");
     }
 
-    it("prompt v5: version, iterations, language, analyst mode and honesty rules", () => {
-      expect(ASSISTANT_PROMPT.version).toBe(5);
+    it("prompt v6: version, iterations, language, analyst mode and honesty rules", () => {
+      expect(ASSISTANT_PROMPT.version).toBe(6);
+      // T-A8: "why did profit change" starts with explain_profit_change; evidence names the metric.
+      expect(ASSISTANT_PROMPT.system).toMatch(/call explain_profit_change first/);
+      expect(ASSISTANT_PROMPT.system).toMatch(
+        /Evidence: the numbers, the period and the metric name/,
+      );
+      expect(ASSISTANT_PROMPT.system).toMatch(/Pass lang "es" to every tool that takes lang/);
       expect(ASSISTANT_MAX_ITERATIONS).toBe(10);
       const p = ASSISTANT_PROMPT.system;
       expect(p).toMatch(/Reply in the language of the user's latest message: English or Spanish/);

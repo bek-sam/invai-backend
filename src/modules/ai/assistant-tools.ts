@@ -36,6 +36,7 @@ import {
   MAX_ROWS,
   previousPeriod,
 } from "./analyst-queries";
+import { analyticsTools } from "./analytics-tools";
 import { screenMarketTerms } from "./niche";
 
 const log = logger("ai.assistant-tools");
@@ -509,6 +510,8 @@ export function assistantTools(ctx: TenantContext): AssistantTool[] {
     ),
     // Wave 18 market tools (T-18-4).
     ...marketTools(ctx),
+    // T-A8: the five v6 analytics tools (finance.read only).
+    ...analyticsTools(ctx, t),
   ];
 }
 

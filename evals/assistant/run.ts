@@ -1,7 +1,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ASSISTANT_PROMPT } from "../../src/ai/prompts";
-import { systemContext } from "../../src/api/context";
+import { permissionsFor, systemContext } from "../../src/api/context";
 import { withTenant } from "../../src/db/client";
 import { env } from "../../src/env";
 import { assistantTools } from "../../src/modules/ai/assistant-tools";
@@ -67,7 +67,12 @@ export async function runAssistantEvals(tenant: EvalTenant): Promise<RouteReport
 
   for (const c of cases) {
     const who = c.vars.tenant === "seeded" && seeded ? seeded : tenant;
-    const tools = assistantTools(systemContext(who.companyId));
+    // The v6 analytics tools need finance.read (T-A8): run as the shop owner would.
+    const tools = assistantTools({
+      ...systemContext(who.companyId),
+      role: "owner",
+      permissions: permissionsFor("owner"),
+    });
     const now = new Date();
     const context = await withTenant(who.companyId, (tx) => shopContext(tx, who.companyId, now));
     const res = await callAssistant(

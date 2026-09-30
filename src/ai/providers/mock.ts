@@ -421,7 +421,27 @@ function planCalls(message: string, now: Date): { calls: PlannedCall[]; fallback
   const calls: PlannedCall[] = [];
   const review =
     /business review|weekly review|what should i do|revisi[oó]n (semanal|del negocio)/.test(t);
-  const compare = review || /compar|\bvs\.?\b|versus|\bwhy\b|por qu[eé]/.test(t);
+  // T-A8: "why did profit change" starts with explain_profit_change (prompt v6), instead of
+  // compare_periods, unless the user also asks for a comparison or a review.
+  const why = /\bwhy\b|por qu[eé]/.test(t);
+  const profitWhy = why && /profit|\bnet\b|margin|ganancia|utilidad|margen/.test(t);
+  const compare = review || /compar|\bvs\.?\b|versus/.test(t) || (why && !profitWhy);
+  const unitEcon =
+    /unit economics|contribution margin|\bcm[123]\b|per.?unit (profit|margin)|margen de contribuci|por unidad/.test(
+      t,
+    );
+  const opsQ =
+    /\boperations\b|reprint cost|film waste|bottleneck|slowest step|press time|minutes per (unit|shirt)|late rate|operaciones|desperdicio|cuello de botella|tasa de retraso/.test(
+      t,
+    );
+  const invQ =
+    /dead stock|stock health|inventory health|size mix|stockout|\bturns\b|inventario (muerto|sin movimiento)|salud del inventario|faltantes|tallas/.test(
+      t,
+    );
+  const shipQ =
+    /shipping (margin|cost|insight|profit)|postage|label cost|free shipping|margen de env[ií]o|costo de env[ií]o|env[ií]o gratis/.test(
+      t,
+    );
   const ads = review || /\bads?\b|ad spend|advertis|\broas\b|\btacos\b|campaign|anuncio/.test(t);
   const insights =
     review ||
@@ -430,6 +450,31 @@ function planCalls(message: string, now: Date): { calls: PlannedCall[]; fallback
   const fulfillment =
     review || /on.?time|\blate\b|reprint|refund|fulfil|a tiempo|reimpres|reembolso/.test(t);
   const scoped = channel ? { channel } : {};
+  if (profitWhy || unitEcon || opsQ || invQ || shipQ) {
+    // v6 tools take lang, and read Spanish period words ("esta semana") too.
+    const lang = detectLang(message);
+    const tp = lang === "es" ? englishPeriods(t) : t;
+    const p = lang === "es" ? resolvePeriod(tp, now) : period;
+    const r6 = { from: p.from.toISOString(), to: p.to.toISOString() };
+    if (profitWhy)
+      calls.push({
+        tool: "explain_profit_change",
+        input: { ...r6, ...(previousOf(tp, p.from, p.to) ?? {}), ...scoped, lang },
+      });
+    if (unitEcon) {
+      const dimension = /design|dise[ñn]o/.test(t)
+        ? "design"
+        : /channel|canal/.test(t)
+          ? "channel"
+          : /blank|prenda/.test(t)
+            ? "blank"
+            : "order";
+      calls.push({ tool: "get_unit_economics", input: { ...r6, dimension, ...scoped, lang } });
+    }
+    if (opsQ) calls.push({ tool: "get_operations_health", input: { ...r6, ...scoped, lang } });
+    if (invQ) calls.push({ tool: "get_inventory_health", input: { lang } });
+    if (shipQ) calls.push({ tool: "get_shipping_insights", input: { ...r6, ...scoped, lang } });
+  }
   if (compare) {
     const prev = both || bothMonths || /\bthis (week|month)\b|\bweek\b/.test(t);
     calls.push({
@@ -452,6 +497,10 @@ function planCalls(message: string, now: Date): { calls: PlannedCall[]; fallback
     /margin|profit|net\b|revenue|earn|made|money|sales/.test(t) &&
     // compare_periods already reports revenue, net and margin for both periods.
     !(compare && !/design|blank|style|daily|per day|by day/.test(t)) &&
+    // v6 tools already answer these (T-A8).
+    !profitWhy &&
+    !unitEcon &&
+    !shipQ &&
     !(ads && !compare && !/margin|profit/.test(t))
   ) {
     const dimension = /design/.test(t)
@@ -477,7 +526,8 @@ function planCalls(message: string, now: Date): { calls: PlannedCall[]; fallback
   if (
     /order|late|at risk|overdue|due|ship/.test(t) &&
     // "Am I shipping on time?" is a fulfillment question; keep the order counts for order words.
-    !(fulfillment && !/order|overdue|at risk|\bdue\b/.test(t))
+    !(fulfillment && !/order|overdue|at risk|\bdue\b/.test(t)) &&
+    !(shipQ && !/order|overdue|at risk|\bdue\b/.test(t))
   )
     calls.push({
       tool: "get_orders_summary",
@@ -494,6 +544,17 @@ function planCalls(message: string, now: Date): { calls: PlannedCall[]; fallback
     return { calls, fallback: true };
   }
   return { calls, fallback: false };
+}
+
+/** Spanish period words → the English ones `resolvePeriod` reads (v6 tools, T-A8). */
+function englishPeriods(t: string): string {
+  return t
+    .replace(/\besta semana\b/g, "this week")
+    .replace(/\bla semana pasada\b|\bsemana pasada\b/g, "last week")
+    .replace(/\beste mes\b/g, "this month")
+    .replace(/\bel mes pasado\b|\bmes pasado\b/g, "last month")
+    .replace(/\bhoy\b/g, "today")
+    .replace(/\bayer\b/g, "yesterday");
 }
 
 const TOOL_LINE = "[Tools used earlier: ";
@@ -571,9 +632,16 @@ async function* mockAssistant(
     // usage below), so a caller torn down mid-loop can still charge for the answer built so far.
     onUsage?.(usageOf(run.system, run.message, { results, answers }));
   }
+  const es = detectLang(run.message) === "es";
   const text = answers.length
-    ? `${answers.join("\n\n")}\n\n_(Demo mode: answer composed from your live shop data without a model call.)_`
-    : "I couldn't find data for that question. Try asking about profit, orders, stock, listings or production.";
+    ? `${answers.join("\n\n")}\n\n${
+        es
+          ? "_(Modo demo: respuesta armada con los datos reales de tu tienda, sin llamar al modelo.)_"
+          : "_(Demo mode: answer composed from your live shop data without a model call.)_"
+      }`
+    : es
+      ? "No encontré datos para esa pregunta. Pregunta por ganancias, pedidos, inventario, publicaciones o producción."
+      : "I couldn't find data for that question. Try asking about profit, orders, stock, listings or production.";
   for (const piece of chunks(text)) yield { type: "text", text: piece };
   const usage = usageOf(run.system, run.message, { results, text });
   return { usage, model: MOCK_MODEL, stopReason: "end_turn" };
