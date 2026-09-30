@@ -151,6 +151,9 @@ async function main() {
     },
     volume: FULL_VOLUME,
     render: { designs: true, artwork: true, sheets: true },
+    // T-A1 (B-168): 18 months of closed order history for analytics, bulk-inserted (see
+    // `buildShopData`'s "closed history" section). Full seed only.
+    closedHistory: true,
   });
 
   // B-207: build this week's digest now, the same way the hourly sweep would once the shop's

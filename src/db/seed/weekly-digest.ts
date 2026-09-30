@@ -29,13 +29,20 @@ import { withSystem, withTenant } from "../client";
  * the same shop and week returns the existing digest instead of creating a second one (AC2).
  * `recomputeProfit` is a plain upsert keyed on `(company_id, order_item_id)`, so re-running it is
  * also a no-op past the first call.
+ *
+ * T-A1 (AC-Seed1 edge case): bounded to everything placed at least 2 days ago, so the handful of
+ * orders the seed just placed in the last 2 days stay without a `profit_lines` row -- the same
+ * "not recomputed yet" state a brand-new order is in for real, before `finance.recompute` first
+ * runs for it. `lastCompleteWeek` below always resolves to a week that ended well before this
+ * cutoff, so the digest's own margin numbers are unaffected.
  */
 export async function buildWeeklyDigest(
   companyId: string,
   timezone: string,
   at: Date = new Date(),
 ): Promise<BuildResult & { weekKey: string }> {
-  await withTenant(companyId, (tx) => recomputeProfit(tx, { companyId }, {}));
+  const recomputeTo = new Date(at.getTime() - 2 * 86_400_000);
+  await withTenant(companyId, (tx) => recomputeProfit(tx, { companyId }, { to: recomputeTo }));
   const local = await withSystem((tx) => localNow(tx, timezone, at));
   const { weekKey } = lastCompleteWeek(local.ymd);
   const result = await buildDigest(companyId, weekKey, at);

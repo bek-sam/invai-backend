@@ -9,6 +9,7 @@ import { shelfFor } from "../../modules/inventory/shelves";
 import { transitionItem } from "../../modules/orders/state-machine";
 import { renderValues } from "../../modules/personalization/service";
 import { HEADER_HEIGHT_IN, LABEL_HEIGHT_IN } from "../../modules/production/sheets";
+import { zoneForZips } from "../../modules/shipping/zone";
 import { issueStationToken, setPin } from "../../modules/tenancy/floor-auth";
 import type { Tx } from "../client";
 import type { Address, SheetSpec } from "../schema";
@@ -27,9 +28,12 @@ import {
   inventorySettings,
   locations,
   orderItems,
+  orderItemTransitions,
   orders,
   packagePresets,
   personalizationTemplates,
+  purchaseOrderLines,
+  purchaseOrders,
   reprints,
   scans,
   shipments,
@@ -137,6 +141,13 @@ export type ShopSeedOptions = {
   volume: { historicalOrders: number; dueSoonOrders: number; adSpendDays: number };
   /** Imaging renders (each only when imaging is up): design art, personalized artwork, sheet files. */
   render: { designs: boolean; artwork: boolean; sheets: boolean };
+  /**
+   * T-A1 (B-168): 18 months of already-closed order history (bulk-inserted, no transitionItem/
+   * imaging calls -- see `seedClosedHistory` below), so analytics has enough of a real trend to
+   * measure. Full seed only: `tenancy.demo`'s small, request-time workspace omits this so it
+   * keeps filling in a few seconds.
+   */
+  closedHistory?: boolean;
 };
 
 export type ShopSeedResult = {
@@ -263,7 +274,7 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
   });
 
   /* ---- settings, suppliers, vendor, channels ---- */
-  const channels = await run(async (tx) => {
+  const { channels, vendorConnectionIds } = await run(async (tx) => {
     await tx.insert(costSettings).values({
       companyId: shopId,
       feeTables: (["etsy", "amazon", "shopify", "tiktok", "walmart"] as const)
@@ -314,18 +325,39 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
       accountNumber: "SS-448210",
       freeFreightThresholdCents: 20000,
     });
-    await tx.insert(vendorConnections).values({
-      companyId: shopId,
-      vendorCompanyId: vendor.vendorCompanyId,
-      name: vendor.name,
-      email: vendor.email,
-      status: "active",
-      delivery: vendor.vendorCompanyId ? "portal" : "email",
-      spec: DEFAULT_SHEET_SPEC,
-      isDefault: true,
-      turnaroundDays: 2,
-      acceptedAt: new Date(Date.now() - 20 * DAY),
-    });
+    const [vendor1] = await tx
+      .insert(vendorConnections)
+      .values({
+        companyId: shopId,
+        vendorCompanyId: vendor.vendorCompanyId,
+        name: vendor.name,
+        email: vendor.email,
+        status: "active",
+        delivery: vendor.vendorCompanyId ? "portal" : "email",
+        spec: DEFAULT_SHEET_SPEC,
+        isDefault: true,
+        turnaroundDays: 2,
+        acceptedAt: new Date(Date.now() - 20 * DAY),
+      })
+      .returning({ id: vendorConnections.id });
+    // A second (non-portal, email delivery) vendor: closed history needs at least 2 vendors so
+    // reprint_cost's "vendor (via gang sheet)" cut (T-A1, AC-Seed1) has more than one value.
+    const [vendor2] = await tx
+      .insert(vendorConnections)
+      .values({
+        companyId: shopId,
+        vendorCompanyId: null,
+        name: "Valley Print Co",
+        email: "orders@valleyprint.test",
+        status: "active",
+        delivery: "email",
+        spec: DEFAULT_SHEET_SPEC,
+        isDefault: false,
+        turnaroundDays: 4,
+        acceptedAt: new Date(Date.now() - 400 * DAY),
+      })
+      .returning({ id: vendorConnections.id });
+    if (!vendor1 || !vendor2) throw new Error("vendor connection insert failed");
     const rows = await tx
       .insert(channelConnections)
       .values([
@@ -373,7 +405,10 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
         },
       ])
       .returning();
-    return Object.fromEntries(rows.map((r) => [r.channel, r.id])) as Record<string, string>;
+    return {
+      channels: Object.fromEntries(rows.map((r) => [r.channel, r.id])) as Record<string, string>,
+      vendorConnectionIds: [vendor1.id, vendor2.id] as [string, string],
+    };
   });
 
   /* ---- blanks ---- */
@@ -410,6 +445,21 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
       .where(eq(blankVariants.companyId, shopId)),
   );
   log.info("blanks", blankReport);
+
+  // T-A1 (AC-Seed1): one variant that never sells (dead stock at a nonzero $ value) and one
+  // variant whose stock is deliberately overbought relative to its sales (the size-mix gap).
+  // Chosen once, from real rows, so both stay valid regardless of catalog order.
+  const deadVariant = blanks.find(
+    (b) => b.styleCode === "BC3001" && b.colorCode === "MST" && b.sizeCode === "3XL",
+  );
+  const overstockVariant = blanks.find(
+    (b) => b.styleCode === "G64000" && b.colorCode === "BLK" && b.sizeCode === "S",
+  );
+  if (!deadVariant || !overstockVariant) throw new Error("seed: dead/overstock variant missing");
+  // Every order-generation path below picks blanks from this list, never from `blanks` directly,
+  // so `deadVariant` is never sold (opening stock still covers it: the inventory-ledger section
+  // further down still iterates the full `blanks` array).
+  const sellableBlanks = blanks.filter((b) => b.id !== deadVariant.id);
 
   /* ---- personalization templates + designs (sample art via imaging) ---- */
   const templateIds = await run(async (tx) => {
@@ -729,6 +779,11 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
     city: string;
     state: string;
     weightOz: number;
+    // T-A1 (AC-Seed1 #2): the closed-history block already decides on-time vs. late (driver-based)
+    // shipping and computes this order's real shipped_at. Carry it through so the shipments loop
+    // below doesn't overwrite it with an always-on-time labeledAt. Undefined for live-flow orders,
+    // which don't have a shipped time chosen yet at push time.
+    shippedAt?: Date;
   }[] = [];
   const actor = { kind: "user" as const, userId: people.office };
   const pressActor = {
@@ -742,7 +797,7 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
     stationId: stationIds["Pack 1"] as string,
   };
   const shopBlanksByStyle = new Map<string, typeof blanks>();
-  for (const b of blanks)
+  for (const b of sellableBlanks)
     shopBlanksByStyle.set(b.styleCode, [...(shopBlanksByStyle.get(b.styleCode) ?? []), b]);
   const sizeWeights = ["S", "M", "M", "L", "L", "L", "XL", "XL", "2XL", "3XL"];
 
@@ -771,7 +826,7 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
             : random.chance(0.6)
               ? "CC1717"
               : "BC3001";
-          const candidates = shopBlanksByStyle.get(styleCode) ?? blanks;
+          const candidates = shopBlanksByStyle.get(styleCode) ?? sellableBlanks;
           const size = random.pick(sizeWeights);
           const colorCode = random.pick(candidates.map((b) => b.colorCode));
           const blank =
@@ -1066,6 +1121,500 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
     log.info("orders", { done: Math.min(batchStart + 20, plans_.length), of: plans_.length });
   }
 
+  /*
+   * ---- T-A1 (B-168, AC-Seed1): 18 months of already-closed order history ----
+   * Bulk-inserted directly (no `transitionItem`, no imaging `/nest` or `/compose` calls): the
+   * seed already takes 15-20 minutes dominated by imaging renders, and this card's own
+   * guidance is to prefer bulk inserts for closed history over the live flow above. Only for
+   * the full seed (`opts.closedHistory`); `tenancy.demo`'s small, request-time workspace never
+   * sets it, so it keeps filling in a few seconds.
+   */
+  if (opts.closedHistory) {
+    const HIST_END_DAYS = 31; // ends just before the "recent" window above starts (day -30..0)
+    const HIST_SPAN_DAYS = 549; // ~18 months
+    const histEnd = new Date(now - HIST_END_DAYS * DAY);
+    const histStart = new Date(histEnd.getTime() - HIST_SPAN_DAYS * DAY);
+    // The most recent full Nov 1 - Dec 31 inside [histStart, histEnd]: the Q4 peak (AC-Seed1).
+    const q4Year = histEnd.getUTCFullYear() - (histEnd.getUTCMonth() >= 10 ? 0 : 1);
+    const q4Start = new Date(Date.UTC(q4Year, 10, 1));
+    const q4End = new Date(Date.UTC(q4Year, 11, 31, 23, 59, 59));
+
+    type HistPlan = {
+      placedAt: Date;
+      channel: string;
+      cancelled: boolean;
+      driver: "personalized" | "rush" | "blocked" | null;
+      buyerKey: number | null;
+    };
+    const histPlans: HistPlan[] = [];
+    for (let t = histStart.getTime(); t < histEnd.getTime(); t += DAY) {
+      const inQ4 = t >= q4Start.getTime() && t <= q4End.getTime();
+      const count = inQ4 ? random.int(3, 4) : random.int(1, 2);
+      for (let k = 0; k < count; k++) {
+        histPlans.push({
+          placedAt: new Date(t + random.int(0, 23) * HOUR + random.int(0, 59) * 60_000),
+          channel: pickChannel(),
+          cancelled: random.chance(0.04),
+          driver: null,
+          buyerKey: null,
+        });
+      }
+    }
+    histPlans.sort((a, b) => a.placedAt.getTime() - b.placedAt.getTime());
+
+    // Late-shipment drivers (AC-Seed1: >=2 of {personalized, rush, blocked_over_24h} clear the
+    // 30-shipped-order minimum sample). Every 4th eligible (non-cancelled) order in date order,
+    // so all three are spread across the whole 18 months rather than clustered.
+    const targets = { personalized: 50, rush: 50, blocked: 50 };
+    let eligible = 0;
+    for (const p of histPlans) {
+      if (p.cancelled) continue;
+      const bucket = eligible % 4;
+      eligible++;
+      if (bucket === 0 && targets.personalized > 0) {
+        p.driver = "personalized";
+        targets.personalized--;
+      } else if (bucket === 1 && targets.rush > 0) {
+        p.driver = "rush";
+        targets.rush--;
+      } else if (bucket === 2 && targets.blocked > 0) {
+        p.driver = "blocked";
+        targets.blocked--;
+      }
+    }
+
+    // Repeat Shopify buyers (AC-Seed1: >=2 buyers, >=2 orders each). 9 buyers, spread through
+    // the whole Shopify order list rather than bunched at one end.
+    const REPEAT_BUYERS = Array.from({ length: 9 }, () => ({
+      name: `${random.pick(FIRST_NAMES)} ${random.pick(LAST_NAMES)}`,
+      ordersLeft: random.chance(0.4) ? 3 : 2,
+    }));
+    const shopifyPlans = histPlans.filter((p) => !p.cancelled && p.channel === "shopify");
+    const buyerStride = Math.max(1, Math.floor(shopifyPlans.length / 24));
+    let buyerCursor = 0;
+    for (
+      let i = 0;
+      i < shopifyPlans.length && buyerCursor < REPEAT_BUYERS.length;
+      i += buyerStride
+    ) {
+      const buyer = REPEAT_BUYERS[buyerCursor] as (typeof REPEAT_BUYERS)[number];
+      if (buyer.ordersLeft <= 0) {
+        buyerCursor++;
+        continue;
+      }
+      (shopifyPlans[i] as HistPlan).buyerKey = buyerCursor;
+      buyer.ordersLeft--;
+    }
+
+    const personalizedDesigns = DESIGNS.filter((d) => personalizedCodes.has(d.code));
+    let historyOrders = 0;
+    let historyItems = 0;
+    let historyCancelled = 0;
+
+    for (let batchStart = 0; batchStart < histPlans.length; batchStart += 40) {
+      const batch = histPlans.slice(batchStart, batchStart + 40);
+      await run(async (tx) => {
+        const orderRows: (typeof orders.$inferInsert)[] = [];
+        const itemRows: (typeof orderItems.$inferInsert)[] = [];
+        const transitionRows: (typeof orderItemTransitions.$inferInsert)[] = [];
+
+        for (const plan of batch) {
+          const i = historyOrders++;
+          const orderId = crypto.randomUUID();
+          const orderNo =
+            plan.channel === "shopify"
+              ? `#${9000 + i}`
+              : plan.channel === "etsy"
+                ? String(5104000000 + i * 37)
+                : plan.channel === "amazon"
+                  ? `114-${String(3000000 + i * 911).slice(0, 7)}-${String(2000000 + i * 13).slice(0, 7)}`
+                  : `6763${String(200000000 + i * 7)}`;
+          const shipBy = new Date(
+            plan.placedAt.getTime() +
+              CHANNEL_RULES[plan.channel as keyof typeof CHANNEL_RULES].shipBy.defaultDays * DAY,
+          );
+          const late = plan.driver !== null;
+          const delivered = !plan.cancelled && random.chance(0.9);
+          const shippedAt = plan.cancelled
+            ? null
+            : late
+              ? new Date(shipBy.getTime() + random.int(4, 36) * HOUR)
+              : new Date(
+                  Math.min(
+                    shipBy.getTime() - random.int(2, 20) * HOUR,
+                    plan.placedAt.getTime() + random.int(24, 96) * HOUR,
+                  ),
+                );
+          const deliveredAt =
+            delivered && shippedAt ? new Date(shippedAt.getTime() + random.int(2, 4) * DAY) : null;
+
+          const styleCode = random.chance(0.75)
+            ? "G64000"
+            : random.chance(0.6)
+              ? "CC1717"
+              : "BC3001";
+          // T-A1: varied destination (not always the shop's own city) so `shipments.dest_zone`
+          // (T-A4) has more than zone 1 to group by once shipments are inserted below.
+          const buyerCity = random.pick(CITIES);
+          const design =
+            plan.driver === "personalized"
+              ? (random.pick(personalizedDesigns) ?? random.pick(DESIGNS))
+              : random.pick(DESIGNS);
+          const personalized = personalizedCodes.has(design.code);
+          const candidates = shopBlanksByStyle.get(styleCode) ?? sellableBlanks;
+          const size = random.pick(sizeWeights);
+          const colorCode = random.pick(candidates.map((b) => b.colorCode));
+          const blank =
+            candidates.find((b) => b.sizeCode === size && b.colorCode === colorCode) ??
+            (candidates[0] as (typeof blanks)[number]);
+          const qty = random.chance(0.85) ? 1 : 2;
+          const unitPrice =
+            plan.channel === "tiktok"
+              ? 2299
+              : plan.channel === "shopify"
+                ? 2800
+                : plan.channel === "amazon"
+                  ? 2699
+                  : 2499;
+          const linePrice = blank.styleCode === "CC1717" ? unitPrice + 800 : unitPrice;
+          const subtotal = qty * linePrice;
+          const shipping = plan.channel === "amazon" ? 0 : random.pick([0, 0, 499, 599]);
+          const isRush = plan.driver === "rush";
+
+          if (plan.cancelled) historyCancelled++;
+          orderRows.push({
+            id: orderId,
+            companyId: shopId,
+            connectionId: channels[plan.channel] as string,
+            channel: plan.channel as "etsy",
+            channelOrderId: `${plan.channel}-hist-${orderNo.replace(/[^0-9a-z]/gi, "")}`,
+            orderNo,
+            status: plan.cancelled ? "cancelled" : deliveredAt ? "delivered" : "shipped",
+            placedAt: plan.placedAt,
+            shipBy,
+            isRush,
+            hasPersonalization: personalized,
+            shippingMethod:
+              plan.channel === "amazon" ? "Standard" : shipping ? "Standard" : "Free shipping",
+            buyerRef:
+              plan.buyerKey !== null
+                ? `buyer-${(REPEAT_BUYERS[plan.buyerKey] as (typeof REPEAT_BUYERS)[number]).name.toLowerCase().replace(/\s+/g, "-")}`
+                : `buyer-hist-${i}`,
+            subtotalCents: subtotal,
+            shippingCents: shipping,
+            taxCents: Math.round(subtotal * 0.072),
+            discountCents: 0,
+            totalCents: subtotal + shipping + Math.round(subtotal * 0.072),
+            itemCount: qty,
+            tags: [],
+            cancelReason: plan.cancelled ? "buyer_request" : null,
+            cancelledAt: plan.cancelled ? new Date(plan.placedAt.getTime() + 8 * HOUR) : null,
+            shippedAt,
+            deliveredAt,
+            createdAt: plan.placedAt,
+            updatedAt: plan.placedAt,
+          });
+
+          // Per-unit item + transition path (one physical unit per row, CLAUDE.md conventions).
+          const path: { state: OrderItemState; at: Date }[] = [];
+          if (plan.cancelled) {
+            path.push({ state: "cancelled", at: new Date(plan.placedAt.getTime() + 8 * HOUR) });
+          } else {
+            if (plan.driver === "blocked") {
+              path.push({ state: "needs_mapping", at: plan.placedAt });
+              path.push({ state: "ready", at: new Date(plan.placedAt.getTime() + 32 * HOUR) });
+            } else {
+              path.push({ state: "ready", at: new Date(plan.placedAt.getTime() + 2 * HOUR) });
+            }
+            const prevAt = (path[path.length - 1] as { at: Date }).at;
+            const onSheetAt = new Date(prevAt.getTime() + 1 * HOUR);
+            path.push({ state: "on_sheet", at: onSheetAt });
+            path.push({ state: "transfer_in", at: new Date(onSheetAt.getTime() + 20 * HOUR) });
+            path.push({
+              state: "pressed",
+              at: new Date((path[path.length - 1] as { at: Date }).at.getTime() + 6 * HOUR),
+            });
+            path.push({
+              state: "packed",
+              at: new Date((path[path.length - 1] as { at: Date }).at.getTime() + 4 * HOUR),
+            });
+            const packedAt = (path[path.length - 1] as { at: Date }).at;
+            const finalShippedAt = new Date(
+              Math.max(packedAt.getTime() + 1 * HOUR, (shippedAt as Date).getTime()),
+            );
+            path.push({ state: "shipped", at: finalShippedAt });
+            if (deliveredAt) path.push({ state: "delivered", at: deliveredAt });
+          }
+          const finalState = (path[path.length - 1] as { state: OrderItemState }).state;
+          const finalAt = (path[path.length - 1] as { at: Date }).at;
+
+          for (let unit = 1; unit <= qty; unit++) {
+            const itemId = crypto.randomUUID();
+            historyItems++;
+            itemRows.push({
+              id: itemId,
+              companyId: shopId,
+              orderId,
+              lineNo: 1,
+              unitNo: unit,
+              unitsInLine: qty,
+              channelLineId: `${orderNo}-1`,
+              channelSku: `${design.code}-${blank.styleCode}-${blank.colorCode}-${blank.sizeCode}`,
+              channelListingId: String(1400000000 + Number.parseInt(design.code.slice(2), 10)),
+              title: `${design.name} Shirt`,
+              variantTitle: `${blank.color} / ${blank.size}`,
+              unitPriceCents: linePrice,
+              state: finalState,
+              stateChangedAt: finalAt,
+              shipBy,
+              isRush,
+              designId: designIds.get(design.code),
+              blankVariantId: blank.id,
+              placement: design.size.placement,
+              printWidthIn: design.size.widthIn,
+              printHeightIn: design.size.heightIn,
+              artworkStatus: personalized ? "approved" : "none",
+              createdAt: plan.placedAt,
+              updatedAt: finalAt,
+            });
+            let prevState: OrderItemState = "imported";
+            for (const hop of path) {
+              transitionRows.push({
+                companyId: shopId,
+                orderItemId: itemId,
+                orderId,
+                fromState: prevState,
+                toState: hop.state,
+                actorKind: "system",
+                createdAt: hop.at,
+              });
+              prevState = hop.state;
+            }
+          }
+
+          if (deliveredAt || (!plan.cancelled && shippedAt)) {
+            shippedOrders.push({
+              id: orderId,
+              orderNo,
+              channel: plan.channel,
+              itemIds: itemRows.filter((r) => r.orderId === orderId).map((r) => r.id as string),
+              delivered: !!deliveredAt,
+              shipBy,
+              placedAt: plan.placedAt,
+              zip: buyerCity.zip,
+              name: `Historical Buyer ${i}`,
+              city: buyerCity.city,
+              state: buyerCity.state,
+              weightOz: qty * blank.weightOz + 0.5,
+              // T-A1 (AC-Seed1 #2): keep the on-time/late shipped_at already decided above (by
+              // plan.driver) instead of letting the shipments loop recompute an always-on-time one.
+              shippedAt: shippedAt ?? undefined,
+            });
+          }
+        }
+
+        await tx.insert(orders).values(orderRows);
+        await tx.insert(orderItems).values(itemRows);
+        await tx.insert(orderItemTransitions).values(transitionRows);
+      });
+      log.info("closed history orders", {
+        done: Math.min(batchStart + 40, histPlans.length),
+        of: histPlans.length,
+      });
+    }
+    log.info("closed history", {
+      orders: historyOrders,
+      items: historyItems,
+      cancelled: historyCancelled,
+      q4: { start: q4Start.toISOString().slice(0, 10), end: q4End.toISOString().slice(0, 10) },
+    });
+
+    // ---- press scans (AC-Seed1: >=1 station with >=100 timed units, realistic spacing) ----
+    // A synthetic ~13-day production window inside the historical range; the scan is a record
+    // of a press event, independent of the item's own (already-inserted) `pressed` transition.
+    await run(async (tx) => {
+      const candidates = await tx
+        .select({ id: orderItems.id })
+        .from(orderItems)
+        .innerJoin(orders, eq(orders.id, orderItems.orderId))
+        .where(
+          and(
+            eq(orderItems.companyId, shopId),
+            sql`${orders.placedAt} < ${histEnd}`,
+            inArray(orderItems.state, ["pressed", "packed", "shipped", "delivered"]),
+          ),
+        )
+        .limit(260);
+      const press1 = stationIds["Press 1"] as string;
+      const press2 = stationIds["Press 2"] as string;
+      const scanWindowStart = new Date(histStart.getTime() + 200 * DAY);
+      let t = scanWindowStart.getTime();
+      let dayCount = 0;
+      const scanRows: (typeof scans.$inferInsert)[] = [];
+      const scanBatch = candidates.slice(40, 40 + 190);
+      for (let n = 0; n < scanBatch.length; n++) {
+        const item = scanBatch[n] as { id: string };
+        // ~14 scans/production day, gaps 1.5-7.5 min (realistic, not constant); one overnight
+        // break every ~14 scans (excluded from press_minutes_per_unit's 0.1-10 min window).
+        if (n > 0 && n % 14 === 0) {
+          dayCount++;
+          t = scanWindowStart.getTime() + dayCount * DAY;
+        } else if (n > 0) {
+          t += (90 + random.int(0, 330)) * 1000;
+        }
+        scanRows.push({
+          companyId: shopId,
+          clientScanId: crypto.randomUUID(),
+          stationId: press1,
+          station: "Press 1",
+          action: "press",
+          transferCode: `HIST-${n}`,
+          orderItemId: item.id,
+          ok: true,
+          scannedAt: new Date(t),
+        });
+      }
+      if (scanRows.length) await tx.insert(scans).values(scanRows);
+
+      // ---- reprints (AC-Seed1: >=3 reasons across >=2 stations and >=2 vendors) ----
+      const reprintCandidates = candidates.slice(0, 40);
+      if (reprintCandidates.length) {
+        const [batch1] = await tx
+          .insert(gangSheetBatches)
+          .values({
+            companyId: shopId,
+            name: "Historical vendor 1",
+            status: "complete",
+            vendorConnectionId: vendorConnectionIds[0],
+            itemCount: reprintCandidates.length,
+            sheetCount: 1,
+          })
+          .returning({ id: gangSheetBatches.id });
+        const [batch2] = await tx
+          .insert(gangSheetBatches)
+          .values({
+            companyId: shopId,
+            name: "Historical vendor 2",
+            status: "complete",
+            vendorConnectionId: vendorConnectionIds[1],
+            itemCount: reprintCandidates.length,
+            sheetCount: 1,
+          })
+          .returning({ id: gangSheetBatches.id });
+        if (!batch1 || !batch2) throw new Error("history: gang sheet batch insert failed");
+        const [sheet1] = await tx
+          .insert(gangSheets)
+          .values({
+            companyId: shopId,
+            batchId: batch1.id,
+            name: "Historical vendor 1 #1",
+            vendorConnectionId: vendorConnectionIds[0],
+            status: "received",
+          })
+          .returning({ id: gangSheets.id });
+        const [sheet2] = await tx
+          .insert(gangSheets)
+          .values({
+            companyId: shopId,
+            batchId: batch2.id,
+            name: "Historical vendor 2 #1",
+            vendorConnectionId: vendorConnectionIds[1],
+            status: "received",
+          })
+          .returning({ id: gangSheets.id });
+        if (!sheet1 || !sheet2) throw new Error("history: gang sheet insert failed");
+        const reasons = ["misprint", "ghosting", "wrong_placement", "peel"] as const;
+        const stationsFor = [press1, press2];
+        const reprintRows: (typeof reprints.$inferInsert)[] = [];
+        for (let n = 0; n < reprintCandidates.length; n++) {
+          const item = reprintCandidates[n] as { id: string };
+          const sheetId = n % 2 === 0 ? sheet1.id : sheet2.id;
+          await tx
+            .update(orderItems)
+            .set({ isReprint: true, gangSheetId: sheetId })
+            .where(eq(orderItems.id, item.id));
+          reprintRows.push({
+            companyId: shopId,
+            orderItemId: item.id,
+            reason: reasons[n % reasons.length] as (typeof reasons)[number],
+            status: "done",
+            stationId: stationsFor[n % 2] as string,
+            requestedAt: new Date(scanWindowStart.getTime() - (n + 1) * DAY),
+          });
+        }
+        await tx.insert(reprints).values(reprintRows);
+        log.info("closed history reprints", { count: reprintRows.length });
+      }
+      log.info("closed history scans", { count: scanRows.length });
+    });
+
+    // ---- purchase orders (AC-Seed1: >=2 supplier x style pairs, cost or lead-time change) ----
+    await run(async (tx) => {
+      const g64000 = sellableBlanks.filter((b) => b.styleCode === "G64000");
+      const cc1717 = sellableBlanks.filter((b) => b.styleCode === "CC1717");
+      const lines: (typeof purchaseOrderLines.$inferInsert)[] = [];
+      const pos: (typeof purchaseOrders.$inferInsert)[] = [];
+      let poNo = 1;
+      // G64000: unit cost drifts up ~10% partway through (clears the >=5% threshold).
+      // CC1717: lead time roughly triples partway through (clears the >3-day threshold).
+      for (let m = 0; m < 16; m++) {
+        const submittedAt = new Date(histStart.getTime() + m * 33 * DAY);
+        const g64Cost = m < 8 ? 260 : 285;
+        const g64Lead = 3;
+        const g64Id = crypto.randomUUID();
+        pos.push({
+          id: g64Id,
+          companyId: shopId,
+          supplier: "ssactivewear",
+          locationId,
+          poNo: `PO-HIST-${poNo++}`,
+          status: "received",
+          submittedAt,
+          receivedAt: new Date(submittedAt.getTime() + g64Lead * DAY),
+          subtotalCents: g64Cost * 48,
+          totalCents: g64Cost * 48,
+        });
+        for (const b of g64000.slice(0, 2)) {
+          lines.push({
+            companyId: shopId,
+            purchaseOrderId: g64Id,
+            blankVariantId: b.id,
+            qty: 24,
+            receivedQty: 24,
+            unitCostCents: g64Cost,
+          });
+        }
+        const ccLead = m < 8 ? 4 : 9;
+        const ccId = crypto.randomUUID();
+        pos.push({
+          id: ccId,
+          companyId: shopId,
+          supplier: "ssactivewear",
+          locationId,
+          poNo: `PO-HIST-${poNo++}`,
+          status: "received",
+          submittedAt,
+          receivedAt: new Date(submittedAt.getTime() + ccLead * DAY),
+          subtotalCents: 640 * 36,
+          totalCents: 640 * 36,
+        });
+        for (const b of cc1717.slice(0, 2)) {
+          lines.push({
+            companyId: shopId,
+            purchaseOrderId: ccId,
+            blankVariantId: b.id,
+            qty: 18,
+            receivedQty: 18,
+            unitCostCents: 640,
+          });
+        }
+      }
+      await tx.insert(purchaseOrders).values(pos);
+      await tx.insert(purchaseOrderLines).values(lines);
+      log.info("closed history purchase orders", { orders: pos.length, lines: lines.length });
+    });
+  }
+
   /* ---- personalized artwork (rendered for real so proofs and sheets have a file) ---- */
   if (imagingUp && opts.render.artwork) {
     let rendered = 0;
@@ -1347,11 +1896,17 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
     let n = 0;
     for (const o of shippedOrders) {
       n++;
-      const labeledAt = new Date(
-        Math.min(o.shipBy.getTime() - 3 * HOUR, o.placedAt.getTime() + 40 * HOUR),
-      );
+      // T-A1 (AC-Seed1 #2): closed-history orders already picked an on-time or late shipped_at
+      // (driver-based); use it verbatim instead of forcing shipBy - 3h, which made every shipped
+      // order look on-time regardless of its late-shipment driver.
+      const labeledAt =
+        o.shippedAt ??
+        new Date(Math.min(o.shipBy.getTime() - 3 * HOUR, o.placedAt.getTime() + 40 * HOUR));
       const postage = 450 + Math.round(o.weightOz * 22);
       const tracking = `9400 1000 0000 ${String(1000 + n).padStart(4, "0")} ${String(3000 + n * 7).padStart(4, "0")} ${String(10 + (n % 90)).padStart(2, "0")}`;
+      // T-A4 (B-171): carrier zone from origin (shop) and destination ZIP3, for shipping-margin
+      // analytics grouped by zone. Only the zone number is stored, never the ZIP itself.
+      const destZone = zoneForZips(profile.address.zip, o.zip);
       const [shipment] = await tx
         .insert(shipments)
         .values({
@@ -1368,6 +1923,7 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
           labelFormat: "pdf",
           postageCents: postage,
           labelFeeCents: 4,
+          destZone,
           lengthIn: 10,
           widthIn: 13,
           heightIn: 1,
@@ -1541,6 +2097,48 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
       lowStock: low.length,
     });
   });
+
+  // T-A1 (AC-Seed1): overbuy one size relative to its own style/color's sales, so
+  // `size_mix_gap.sql` has a real gap (>=15 points) to show, at a nontrivial dollar value.
+  // `deadVariant` already has a nonzero on-hand value from the opening stock above and no
+  // consume movements at all (it was excluded from every order-generation path), which is
+  // exactly what `blank_stock_health.sql` calls dead stock.
+  if (opts.closedHistory) {
+    await run(async (tx) => {
+      const OVERSTOCK_QTY = 300;
+      await tx.insert(inventoryMovements).values({
+        companyId: shopId,
+        blankVariantId: overstockVariant.id,
+        locationId,
+        kind: "receive",
+        qty: OVERSTOCK_QTY,
+        unitCostCents: overstockVariant.costCents,
+        refType: "purchase_order",
+        note: "Historical overbuy (T-A1 size-mix gap)",
+        idempotencyKey: "seed:receive:overstock:history",
+        createdAt: new Date(now - 300 * DAY),
+      });
+      await tx
+        .update(stockLevels)
+        .set({
+          onHand: sql`${stockLevels.onHand} + ${OVERSTOCK_QTY}`,
+          available: sql`${stockLevels.available} + ${OVERSTOCK_QTY}`,
+          updatedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(stockLevels.companyId, shopId),
+            eq(stockLevels.blankVariantId, overstockVariant.id),
+            eq(stockLevels.locationId, locationId),
+          ),
+        );
+      log.info("closed history stock", {
+        deadVariant: deadVariant.sku,
+        overstockVariant: overstockVariant.sku,
+        overstockQty: OVERSTOCK_QTY,
+      });
+    });
+  }
 
   /* ---- channel listings (from the seeded orders; push stays off until the shop opts in) ---- */
   const listingReport = await run((tx) => recordListingsForCompany(tx, shopId));

@@ -22,6 +22,11 @@ import { seedMarketDemand } from "./market-demand";
  * this test was flaky under `pnpm test src/db/seed src/modules/market` before this fix).
  */
 describe("seedMarketDemand", () => {
+  // T-A1: this test calls seedMarketDemand twice (each run hits every configured demand source
+  // for real against the mock provider) plus several DB round trips. It takes ~19s alone; under a
+  // loaded full-suite run it can exceed the file's default 30s testTimeout on wall-clock alone,
+  // with nothing actually wrong (same shape as the Shopify OAuth state tests in
+  // src/modules/channels/webhooks.test.ts). Give it a generous timeout instead of a flaky pass.
   it("writes mock outside-demand rows and is a no-op on a second call", async () => {
     await withSystem((tx) => tx.delete(marketSeriesCache));
     const company = await createCompany();
@@ -52,5 +57,5 @@ describe("seedMarketDemand", () => {
       tx.select({ n: sql<number>`count(*)`.mapWith(Number) }).from(marketSeriesCache),
     )) as [{ n: number }];
     expect(countAfterSecond).toBe(countAfterFirst); // no duplicate rows (AC2)
-  });
+  }, 60_000);
 });
