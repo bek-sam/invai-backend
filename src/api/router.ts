@@ -1,4 +1,5 @@
 import { aiRouter } from "../modules/ai/router";
+import { analyticsRouter } from "../modules/analytics/router";
 import { billingRouter } from "../modules/billing/router";
 import { blanksRouter, designsRouter, productsRouter } from "../modules/catalog/router";
 import { channelsRouter, skuRulesRouter } from "../modules/channels/router";
@@ -59,6 +60,7 @@ export const router = os.router({
   privacy: privacyRouter,
   market: marketRouter,
   digest: digestRouter,
+  analytics: analyticsRouter,
 });
 
 export type Router = typeof router;
