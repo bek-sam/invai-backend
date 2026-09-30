@@ -78,6 +78,7 @@ import { pushTrackingForShipment } from "../channels/service";
 import { todayRange } from "../orders/shipby";
 import { transitionItem } from "../orders/state-machine";
 import { createJobRow, updateJobRow } from "../production/service";
+import { zoneForZips } from "./zone";
 
 const log = logger("shipping");
 
@@ -344,6 +345,7 @@ function toShipment(
     deliveredAt: row.deliveredAt?.toISOString() ?? null,
     voidedAt: row.voidedAt?.toISOString() ?? null,
     exportedAt: row.exportedAt?.toISOString() ?? null,
+    destZone: row.destZone,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),
   };
@@ -919,7 +921,9 @@ export async function buyLabel(
         .from(shipments)
         .where(eq(shipments.id, input.shipmentId))
         .for("update");
-      if (s?.status === "buying") await recordLabel(tx, ctx, s, plan.quote, label);
+      // T-A4: only the zone number is kept; the ZIPs stay in memory (AC-A4).
+      const destZone = zoneForZips(plan.req.from.zip, plan.req.to.zip);
+      if (s?.status === "buying") await recordLabel(tx, ctx, s, plan.quote, label, destZone);
       return getShipment(tx, ctx, input.shipmentId);
     });
   } catch (err) {
@@ -947,6 +951,7 @@ async function recordLabel(
   s: ShipmentRow,
   quote: RateQuote,
   label: PurchasedLabel,
+  destZone: number | null,
 ) {
   const [order] = await tx.select().from(orders).where(eq(orders.id, s.orderId)).limit(1);
   if (!order) throw notFound("order", s.orderId);
@@ -1003,6 +1008,7 @@ async function recordLabel(
       trackingPushError: cancelled.length ? "Cancelled: the label is being voided" : null,
       labeledAt: now,
       voidedAt: null,
+      destZone,
     })
     .where(eq(shipments.id, s.id));
   if (itemIds.length)
