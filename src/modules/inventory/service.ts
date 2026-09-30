@@ -52,7 +52,14 @@ import { keyset, type PageInput } from "../../lib/pagination";
 import { objectKey } from "../../lib/s3";
 import { isSampleWorkspace } from "../tenancy/demo-flag";
 import { defaultLocationId, recordMovement } from "./ledger";
-import { daysOfCover, effectiveReorderPoint, planReorder } from "./reorder";
+import {
+  daysOfCover,
+  effectiveReorderPoint,
+  type PlannedLine,
+  planReorder,
+  type SizeShare,
+  splitBySizeCurve,
+} from "./reorder";
 
 /*
  * Inventory service: the stock ledger (./ledger.ts), stock views with velocity and days of
@@ -771,6 +778,52 @@ export async function suppliersStock(tx: Tx, ctx: Ctx, blankVariantIds: string[]
 
 /* ----------------------------- reorder suggestions ---------------------------- */
 
+/**
+ * T-A5 AC-C3: within one supplier's plan, redistributes each style x color group's total
+ * suggested qty (the group's own points, low-cover top-up and free-freight padding already
+ * summed by `planReorder`) across its sizes in proportion to the trailing size curve
+ * (`splitBySizeCurve`), instead of leaving each size's qty at what its own independent reorder
+ * point produced -- that's what lets an under-stocked size (a "size gap") pick up units even
+ * when its own point wasn't crossed. The group's total qty is unchanged, so cost-per-unit
+ * differences across sizes are the only thing that can move the plan's subtotal; the caller
+ * recomputes it from the redistributed lines. A size the supplier currently has zero live stock
+ * for is left out of the curve split (it never receives units, same as `planReorder`'s own
+ * "don't order" rule) and single-size groups pass through untouched -- this only ever proposes
+ * quantities on a still-editable draft; it does not create, edit or submit a PO.
+ */
+function splitPlanLinesBySizeCurve(
+  lines: PlannedLine[],
+  viewBy: Map<string, StockView>,
+  live: Map<string, number | null>,
+): PlannedLine[] {
+  const groups = new Map<string, PlannedLine[]>();
+  for (const l of lines) {
+    const v = viewBy.get(l.blankVariantId);
+    if (!v) continue;
+    const key = `${v.blank.styleCode}::${v.blank.colorCode}`;
+    groups.set(key, [...(groups.get(key) ?? []), l]);
+  }
+  const out: PlannedLine[] = [];
+  for (const group of groups.values()) {
+    const orderable = group.filter((l) => live.get(l.blankVariantId) !== 0);
+    const unorderable = group.filter((l) => live.get(l.blankVariantId) === 0);
+    out.push(...unorderable);
+    if (orderable.length < 2) {
+      out.push(...orderable);
+      continue;
+    }
+    const totalQty = orderable.reduce((sum, l) => sum + l.qty, 0);
+    const shares: SizeShare[] = orderable.map((l) => {
+      const v = viewBy.get(l.blankVariantId) as StockView;
+      return { blankVariantId: l.blankVariantId, size: v.blank.size, salesShare: v.dailyVelocity };
+    });
+    const split = splitBySizeCurve(totalQty, shares);
+    const qtyBy = new Map(split.map((s) => [s.blankVariantId, s.qty]));
+    for (const l of orderable) out.push({ ...l, qty: qtyBy.get(l.blankVariantId) ?? l.qty });
+  }
+  return out;
+}
+
 export async function reorderSuggestions(
   tx: Tx,
   ctx: Ctx,
@@ -814,35 +867,43 @@ export async function reorderSuggestions(
   const viewBy = new Map(views.map((v) => [v.blankVariantId, v]));
   return {
     generatedAt: new Date().toISOString(),
-    items: plans.map((p) => ({
-      supplier: p.supplier as Supplier,
-      supplierName:
-        rows.find((r) => r.supplier === p.supplier)?.name ?? SUPPLIER_NAMES[p.supplier as Supplier],
-      freeFreightThreshold: p.threshold,
-      subtotal: p.subtotal,
-      meetsThreshold: p.meetsThreshold,
-      shortfall: p.shortfall,
-      lines: p.lines.flatMap((l) => {
-        const v = viewBy.get(l.blankVariantId);
-        if (!v || l.qty <= 0) return [];
-        return [
-          {
-            blankVariantId: l.blankVariantId,
-            blank: v.blank,
-            available: v.available,
-            incoming: v.incoming,
-            reorderPoint: l.reorderPoint,
-            dailyVelocity: v.dailyVelocity,
-            daysOfCover: v.daysOfCover,
-            suggestedQty: l.qty,
-            unitCost: v.blank.cost,
-            lineCost: l.qty * v.blank.cost,
-            supplierStock: live.get(l.blankVariantId) ?? null,
-            reason: l.reason,
-          },
-        ];
-      }),
-    })),
+    items: plans.map((p) => {
+      const lines = splitPlanLinesBySizeCurve(p.lines, viewBy, live);
+      const subtotal = lines.reduce(
+        (sum, l) => sum + l.qty * (viewBy.get(l.blankVariantId)?.blank.cost ?? 0),
+        0,
+      );
+      return {
+        supplier: p.supplier as Supplier,
+        supplierName:
+          rows.find((r) => r.supplier === p.supplier)?.name ??
+          SUPPLIER_NAMES[p.supplier as Supplier],
+        freeFreightThreshold: p.threshold,
+        subtotal,
+        meetsThreshold: subtotal >= p.threshold,
+        shortfall: Math.max(0, p.threshold - subtotal),
+        lines: lines.flatMap((l) => {
+          const v = viewBy.get(l.blankVariantId);
+          if (!v || l.qty <= 0) return [];
+          return [
+            {
+              blankVariantId: l.blankVariantId,
+              blank: v.blank,
+              available: v.available,
+              incoming: v.incoming,
+              reorderPoint: l.reorderPoint,
+              dailyVelocity: v.dailyVelocity,
+              daysOfCover: v.daysOfCover,
+              suggestedQty: l.qty,
+              unitCost: v.blank.cost,
+              lineCost: l.qty * v.blank.cost,
+              supplierStock: live.get(l.blankVariantId) ?? null,
+              reason: l.reason,
+            },
+          ];
+        }),
+      };
+    }),
   };
 }
 
