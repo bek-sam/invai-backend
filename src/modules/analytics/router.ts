@@ -2,6 +2,7 @@ import { contract } from "@invai/contracts";
 import { authed, stubRouter } from "../../api/orpc";
 import { withTenant } from "../../db/client";
 import * as finance from "./finance-service";
+import * as operations from "./operations-service";
 
 /*
  * `analytics.*` (contract 0.9.0, wave A1). The guard already enforced `finance.read` from the
@@ -30,5 +31,9 @@ export const analyticsRouter = authed.analytics.router({
   ),
   breakEven: authed.analytics.breakEven.handler(({ input, context: { tenant } }) =>
     withTenant(tenant.companyId, (tx) => finance.breakEven(tx, tenant, input)),
+  ),
+  // T-A4: operations analytics.
+  operations: authed.analytics.operations.handler(({ input, context: { tenant } }) =>
+    withTenant(tenant.companyId, (tx) => operations.getOperations(tx, tenant, input)),
   ),
 });

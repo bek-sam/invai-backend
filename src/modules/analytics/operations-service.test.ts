@@ -449,6 +449,22 @@ describe("analytics.operations (T-A4)", () => {
     expect(seen).toEqual([]);
   });
 
+  it("the owner reaches the service through the router", async () => {
+    const owner = await createUser(a.companyId, "owner");
+    const context = {
+      ...anonymousContext(new Headers(), null),
+      sessionKind: "user" as const,
+      user: { id: owner.id, name: owner.name, email: owner.email },
+      companyId: a.companyId,
+      orgType: "shop" as const,
+      role: "owner" as const,
+      permissions: permissionsFor("owner"),
+    };
+    const o = await call(router.analytics.operations, { period: PERIOD }, { context });
+    expect(o).toMatchObject({ hasEnoughHistory: true, bottleneckStep: "on_sheet" });
+    expect(o.reprintCost.total).toBe(1200);
+  });
+
   it("roles without finance.read get FORBIDDEN through the router (AC-E5)", async () => {
     for (const role of ["designer", "presser", "packer", "receiver"] as const) {
       const user = await createUser(a.companyId, role);
