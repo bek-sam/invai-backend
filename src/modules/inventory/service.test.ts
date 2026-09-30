@@ -261,3 +261,119 @@ describe("reorder size-curve split (AC-C3)", () => {
     expect(submitted.status).toBe("submitted");
   });
 });
+
+/*
+ * T-A5 review r1 finding 1 (AC-C3): the size split works on the position after the order, keeps
+ * the supplier-stock cap and never opens a gap between sizes that sell the same. SKUs are picked
+ * against the mock supplier's stable hash: T5R208 has exactly 40 in stock, the others > 1500.
+ */
+describe("reorder size split: supplier cap and equal end position (AC-C3, r1)", () => {
+  let companyId: string;
+  let ctx: ReturnType<typeof tenantContext>;
+
+  beforeAll(async () => {
+    companyId = (await createCompany()).id;
+    const owner = await createUser(companyId, "owner");
+    ctx = tenantContext(companyId, owner.id, "owner");
+    const location = await createLocation(companyId);
+    const spec = [
+      // style, color, size, supplier sku, available after, consumed (the curve)
+      { style: "G50000", size: "S", sku: "T5R2", onHand: 0, used: 50 },
+      { style: "G50000", size: "M", sku: "T5R4", onHand: 0, used: 50 },
+      { style: "G50000", size: "L", sku: "T5R208", onHand: 0, used: 100 },
+      { style: "G18000", size: "S", sku: "T5R7", onHand: 20, used: 200 },
+      { style: "G18000", size: "M", sku: "T5R8", onHand: 0, used: 200 },
+    ];
+    const rows = await withSystem((tx) =>
+      tx
+        .insert(blankVariants)
+        .values(
+          spec.map((s) => ({
+            companyId,
+            brand: "Gildan",
+            style: s.style,
+            styleCode: s.style,
+            color: "Black",
+            colorCode: "BLK",
+            size: s.size,
+            sizeCode: s.size,
+            sku: `${s.style}-BLK-${s.size}`,
+            supplierSku: s.sku,
+            costCents: 400,
+          })),
+        )
+        .returning(),
+    );
+    await withTenant(companyId, (tx) =>
+      svc.updateSettings(tx, ctx, {
+        suppliers: [
+          { supplier: "ssactivewear", freeFreightThreshold: 0, accountNumber: null, apiKey: null },
+        ],
+      }),
+    );
+    await withTenant(companyId, async (tx) => {
+      for (const s of spec) {
+        const id = rows.find((r) => r.supplierSku === s.sku)?.id as string;
+        const base = { blankVariantId: id, locationId: location.id };
+        await recordMovement(tx, ctx, { ...base, kind: "receive", qty: s.used + s.onHand });
+        await recordMovement(tx, ctx, { ...base, kind: "consume", qty: -s.used });
+      }
+    });
+  });
+
+  async function linesOf(style: string) {
+    const sugg = await withTenant(companyId, (tx) => svc.reorderSuggestions(tx, ctx, {}));
+    const lines =
+      sugg.items
+        .find((s) => s.supplier === "ssactivewear")
+        ?.lines.filter((l) => l.blank.styleCode === style) ?? [];
+    return new Map(lines.map((l) => [l.blank.size, l]));
+  }
+
+  it("never suggests more of a size than the supplier has; the excess goes to sizes with room", async () => {
+    const by = await linesOf("G50000");
+    const l = by.get("L");
+    expect(l?.supplierStock).toBe(40);
+    expect(l?.suggestedQty).toBe(40);
+    const s = by.get("S")?.suggestedQty as number;
+    const m = by.get("M")?.suggestedQty as number;
+    expect(s).toBe(m);
+    // S and M sell half of L each; with L held at 40 they absorb the rest, well past half of L.
+    expect(s).toBeGreaterThan(20);
+    for (const line of by.values())
+      expect(line.suggestedQty).toBeLessThanOrEqual(line.supplierStock ?? Infinity);
+  });
+
+  it("sizes that sell the same end at the same position, whatever their on-hand is now", async () => {
+    const by = await linesOf("G18000");
+    const s = by.get("S");
+    const m = by.get("M");
+    expect(s?.available).toBe(20);
+    expect(m?.available).toBe(0);
+    const endS = (s?.available ?? 0) + (s?.incoming ?? 0) + (s?.suggestedQty ?? 0);
+    const endM = (m?.available ?? 0) + (m?.incoming ?? 0) + (m?.suggestedQty ?? 0);
+    expect(Math.abs(endS - endM)).toBeLessThanOrEqual(1);
+    expect(m?.suggestedQty).toBeGreaterThan(s?.suggestedQty ?? 0);
+  });
+
+  it("caps every line and shrinks the group total when the supplier can't fill it (pure)", () => {
+    const info = new Map<string, svc.SizeCurveInfo>([
+      ["a", { group: "g", velocity: 1, position: 0, supplierStock: 5 }],
+      ["b", { group: "g", velocity: 1, position: 0, supplierStock: 7 }],
+      ["c", { group: "g", velocity: 1, position: 0, supplierStock: 0 }],
+    ]);
+    const line = (id: string, qty: number) => ({
+      blankVariantId: id,
+      qty,
+      reason: "below_reorder_point" as const,
+      reorderPoint: null,
+      daysOfCover: null,
+    });
+    const out = svc.splitLinesBySizeCurve([line("a", 20), line("b", 20), line("c", 0)], info);
+    expect(out.map((l) => [l.blankVariantId, l.qty])).toEqual([
+      ["a", 5],
+      ["b", 7],
+      ["c", 0],
+    ]);
+  });
+});

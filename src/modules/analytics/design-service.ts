@@ -9,6 +9,7 @@ import type { SQL } from "drizzle-orm";
 import { sql } from "drizzle-orm";
 import type { TenantContext } from "../../api/context";
 import type { Tx } from "../../db/client";
+import { logger } from "../../lib/log";
 import { getTrendSignal } from "../market/service";
 import { companyTimezone } from "./shared";
 
@@ -24,11 +25,15 @@ import { companyTimezone } from "./shared";
 type Ctx = Pick<TenantContext, "companyId">;
 type Row = Record<string, unknown>;
 
+const log = logger("analytics.design");
+
 /** design_lifecycle_stage.md: u4/p4 floor, same as MIN_UNITS in the analyst queries. */
 const MIN_UNITS = 3;
 const DAY_MS = 86_400_000;
 const NEW_WINDOW_MS = 56 * DAY_MS;
 const DEAD_WINDOW_MS = 60 * DAY_MS;
+/** design_lifecycle_stage.md caveat: never-sold counts as dead only after 60 days in InvAI. */
+const NEVER_SOLD_DEAD_HISTORY_MS = 60 * DAY_MS;
 const STEADY_WINDOW_MS = 60 * DAY_MS;
 const GROWING_RATIO = 1.25;
 const DECLINING_RATIO = 0.75;
@@ -49,10 +54,13 @@ function stageOf(
     hasActiveListing: boolean;
   },
   t: Date,
+  /** False while the shop has under 60 days in InvAI: a never-sold listing can't be dated yet. */
+  neverSoldCanBeDead: boolean,
 ): DesignLifecycleStage {
   const { u4, p4, firstSaleAt, lastSaleAt, hasActiveListing } = row;
-  if (hasActiveListing && (!lastSaleAt || lastSaleAt.getTime() < t.getTime() - DEAD_WINDOW_MS))
+  if (hasActiveListing && lastSaleAt && lastSaleAt.getTime() < t.getTime() - DEAD_WINDOW_MS)
     return "dead";
+  if (hasActiveListing && !lastSaleAt && neverSoldCanBeDead) return "dead";
   if (firstSaleAt && firstSaleAt.getTime() >= t.getTime() - NEW_WINDOW_MS) return "new";
   if (u4 >= MIN_UNITS && u4 >= GROWING_RATIO * p4) return "growing";
   if (p4 >= MIN_UNITS && u4 <= DECLINING_RATIO * p4) return "declining";
@@ -60,7 +68,11 @@ function stageOf(
   return "inactive";
 }
 
-/** A market trend that isn't `insufficient` wins over the lifecycle-only stage (AC-C4). */
+/**
+ * The design's own statistical trend (market module, `subjectType design`, `source own`) wins
+ * over the lifecycle-only stage when it isn't `insufficient` (AC-C4). A niche-level reading
+ * (outside sources for the design's niche) is not the design's trend and never moves the stage.
+ */
 const STAGE_FROM_TREND: Partial<Record<TrendClass, DesignLifecycleStage>> = {
   rising: "growing",
   falling: "declining",
@@ -91,10 +103,16 @@ export async function designLifecycle(
     tx,
     sql`select coalesce(${input.asOf ?? null}::date, (now() at time zone ${tz})::date) as asof_date,
           (coalesce(${input.asOf ?? null}::date, (now() at time zone ${tz})::date)::timestamp
-            at time zone ${tz}) as t`,
+            at time zone ${tz}) as t,
+          (select c.created_at from companies c where c.id = ${ctx.companyId}) as company_created_at`,
   );
   const asOfDate = String(resolved?.asof_date);
   const t = new Date(String(resolved?.t));
+  const createdAt = resolved?.company_created_at
+    ? new Date(String(resolved.company_created_at))
+    : t;
+  const historyMs = t.getTime() - createdAt.getTime();
+  const neverSoldCanBeDead = historyMs >= NEVER_SOLD_DEAD_HISTORY_MS;
 
   const list = await rows(
     tx,
@@ -131,20 +149,33 @@ export async function designLifecycle(
     const hasActiveListing = Boolean(r.has_active_listing);
     const u4 = num(r.u4);
     const p4 = num(r.p4);
-    let stage = stageOf({ u4, p4, firstSaleAt, lastSaleAt, hasActiveListing }, t);
+    let stage = stageOf(
+      { u4, p4, firstSaleAt, lastSaleAt, hasActiveListing },
+      t,
+      neverSoldCanBeDead,
+    );
 
     let marketTrend: TrendClass | null = null;
     let marketGrowth4w: number | null = null;
-    try {
-      const trend = await getTrendSignal(tx, ctx, { designId: String(r.design_id) });
-      if (trend.trend !== "insufficient") {
-        marketTrend = trend.trend;
-        marketGrowth4w = trend.growth4w;
-        stage = STAGE_FROM_TREND[trend.trend] ?? stage;
-      }
-    } catch {
-      // A glitch reading the market signal never breaks design lifecycle: it's a business
-      // outcome ("no market trend"), never an error, for this read.
+    // A savepoint, so a failed market read rolls back only itself and never leaves the outer
+    // transaction aborted for the queries after it; the failure is logged, not hidden.
+    const trend = await tx
+      .transaction((sp) => getTrendSignal(sp, ctx, { designId: String(r.design_id) }))
+      .catch((err: unknown) => {
+        log.warn("market trend read failed", {
+          companyId: ctx.companyId,
+          designId: String(r.design_id),
+          error: (err as Error).message,
+        });
+        return null;
+      });
+    const own = trend?.readings.find(
+      (x) => x.provenance.source === "own" && x.trend !== "insufficient",
+    );
+    if (own) {
+      marketTrend = own.trend;
+      marketGrowth4w = own.growth4w;
+      stage = STAGE_FROM_TREND[own.trend] ?? stage;
     }
 
     rowsOut.push({
@@ -179,8 +210,10 @@ export async function designLifecycle(
 
   return {
     asOf: asOfDate,
-    // AC-B/C-screen1: nothing to show at all is a shop new to InvAI, not "no designs".
-    hasEnoughHistory: rowsOut.length > 0,
+    // AC-B/C-screen1: whole-screen "not enough history yet" unless some design has the
+    // metric's minimum sample (3 units in a year), or the shop is old enough in InvAI for its
+    // never-sold listings to count as dead.
+    hasEnoughHistory: neverSoldCanBeDead || rowsOut.some((r) => r.units365d >= MIN_UNITS),
     rows: rowsOut,
     stageCounts,
   };

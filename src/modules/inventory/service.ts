@@ -52,14 +52,7 @@ import { keyset, type PageInput } from "../../lib/pagination";
 import { objectKey } from "../../lib/s3";
 import { isSampleWorkspace } from "../tenancy/demo-flag";
 import { defaultLocationId, recordMovement } from "./ledger";
-import {
-  daysOfCover,
-  effectiveReorderPoint,
-  type PlannedLine,
-  planReorder,
-  type SizeShare,
-  splitBySizeCurve,
-} from "./reorder";
+import { daysOfCover, effectiveReorderPoint, type PlannedLine, planReorder } from "./reorder";
 
 /*
  * Inventory service: the stock ledger (./ledger.ts), stock views with velocity and days of
@@ -778,50 +771,96 @@ export async function suppliersStock(tx: Tx, ctx: Ctx, blankVariantIds: string[]
 
 /* ----------------------------- reorder suggestions ---------------------------- */
 
+/** What the size-curve split needs to know about one variant's line. */
+export type SizeCurveInfo = {
+  /** Style x color: lines with the same group are split together. */
+  group: string;
+  /** Trailing daily velocity: the size curve's weight for this size. */
+  velocity: number;
+  /** Available + incoming now. */
+  position: number;
+  /** Live supplier stock; null when unknown (no cap), 0 when out (never ordered). */
+  supplierStock: number | null;
+};
+
 /**
- * T-A5 AC-C3: within one supplier's plan, redistributes each style x color group's total
- * suggested qty (the group's own points, low-cover top-up and free-freight padding already
- * summed by `planReorder`) across its sizes in proportion to the trailing size curve
- * (`splitBySizeCurve`), instead of leaving each size's qty at what its own independent reorder
- * point produced -- that's what lets an under-stocked size (a "size gap") pick up units even
- * when its own point wasn't crossed. The group's total qty is unchanged, so cost-per-unit
- * differences across sizes are the only thing that can move the plan's subtotal; the caller
- * recomputes it from the redistributed lines. A size the supplier currently has zero live stock
- * for is left out of the curve split (it never receives units, same as `planReorder`'s own
- * "don't order" rule) and single-size groups pass through untouched -- this only ever proposes
- * quantities on a still-editable draft; it does not create, edit or submit a PO.
+ * T-A5 AC-C3: within one supplier's plan, re-splits each style x color group's total suggested
+ * qty (already summed by `planReorder`: own points, low-cover top-up, free-freight padding) so
+ * that the group's *position after the order* (available + incoming + qty) follows the trailing
+ * size curve. It water-fills: find the level L where each size's qty is
+ * `clamp(L x share - position, 0, supplierStock)` and the qtys sum to the group total. So:
+ * - sizes that sell the same end at the same position, whatever their on-hand is now (a size
+ *   gap is closed, never created);
+ * - no line exceeds what the supplier has (`baseSuggestion`'s `min(qty, supplierStock)` cap);
+ *   the excess goes to the sizes with room, and if no size has room the group total shrinks;
+ * - a size the supplier has none of stays out; single-size groups pass through untouched.
+ * Lines keep their input order (most-needed first). It only proposes quantities on a
+ * still-editable draft; it never creates, edits or submits a PO.
  */
-function splitPlanLinesBySizeCurve(
+export function splitLinesBySizeCurve(
   lines: PlannedLine[],
-  viewBy: Map<string, StockView>,
-  live: Map<string, number | null>,
+  info: Map<string, SizeCurveInfo>,
 ): PlannedLine[] {
   const groups = new Map<string, PlannedLine[]>();
   for (const l of lines) {
-    const v = viewBy.get(l.blankVariantId);
-    if (!v) continue;
-    const key = `${v.blank.styleCode}::${v.blank.colorCode}`;
-    groups.set(key, [...(groups.get(key) ?? []), l]);
+    const i = info.get(l.blankVariantId);
+    if (!i || i.supplierStock === 0) continue;
+    groups.set(i.group, [...(groups.get(i.group) ?? []), l]);
   }
-  const out: PlannedLine[] = [];
+  const qtyBy = new Map<string, number>();
   for (const group of groups.values()) {
-    const orderable = group.filter((l) => live.get(l.blankVariantId) !== 0);
-    const unorderable = group.filter((l) => live.get(l.blankVariantId) === 0);
-    out.push(...unorderable);
-    if (orderable.length < 2) {
-      out.push(...orderable);
-      continue;
-    }
-    const totalQty = orderable.reduce((sum, l) => sum + l.qty, 0);
-    const shares: SizeShare[] = orderable.map((l) => {
-      const v = viewBy.get(l.blankVariantId) as StockView;
-      return { blankVariantId: l.blankVariantId, size: v.blank.size, salesShare: v.dailyVelocity };
+    if (group.length < 2) continue;
+    const items = group.map((l) => {
+      const i = info.get(l.blankVariantId) as SizeCurveInfo;
+      return {
+        id: l.blankVariantId,
+        w: Math.max(0, i.velocity),
+        pos: Math.max(0, i.position),
+        cap: i.supplierStock == null ? Number.POSITIVE_INFINITY : Math.max(0, i.supplierStock),
+      };
     });
-    const split = splitBySizeCurve(totalQty, shares);
-    const qtyBy = new Map(split.map((s) => [s.blankVariantId, s.qty]));
-    for (const l of orderable) out.push({ ...l, qty: qtyBy.get(l.blankVariantId) ?? l.qty });
+    const sumW = items.reduce((s, x) => s + x.w, 0);
+    if (sumW <= 0) for (const x of items) x.w = 1;
+    const totalW = items.reduce((s, x) => s + x.w, 0);
+    for (const x of items) x.w /= totalW;
+    const capTotal = items.reduce((s, x) => s + (x.w > 0 ? x.cap : 0), 0);
+    const total = Math.min(
+      group.reduce((s, l) => s + l.qty, 0),
+      capTotal,
+    );
+    const fill = (level: number) =>
+      items.map((x) => (x.w > 0 ? Math.min(x.cap, Math.max(0, level * x.w - x.pos)) : 0));
+    const sum = (a: number[]) => a.reduce((s, n) => s + n, 0);
+    // Bisection on the level: fill() is monotone in it.
+    let lo = 0;
+    let hi = 1;
+    while (sum(fill(hi)) < total && hi < 1e12) hi *= 2;
+    for (let k = 0; k < 100; k++) {
+      const mid = (lo + hi) / 2;
+      if (sum(fill(mid)) < total) lo = mid;
+      else hi = mid;
+    }
+    const raw = fill(hi);
+    // Largest remainder to whole units, never past a cap.
+    const out = raw.map((r) => Math.floor(r + 1e-9));
+    let left = total - sum(out);
+    const order = raw
+      .map((r, i) => ({ i, frac: r - (out[i] ?? 0) }))
+      .sort((a, b) => b.frac - a.frac || a.i - b.i);
+    for (const { i } of order) {
+      if (left <= 0) break;
+      const x = items[i];
+      if (!x || x.w <= 0 || (out[i] ?? 0) + 1 > x.cap) continue;
+      out[i] = (out[i] ?? 0) + 1;
+      left -= 1;
+    }
+    items.forEach((x, i) => {
+      qtyBy.set(x.id, out[i] ?? 0);
+    });
   }
-  return out;
+  return lines.map((l) =>
+    qtyBy.has(l.blankVariantId) ? { ...l, qty: qtyBy.get(l.blankVariantId) as number } : l,
+  );
 }
 
 export async function reorderSuggestions(
@@ -865,10 +904,21 @@ export async function reorderSuggestions(
     params,
   );
   const viewBy = new Map(views.map((v) => [v.blankVariantId, v]));
+  const curveInfo = new Map<string, SizeCurveInfo>(
+    views.map((v) => [
+      v.blankVariantId,
+      {
+        group: `${v.blank.styleCode}::${v.blank.colorCode}`,
+        velocity: v.dailyVelocity,
+        position: v.available + v.incoming,
+        supplierStock: live.get(v.blankVariantId) ?? null,
+      },
+    ]),
+  );
   return {
     generatedAt: new Date().toISOString(),
     items: plans.map((p) => {
-      const lines = splitPlanLinesBySizeCurve(p.lines, viewBy, live);
+      const lines = splitLinesBySizeCurve(p.lines, curveInfo);
       const subtotal = lines.reduce(
         (sum, l) => sum + l.qty * (viewBy.get(l.blankVariantId)?.blank.cost ?? 0),
         0,

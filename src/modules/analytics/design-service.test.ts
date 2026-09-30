@@ -4,7 +4,15 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { anonymousContext, permissionsFor } from "../../api/context";
 import { router } from "../../api/router";
 import { withSystem, withTenant } from "../../db/client";
-import { companies, designs, listings, marketSignals, orderItems, orders } from "../../db/schema";
+import {
+  companies,
+  designs,
+  listings,
+  marketDesignNiches,
+  marketSignals,
+  orderItems,
+  orders,
+} from "../../db/schema";
 import {
   createCompany,
   createConnection,
@@ -179,6 +187,89 @@ describe("analytics.designLifecycle", () => {
     await withSystem((tx) =>
       tx.delete(marketSignals).where(eq(marketSignals.companyId, a.companyId)),
     );
+  });
+
+  it("a niche-level reading never moves the stage; only the design's own trend does (AC-C4, r1)", async () => {
+    await withSystem(async (tx) => {
+      await tx.insert(marketDesignNiches).values({
+        companyId: a.companyId,
+        designId: a.ids.dead,
+        niches: ["teacher"],
+        source: "stems",
+      });
+      await tx.insert(marketSignals).values({
+        companyId: a.companyId,
+        subjectType: "niche",
+        subjectId: "teacher",
+        signal: "trend",
+        source: "google_trends",
+        value: { trend: "rising", g4: 0.4, windowWeeks: 26, insufficientReason: null },
+        n: 26,
+        sampleFactor: 1,
+        reliability: 0.8,
+        agreement: 1,
+        licence: "official_api",
+        mock: false,
+        asOf: day("2026-05-30"),
+        fetchedAt: day("2026-05-30"),
+        computedOn: "2026-05-30",
+      });
+    });
+    try {
+      const r = await lifecycle(a);
+      const dead = r.rows.find((x) => x.designId === a.ids.dead);
+      // The niche says "rising"; the design itself hasn't sold in 60 days: still dead.
+      expect(dead).toMatchObject({ stage: "dead", marketTrend: null, marketGrowth4w: null });
+    } finally {
+      await withSystem(async (tx) => {
+        await tx.delete(marketSignals).where(eq(marketSignals.companyId, a.companyId));
+        await tx.delete(marketDesignNiches).where(eq(marketDesignNiches.companyId, a.companyId));
+      });
+    }
+  });
+
+  it("a brand-new shop with listings and no sales has no dead designs and not enough history (AC-B/C-screen1, r1)", async () => {
+    const shop = await createCompany();
+    const owner = await createUser(shop.id, "owner");
+    const ctx = tenantContext(shop.id, owner.id, "owner");
+    const connectionId = (await createConnection(shop.id, "etsy")).id;
+    const ids: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      const [d] = await withSystem((tx) =>
+        tx
+          .insert(designs)
+          .values({ companyId: shop.id, code: `N-${i}-${Date.now()}`, name: `Never Sold ${i}` })
+          .returning(),
+      );
+      if (!d) throw new Error("seed failed");
+      ids.push(d.id);
+      await withSystem((tx) =>
+        tx.insert(listings).values({
+          companyId: shop.id,
+          connectionId,
+          channel: "etsy",
+          channelListingId: `NL-${i}-${Math.random().toString(36).slice(2)}`,
+          title: "Listing",
+          state: "active",
+          designId: d.id,
+        }),
+      );
+    }
+    const today = await withTenant(shop.id, (tx) => designLifecycle(tx, ctx, {}));
+    expect(today.hasEnoughHistory).toBe(false);
+    expect(today.rows.map((r) => r.designId).sort()).toEqual([...ids].sort());
+    expect(today.rows.some((r) => r.stage === "dead")).toBe(false);
+
+    // After 60 days in InvAI the same never-sold listings count as dead.
+    await withSystem((tx) =>
+      tx
+        .update(companies)
+        .set({ createdAt: new Date(Date.now() - 61 * 86_400_000) })
+        .where(eq(companies.id, shop.id)),
+    );
+    const later = await withTenant(shop.id, (tx) => designLifecycle(tx, ctx, {}));
+    expect(later.hasEnoughHistory).toBe(true);
+    expect(later.rows.every((r) => r.stage === "dead")).toBe(true);
   });
 
   it("hasEnoughHistory is false for a brand-new shop (AC-B/C-screen1)", async () => {
