@@ -49,10 +49,13 @@ worker after a reset so its repeatable sweeps re-register. The seed is safe with
 running: each builder phase parks the outbox events it emitted and the last step releases them all
 (`src/db/seed/outbox-hold.ts`). Seeding a DB copy? Set `SEED_OUTPUT_FILE=<path>` so the copy's run
 doesn't overwrite the shared `seed-output.json`. `pnpm test` redirects `REDIS_URL` the same way it
-redirects the database URLs (B-205): a DB 0 (or unspecified) `REDIS_URL` moves to DB 15, so a dev or
-CI worker on DB 0 never sees test jobs or streams. Set `TEST_REDIS_URL` to pick a different test DB,
-or pin `REDIS_URL=redis://localhost:6379/<n>` yourself (a non-zero DB you set is kept as-is, never
-redirected) — the pattern to use when several agents run the suite at once.
+redirects the database URLs (B-205): any `REDIS_URL` whose path isn't written as a plain positive
+integer (`/14`) — no path, `/0`, `/0/`, `/0.5`, `/0x1`, blank, anything else — is treated as DB 0
+and moves to DB 15, so a dev or CI worker on DB 0 never sees test jobs or streams. Set
+`TEST_REDIS_URL` to pick a different test DB, or pin `REDIS_URL=redis://localhost:6379/<n>`
+yourself (a DB written that way is kept as-is, never redirected) — the pattern to use when several
+agents run the suite at once. `TEST_REDIS_URL` itself must be a pinned non-zero DB the same way;
+one written as DB 0 fails the boot with a clear error rather than silently running on DB 0.
 
 No real API keys are needed: every integration (Claude, EasyPost, Shopify, S&S) falls back to a
 mock provider automatically when its env var is unset (`env.mocks.*` in `src/env.ts`). See

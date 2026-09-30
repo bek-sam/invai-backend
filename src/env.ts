@@ -169,10 +169,24 @@ function withDatabase(url: string, database: string): string {
 /** Default Redis DB for tests (B-205): never 0, the dev/CI worker's DB. */
 const TEST_REDIS_DB = 15;
 
-/** Redis DB index encoded in the URL path (`/14` -> 14); no path or `/0` reads as 0 (unset). */
-function redisDbIndex(url: string): number {
+/**
+ * True only when the URL's path is written exactly as a positive integer with no leading zero
+ * (`/1`, `/14`, ...) — the one shape treated as "the caller explicitly pinned a non-zero DB".
+ * Everything else — no path, a bare `/0`, a trailing slash (`/0/`), a decimal (`/0.5`), hex
+ * (`/0x1`), blank or non-numeric text — is treated as DB 0 (unset) and redirected.
+ *
+ * This is deliberately *stricter* than ioredis's own parsing. ioredis picks the DB with
+ * `parseInt(options.db, 10)` (`node_modules/ioredis/built/Redis.js:725-726`), so `/0/` and
+ * `/0x1` both resolve to live DB 0 there too — but a naive `Number(path) !== 0` check (this
+ * function's round-1 shape) reads `/0/` and `/0x1` as *non-zero* (`Number` returns `NaN`, and
+ * `NaN !== 0` is true) and wrongly keeps them as "pinned", so the suite ends up on DB 0 anyway
+ * (round-1 review finding). Matching ioredis's `parseInt` instead of anchoring on a canonical
+ * literal would have the same hole for any other `Number`/`parseInt` divergence, so this checks
+ * the literal text.
+ */
+function isPinnedNonZeroDb(url: string): boolean {
   const path = new URL(url).pathname.replace(/^\//, "");
-  return path === "" ? 0 : Number(path);
+  return /^[1-9]\d*$/.test(path);
 }
 
 /**
@@ -181,10 +195,27 @@ function redisDbIndex(url: string): number {
  * use): that explicit choice always wins, so two agents pinning different DBs never collide.
  */
 function withTestRedisDb(url: string): string {
-  if (redisDbIndex(url) !== 0) return url;
+  if (isPinnedNonZeroDb(url)) return url;
   const u = new URL(url);
   u.pathname = `/${TEST_REDIS_DB}`;
   return u.toString();
+}
+
+/**
+ * `TEST_REDIS_URL` is an explicit, higher-trust opt-in (a second agent pinning its own DB per
+ * `team/agent-brief.md`) — but "explicit" must not mean "even DB 0 is honored verbatim". Round 1
+ * used `raw.TEST_REDIS_URL` as-is with no check at all. A `TEST_REDIS_URL` that isn't a pinned
+ * non-zero DB fails the boot with a clear message instead of silently sharing the dev/CI worker's
+ * DB 0 (chosen over a silent redirect so a mistyped `TEST_REDIS_URL` can't go unnoticed).
+ */
+function assertTestRedisDbPinned(url: string): string {
+  if (!isPinnedNonZeroDb(url)) {
+    throw new Error(
+      `TEST_REDIS_URL must point at a non-zero Redis DB (got "${url}"), never DB 0 — the ` +
+        "dev/CI worker's DB (B-205). Use e.g. redis://localhost:6379/14.",
+    );
+  }
+  return url;
 }
 
 const isTest = raw.NODE_ENV === "test";
@@ -250,10 +281,15 @@ export const env = {
   /**
    * Under test, redirected to a non-zero DB so the suite never shares BullMQ queues or realtime
    * streams with a dev worker on DB 0 (B-205), mirroring how DATABASE_URL redirects to invai_test.
-   * `TEST_REDIS_URL` wins when set; otherwise an already non-zero `REDIS_URL` DB is kept as-is;
+   * `TEST_REDIS_URL` wins when set, but it must itself be a pinned non-zero DB (throws otherwise,
+   * `assertTestRedisDbPinned`); otherwise an already non-zero `REDIS_URL` DB is kept as-is;
    * otherwise it redirects to `TEST_REDIS_DB` (15).
    */
-  REDIS_URL: isTest ? (raw.TEST_REDIS_URL ?? withTestRedisDb(raw.REDIS_URL)) : raw.REDIS_URL,
+  REDIS_URL: isTest
+    ? raw.TEST_REDIS_URL
+      ? assertTestRedisDbPinned(raw.TEST_REDIS_URL)
+      : withTestRedisDb(raw.REDIS_URL)
+    : raw.REDIS_URL,
   FLOOR_TOKEN_SECRET: raw.FLOOR_TOKEN_SECRET ?? raw.BETTER_AUTH_SECRET,
   /** Undefined only in production with ALLOW_MOCKS=true; the mailer then logs instead of sending. */
   SMTP_URL: raw.SMTP_URL ?? (isProd ? undefined : "smtp://localhost:1025"),
