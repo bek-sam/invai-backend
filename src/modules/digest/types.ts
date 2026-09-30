@@ -128,6 +128,75 @@ export type Snapshot = {
   };
   lowStock: LowStockBlank[];
   unhealthyChannels: UnhealthyChannel[];
+  /**
+   * Track E inputs (T-A9, D9..D13 and D2's bridge mover), read from the `analytics.*` services.
+   * Optional so a hand-built snapshot without them fires none of D9..D13.
+   */
+  trackE?: TrackE;
+};
+
+/** D9: one channel's shipping margin per labeled order this week and in the weeks before. */
+export type ShippingChannelWeek = {
+  channel: Channel;
+  labeledOrders: number;
+  /** Cents; null with no labeled orders. */
+  marginPerOrder: number | null;
+  /** Margin per order in each of the previous weeks that had labeled orders, most recent first. */
+  trailing: number[];
+};
+
+/** D11: one size of a style × color that sells more than its share of stock. */
+export type SizeGap = {
+  style: string;
+  color: string;
+  size: string;
+  gapPts: number;
+  coverDays: number;
+  unitsSold: number;
+  onHand: number;
+};
+
+/** D12: one supplier × style's latest monthly unit cost against the one ≥ 3 months earlier. */
+export type SupplierCostRise = {
+  supplierName: string;
+  style: string;
+  month: string;
+  baseMonth: string;
+  unitCost: number;
+  baseUnitCost: number;
+  /** Units bought in the latest month. */
+  units: number;
+};
+
+export type TrackE = {
+  shipping: ShippingChannelWeek[];
+  losing: {
+    ordersWithProfitLine: number;
+    losingOrders: number;
+    losingPct: number | null;
+    lossCents: number;
+  };
+  inventory: {
+    days: number;
+    deadPctOfStockValue: number | null;
+    deadValue: number;
+    deadVariants: number;
+    /** The dead-stock row with the largest value, named by style and color. */
+    topDead: { blankVariantId: string; style: string; color: string; value: number } | null;
+    gaps: SizeGap[];
+  };
+  supplierCosts: SupplierCostRise[];
+  breakEven: {
+    fixedCostsSet: boolean;
+    hasEnoughOrders: boolean;
+    days: number;
+    orders: number;
+    pace: number | null;
+    breakEvenOrders: number | null;
+    operatingProfitPace: number | null;
+  };
+  /** `analytics.profitBridge` (by design, same period) top mover; null when nothing moved. */
+  bridgeTopMover: { key: string; label: string; change: number } | null;
 };
 
 /** A detector's output before ranking. */

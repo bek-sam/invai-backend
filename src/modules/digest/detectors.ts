@@ -95,16 +95,33 @@ export function d2Change(s: Snapshot): Candidate[] {
         ),
       );
     }
+    // AC-E1f: name the mover `analytics.profitBridge` ranks first for the same period (by design,
+    // the bridge's and `explain_profit_change`'s default), not a second ranking of our own.
+    const mover = s.trackE?.bridgeTopMover ?? null;
+    if (mover) {
+      facts.push(fact("d2.topMover", "text", mover.label));
+      facts.push(fact("d2.topMoverChange", "cents", mover.change));
+    }
+    const moverParams: DigestActionParams = mover
+      ? {
+          designName: mover.label,
+          ...(mover.key !== "unmapped" ? { designId: mover.key } : {}),
+        }
+      : top
+        ? { channel: top.channel }
+        : {};
     out.push({
       detector: "D2",
       section: "action",
       fingerprint: `D2:${metric}:${cur >= prev ? "up" : "down"}`,
       impactCents: absPrev,
       confidence: s.incompleteOrders > 0 ? 0.6 : 0.8,
-      templateKey: "D2 action",
-      action: action("see_what_changed", "/analytics/profit?dim=channel&days=7", {
-        ...(top ? { channel: top.channel } : {}),
-      }),
+      templateKey: mover ? "D2 action.mover" : "D2 action",
+      action: action(
+        "see_what_changed",
+        mover ? "/analytics/profit?view=why&days=7" : "/analytics/profit?dim=channel&days=7",
+        moverParams,
+      ),
       facts,
     });
     break; // one D2 row: net if it moved, else revenue
@@ -358,13 +375,207 @@ export function d8Wins(s: Snapshot): Candidate[] {
   return out;
 }
 
+/*
+ * Track E detectors (T-A9, spec business-analytics-v2 AC-E1..E1e). Inputs come from the
+ * `analytics.*` services through `snapshot.trackE`; without it none of them fires.
+ */
+
+const PROFIT_VIEW = "/analytics/profit";
+const INVENTORY_VIEW = "/analytics/inventory";
+
+/** D9: shipping loss per labeled order ≥ $0.50 worse than the channel's 4-week median. */
+export function d9ShippingLoss(s: Snapshot): Candidate[] {
+  const out: Candidate[] = [];
+  for (const c of s.trackE?.shipping ?? []) {
+    if (c.labeledOrders < C.d9.minLabeledOrders || c.marginPerOrder === null) continue;
+    if (c.trailing.length < C.d9.trailingWeeks) continue;
+    const base = median(c.trailing.slice(0, C.d9.trailingWeeks));
+    if (base === null) continue;
+    const worse = Math.round(base - c.marginPerOrder);
+    // A loss (margin below 0) that got worse; a smaller profit is not a shipping loss.
+    if (c.marginPerOrder >= 0 || worse < C.d9.minWorseCents) continue;
+    out.push({
+      detector: "D9",
+      section: "action",
+      fingerprint: `D9:${c.channel}`,
+      impactCents: worse * c.labeledOrders,
+      confidence: 0.8,
+      templateKey: "D9 action",
+      action: action(
+        "review_shipping_prices",
+        `${PROFIT_VIEW}?view=shipping&days=28&channel=${enc(c.channel)}`,
+        { channel: c.channel, deltaCents: -worse, n: c.labeledOrders },
+      ),
+      facts: [
+        fact(`d9.${c.channel}.marginPerOrder`, "cents", c.marginPerOrder),
+        fact(`d9.${c.channel}.medianMarginPerOrder`, "cents", Math.round(base)),
+        fact(`d9.${c.channel}.labeledOrders`, "count", c.labeledOrders),
+      ],
+    });
+  }
+  return out;
+}
+
+/** D10: losing orders above 5% of orders, with ≥ 30 orders. */
+export function d10LosingOrders(s: Snapshot): Candidate[] {
+  const l = s.trackE?.losing;
+  if (!l || l.ordersWithProfitLine < C.d10.minOrders || l.losingPct === null) return [];
+  if (l.losingPct <= C.d10.minLosingPct) return [];
+  return [
+    {
+      detector: "D10",
+      section: "action",
+      fingerprint: "D10:losing",
+      impactCents: Math.abs(l.lossCents),
+      confidence: 0.8,
+      templateKey: "D10 action",
+      action: action("review_losing_orders", `${PROFIT_VIEW}?view=losing&days=7`, {
+        n: l.losingOrders,
+        points: l.losingPct,
+      }),
+      facts: [
+        fact("d10.losingOrders", "count", l.losingOrders),
+        fact("d10.orders", "count", l.ordersWithProfitLine),
+        fact("d10.losingPct", "pct", l.losingPct),
+        fact("d10.loss", "cents", l.lossCents),
+      ],
+    },
+  ];
+}
+
+/**
+ * D11: dead stock above 15% of stock value (one action naming the largest dead style × color),
+ * and each size at or below −15 points of its sales share with under 14 days of cover.
+ */
+export function d11StockHealth(s: Snapshot): Candidate[] {
+  const inv = s.trackE?.inventory;
+  if (!inv) return [];
+  const out: Candidate[] = [];
+  if (
+    inv.deadPctOfStockValue !== null &&
+    inv.deadPctOfStockValue > C.d11.maxDeadPct &&
+    inv.topDead
+  ) {
+    const d = inv.topDead;
+    out.push({
+      detector: "D11",
+      section: "action",
+      fingerprint: `D11:dead:${d.blankVariantId}`,
+      impactCents: inv.deadValue,
+      confidence: 0.6,
+      templateKey: "D11 action.dead",
+      action: action("review_dead_stock", INVENTORY_VIEW, {
+        style: d.style,
+        color: d.color,
+        blankVariantId: d.blankVariantId,
+        points: inv.deadPctOfStockValue,
+      }),
+      facts: [
+        fact("d11.deadPct", "pct", inv.deadPctOfStockValue),
+        fact("d11.deadValue", "cents", inv.deadValue),
+        fact("d11.deadVariants", "count", inv.deadVariants),
+      ],
+    });
+  }
+  const perUnit = s.current.units > 0 ? s.current.net / s.current.units : 0;
+  const gaps = inv.gaps
+    .filter((g) => g.gapPts <= C.d11.maxGapPts && g.coverDays < C.d11.maxCoverDays)
+    .sort((a, b) => a.gapPts - b.gapPts || a.style.localeCompare(b.style))
+    .slice(0, C.d11.maxGaps);
+  for (const [i, g] of gaps.entries()) {
+    // Units short over the next 14 days at the window's sales rate, at this week's net per unit.
+    const daily = g.unitsSold / inv.days;
+    const short = Math.max(0, daily * C.d11.maxCoverDays - g.onHand);
+    const id = `${g.style}:${g.color}:${g.size}`;
+    out.push({
+      detector: "D11",
+      section: "action",
+      fingerprint: `D11:gap:${id}`.slice(0, 128),
+      impactCents: Math.max(0, Math.round(short * perUnit)),
+      confidence: 0.7,
+      templateKey: "D11 action.gap",
+      action: action("restock_size_gap", INVENTORY_VIEW, {
+        style: g.style,
+        color: g.color,
+        size: g.size,
+        points: g.gapPts,
+      }),
+      facts: [
+        fact(`d11.gap${i}.gapPts`, "pct", g.gapPts),
+        fact(`d11.gap${i}.coverDays`, "count", Math.round(g.coverDays * 10) / 10),
+      ],
+    });
+  }
+  return out;
+}
+
+/** D12: a supplier's unit cost for a style ≥ 5% above its cost 3 months earlier. */
+export function d12BlankCost(s: Snapshot): Candidate[] {
+  const out: Candidate[] = [];
+  for (const [i, r] of (s.trackE?.supplierCosts ?? []).entries()) {
+    const rise = pctChange(r.unitCost, r.baseUnitCost);
+    if (rise === null || rise < C.d12.minRisePct) continue;
+    const delta = Math.round(r.unitCost - r.baseUnitCost);
+    const id = `${r.supplierName}:${r.style}`;
+    out.push({
+      detector: "D12",
+      section: "action",
+      fingerprint: `D12:${id}`.slice(0, 128),
+      // Margin impact: the rise on the units bought in the latest month.
+      impactCents: Math.max(0, Math.round((r.unitCost - r.baseUnitCost) * r.units)),
+      confidence: 0.7,
+      templateKey: "D12 action",
+      action: action("review_blank_cost", INVENTORY_VIEW, {
+        supplierName: r.supplierName,
+        style: r.style,
+        points: Math.round(rise * 10) / 10,
+        deltaCents: delta,
+      }),
+      facts: [
+        fact(`d12.${i}.unitCost`, "cents", Math.round(r.unitCost)),
+        fact(`d12.${i}.baseUnitCost`, "cents", Math.round(r.baseUnitCost)),
+        fact(`d12.${i}.risePct`, "pct", Math.round(rise * 10) / 10),
+      ],
+    });
+  }
+  return out;
+}
+
+/** D13: fixed costs set, ≥ 30 orders in 4 weeks, and the monthly pace is below break-even. */
+export function d13BreakEven(s: Snapshot): Candidate[] {
+  const b = s.trackE?.breakEven;
+  if (!b?.fixedCostsSet || !b.hasEnoughOrders || b.operatingProfitPace === null) return [];
+  if (b.operatingProfitPace >= 0) return [];
+  // The monthly shortfall, scaled to one week so it ranks against weekly impacts.
+  const weekly = Math.round((-b.operatingProfitPace * 7) / 30);
+  return [
+    {
+      detector: "D13",
+      section: "action",
+      fingerprint: "D13:breakEven",
+      impactCents: weekly,
+      confidence: 0.7,
+      templateKey: "D13 action",
+      action: action("see_break_even", `${PROFIT_VIEW}?view=breakeven`, {
+        deltaCents: b.operatingProfitPace,
+        ...(b.breakEvenOrders !== null ? { n: b.breakEvenOrders } : {}),
+      }),
+      facts: [
+        fact("d13.operatingProfitPace", "cents", b.operatingProfitPace),
+        fact("d13.pace", "count", b.pace),
+        fact("d13.breakEvenOrders", "count", b.breakEvenOrders),
+      ],
+    },
+  ];
+}
+
 /** Most of the week's orders have no final fees yet: money-based findings would be wrong. */
 export function profitUnreliable(s: Snapshot): boolean {
   const all = s.current.orders + s.incompleteOrders;
   return all > 0 && s.incompleteOrders / all > C.maxIncompleteShare;
 }
 
-/** Every detector, in spec order. */
+/** Every detector, in spec order (D10 and D13 read profit lines: silent when fees are unreliable). */
 export function detect(s: Snapshot): Candidate[] {
   const unreliable = profitUnreliable(s);
   const money = (cs: Candidate[]) => (unreliable ? [] : cs);
@@ -377,5 +588,10 @@ export function detect(s: Snapshot): Candidate[] {
     ...d6Fulfillment(s),
     ...d7Stock(s),
     ...d8Wins(s).filter((c) => !unreliable || c.fingerprint !== "D8:bestNet"),
+    ...d9ShippingLoss(s),
+    ...money(d10LosingOrders(s)),
+    ...d11StockHealth(s),
+    ...d12BlankCost(s),
+    ...money(d13BreakEven(s)),
   ];
 }

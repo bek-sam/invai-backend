@@ -3,6 +3,7 @@ import { and, eq, gte, inArray, isNotNull, lt, ne, or, sql } from "drizzle-orm";
 import type { TenantContext } from "../../api/context";
 import type { Tx } from "../../db/client";
 import { channelConnections, orders, profitLines } from "../../db/schema";
+import { errorData, logger } from "../../lib/log";
 import {
   adPerformance,
   comparePeriods,
@@ -13,6 +14,7 @@ import {
 import { getProfit } from "../finance/service";
 import { lowStockItems } from "../inventory/service";
 import { DIGEST_CONFIG as C } from "./config";
+import { computeTrackE } from "./track-e";
 import type { CostLines, LowStockBlank, Snapshot, UnhealthyChannel, WeekTotals } from "./types";
 import { addDays, localMidnights } from "./week";
 
@@ -28,6 +30,8 @@ import { addDays, localMidnights } from "./week";
  */
 
 type Ctx = Pick<TenantContext, "companyId">;
+
+const log = logger("digest.snapshot");
 
 export type WeekWindow = {
   weekKey: string;
@@ -189,6 +193,25 @@ export async function computeSnapshot(
   const unhealthyChannels = await unhealthy(tx, ctx, w);
   const lowStock = await lowStockForTopDesigns(tx, ctx, w, trailFrom, designs.topNet);
 
+  // Track E (D9..D13, D2's mover) in a savepoint: a failed analytics read leaves those detectors
+  // silent for this build instead of failing the whole digest.
+  const trackE = await tx
+    .transaction((sp) =>
+      computeTrackE(
+        sp,
+        ctx,
+        { periodFrom: w.periodFrom, periodTo: w.periodTo, weekStarts: mids as Date[] },
+        w.timezone,
+      ),
+    )
+    .catch((err) => {
+      log.warn("track E inputs unavailable; D9..D13 left out", {
+        companyId: ctx.companyId,
+        ...errorData(err),
+      });
+      return undefined;
+    });
+
   const netPerUnit = cmp.current.units > 0 ? cmp.current.net / cmp.current.units : null;
   return {
     weekKey: w.weekKey,
@@ -271,6 +294,7 @@ export async function computeSnapshot(
     },
     lowStock,
     unhealthyChannels,
+    trackE,
   };
 }
 

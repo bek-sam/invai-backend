@@ -264,6 +264,45 @@ describe("finance analytics (T-A3)", () => {
     expect(isolated.shipmentsWithoutZone).toBe(0);
   });
 
+  it("T-A9 (A1 note): channel and service rows with equal margin sort by label, then key, on every run", async () => {
+    const t = (await createCompany()).id;
+    const period = await localPeriod(t, "2026-09-01", "2026-09-08");
+    // Inserted in reverse label order, so SQL or insertion order alone wouldn't sort them.
+    const specs = [
+      { channel: "walmart" as const, service: "Priority" },
+      { channel: "tiktok" as const, service: "Express" },
+      { channel: "shopify" as const, service: "GroundAdvantage" },
+      { channel: "etsy" as const, service: "First" },
+    ];
+    for (const sp of specs) {
+      const { order } = await addOrder(t, {
+        channel: sp.channel,
+        placedAt: new Date("2026-09-02T18:00:00Z"),
+        subtotal: 2800,
+        shipping: 500,
+        lines: [{ revenue: 2800, label: 454 }],
+      });
+      await addShipment(t, order.id, {
+        postage: 450,
+        labeledAt: new Date("2026-09-03T17:00:00Z"),
+        service: sp.service,
+      });
+    }
+    const ctxT = tenantContext(t, null, "owner");
+    for (let i = 0; i < 3; i++) {
+      const ch = await run(t, (tx) => svc.shippingMargin(tx, ctxT, { period, groupBy: "channel" }));
+      expect(ch.rows.map((r) => r.margin)).toEqual([46, 46, 46, 46]);
+      expect(ch.rows.map((r) => r.label)).toEqual(["Etsy", "Shopify", "TikTok Shop", "Walmart"]);
+      const sv = await run(t, (tx) => svc.shippingMargin(tx, ctxT, { period, groupBy: "service" }));
+      expect(sv.rows.map((r) => r.key)).toEqual([
+        "usps/Express",
+        "usps/First",
+        "usps/GroundAdvantage",
+        "usps/Priority",
+      ]);
+    }
+  });
+
   it("AC-A5: volume + rate = total change, and the top mover is design Y (new this week)", async () => {
     const pb = await run(a, (tx) => svc.profitBridge(tx, ctxA, { period: s.current }));
     expect(pb.basePeriod).toEqual(s.base);

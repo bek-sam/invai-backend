@@ -459,7 +459,8 @@ export async function shippingMargin(
       ? bandOrder(a.key) - bandOrder(b.key)
       : input.groupBy === "zone"
         ? Number(a.key) - Number(b.key)
-        : a.margin - b.margin,
+        : // Equal margins sort the same way on every run (A1 note): label, then key.
+          a.margin - b.margin || a.label.localeCompare(b.label) || a.key.localeCompare(b.key),
   );
   return {
     period: input.period,

@@ -19,7 +19,13 @@ export function scoreOf(c: Candidate, history: History): number {
 const byScore = (a: { score: number; fingerprint: string }, b: typeof a) =>
   b.score - a.score || a.fingerprint.localeCompare(b.fingerprint);
 
-export function rank(candidates: Candidate[], history: History): RankedDigest {
+/** `maxActions`: 3 for the digest (contract), 5 for Today's action panel. */
+export function rank(
+  candidates: Candidate[],
+  history: History,
+  opts: { maxActions?: number } = {},
+): RankedDigest {
+  const maxActions = opts.maxActions ?? C.ranking.maxActions;
   const scored = candidates.map((c) => ({ ...c, score: scoreOf(c, history) }));
   const tired = (c: Candidate) =>
     (history.weeksShownWithoutAction.get(c.fingerprint) ?? 0) >=
@@ -38,15 +44,15 @@ export function rank(candidates: Candidate[], history: History): RankedDigest {
   const actions: (Candidate & { score: number })[] = [...pinned];
   let marketInActions = 0;
   for (const c of pool) {
-    if (actions.length >= Math.max(C.ranking.maxActions, pinned.length)) break;
+    if (actions.length >= Math.max(maxActions, pinned.length)) break;
     if (c.section === "market") {
       if (marketInActions >= 1) continue;
       marketInActions++;
     }
     actions.push(c);
   }
-  // D1 rows are all kept (one per channel), but never more than the contract's 3 slots.
-  const shownActions = actions.slice(0, C.ranking.maxActions);
+  // D1 rows are all kept (one per channel), but never more than the contract's slots.
+  const shownActions = actions.slice(0, maxActions);
   const taken = new Set(shownActions.map((c) => c.fingerprint));
 
   const win = scored.filter((c) => c.section === "win").sort(byScore)[0] ?? null;

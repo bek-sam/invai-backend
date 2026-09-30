@@ -7,7 +7,7 @@ import {
   type MarketRecommendation,
 } from "@invai/contracts";
 import { nicheLabel } from "../market/niches";
-import type { Lang } from "./facts";
+import { formatValue, type Lang } from "./facts";
 
 /*
  * Email rendering (spec step 11, AC13, PM P1). Every line is a template key from the table below
@@ -63,6 +63,11 @@ export const TEMPLATES = {
   "section.win": { en: "Win of the week", es: "El logro de la semana" },
   "D1 action": { en: "Reconnect {{channel}}", es: "Vuelve a conectar {{channel}}" },
   "D2 action": { en: "See what changed", es: "Ver qué cambió" },
+  /** new (T-A9, AC-E1f): D2 names the profit bridge's top mover. */
+  "D2 action.mover": {
+    en: "See what changed: {{mover}} moved your profit the most",
+    es: "Ver qué cambió: {{mover}} fue lo que más movió tu ganancia",
+  },
   "D3 action": { en: "Review {{costLine}} costs", es: "Revisa los costos de {{costLine}}" },
   "D4 action": { en: "Review ads on {{channel}}", es: "Revisa los anuncios en {{channel}}" },
   "D4 note": {
@@ -77,6 +82,28 @@ export const TEMPLATES = {
   "D6 action.ship": { en: "Ship {{n}} overdue orders", es: "Envía {{n}} pedidos atrasados" },
   "D6 action.reprints": { en: "See reprints", es: "Ver reimpresiones" },
   "D7 action": { en: "Reorder {{blank}}", es: "Vuelve a pedir {{blank}}" },
+  /** new (T-A9, spec business-analytics-v2 Track E): D9..D13. */
+  "D9 action": {
+    en: "Review shipping prices on {{channel}}",
+    es: "Revisa los precios de envío en {{channel}}",
+  },
+  "D10 action": { en: "Review your losing orders", es: "Revisa tus pedidos con pérdida" },
+  "D11 action.dead": {
+    en: "Review stock that isn't selling: {{style}} {{color}}",
+    es: "Revisa el inventario que no se vende: {{style}} {{color}}",
+  },
+  "D11 action.gap": {
+    en: "Restock {{style}} {{color}} in size {{size}}",
+    es: "Vuelve a surtir {{style}} {{color}} en talla {{size}}",
+  },
+  "D12 action": {
+    en: "Review blank cost: {{style}} from {{supplier}} is up {{pct}}",
+    es: "Revisa el costo de prendas: {{style}} de {{supplier}} subió {{pct}}",
+  },
+  "D13 action": {
+    en: "Sales are below break-even: see what it takes",
+    es: "Las ventas están por debajo del punto de equilibrio: mira qué se necesita",
+  },
   /** new: D8 wins. */
   "D8 win.bestNet": {
     en: "Your best net week in {{n}} weeks: {{net}}",
@@ -241,8 +268,10 @@ export function actionPart(i: RenderInsight, lang: Lang): Part {
   switch (k) {
     case "reconnect_channel":
       return { key: "D1 action", vars: { channel: channelName(p.channel) } };
-    case "see_what_changed":
-      return { key: "D2 action", vars: {} };
+    case "see_what_changed": {
+      const mover = factOf(i, "d2.topMover")?.formatted[lang] ?? p.designName;
+      return mover ? { key: "D2 action.mover", vars: { mover } } : { key: "D2 action", vars: {} };
+    }
     case "review_costs": {
       const key = `costLine.${p.costLine}` as TemplateKey;
       return {
@@ -268,6 +297,28 @@ export function actionPart(i: RenderInsight, lang: Lang): Part {
       return { key: "D6 action.reprints", vars: {} };
     case "reorder_blank":
       return { key: "D7 action", vars: { blank: p.blankName ?? "" } };
+    case "review_shipping_prices":
+      return { key: "D9 action", vars: { channel: channelName(p.channel) } };
+    case "review_losing_orders":
+      return { key: "D10 action", vars: {} };
+    case "review_dead_stock":
+      return { key: "D11 action.dead", vars: { style: p.style ?? "", color: p.color ?? "" } };
+    case "restock_size_gap":
+      return {
+        key: "D11 action.gap",
+        vars: { style: p.style ?? "", color: p.color ?? "", size: p.size ?? "" },
+      };
+    case "review_blank_cost":
+      return {
+        key: "D12 action",
+        vars: {
+          style: p.style ?? "",
+          supplier: p.supplierName ?? "",
+          pct: p.points === undefined ? "" : formatValue("pct", p.points, lang),
+        },
+      };
+    case "see_break_even":
+      return { key: "D13 action", vars: {} };
     case "market":
       return marketPart(i, lang);
     default: {

@@ -44,6 +44,11 @@ export const DIGEST_DETECTOR_KEYS = [
   "D7",
   "D8",
   "market",
+  "D9",
+  "D10",
+  "D11",
+  "D12",
+  "D13",
 ] as const;
 /** Where an insight is shown: one of the ≤ 3 actions, the one win, or the Market watch block. */
 export const DIGEST_SECTIONS = ["action", "win", "market"] as const;
@@ -270,5 +275,89 @@ export const digestDeliveries = pgTable(
       foreignColumns: [digests.companyId, digests.id],
     }).onDelete("cascade"),
     tenantPolicy("digest_deliveries"),
+  ],
+).enableRLS();
+
+/*
+ * Today's action panel (wave A2, T-A9; architect ruling 2 in `waves/A2/reviews/plan-architect.md`).
+ * A daily set per shop, built by a job from the digest's snapshot, detectors and ranking over the
+ * 7 days ending yesterday (shop time); the read is a plain SELECT. `today_action_sets` marks a
+ * built day, so a healthy day with no actions still reads as built (`steady`). Children reference
+ * their parent by `(company_id, ...)` (S-26). Retention: 90 days (modules/today/jobs.ts purge).
+ * No buyer PII: params are channel, design, blank, supplier names and numbers.
+ */
+
+/** One built day per shop. `(company_id, date)` is the idempotency key of the build job. */
+export const todayActionSets = pgTable(
+  "today_action_sets",
+  {
+    id: id(),
+    companyId: companyId(),
+    /** The shop-local day the set is for; the window is `date - 7` .. `date - 1`. */
+    date: date({ mode: "string" }).notNull(),
+    windowStart: date({ mode: "string" }).notNull(),
+    windowEnd: date({ mode: "string" }).notNull(),
+    generatedAt: timestamp({ withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    unique("today_action_sets_company_id_id_unique").on(t.companyId, t.id),
+    uniqueIndex().on(t.companyId, t.date),
+    tenantPolicy("today_action_sets"),
+  ],
+).enableRLS();
+
+/** A ranked action (at most 5 per set). `key` is the candidate's fingerprint, unique per day. */
+export const todayActions = pgTable(
+  "today_actions",
+  {
+    id: id(),
+    companyId: companyId(),
+    setId: uuid().notNull(),
+    date: date({ mode: "string" }).notNull(),
+    key: text().notNull(),
+    rank: integer().notNull(),
+    detector: text(enumText(DIGEST_DETECTOR_KEYS)).notNull(),
+    kind: text().notNull(),
+    /** Contract `DigestActionParams`. */
+    params: jsonb().$type<Record<string, unknown>>().notNull().default({}),
+    href: text().notNull(),
+    impactCents: integer(),
+    generatedAt: timestamp({ withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    unique("today_actions_company_id_id_unique").on(t.companyId, t.id),
+    uniqueIndex().on(t.companyId, t.date, t.key),
+    index().on(t.companyId, t.setId),
+    foreignKey({
+      name: "today_actions_set_fk",
+      columns: [t.companyId, t.setId],
+      foreignColumns: [todayActionSets.companyId, todayActionSets.id],
+    }).onDelete("cascade"),
+    tenantPolicy("today_actions"),
+  ],
+).enableRLS();
+
+/** First click per (action, person), like `digest_clicks`. */
+export const todayActionClicks = pgTable(
+  "today_action_clicks",
+  {
+    id: id(),
+    companyId: companyId(),
+    actionId: uuid().notNull(),
+    date: date({ mode: "string" }).notNull(),
+    key: text().notNull(),
+    userId: uuid()
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    clickedAt: timestamp({ withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex().on(t.companyId, t.actionId, t.userId),
+    foreignKey({
+      name: "today_action_clicks_action_fk",
+      columns: [t.companyId, t.actionId],
+      foreignColumns: [todayActions.companyId, todayActions.id],
+    }).onDelete("cascade"),
+    tenantPolicy("today_action_clicks"),
   ],
 ).enableRLS();
