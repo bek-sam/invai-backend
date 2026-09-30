@@ -1134,8 +1134,14 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
     const HIST_SPAN_DAYS = 549; // ~18 months
     const histEnd = new Date(now - HIST_END_DAYS * DAY);
     const histStart = new Date(histEnd.getTime() - HIST_SPAN_DAYS * DAY);
-    // The most recent full Nov 1 - Dec 31 inside [histStart, histEnd]: the Q4 peak (AC-Seed1).
-    const q4Year = histEnd.getUTCFullYear() - (histEnd.getUTCMonth() >= 10 ? 0 : 1);
+    // The most recent full Nov 1 - Dec 31 (UTC) whose Dec 31 falls on or before histEnd: the Q4
+    // peak (AC-Seed1). Picking by histEnd's own month (as before) chose an *in-progress* Q4
+    // whenever the seed happened to run in Nov/Dec, boosting only the few days up to histEnd
+    // instead of a full quarter (review r1 finding 2).
+    const q4Year =
+      histEnd.getTime() >= Date.UTC(histEnd.getUTCFullYear(), 11, 31, 23, 59, 59)
+        ? histEnd.getUTCFullYear()
+        : histEnd.getUTCFullYear() - 1;
     const q4Start = new Date(Date.UTC(q4Year, 10, 1));
     const q4End = new Date(Date.UTC(q4Year, 11, 31, 23, 59, 59));
 
@@ -1147,9 +1153,24 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
       buyerKey: number | null;
     };
     const histPlans: HistPlan[] = [];
+    // T-A1 r2 (review r1 finding 1): daily volume ramps gently from ~6/day at the start of the 18
+    // months up to ~11/day by histEnd, so closed history meets the live window's own rate
+    // (FULL_VOLUME.historicalOrders=300 + dueSoonOrders=60 spread over the last ~30 days, ~12/day)
+    // instead of stopping dead at ~1.5/day. The old flat rate left a volume cliff where the ~700
+    // orders/month of live-flow data met ~45 orders/month of history, so basePeriod period-over-
+    // period comparisons (contracts analytics.ts) showed ~+700% for every channel and design.
+    // Q4 multiplies the ramped *local* rate, so the peak stays >=1.5x its own trailing average
+    // wherever in the ramp it lands, not just against the flat pre-fix average.
+    const RAMP_START_RATE = 6;
+    const RAMP_END_RATE = 11;
+    const Q4_MULTIPLIER = 1.75;
+    const histSpanMs = histEnd.getTime() - histStart.getTime();
     for (let t = histStart.getTime(); t < histEnd.getTime(); t += DAY) {
+      const frac = (t - histStart.getTime()) / histSpanMs;
+      const baseRate = RAMP_START_RATE + (RAMP_END_RATE - RAMP_START_RATE) * frac;
       const inQ4 = t >= q4Start.getTime() && t <= q4End.getTime();
-      const count = inQ4 ? random.int(3, 4) : random.int(1, 2);
+      const rate = inQ4 ? baseRate * Q4_MULTIPLIER : baseRate;
+      const count = Math.max(1, Math.round(rate) + random.int(-2, 2));
       for (let k = 0; k < count; k++) {
         histPlans.push({
           placedAt: new Date(t + random.int(0, 23) * HOUR + random.int(0, 59) * 60_000),
@@ -1163,14 +1184,19 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
     histPlans.sort((a, b) => a.placedAt.getTime() - b.placedAt.getTime());
 
     // Late-shipment drivers (AC-Seed1: >=2 of {personalized, rush, blocked_over_24h} clear the
-    // 30-shipped-order minimum sample). Every 4th eligible (non-cancelled) order in date order,
-    // so all three are spread across the whole 18 months rather than clustered.
-    const targets = { personalized: 50, rush: 50, blocked: 50 };
-    let eligible = 0;
-    for (const p of histPlans) {
-      if (p.cancelled) continue;
-      const bucket = eligible % 4;
-      eligible++;
+    // 30-shipped-order minimum sample). A stride over the *whole* eligible (non-cancelled) pool,
+    // not a fixed "every 4th" from the front: with the ramp above growing the pool ~5x, "every
+    // 4th" would exhaust all 150 target assignments in the pool's first ~4% (roughly its first
+    // month) instead of spreading them across the 18 months as intended.
+    const DRIVER_TARGET = 50;
+    const targets = { personalized: DRIVER_TARGET, rush: DRIVER_TARGET, blocked: DRIVER_TARGET };
+    const eligiblePlans = histPlans.filter((p) => !p.cancelled);
+    const driverStride = Math.max(1, Math.floor(eligiblePlans.length / (DRIVER_TARGET * 4)));
+    let driverCursor = 0;
+    for (let i = 0; i < eligiblePlans.length; i += driverStride) {
+      const p = eligiblePlans[i] as HistPlan;
+      const bucket = driverCursor % 4;
+      driverCursor++;
       if (bucket === 0 && targets.personalized > 0) {
         p.driver = "personalized";
         targets.personalized--;
