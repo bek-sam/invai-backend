@@ -930,6 +930,11 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
         });
 
         const itemIds: string[] = [];
+        // B-243: `plan.qcFail` is an order-level roll, but a QC fail hits one physical unit, not
+        // every unit on the order. Gate it at order scope so only the first eligible item in this
+        // order gets the reprint detour; siblings press straight through (AC1/AC2: partial
+        // reprints, not every item on the order).
+        let orderQcFailApplied = false;
         let lineNo = 0;
         for (const line of lines) {
           lineNo++;
@@ -1046,9 +1051,10 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
                       ? "pick"
                       : null;
               const a = next === "pressed" ? pressActor : next === "packed" ? packActor : actor;
-              if (next === "packed" && plan.qcFail && !qcFailed) {
+              if (next === "packed" && plan.qcFail && !orderQcFailApplied) {
                 // QC fail: pressed -> ready (reprint), then back through the sheet.
                 qcFailed = true;
+                orderQcFailApplied = true;
                 await transitionItem(tx, item.id, "ready", {
                   actor: pressActor,
                   stationKind: "qc",
@@ -1536,7 +1542,31 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
       if (scanRows.length) await tx.insert(scans).values(scanRows);
 
       // ---- reprints (AC-Seed1: >=3 reasons across >=2 stations and >=2 vendors) ----
-      const reprintCandidates = candidates.slice(0, 40);
+      // B-243: pick one item per multi-item order (never every item on the order), so each
+      // forced historical reprint leaves at least one sibling item on that order unreprinted
+      // (AC2: partial reprints, not full-order reprints). The target count (160, tuned against
+      // this seed's ~6,000 pressed-or-later items) plus the live-flow qcFail reprints lands
+      // the overall reprint share in AC1's 2-4%-of-pressed-items band (real QC failures hit
+      // ~3% of pressed items per the reprint-cost research).
+      const HISTORICAL_REPRINT_TARGET = 160;
+      const multiItemOrders = await tx
+        .select({
+          itemId: sql<string>`min(${orderItems.id}::text)`,
+          itemCount: sql<number>`count(*)`,
+        })
+        .from(orderItems)
+        .innerJoin(orders, eq(orders.id, orderItems.orderId))
+        .where(
+          and(
+            eq(orderItems.companyId, shopId),
+            sql`${orders.placedAt} < ${histEnd}`,
+            inArray(orderItems.state, ["pressed", "packed", "shipped", "delivered"]),
+          ),
+        )
+        .groupBy(orderItems.orderId)
+        .having(sql`count(*) >= 2`)
+        .limit(HISTORICAL_REPRINT_TARGET);
+      const reprintCandidates = multiItemOrders.map((r) => ({ id: r.itemId }));
       if (reprintCandidates.length) {
         const [batch1] = await tx
           .insert(gangSheetBatches)
