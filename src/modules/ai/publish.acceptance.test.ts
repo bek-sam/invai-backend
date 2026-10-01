@@ -136,12 +136,18 @@ describe("T-20-3 publishDraft is repeatable", () => {
     expect(ok.length).toBeGreaterThanOrEqual(1);
     for (const r of results)
       if (r.status === "rejected") expect((r.reason as { code?: string }).code).toBe("CONFLICT");
-    const urls = new Set(
+    // B-229: compare the object key, not the full presigned URL — two concurrent calls sign the
+    // same key independently, and the signature's timestamp (query string) can legitimately differ
+    // across a second boundary even though both point at the same S3 object.
+    const keys = new Set(
       ok.map(
-        (r) => (r as PromiseFulfilledResult<{ publishedUrl: string | null }>).value.publishedUrl,
+        (r) =>
+          (r as PromiseFulfilledResult<{ publishedUrl: string | null }>).value.publishedUrl?.split(
+            "?",
+          )[0],
       ),
     );
-    expect(urls.size).toBe(1);
+    expect(keys.size).toBe(1);
     const objects = await listObjects(`${companyId}/listing-export/`);
     expect(objects.filter((o) => o.key.includes(draft.id))).toHaveLength(1);
     expect((await draftRow(draft.id)).status).toBe("approved");

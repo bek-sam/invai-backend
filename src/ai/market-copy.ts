@@ -49,6 +49,8 @@ export const MARKET_COPY = {
   },
   volumeUnknown: { en: "volume effect unknown", es: "efecto en el volumen desconocido" },
   estimate: { en: "Estimate", es: "Estimación" },
+  /** B-192: a peak month already under way never shows an act-by date, which would read as past. */
+  seasonUnderWay: { en: "The season is on now.", es: "La temporada ya está en curso." },
 } satisfies Record<string, Copy>;
 
 export const BAND_COPY: Record<"high" | "medium" | "low", Copy> = {

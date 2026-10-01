@@ -148,7 +148,7 @@ export function assistantTools(ctx: TenantContext): AssistantTool[] {
         const answer =
           tot.revenue === 0
             ? `${who} had no profit data for ${when}.`
-            : `**${who}, ${when}: ${pct(tot.marginPct)} margin.** Revenue ${usd(tot.revenue)}, net profit ${usd(tot.net)} after channel fees ${usd(tot.channelFees)}, blanks ${usd(tot.blankCost)}, transfers ${usd(tot.transferCost)}, labels ${usd(tot.labelCost)}, ads ${usd(tot.adsCost)} and labor ${usd(tot.laborCost)}.${
+            : `${who}, ${when}: ${pct(tot.marginPct)} margin. Revenue ${usd(tot.revenue)}, net profit ${usd(tot.net)} after channel fees ${usd(tot.channelFees)}, blanks ${usd(tot.blankCost)}, transfers ${usd(tot.transferCost)}, labels ${usd(tot.labelCost)}, ads ${usd(tot.adsCost)} and labor ${usd(tot.laborCost)}.${
                 !i.channel && top.length > 1 ? `\n\nBy ${i.dimension}: ${top.join("; ")}.` : ""
               }${s.incomplete ? " Some orders are still missing cost data, so treat this as an estimate." : ""}`;
         return {
@@ -215,7 +215,7 @@ export function assistantTools(ctx: TenantContext): AssistantTool[] {
           return {
             data: { total, byStatus, byChannel, open: now },
             summary: `${total} orders ${when}; ${now?.overdue ?? 0} overdue, ${now?.dueToday ?? 0} due today`,
-            answer: `**${total} orders** were placed ${when}${channels ? ` (${channels})` : ""}. Right now ${now?.overdue ?? 0} open orders are overdue, ${now?.dueToday ?? 0} are due today and ${now?.atRisk ?? 0} must ship within 24 hours.`,
+            answer: `${total} orders were placed ${when}${channels ? ` (${channels})` : ""}. Right now ${now?.overdue ?? 0} open orders are overdue, ${now?.dueToday ?? 0} are due today and ${now?.atRisk ?? 0} must ship within 24 hours.`,
           };
         }),
     ),
@@ -253,7 +253,7 @@ export function assistantTools(ctx: TenantContext): AssistantTool[] {
         return {
           data: { lowStockCount: res.lowStockCount, items },
           summary: `${res.lowStockCount} variants below reorder point`,
-          answer: `**${res.lowStockCount} blank variants are below their reorder point.**${worst ? ` Lowest cover: ${worst}.` : ""} The reorder suggestions page groups these per supplier up to the free-freight line.`,
+          answer: `${res.lowStockCount} blank variants are below their reorder point.${worst ? ` Lowest cover: ${worst}.` : ""} The reorder suggestions page groups these per supplier up to the free-freight line.`,
         };
       },
     ),
@@ -290,7 +290,7 @@ export function assistantTools(ctx: TenantContext): AssistantTool[] {
             data: { designs: rows },
             summary: `Top ${rows.length} designs ${when}`,
             answer: rows.length
-              ? `**Top designs ${when}:** ${rows.map((r, n) => `${n + 1}. ${r.name} — ${r.units} units, ${usd(r.revenue)}`).join("; ")}.`
+              ? `Top designs ${when}: ${rows.map((r, n) => `${n + 1}. ${r.name} — ${r.units} units, ${usd(r.revenue)}`).join("; ")}.`
               : `No design sales ${when}.`,
           };
         }),
@@ -312,7 +312,7 @@ export function assistantTools(ctx: TenantContext): AssistantTool[] {
         return {
           data: { rows: s.rows, totals: s.totals },
           summary: `${s.rows.length} channels ${when}`,
-          answer: `**Channels ${when}:** ${s.rows
+          answer: `Channels ${when}: ${s.rows
             .map((r) => `${label(r.key)} ${usd(r.revenue)} revenue, ${pct(r.marginPct)} margin`)
             .join("; ")}.`,
         };
@@ -358,7 +358,7 @@ export function assistantTools(ctx: TenantContext): AssistantTool[] {
           return {
             data: { items, sheets },
             summary: `${n("ready")} ready, ${n("on_sheet")} on sheets, ${n("transfer_in")} to press`,
-            answer: `**Floor right now:** ${n("ready")} items ready for a sheet, ${n("on_sheet")} on sheets at the vendor, ${n("transfer_in")} transfers in hand waiting to press, ${n("pressed")} pressed awaiting QC and ${n("packed")} packed. ${n("needs_mapping") + n("needs_artwork")} items are blocked on mapping or artwork. Sheets: ${sh("sent") + sh("acknowledged")} waiting on the vendor, ${sh("printed") + sh("shipped")} printed or in transit.`,
+            answer: `Floor right now: ${n("ready")} items ready for a sheet, ${n("on_sheet")} on sheets at the vendor, ${n("transfer_in")} transfers in hand waiting to press, ${n("pressed")} pressed awaiting QC and ${n("packed")} packed. ${n("needs_mapping") + n("needs_artwork")} items are blocked on mapping or artwork. Sheets: ${sh("sent") + sh("acknowledged")} waiting on the vendor, ${sh("printed") + sh("shipped")} printed or in transit.`,
           };
         }),
     ),
@@ -386,7 +386,7 @@ export function assistantTools(ctx: TenantContext): AssistantTool[] {
           answer:
             current.revenue === 0 && previous.revenue === 0
               ? `${who} had no sales in either period (${when}).`
-              : `**${who}, ${when}: revenue ${usd(current.revenue)} vs ${usd(previous.revenue)} (${signedPct(change.revenue.pct)}).** Net profit ${usd(current.net)} vs ${usd(previous.net)} (${signedUsd(change.net.abs)}), margin ${pct(current.margin)} vs ${pct(previous.margin)}. Orders ${current.orders} vs ${previous.orders}, average order ${current.avgOrderValue == null ? "n/a" : usd(current.avgOrderValue)} vs ${previous.avgOrderValue == null ? "n/a" : usd(previous.avgOrderValue)}, ads ${usd(current.adsCost)} vs ${usd(previous.adsCost)}.${driver}${incomplete ? " Some orders are still missing cost data, so treat net as an estimate." : ""}`,
+              : `${who}, ${when}: revenue ${usd(current.revenue)} vs ${usd(previous.revenue)} (${signedPct(change.revenue.pct)}). Net profit ${usd(current.net)} vs ${usd(previous.net)} (${signedUsd(change.net.abs)}), margin ${pct(current.margin)} vs ${pct(previous.margin)}. Orders ${current.orders} vs ${previous.orders}, average order ${current.avgOrderValue == null ? "n/a" : usd(current.avgOrderValue)} vs ${previous.avgOrderValue == null ? "n/a" : usd(previous.avgOrderValue)}, ads ${usd(current.adsCost)} vs ${usd(previous.adsCost)}.${driver}${incomplete ? " Some orders are still missing cost data, so treat net as an estimate." : ""}`,
         };
       },
     ),
@@ -406,7 +406,7 @@ export function assistantTools(ctx: TenantContext): AssistantTool[] {
             data: d,
             summary: `${campaigns.length} campaigns ${when}: ${usd(totalSpend)} spend`,
             answer: campaigns.length
-              ? `**Ad spend ${when}: ${usd(totalSpend)}.** ${campaigns
+              ? `Ad spend ${when}: ${usd(totalSpend)}. ${campaigns
                   .slice(0, 5)
                   .map(
                     (c) =>
@@ -432,7 +432,7 @@ export function assistantTools(ctx: TenantContext): AssistantTool[] {
           answer:
             totalSpend === 0
               ? `No ad spend was recorded ${when}.`
-              : `**Ads ${when}: ${usd(totalSpend)} spend, ROAS ${roasText(totals.roas)}, TACoS ${pct(totals.tacos)}.** ${channels
+              : `Ads ${when}: ${usd(totalSpend)} spend, ROAS ${roasText(totals.roas)}, TACoS ${pct(totals.tacos)}. ${channels
                   .filter((c) => c.spend > 0)
                   .map(
                     (c) =>
@@ -471,7 +471,7 @@ export function assistantTools(ctx: TenantContext): AssistantTool[] {
           data,
           summary: `Designs ${when}: ${rising.length} rising, ${falling.length} falling, ${lowMargin.length} low margin, ${crossListingGaps.length} cross-listing gaps`,
           answer: designsSold
-            ? `**Designs ${when} vs the period before.** Rising: ${list(rising, (r) => `${r.name} ${r.previousUnits} → ${r.units} units`)}. Falling: ${list(falling, (r) => `${r.name} ${r.previousUnits} → ${r.units} units`)}. Low margin (under 15%): ${list(lowMargin, (r) => `${r.name} ${pct(r.margin)} on ${r.units} units`)}. Top net profit: ${list(topNet, (r) => `${r.name} ${usd(r.net)}`)}. Cross-listing gaps: ${list(crossListingGaps, (g) => `${g.name} sells on ${label(g.soldOn[0]?.channel ?? "")} (${g.soldOn[0]?.units} units) but has no active listing on ${g.missingOn.map(label).join(", ")}`)}.${note}`
+            ? `Designs ${when} vs the period before. Rising: ${list(rising, (r) => `${r.name} ${r.previousUnits} → ${r.units} units`)}. Falling: ${list(falling, (r) => `${r.name} ${r.previousUnits} → ${r.units} units`)}. Low margin (under 15%): ${list(lowMargin, (r) => `${r.name} ${pct(r.margin)} on ${r.units} units`)}. Top net profit: ${list(topNet, (r) => `${r.name} ${usd(r.net)}`)}. Cross-listing gaps: ${list(crossListingGaps, (g) => `${g.name} sells on ${label(g.soldOn[0]?.channel ?? "")} (${g.soldOn[0]?.units} units) but has no active listing on ${g.missingOn.map(label).join(", ")}`)}.${note}`
             : `No design sales ${when}.${note}`,
         };
       },
@@ -492,7 +492,7 @@ export function assistantTools(ctx: TenantContext): AssistantTool[] {
         return {
           data: d,
           summary: `${who} ${when}: ${pct(totals.onTimeRate)} on time, ${totals.overdueOpenNow} overdue now, ${totals.reprints} reprints`,
-          answer: `**${who}, ${when}: ${pct(totals.onTimeRate)} shipped on time** (${totals.onTime} of ${totals.shipped}, ${totals.late} late), median ${hrs(totals.medianHoursToShip)} from order to ship. ${totals.overdueOpenNow} open orders are overdue right now.${
+          answer: `${who}, ${when}: ${pct(totals.onTimeRate)} shipped on time (${totals.onTime} of ${totals.shipped}, ${totals.late} late), median ${hrs(totals.medianHoursToShip)} from order to ship. ${totals.overdueOpenNow} open orders are overdue right now.${
             channels.length > 1
               ? ` By channel: ${channels.map((c) => `${label(c.channel)} ${pct(c.onTimeRate)} on time, ${c.overdueOpenNow} overdue`).join("; ")}.`
               : ""
@@ -930,10 +930,10 @@ function marketTools(ctx: TenantContext): AssistantTool[] {
           });
           const line = (r: (typeof rows)[number]) => {
             if (r.trend === "insufficient")
-              return `**${r.label}**: ${MARKET_COPY.notEnough[lang]} (${INSUFFICIENT[r.insufficientReason ?? "no_source"]?.[lang] ?? ""}).`;
+              return `${r.label}: ${MARKET_COPY.notEnough[lang]} (${INSUFFICIENT[r.insufficientReason ?? "no_source"]?.[lang] ?? ""}).`;
             const g = signedRatio(r.growth4w);
             const y = signedRatio(r.yoy);
-            const head = `**${r.label}**: ${TREND_WORD[r.trend]?.[lang]}${g ? `, ${g} ${lang === "es" ? "en 4 semanas" : "over 4 weeks"}` : ""}${y ? `, ${y} ${lang === "es" ? "contra el año pasado" : "year over year"}` : ""} (${BAND_COPY[r.band][lang]}).`;
+            const head = `${r.label}: ${TREND_WORD[r.trend]?.[lang]}${g ? `, ${g} ${lang === "es" ? "en 4 semanas" : "over 4 weeks"}` : ""}${y ? `, ${y} ${lang === "es" ? "contra el año pasado" : "year over year"}` : ""} (${BAND_COPY[r.band][lang]}).`;
             const readings = r.readings
               .map(
                 (x) =>
@@ -1006,7 +1006,7 @@ function marketTools(ctx: TenantContext): AssistantTool[] {
           const months = (ms: number[]) => ms.map((m) => monthName(m, lang)).join(", ");
           const line = (r: (typeof rows)[number]) => {
             if (!r.indexSource || !r.index.length)
-              return `**${r.label}**: ${MARKET_COPY.notEnough[lang]}.`;
+              return `${r.label}: ${MARKET_COPY.notEnough[lang]}.`;
             const from =
               r.indexSource === "census_prior"
                 ? MARKET_COPY.seasonCensus[lang]
@@ -1026,11 +1026,16 @@ function marketTools(ctx: TenantContext): AssistantTool[] {
             const off = r.offMonths.length
               ? `; ${lang === "es" ? "meses bajos" : "off months"}: ${months(r.offMonths)}`
               : "";
-            const act = r.actBy
-              ? ` ${lang === "es" ? "Actúa antes del" : "Act by"} ${r.actBy.date}: ${weeks(Math.round(r.actBy.weeksToPeak), lang)} ${lang === "es" ? "al pico, tu tiempo de producción es de" : "to the peak, your lead time is"} ${weeks(Math.round(r.actBy.leadTimeWeeks), lang)}.${r.actBy.actNow ? (lang === "es" ? " Hazlo ya." : " Act now.") : ""}`
-              : "";
+            // B-192: `weeksToPeak` is clamped to 0 only when the peak month has already begun
+            // (signals.ts `actBy()`); the computed act-by date is then before today, so show
+            // "the season is on now" instead of a stale past date (R1 does the same, rules.ts).
+            const act = !r.actBy
+              ? ""
+              : r.actBy.weeksToPeak === 0
+                ? ` ${MARKET_COPY.seasonUnderWay[lang]}`
+                : ` ${lang === "es" ? "Actúa antes del" : "Act by"} ${r.actBy.date}: ${weeks(Math.round(r.actBy.weeksToPeak), lang)} ${lang === "es" ? "al pico, tu tiempo de producción es de" : "to the peak, your lead time is"} ${weeks(Math.round(r.actBy.leadTimeWeeks), lang)}.${r.actBy.actNow ? (lang === "es" ? " Hazlo ya." : " Act now.") : ""}`;
             return [
-              `**${r.label}**: ${peak}${off} (${from}; ${src}; ${BAND_COPY[r.band][lang]}).${act}`,
+              `${r.label}: ${peak}${off} (${from}; ${src}; ${BAND_COPY[r.band][lang]}).${act}`,
               r.stale ? MARKET_COPY.staleNote[lang] : "",
             ]
               .filter(Boolean)
@@ -1085,7 +1090,7 @@ function marketTools(ctx: TenantContext): AssistantTool[] {
               {
                 data: { ...base, reason: p.reason },
                 summary: `${d.name} on ${ch}: no price position (${p.reason.replace(/_/g, " ")})`,
-                answer: `**${d.name}, ${ch}**: ${fill(UNAVAILABLE[p.reason]?.[lang] ?? "", { channel: ch })}${src ? ` ${src}.` : ""}`,
+                answer: `${d.name}, ${ch}: ${fill(UNAVAILABLE[p.reason]?.[lang] ?? "", { channel: ch })}${src ? ` ${src}.` : ""}`,
               },
               [base],
               recs,
@@ -1111,8 +1116,8 @@ function marketTools(ctx: TenantContext): AssistantTool[] {
               summary: `${d.name} on ${ch}: ${p.priceBand} price band, ${p.n} comparables`,
               answer:
                 lang === "es"
-                  ? `**${d.name}, ${ch}**: tu precio ${p.currentPriceCents != null ? money(p.currentPriceCents) : ""} está en el percentil ${Math.round(p.percentile * 100)} de ${p.n} publicaciones comparables (rango ${bandWord}). Q1 ${money(p.q1Cents)}, mediana ${money(p.medianCents)}, Q3 ${money(p.q3Cents)}. ${src}. ${BAND_COPY[p.band][lang]}.${p.stale ? ` ${MARKET_COPY.staleNote[lang]}` : ""}`
-                  : `**${d.name}, ${ch}**: your price ${p.currentPriceCents != null ? money(p.currentPriceCents) : ""} sits at the ${Math.round(p.percentile * 100)}th percentile of ${p.n} comparable listings (${bandWord} band). Q1 ${money(p.q1Cents)}, median ${money(p.medianCents)}, Q3 ${money(p.q3Cents)}. ${src}. ${BAND_COPY[p.band][lang]}.${p.stale ? ` ${MARKET_COPY.staleNote[lang]}` : ""}`,
+                  ? `${d.name}, ${ch}: tu precio ${p.currentPriceCents != null ? money(p.currentPriceCents) : ""} está en el percentil ${Math.round(p.percentile * 100)} de ${p.n} publicaciones comparables (rango ${bandWord}). Q1 ${money(p.q1Cents)}, mediana ${money(p.medianCents)}, Q3 ${money(p.q3Cents)}. ${src}. ${BAND_COPY[p.band][lang]}.${p.stale ? ` ${MARKET_COPY.staleNote[lang]}` : ""}`
+                  : `${d.name}, ${ch}: your price ${p.currentPriceCents != null ? money(p.currentPriceCents) : ""} sits at the ${Math.round(p.percentile * 100)}th percentile of ${p.n} comparable listings (${bandWord} band). Q1 ${money(p.q1Cents)}, median ${money(p.medianCents)}, Q3 ${money(p.q3Cents)}. ${src}. ${BAND_COPY[p.band][lang]}.${p.stale ? ` ${MARKET_COPY.staleNote[lang]}` : ""}`,
             },
             [base],
             recs,
@@ -1198,7 +1203,7 @@ function marketTools(ctx: TenantContext): AssistantTool[] {
             {
               data: { ...base, lang },
               summary: `${d.name} on ${ch}: ${rows.length} prices simulated${s.floorPriceCents != null ? `, floor ${money(s.floorPriceCents)}` : ""}`,
-              answer: `**${d.name}, ${ch}** (${lang === "es" ? "tus costos de 90 días" : "your 90-day costs"}): ${table}.${breakEven}${floor}${volume}${missing}${src ? ` ${src}.` : ""}`,
+              answer: `${d.name}, ${ch} (${lang === "es" ? "tus costos de 90 días" : "your 90-day costs"}): ${table}.${breakEven}${floor}${volume}${missing}${src ? ` ${src}.` : ""}`,
             },
             [base],
             recs,

@@ -778,6 +778,22 @@ describe("ai module", () => {
       expect(planFollowUp("And only Etsy?", [], now)).toBeNull();
     });
 
+    it("B-114: 'And only Etsy?' after an ads question re-scopes get_ad_performance, not profit/orders", async () => {
+      const first = await askAll(ctx, "Are my ads paying off?");
+      const convId = first[0]?.type === "start" ? first[0].conversationId : "";
+      const call1 = first.find((e) => e.type === "tool_call");
+      expect(call1).toMatchObject({ name: "get_ad_performance" });
+      const second = await askAll(ctx, "And only Etsy?", convId);
+      const calls2 = second.filter((e) => e.type === "tool_call");
+      expect(calls2).toEqual([
+        {
+          type: "tool_call",
+          name: "get_ad_performance",
+          input: { ...(call1?.type === "tool_call" ? call1.input : {}), channel: "etsy" },
+        },
+      ]);
+    });
+
     it("toolMemoryLine: compact, capped at 600 characters, no brackets or newlines", () => {
       expect(svc.toolMemoryLine(null)).toBeNull();
       expect(svc.toolMemoryLine({ calls: [] })).toBeNull();

@@ -5,7 +5,7 @@ import { closeQueues } from "../src/lib/queues";
 import { runAssistantEvals } from "./assistant/run";
 import { runDigestNarrative } from "./digest_narrative/run";
 import type { EvalTenant } from "./lib/fixtures";
-import { createEvalTenant } from "./lib/fixtures";
+import { createEvalTenant, deleteEvalTenant } from "./lib/fixtures";
 import { printOverall, printRoute, type RouteSummary } from "./lib/report";
 import type { RouteReport } from "./lib/types";
 import { runListingCopy } from "./listing_copy/run";
@@ -64,30 +64,38 @@ async function main() {
   const tenant = await createEvalTenant();
   console.log(`Eval tenant (companyId): ${tenant.companyId}`);
 
-  const summaries: RouteSummary[] = [];
-  let plumbingFailed = false;
-  for (const name of names) {
-    const report = await ROUTES[name]?.(tenant);
-    if (!report) continue;
-    const summary = printRoute(report);
-    summaries.push(summary);
-    if (report.mode !== "skipped" && summary.plumbingPass < summary.cases) plumbingFailed = true;
-  }
-  printOverall(summaries);
+  try {
+    const summaries: RouteSummary[] = [];
+    let plumbingFailed = false;
+    for (const name of names) {
+      const report = await ROUTES[name]?.(tenant);
+      if (!report) continue;
+      const summary = printRoute(report);
+      summaries.push(summary);
+      if (report.mode !== "skipped" && summary.plumbingPass < summary.cases) plumbingFailed = true;
+    }
+    printOverall(summaries);
 
-  if (jsonOut) {
-    writeFileSync(
-      jsonOut,
-      `${JSON.stringify({ generatedAt: new Date().toISOString(), mode: env.mocks.ai ? "mock" : "real", routes: summaries }, null, 2)}\n`,
-    );
-    console.log(`\nWrote ${jsonOut}`);
-  }
+    if (jsonOut) {
+      writeFileSync(
+        jsonOut,
+        `${JSON.stringify({ generatedAt: new Date().toISOString(), mode: env.mocks.ai ? "mock" : "real", routes: summaries }, null, 2)}\n`,
+      );
+      console.log(`\nWrote ${jsonOut}`);
+    }
 
-  if (plumbingFailed) {
-    console.error(
-      "\nOne or more routes have plumbing failures (schema/structure, not model quality) — see above.",
+    if (plumbingFailed) {
+      console.error(
+        "\nOne or more routes have plumbing failures (schema/structure, not model quality) — see above.",
+      );
+      process.exitCode = 1;
+    }
+  } finally {
+    // B-165: delete the throwaway tenant on every exit, including a route throwing, so a failed
+    // run doesn't leave eval companies behind in whatever database `env` points at.
+    await deleteEvalTenant(tenant).catch((err) =>
+      console.error(`Could not delete eval tenant ${tenant.companyId}:`, err),
     );
-    process.exitCode = 1;
   }
 }
 

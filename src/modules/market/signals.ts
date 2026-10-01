@@ -98,8 +98,8 @@ export function median(values: number[]): number {
   );
 }
 
-/** OLS of y on x = 0..n-1: slope, its standard error and t. */
-export function ols(y: number[]): { slope: number; se: number; t: number } {
+/** OLS of y on x = 0..n-1: slope, intercept (fitted value at x = 0), its standard error and t. */
+export function ols(y: number[]): { slope: number; intercept: number; se: number; t: number } {
   const n = y.length;
   const xm = (n - 1) / 2;
   const ym = y.reduce((a, b) => a + b, 0) / n;
@@ -110,6 +110,7 @@ export function ols(y: number[]): { slope: number; se: number; t: number } {
     sxx += (i - xm) ** 2;
   }
   const slope = sxx > 0 ? sxy / sxx : 0;
+  const intercept = ym - slope * xm;
   let sse = 0;
   for (let i = 0; i < n; i++) {
     const fit = ym + slope * (i - xm);
@@ -118,7 +119,7 @@ export function ols(y: number[]): { slope: number; se: number; t: number } {
   const se = n > 2 && sxx > 0 ? Math.sqrt(sse / (n - 2) / sxx) : Number.POSITIVE_INFINITY;
   // A perfect fit (se 0) is as certain as it gets; a flat perfect fit has t 0.
   const t = se === 0 ? (slope === 0 ? 0 : Math.sign(slope) * Number.POSITIVE_INFINITY) : slope / se;
-  return { slope, se, t };
+  return { slope, intercept, se, t };
 }
 
 /* ---------------------------------- trend ---------------------------------- */
@@ -202,7 +203,7 @@ export function yearOverYear(series: (number | null)[], minDenominator: number):
 export type MonthPoint = { period: string; value: number };
 
 export type SeasonalityIndex = {
-  /** Index per calendar month, 1..12 (month mean ÷ all-month mean). */
+  /** Index per calendar month, 1..12, on detrended data (spec Step 3a). */
   index: { month: number; index: number }[];
   peakMonths: number[];
   offMonths: number[];
@@ -210,31 +211,43 @@ export type SeasonalityIndex = {
 };
 
 /**
- * Seasonality index over whole years of monthly values (the latest `k × 12` months, k ≥ 2, at
- * most 5). `null` when fewer than 2 full years exist or the series is all zero.
+ * Seasonality index on **detrended** monthly data (spec Step 3a, B-131). A month mean of raw
+ * values confounds trend with season: in a genuinely rising niche, later calendar months are on
+ * average higher simply because they fall later in the trend, not because they're seasonally
+ * busier — which then makes Trend's `y / SI` deseasonalization cancel the real trend back out.
+ *
+ * Fix: fit one OLS regression of ln(y+1) on the month index over the whole series (its full
+ * available history, not a windowed slice), take the ratio of each actual point to that trend fit
+ * (ŷ_t), average the ratios by calendar month across every year present, then normalize the 12
+ * values to a mean of 1.
+ *
+ * Needs ≥ 2 full years (24 points) with ≥ 2 observed years for every calendar month (so each
+ * month's average is over at least 2 ratios); `null` otherwise, or when the series is all zero.
  */
 export function seasonalityIndex(months: MonthPoint[]): SeasonalityIndex | null {
   const c = MARKET_CONFIG.seasonality;
   const sorted = [...months].sort((a, b) => a.period.localeCompare(b.period));
-  const years = Math.min(5, Math.floor(sorted.length / 12));
-  if (years < c.minYears) return null;
-  const used = sorted.slice(sorted.length - years * 12);
+  if (sorted.length < c.minYears * 12) return null;
+  const { slope, intercept } = ols(sorted.map((p) => Math.log(p.value + 1)));
   const sums = new Array<number>(12).fill(0);
   const counts = new Array<number>(12).fill(0);
-  for (const p of used) {
+  sorted.forEach((p, i) => {
+    const fitted = Math.exp(intercept + slope * i) - 1;
+    const ratio = (p.value + 1) / (fitted + 1);
     const m = Number(p.period.slice(5, 7)) - 1;
-    sums[m] = (sums[m] ?? 0) + p.value;
+    sums[m] = (sums[m] ?? 0) + ratio;
     counts[m] = (counts[m] ?? 0) + 1;
-  }
-  const means = sums.map((s, i) => (counts[i] ? s / (counts[i] ?? 1) : 0));
-  const overall = means.reduce((a, b) => a + b, 0) / 12;
+  });
+  if (counts.some((n) => n < c.minYears)) return null;
+  const siRaw = sums.map((s, i) => s / (counts[i] ?? 1));
+  const overall = siRaw.reduce((a, b) => a + b, 0) / 12;
   if (overall <= 0) return null;
-  const index = means.map((m, i) => ({ month: i + 1, index: round4(m / overall) }));
+  const index = siRaw.map((v, i) => ({ month: i + 1, index: round4(v / overall) }));
   return {
     index,
     peakMonths: index.filter((x) => x.index >= c.peakIndex).map((x) => x.month),
     offMonths: index.filter((x) => x.index <= c.offIndex).map((x) => x.month),
-    yearsUsed: years,
+    yearsUsed: Math.floor(sorted.length / 12),
   };
 }
 

@@ -124,7 +124,7 @@ async function ask(ctx: TenantContext, message: string, conversationId?: string)
 
 /** Every number in the answer (outside the mock provider's demo-mode footer) must be in a tool output. */
 function numbersNotInTools(turn: Turn): string[] {
-  const body = turn.text.replace(/_\(Demo mode:[^)]*\)_/g, "");
+  const body = turn.text.replace(/\((?:Demo mode|Modo demo):[^)]*\)/g, "");
   const blob = turn.outputs.map((o) => o.blob).join("\n");
   const found = body.match(/\d[\d,]*(?:\.\d+)?/g) ?? [];
   const missing: string[] = [];

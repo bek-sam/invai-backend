@@ -636,8 +636,8 @@ async function* mockAssistant(
   const text = answers.length
     ? `${answers.join("\n\n")}\n\n${
         es
-          ? "_(Modo demo: respuesta armada con los datos reales de tu tienda, sin llamar al modelo.)_"
-          : "_(Demo mode: answer composed from your live shop data without a model call.)_"
+          ? "(Modo demo: respuesta armada con los datos reales de tu tienda, sin llamar al modelo.)"
+          : "(Demo mode: answer composed from your live shop data without a model call.)"
       }`
     : es
       ? "No encontré datos para esa pregunta. Pregunta por ganancias, pedidos, inventario, publicaciones o producción."

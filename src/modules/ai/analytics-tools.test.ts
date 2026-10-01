@@ -238,7 +238,7 @@ describe("assistant tools v6 (T-A8)", () => {
       const d = out.data as Data;
       expect(d.totals.cm3, channel ?? "all").toBe(api.totals.cm3);
       expect(d.totals).toEqual(api.totals);
-      const net = /\*\*[^*]*: (-?\$[\d,]+\.\d{2})\*\*/.exec(out.answer)?.[1];
+      const net = /: (-?\$[\d,]+\.\d{2}) (?:on revenue|sobre ingresos)/.exec(out.answer)?.[1];
       expect(cents(net ?? ""), channel ?? "all").toBe(api.totals.cm3);
     }
   });
@@ -264,7 +264,7 @@ describe("assistant tools v6 (T-A8)", () => {
     expect(volume).toBe(pb.volumePart);
     expect(perUnit).toBe(pb.ratePart);
     expect(volume + perUnit).toBe(total);
-    expect(r.text).toContain(`Biggest mover: **${pb.topMovers[0]?.label}**`);
+    expect(r.text).toContain(`Biggest mover: ${pb.topMovers[0]?.label}`);
   });
 
   it("AC-E3: a Spanish question gets Spanish text and labels", async () => {

@@ -1110,7 +1110,7 @@ describe("market tools (T-18-4)", () => {
     );
     const out = await run(a.ctx, "get_market_trend");
     expect(out.answer).toContain(
-      "**Spooky Pumpkin Ghost**: Not enough data (fewer than 13 weekly points).",
+      "Spooky Pumpkin Ghost: Not enough data (fewer than 13 weekly points).",
     );
     expect(out.answer).toMatch(
       /Your sales, as of 2026-09-20: rising \+20\.0%; Google Trends, as of 2026-09-20 \(Sample data\): falling -16\.0%/,
@@ -1278,10 +1278,37 @@ describe("market tools (T-18-4)", () => {
       "List Spooky Pumpkin Ghost on Amazon and stock Gildan 64000 Black M before November.",
     );
     expect(out.answer.split("\n")[0]).toBe(
-      "**Halloween**: peaks in October (All US clothing stores, not specific to your niche; US Census retail trade, as of 2026-09-20; Medium confidence: test it). Act by 2026-09-07: 6 weeks to the peak, your lead time is 4 weeks. Act now.",
+      "Halloween: peaks in October (All US clothing stores, not specific to your niche; US Census retail trade, as of 2026-09-20; Medium confidence: test it). Act by 2026-09-07: 6 weeks to the peak, your lead time is 4 weeks. Act now.",
     );
     const unknown = await run(a.ctx, "get_seasonality", { niche: "Sunset Palms" });
     expect((unknown.data as { reason: string }).reason).toBe("unknown_niche");
+  });
+
+  it("B-192: a peak already under way never prints a past act-by date, in en or es", async () => {
+    m.getSeasonalitySignal.mockImplementation(async (_tx, _ctx, i) => ({
+      subject: subjectOf(i),
+      confidence: 0.6,
+      band: "medium",
+      stale: false,
+      mock: false,
+      sources: [prov("census", false)],
+      asOf: AS_OF,
+      index: Array.from({ length: 12 }, (_, k) => ({ month: k + 1, index: k === 8 ? 1.6 : 0.95 })),
+      peakMonths: [9],
+      offMonths: [],
+      indexSource: "census_prior",
+      // signals.ts actBy(): weeksToPeak clamps to 0 only once the peak month has begun, which
+      // would otherwise compute an act-by date before today (B-192's bug).
+      actBy: { date: "2026-08-04", peakMonth: 9, weeksToPeak: 0, leadTimeWeeks: 4, actNow: true },
+      yearsUsed: 10,
+    }));
+    const en = await run(a.ctx, "get_seasonality", { niche: "camping" });
+    expect(en.answer).toContain(MARKET_COPY.seasonUnderWay.en);
+    expect(en.answer).not.toContain("2026-08-04");
+    expect(en.answer).not.toContain("Act by");
+    const es = await run(a.ctx, "get_seasonality", { niche: "camping", lang: "es" });
+    expect(es.answer).toContain(MARKET_COPY.seasonUnderWay.es);
+    expect(es.answer).not.toContain("2026-08-04");
   });
 
   it("niche names match singular or plural, key or label, any case", async () => {
@@ -1318,7 +1345,7 @@ describe("market tools (T-18-4)", () => {
       currentPriceCents: 2499,
     });
     expect(out.answer).toBe(
-      "**Spooky Pumpkin Ghost, Etsy**: There's no approved price source for Etsy yet.",
+      "Spooky Pumpkin Ghost, Etsy: There's no approved price source for Etsy yet.",
     );
     const es = await run(a.ctx, "get_price_position", { lang: "es" });
     expect(es.answer).toContain("Todavía no hay una fuente de precios aprobada para Etsy.");
@@ -1382,7 +1409,7 @@ describe("market tools (T-18-4)", () => {
       (out.data as { rows: { netPerUnitCents: number }[] }).rows.map((r) => r.netPerUnitCents),
     ).toEqual([239, 426]);
     expect(out.answer).toBe(
-      "**Spooky Pumpkin Ghost, Etsy** (your 90-day costs): $19.99: net $2.39 per unit, 12.0% margin; $21.99: net $4.26 per unit, 19.4% margin. Break-even: $17.45. Floor price (15.0% margin): $21.05. (volume effect unknown)",
+      "Spooky Pumpkin Ghost, Etsy (your 90-day costs): $19.99: net $2.39 per unit, 12.0% margin; $21.99: net $4.26 per unit, 19.4% margin. Break-even: $17.45. Floor price (15.0% margin): $21.05. (volume effect unknown)",
     );
   });
 

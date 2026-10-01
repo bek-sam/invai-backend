@@ -23,6 +23,7 @@ import {
   leadTimeWeeks,
   marginPctAt,
   netAt,
+  ols,
   pricePercentile,
   priceResponse,
   priceStats,
@@ -135,7 +136,40 @@ describe("seasonality index and act-by", () => {
     expect(si?.peakMonths).toEqual([9, 10]);
     expect(si?.offMonths).toContain(3);
     const oct = si?.index.find((x) => x.month === 10)?.index ?? 0;
-    expect(oct).toBeCloseTo(2 / (halloween.reduce((a, b) => a + b, 0) / 12), 3);
+    // This fixture has no true trend, so the detrended index (Step 3a) sits close to the plain
+    // month-mean ratio, but not exactly on it: fitting an OLS trend to an exactly periodic series
+    // over 3 whole periods leaves a small edge-effect slope (see the ols() boundary term), which
+    // nudges the ratio. 2.1873 is this function's own (detrended) answer, pinned as a regression
+    // value; a true-trend case is covered below (AC34, B-131 worked example).
+    expect(oct).toBeCloseTo(2.1873, 3);
+  });
+
+  it("AC34 (B-131 worked example): a rising niche with a true October factor doesn't read as seasonal everywhere, and deseasonalizing recovers its true growth", () => {
+    // Spec Step 3a worked example: a true steady 5%/month compounding trend, true 1.3× October
+    // factor, every other month's true factor 1.0 (no other real seasonality). Values as the
+    // spec's table (illustrative, rounded to whole units).
+    const y1 = [100, 105, 110, 116, 122, 128, 134, 141, 148, 202, 163, 171];
+    const y2 = [180, 189, 198, 208, 218, 229, 241, 253, 265, 363, 293, 307];
+    const points = [...y1, ...y2].map((value, i) => ({
+      period: `${2024 + Math.floor(i / 12)}-${String((i % 12) + 1).padStart(2, "0")}`,
+      value,
+    }));
+    const si = seasonalityIndex(points);
+    const at = (m: number) => si?.index.find((x) => x.month === m)?.index ?? 0;
+    // (a) SI[Oct] within 0.05 of the true 1.30; every other month within 0.05 of 1.00 — not the
+    // old raw method's SI[Oct] ≈ 1.48 with non-October months drifting up to ≈ 1.25.
+    expect(at(10)).toBeCloseTo(1.3, 1);
+    for (let m = 1; m <= 12; m++) {
+      if (m === 10) continue;
+      expect(Math.abs(at(m) - 1)).toBeLessThanOrEqual(0.05);
+    }
+    // (b) Deseasonalize the most recent 6 months (Jul–Dec Y2) by their month's SI, then fit
+    // growth the same way Trend does (OLS of ln(y+1)): the recovered per-month growth sits within
+    // 1 percentage point of the fixture's true 5%, not the old method's flat (~0%) reading.
+    const recent6 = points.slice(-6).map((p) => p.value / at(Number(p.period.slice(5, 7))));
+    const { slope } = ols(recent6.map((v) => Math.log(v + 1)));
+    const perMonthGrowth = Math.exp(slope) - 1;
+    expect(Math.abs(perMonthGrowth - 0.05)).toBeLessThanOrEqual(0.01);
   });
 
   it("weekly points roll up to monthly means by each week's Thursday", () => {

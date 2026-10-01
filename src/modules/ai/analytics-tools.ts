@@ -174,8 +174,8 @@ export function analyticsTools(ctx: TenantContext, t: Wrap): AssistantTool[] {
         else {
           parts.push(
             es
-              ? `**Margen de contribución (CM3, ganancia neta), ${who}, ${when}: ${usd(tot.cm3)}** sobre ingresos de ${usd(tot.revenue)} (${pctOf(tot.cm3Pct, i.lang)}). CM1 después de prendas, transfers y comisiones: ${usd(tot.cm1)}; CM2 después de envío, empaque, mano de obra y reembolsos: ${usd(tot.cm2)}; CM3 después de anuncios: ${usd(tot.cm3)}. ${tot.orders} pedidos, ${tot.units} unidades.`
-              : `**Contribution margin (CM3, net profit), ${who}, ${when}: ${usd(tot.cm3)}** on revenue ${usd(tot.revenue)} (${pctOf(tot.cm3Pct, i.lang)}). CM1 after blanks, transfers and channel fees: ${usd(tot.cm1)}; CM2 after labels, packaging, labor and refunds: ${usd(tot.cm2)}; CM3 after ads: ${usd(tot.cm3)}. ${tot.orders} orders, ${tot.units} units.`,
+              ? `Margen de contribución (CM3, ganancia neta), ${who}, ${when}: ${usd(tot.cm3)} sobre ingresos de ${usd(tot.revenue)} (${pctOf(tot.cm3Pct, i.lang)}). CM1 después de prendas, transfers y comisiones: ${usd(tot.cm1)}; CM2 después de envío, empaque, mano de obra y reembolsos: ${usd(tot.cm2)}; CM3 después de anuncios: ${usd(tot.cm3)}. ${tot.orders} pedidos, ${tot.units} unidades.`
+              : `Contribution margin (CM3, net profit), ${who}, ${when}: ${usd(tot.cm3)} on revenue ${usd(tot.revenue)} (${pctOf(tot.cm3Pct, i.lang)}). CM1 after blanks, transfers and channel fees: ${usd(tot.cm1)}; CM2 after labels, packaging, labor and refunds: ${usd(tot.cm2)}; CM3 after ads: ${usd(tot.cm3)}. ${tot.orders} orders, ${tot.units} units.`,
           );
           if (i.dimension !== "order" && top.length > 1)
             parts.push(es ? `Mayor CM3: ${top.join("; ")}.` : `Highest CM3: ${top.join("; ")}.`);
@@ -245,8 +245,8 @@ export function analyticsTools(ctx: TenantContext, t: Wrap): AssistantTool[] {
         else {
           lines.push(
             es
-              ? `**Puente de ganancia (margen de contribución CM3), ${when}: la ganancia neta cambió ${signed(b.totalChange)} (de ${usd(b.baseCm3)} a ${usd(b.currentCm3)}).**`
-              : `**Profit bridge (contribution margin CM3), ${when}: net profit changed ${signed(b.totalChange)} (from ${usd(b.baseCm3)} to ${usd(b.currentCm3)}).**`,
+              ? `Puente de ganancia (margen de contribución CM3), ${when}: la ganancia neta cambió ${signed(b.totalChange)} (de ${usd(b.baseCm3)} a ${usd(b.currentCm3)}).`
+              : `Profit bridge (contribution margin CM3), ${when}: net profit changed ${signed(b.totalChange)} (from ${usd(b.baseCm3)} to ${usd(b.currentCm3)}).`,
             es
               ? `- Volumen (vendiste más o menos unidades): ${signed(b.volumePart)}\n- Por unidad (cada venta dejó más o menos): ${signed(b.ratePart)}\n- Volumen + por unidad = ${signed(b.volumePart + b.ratePart)}.`
               : `- Volume (sold more or fewer units): ${signed(b.volumePart)}\n- Per unit (each sale earned more or less): ${signed(b.ratePart)}\n- Volume + per unit = ${signed(b.volumePart + b.ratePart)}.`,
@@ -255,8 +255,8 @@ export function analyticsTools(ctx: TenantContext, t: Wrap): AssistantTool[] {
           if (top)
             lines.push(
               es
-                ? `Mayor cambio: **${top.label}**, ${signed(top.change)} (volumen ${signed(top.volumePart)}, por unidad ${signed(top.ratePart)}; unidades ${top.baseUnits} → ${top.currentUnits}).`
-                : `Biggest mover: **${top.label}**, ${signed(top.change)} (volume ${signed(top.volumePart)}, per unit ${signed(top.ratePart)}; units ${top.baseUnits} → ${top.currentUnits}).`,
+                ? `Mayor cambio: ${top.label}, ${signed(top.change)} (volumen ${signed(top.volumePart)}, por unidad ${signed(top.ratePart)}; unidades ${top.baseUnits} → ${top.currentUnits}).`
+                : `Biggest mover: ${top.label}, ${signed(top.change)} (volume ${signed(top.volumePart)}, per unit ${signed(top.ratePart)}; units ${top.baseUnits} → ${top.currentUnits}).`,
             );
           if (rest.length)
             lines.push(
@@ -330,8 +330,8 @@ export function analyticsTools(ctx: TenantContext, t: Wrap): AssistantTool[] {
         const s: string[] = [];
         s.push(
           es
-            ? `**Operaciones, ${when}.** Costo de reimpresiones (reprint_cost): ${usd(rc.total)} en ${rc.reprints} reimpresiones, tasa ${pctOf(rc.ratePct, L)} de ${rc.itemsPressed} piezas planchadas.${byReason[0] ? ` Motivo principal: ${byReason[0].label}, ${usd(byReason[0].cost)}.` : ""}`
-            : `**Operations, ${when}.** Reprint cost (reprint_cost): ${usd(rc.total)} on ${rc.reprints} reprints, rate ${pctOf(rc.ratePct, L)} of ${rc.itemsPressed} items pressed.${byReason[0] ? ` Top reason: ${byReason[0].label}, ${usd(byReason[0].cost)}.` : ""}`,
+            ? `Operaciones, ${when}. Costo de reimpresiones (reprint_cost): ${usd(rc.total)} en ${rc.reprints} reimpresiones, tasa ${pctOf(rc.ratePct, L)} de ${rc.itemsPressed} piezas planchadas.${byReason[0] ? ` Motivo principal: ${byReason[0].label}, ${usd(byReason[0].cost)}.` : ""}`
+            : `Operations, ${when}. Reprint cost (reprint_cost): ${usd(rc.total)} on ${rc.reprints} reprints, rate ${pctOf(rc.ratePct, L)} of ${rc.itemsPressed} items pressed.${byReason[0] ? ` Top reason: ${byReason[0].label}, ${usd(byReason[0].cost)}.` : ""}`,
           es
             ? `Desperdicio de film (film_waste_cost): ${usd(o.filmWaste.wasteCost)} en ${o.filmWaste.sheets} hojas, uso del film ${pctOf(o.filmWaste.filmUsePct, L)}.`
             : `Film waste (film_waste_cost): ${usd(o.filmWaste.wasteCost)} on ${o.filmWaste.sheets} sheets, film use ${pctOf(o.filmWaste.filmUsePct, L)}.`,
@@ -415,8 +415,8 @@ export function analyticsTools(ctx: TenantContext, t: Wrap): AssistantTool[] {
         const out = h.stockoutExposure;
         const s: string[] = [
           es
-            ? `**Salud del inventario de prendas (blank_stock_health), últimos ${h.days} días:** ${usd(h.onHandValue)} en ${h.onHandUnits} unidades; rotación ${h.turns ?? "sin datos suficientes"}${h.turns != null ? " veces al año" : ""}.`
-            : `**Blank stock health (blank_stock_health), last ${h.days} days:** ${usd(h.onHandValue)} on hand in ${h.onHandUnits} units; turns ${h.turns ?? "not enough data"}${h.turns != null ? "x a year" : ""}.`,
+            ? `Salud del inventario de prendas (blank_stock_health), últimos ${h.days} días: ${usd(h.onHandValue)} en ${h.onHandUnits} unidades; rotación ${h.turns ?? "sin datos suficientes"}${h.turns != null ? " veces al año" : ""}.`
+            : `Blank stock health (blank_stock_health), last ${h.days} days: ${usd(h.onHandValue)} on hand in ${h.onHandUnits} units; turns ${h.turns ?? "not enough data"}${h.turns != null ? "x a year" : ""}.`,
           es
             ? `Inventario sin movimiento: ${h.deadStock.variants} variantes por ${usd(h.deadStock.value)} (${pctOf(h.deadStock.pctOfStockValue, i.lang)} del valor)${dead[0] ? `, la mayor ${dead[0].label} ${usd(dead[0].value)}` : ""}.`
             : `Dead stock: ${h.deadStock.variants} variants worth ${usd(h.deadStock.value)} (${pctOf(h.deadStock.pctOfStockValue, i.lang)} of stock value)${dead[0] ? `, largest ${dead[0].label} ${usd(dead[0].value)}` : ""}.`,
@@ -490,8 +490,8 @@ export function analyticsTools(ctx: TenantContext, t: Wrap): AssistantTool[] {
               : ` (${usd(tot.marginPerOrder)} ${es ? "por pedido" : "per order"})`;
           s.push(
             es
-              ? `**Margen de envío (shipping_margin), ${when}: ${usd(tot.margin)}${per}** en ${tot.labeledOrders} pedidos con etiqueta: cobrado ${usd(tot.charged)}, costo de etiquetas ${usd(tot.labelCost)}. ${tot.freeShippingOrders} pedidos con envío gratis.`
-              : `**Shipping margin (shipping_margin), ${when}: ${usd(tot.margin)}${per}** on ${tot.labeledOrders} labeled orders: charged ${usd(tot.charged)}, label cost ${usd(tot.labelCost)}. ${tot.freeShippingOrders} free-shipping orders.`,
+              ? `Margen de envío (shipping_margin), ${when}: ${usd(tot.margin)}${per} en ${tot.labeledOrders} pedidos con etiqueta: cobrado ${usd(tot.charged)}, costo de etiquetas ${usd(tot.labelCost)}. ${tot.freeShippingOrders} pedidos con envío gratis.`
+              : `Shipping margin (shipping_margin), ${when}: ${usd(tot.margin)}${per} on ${tot.labeledOrders} labeled orders: charged ${usd(tot.charged)}, label cost ${usd(tot.labelCost)}. ${tot.freeShippingOrders} free-shipping orders.`,
           );
           if (worst && rows.length > 1)
             s.push(

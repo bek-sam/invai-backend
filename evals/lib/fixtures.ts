@@ -1,3 +1,6 @@
+import { eq } from "drizzle-orm";
+import { withSystem } from "../../src/db/client";
+import { companies } from "../../src/db/schema";
 import { createCompany, createLocation, createUser } from "../../src/test/fixtures";
 
 /*
@@ -17,4 +20,15 @@ export async function createEvalTenant(): Promise<EvalTenant> {
   const user = await createUser(company.id, "owner");
   await createLocation(company.id);
   return { companyId: company.id, userId: user.id };
+}
+
+/**
+ * B-165: every company table's `companyId` cascades on delete (`db/schema/tenancy.ts`
+ * `companyId()`), so one delete of the `companies` row removes everything the run created (users,
+ * locations, ai_jobs, assistant conversations, …). `withSystem` because this is cross-tenant
+ * cleanup, like the seed, not a request path. The caller runs this in a `finally`, so a throwaway
+ * tenant isn't left behind on a failed or partial run (`evals/run.ts`).
+ */
+export async function deleteEvalTenant(tenant: EvalTenant): Promise<void> {
+  await withSystem((tx) => tx.delete(companies).where(eq(companies.id, tenant.companyId)));
 }
