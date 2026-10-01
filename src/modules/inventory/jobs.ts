@@ -16,6 +16,18 @@ const log = logger("inventory.jobs");
 
 export const STUCK_SUBMITTING_SWEEP_EVERY_MS = 5 * 60_000;
 
+/**
+ * `po.supplier` is the stored enum code (`ssactivewear`, `sanmar`, `other`), never a shop-facing
+ * name. `po_stuck_submitting`'s `supplierName` param must read like a supplier, not a raw code
+ * (review round 2, finding 3): a small local map, since `service.ts`'s own `SUPPLIER_NAMES` isn't
+ * exported and this card only touches the alert input object here.
+ */
+const SUPPLIER_DISPLAY_NAMES: Record<string, string> = {
+  ssactivewear: "S&S Activewear",
+  sanmar: "SanMar",
+  other: "Other",
+};
+
 /** One company's sweep for POs stuck in `submitting` past `STUCK_SUBMITTING_MS`. */
 export const stuckSubmittingPoJob = defineJob({
   queue: "reports",
@@ -38,7 +50,10 @@ export const stuckSubmittingPoJob = defineJob({
           dedupeKey: `po-stuck-submitting-${po.id}`,
           data: { poNo: po.poNo, supplier: po.supplier },
           messageCode: "po_stuck_submitting",
-          params: { poNo: po.poNo, supplierName: po.supplier },
+          params: {
+            poNo: po.poNo,
+            supplierName: SUPPLIER_DISPLAY_NAMES[po.supplier] ?? po.supplier,
+          },
         });
       }
       return { stuck: stuck.length };

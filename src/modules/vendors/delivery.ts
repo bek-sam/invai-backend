@@ -236,7 +236,10 @@ async function alertLostDelivery(
       messageEs: copy.messageEs,
     },
     messageCode: d.outcome === "unknown" ? "vendor_email_unconfirmed" : "vendor_email_failed",
-    params: { sheetName: sheet, vendorName: vendor },
+    // The English fallback message may still say "the vendor" (prose), but a translated line
+    // built from params must never show that English phrase, so the key is left out entirely
+    // when the vendor's name is unknown (review round 2, finding 3).
+    params: { sheetName: sheet, ...(info?.vendor ? { vendorName: info.vendor } : {}) },
   });
 }
 

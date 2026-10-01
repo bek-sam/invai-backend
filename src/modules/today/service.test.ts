@@ -7,7 +7,17 @@ import {
 import { and, eq } from "drizzle-orm";
 import { beforeAll, describe, expect, it } from "vitest";
 import { withSystem, withTenant } from "../../db/client";
-import { alerts, channelConnections, locations, orders, subscriptions } from "../../db/schema";
+import {
+  alerts,
+  blankVariants,
+  channelConnections,
+  gangSheetBatches,
+  gangSheets,
+  locations,
+  orders,
+  subscriptions,
+  usage,
+} from "../../db/schema";
 import {
   createCompany,
   createConnection,
@@ -16,6 +26,7 @@ import {
   createUser,
   tenantContext,
 } from "../../test/fixtures";
+import { periodOf } from "../billing/service";
 import { onOrganizationCreated } from "./org-hooks";
 import * as svc from "./service";
 
@@ -188,6 +199,89 @@ describe("today + alerts", () => {
   });
 });
 
+// R1 review round 2, blocking finding 1: the it.each round trip below feeds hand-made params
+// into raiseAlert directly, so it never runs the generateAlerts call sites themselves
+// (service.ts:399 sheet_stuck, :419 stock_low, :443 plan_limit_near/reached). Drop a key there
+// (e.g. `incoming`) and the round-trip test stays green while this one goes red.
+describe("generateAlerts fills params at its own call sites (B-224)", () => {
+  it("sheet_stuck, stock_low, plan_limit_near and plan_limit_reached carry the ruled params", async () => {
+    const companyId = (await createCompany()).id;
+    const owner = await createUser(companyId, "owner");
+    const ctx = tenantContext(companyId, owner.id, "owner");
+    await createLocation(companyId);
+
+    const [batch] = await withSystem((tx) =>
+      tx.insert(gangSheetBatches).values({ companyId, name: "b" }).returning(),
+    );
+    const [sheet] = await withSystem((tx) =>
+      tx
+        .insert(gangSheets)
+        .values({
+          companyId,
+          batchId: batch?.id as string,
+          name: "S-12",
+          status: "sent",
+          sentAt: new Date(Date.now() - 30 * 3_600_000),
+        })
+        .returning(),
+    );
+
+    const [blank] = await withSystem((tx) =>
+      tx
+        .insert(blankVariants)
+        .values({
+          companyId,
+          brand: "Gildan",
+          style: "Softstyle",
+          styleCode: "G64000",
+          color: "Black",
+          colorCode: "BLK",
+          size: "M",
+          sizeCode: "M",
+          sku: "G64000-BLK-M",
+          reorderPoint: 10,
+        })
+        .returning(),
+    );
+
+    await withSystem((tx) =>
+      tx.insert(usage).values({ companyId, period: periodOf().key, ordersImported: 270 }),
+    );
+
+    await withTenant(companyId, (tx) => svc.generateAlerts(tx, ctx));
+    const list = await withTenant(companyId, (tx) => svc.listAlerts(tx, ctx, { limit: 100 }));
+
+    const stuck = list.items.find((a) => a.kind === "sheet_stuck" && a.entity?.id === sheet?.id);
+    expect(stuck?.messageCode).toBe("sheet_stuck");
+    expect(stuck?.params).toEqual({ sheetName: "S-12", hours: 30, sheetStatus: "sent" });
+
+    const low = list.items.find((a) => a.kind === "stock_low" && a.entity?.id === blank?.id);
+    expect(low?.messageCode).toBe("stock_low");
+    expect(low?.params).toEqual({
+      blankName: "Gildan G64000 Black M",
+      available: 0,
+      reorderPoint: 10,
+      incoming: 0,
+    });
+
+    const near = list.items.find(
+      (a) => a.kind === "plan_limit_reached" && a.messageCode === "plan_limit_near",
+    );
+    expect(near?.params).toEqual({ usedPct: 90, used: 270, limit: 300, planName: "Trial" });
+
+    // Push usage to the limit: the same dedupe key now raises `plan_limit_reached`.
+    await withSystem((tx) =>
+      tx.update(usage).set({ ordersImported: 300 }).where(eq(usage.companyId, companyId)),
+    );
+    await withTenant(companyId, (tx) => svc.generateAlerts(tx, ctx));
+    const list2 = await withTenant(companyId, (tx) => svc.listAlerts(tx, ctx, { limit: 100 }));
+    const reached = list2.items.find(
+      (a) => a.kind === "plan_limit_reached" && a.messageCode === "plan_limit_reached",
+    );
+    expect(reached?.params).toEqual({ used: 300, limit: 300, planName: "Trial" });
+  });
+});
+
 describe("Alert.messageCode/params round trip (B-224)", () => {
   let companyId: string;
   let ctx: ReturnType<typeof tenantContext>;
@@ -304,5 +398,33 @@ describe("Alert.messageCode/params round trip (B-224)", () => {
     expect(list.items.find((a) => a.id === unknownCode?.id)?.message).toBe(
       "A code this build doesn't know yet",
     );
+  });
+
+  // R1 review round 2, blocking finding 2: toAlert must drop both fields when a *known* code's
+  // stored params fail AlertParams parsing (a bad enum value here), not just for an unknown code.
+  it("a known code with params that fail AlertParams parsing shows only the English fallback", async () => {
+    const [badParams] = await withSystem((tx) =>
+      tx
+        .insert(alerts)
+        .values({
+          companyId,
+          kind: "sheet_stuck",
+          severity: "warning",
+          title: "Sheet S-1 stuck with the vendor",
+          message: "Sent 5h ago, still sent.",
+          dedupeKey: "roundtrip:bad-params",
+          data: {
+            messageCode: "sheet_stuck",
+            params: { sheetName: "S-1", hours: 5, sheetStatus: "not_a_real_status" },
+          },
+        })
+        .returning({ id: alerts.id }),
+    );
+    const list = await withTenant(companyId, (tx) => svc.listAlerts(tx, ctx, { limit: 200 }));
+    const alert = list.items.find((a) => a.id === badParams?.id);
+    expect(alert?.messageCode).toBeUndefined();
+    expect(alert?.params).toBeUndefined();
+    expect(alert?.title).toBe("Sheet S-1 stuck with the vendor");
+    expect(alert?.message).toBe("Sent 5h ago, still sent.");
   });
 });
