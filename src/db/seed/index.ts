@@ -59,16 +59,25 @@ async function signUp(email: string, name: string): Promise<string> {
  * T-P5-1 overwrote it from a scratch seed). `invai` always writes `seed-output.json` as today,
  * whatever `SEED_OUTPUT_FILE` is. Checked before any insert so a refusal never comes after the
  * ~15-minute render-heavy seed has already run.
+ *
+ * Round 2 (review finding 1): the seed writes through both pools -- `systemDb`
+ * (MIGRATION_DATABASE_URL) and `auth`/`signUp` (DATABASE_URL, client.ts). Checking only one lets
+ * a mixed env (one pinned to `invai`, the other scratch) pass the guard while still writing a mix
+ * of companies and users across two databases and overwriting the shared seed-output.json. Both
+ * URLs must name `invai`, or SEED_OUTPUT_FILE must be set.
  */
 export function assertSafeToSeed(
+  databaseUrl: string,
   migrationDatabaseUrl: string,
   seedOutputFile: string | undefined,
 ): void {
-  const database = new URL(migrationDatabaseUrl).pathname.slice(1);
-  if (database === "invai") return;
+  const database = new URL(databaseUrl).pathname.slice(1);
+  const migrationDatabase = new URL(migrationDatabaseUrl).pathname.slice(1);
+  if (database === "invai" && migrationDatabase === "invai") return;
   if (!seedOutputFile?.trim()) {
+    const other = database !== "invai" ? database : migrationDatabase;
     throw new Error(
-      `[seed] refusing: seeding ${database} would overwrite the shared seed-output.json. ` +
+      `[seed] refusing: seeding ${other} would overwrite the shared seed-output.json. ` +
         "Set SEED_OUTPUT_FILE=<path> for this database.",
     );
   }
@@ -83,7 +92,7 @@ async function seedGlobals() {
 
 async function main() {
   const started = Date.now();
-  assertSafeToSeed(env.MIGRATION_DATABASE_URL, process.env.SEED_OUTPUT_FILE);
+  assertSafeToSeed(env.DATABASE_URL, env.MIGRATION_DATABASE_URL, process.env.SEED_OUTPUT_FILE);
   const [existing] = await systemDb
     .select({ id: companies.id })
     .from(companies)
