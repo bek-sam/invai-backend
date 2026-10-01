@@ -46,9 +46,28 @@ describe("fetchJsonWithPolicy", () => {
     expect(calls).toBe(3);
   });
 
+  // B-229 part 1: this used real timers, so the two full-jitter retry sleeps (up to ~500ms then
+  // ~1000ms) made the test's actual duration flaky and slow. An injected sleep makes it
+  // deterministic and fast, and the fetch call count now asserts the retry budget directly
+  // instead of just the final error — no assertion is weaker than before.
+  //
+  // `vi.useFakeTimers()` (sinon's full clock install) was tried first and reproducibly hung this
+  // test: `takeToken`'s real Redis round trip (the per-provider rate limiter http.ts always
+  // calls first) never resolved once a sinon fake clock was installed, even restricted to
+  // `toFake: ["setTimeout", "clearTimeout"]` (confirmed with a standalone repro against the same
+  // Redis client). Stubbing just the global `setTimeout` function to run its callback
+  // immediately avoids that: ioredis and pg resolve a prior-cached reference to the *real*
+  // setTimeout from module load time, so only http.ts's own `sleep()` (which looks up
+  // `globalThis.setTimeout` fresh on every call) is affected.
   it("gives up after exhausting retries on a persistent 500", async () => {
-    vi.stubGlobal("fetch", respond(500, { message: "down" }));
+    vi.stubGlobal("setTimeout", ((fn: () => void) => {
+      fn();
+      return 0 as unknown as ReturnType<typeof setTimeout>;
+    }) as typeof setTimeout);
+    const fetchSpy = respond(500, { message: "down" });
+    vi.stubGlobal("fetch", fetchSpy);
     await expect(fetchJsonWithPolicy(policy())).rejects.toThrow(MarketProviderError);
+    expect(fetchSpy).toHaveBeenCalledTimes(3); // 1 initial attempt + 2 retries, then give up
   });
 
   it("never follows a redirect (no blind redirects, rule 8)", async () => {

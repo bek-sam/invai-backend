@@ -45,7 +45,16 @@ export function assertTestDatabase(url: string, label = "database"): void {
 function databaseName(url: string | undefined): string {
   if (!url) return "";
   try {
-    return new URL(url).pathname.slice(1);
+    const raw = new URL(url).pathname.slice(1);
+    // B-215: `.pathname` is percent-encoded, not decoded (`/%69nvai` stays "%69nvai", not
+    // "invai"), so comparing it as-is against "invai" lets a percent-encoded dev DB name slip
+    // past both the devNames check and the "test" segment check below. Decode before comparing;
+    // a malformed percent sequence falls back to the raw text rather than being silently ignored.
+    try {
+      return decodeURIComponent(raw);
+    } catch {
+      return raw;
+    }
   } catch {
     return "";
   }

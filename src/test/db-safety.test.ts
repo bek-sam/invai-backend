@@ -99,4 +99,30 @@ describe("assertTestDatabase", () => {
       assertTestDatabase("postgres://invai:invai@localhost:5432/invai_rev_t230_test"),
     ).not.toThrow();
   });
+
+  // B-215: `.pathname` is percent-encoded ("%69nvai" stays as written, it isn't decoded to
+  // "invai" for free), so a naive comparison against the literal string "invai" lets this
+  // through unless the name is decoded first.
+  it("refuses a percent-encoded spelling of the dev database name", () => {
+    expect(() => assertTestDatabase("postgres://invai:invai@localhost:5432/%69nvai")).toThrow(
+      /doesn't look like a test database/,
+    );
+  });
+
+  it("refuses a percent-encoded dev database even when pinned via TEST_DATABASE_URL", () => {
+    const url = "postgres://invai:invai@localhost:5432/%69nvai";
+    process.env.TEST_DATABASE_URL = url;
+    expect(() => assertTestDatabase(url)).toThrow(/doesn't look like a test database/);
+  });
+
+  it("refuses a percent-encoded spelling of the raw, un-redirected DATABASE_URL's name", () => {
+    const original = process.env.DATABASE_URL;
+    process.env.DATABASE_URL = "postgres://invai_app:invai@localhost:5432/some_shop_prod";
+    const url = "postgres://invai_app:invai@localhost:5432/%73ome_shop_prod";
+    try {
+      expect(() => assertTestDatabase(url)).toThrow(/doesn't look like a test database/);
+    } finally {
+      process.env.DATABASE_URL = original;
+    }
+  });
 });

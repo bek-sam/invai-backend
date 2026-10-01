@@ -48,22 +48,31 @@ worker started afterwards never replays jobs for rows that no longer exist. Rest
 worker after a reset so its repeatable sweeps re-register. The seed is safe with the worker
 running: each builder phase parks the outbox events it emitted and the last step releases them all
 (`src/db/seed/outbox-hold.ts`). Seeding a DB copy? Set `SEED_OUTPUT_FILE=<path>` so the copy's run
-doesn't overwrite the shared `seed-output.json`. `pnpm test` redirects `REDIS_URL` the same way it
-redirects the database URLs (B-205): any `REDIS_URL` whose path isn't written as a plain positive
-integer (`/14`) — no path, `/0`, `/0/`, `/0.5`, `/0x1`, blank, anything else — is treated as DB 0
-and moves to DB 15, so a dev or CI worker on DB 0 never sees test jobs or streams. Set
-`TEST_REDIS_URL` to pick a different test DB, or pin `REDIS_URL=redis://localhost:6379/<n>`
-yourself (a DB written that way is kept as-is, never redirected) — the pattern to use when several
-agents run the suite at once. `TEST_REDIS_URL` itself must be a pinned non-zero DB the same way;
-one written as DB 0 fails the boot with a clear error rather than silently running on DB 0. `pnpm
-test` also truncates every tenant table in `invai_test` once, at the start of the run (B-205 AC6),
-so a shared, row-polluted `invai_test` never changes what a test sees. `assertTestDatabase`
-(`src/test/db-safety.ts`) guards the truncate: it refuses a name that isn't a whole `test` segment
-(`invai_test`, not `invai_latest`), and it refuses the dev database — literally named `invai`, or
-whatever `DATABASE_URL`/`MIGRATION_DATABASE_URL` raw point at — even if pinned via
-`TEST_DATABASE_URL`/`TEST_MIGRATION_DATABASE_URL` by mistake. Sharing plain `invai_test` with
-another agent still means a run wipes the other's in-progress rows; pin your own
-`TEST_DATABASE_URL`/`TEST_MIGRATION_DATABASE_URL` (per `team/agent-brief.md`) when it's busy.
+doesn't overwrite the shared `seed-output.json`.
+
+**`pnpm test` gets its own database and Redis DB automatically (T-P1-1, B-228).** Unless you pin
+`TEST_DATABASE_URL`/`TEST_MIGRATION_DATABASE_URL`, `global-setup.ts` (via `src/test/test-db.ts`)
+creates a fresh `invai_test_<pid>` cloned from a migrated template `invai_test_tpl`, and drops it
+when the run ends. Unless you pin `REDIS_URL` to a non-zero DB or set `TEST_REDIS_URL`,
+`src/test/test-redis.ts` claims a free Redis DB from 1–14 (a `SET NX` lock key held in DB 15,
+released at teardown) and fails with a clear message if every one is already claimed; DB 0 (the
+dev/CI worker's DB) and DB 15 are never handed out as a test target. **This means two or more
+agents can run `pnpm test` at the same time with no coordination** — the old rule of pinning your
+own `TEST_DATABASE_URL`/`REDIS_URL` by hand (`team/agent-brief.md`) is retired for a plain `pnpm
+test`; pin them yourself only when you want a *specific* database (for example to inspect it
+afterwards, or to point every worker at the same scratch DB another tool already seeded).
+A per-run database that survives a crashed run (`invai_test_<pid>` whose pid is dead on this host)
+is swept at the next setup once it's over an hour old; the template and anything not matching that
+exact `invai_test_<digits>` pattern — including a plain `invai_test`, or a hand-pinned name like
+`invai_t23_0_test` — is never touched. `assertTestDatabase` (`src/test/db-safety.ts`) still guards
+every database `global-setup.ts` touches: it refuses a name that isn't a whole `test` segment
+(`invai_test`, not `invai_latest`), it decodes the database name before comparing (so a
+percent-encoded `%69nvai` is still refused as the dev DB, B-215), and it refuses the dev
+database — literally named `invai`, or whatever `DATABASE_URL`/`MIGRATION_DATABASE_URL` raw point
+at — even if pinned via `TEST_DATABASE_URL`/`TEST_MIGRATION_DATABASE_URL` by mistake. The claimed
+(or pinned) URLs reach every worker through Vitest's `provide()`/`inject()` channel
+(`src/test/setup-env.ts`, `src/test/provided-context.ts`), not by relying on `process.env`
+propagating into a worker thread or fork for free.
 
 No real API keys are needed: every integration (Claude, EasyPost, Shopify, S&S) falls back to a
 mock provider automatically when its env var is unset (`env.mocks.*` in `src/env.ts`). See
