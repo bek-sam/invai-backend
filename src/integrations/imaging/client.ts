@@ -295,25 +295,32 @@ export function createImagingClient(
     /**
      * A thumbnail for `out_key`, longest side at most `max_px` (imaging default 512).
      *
-     * T-P2-2 (B-233): a bad-input rejection (4xx/422) and a momentary blip while imaging is
-     * actually up (connection reset, timeout, 5xx) both throw, so the caller can tell a real
-     * rejection from a retry-worthy failure, and a job retries instead of a momentary outage
-     * freezing a gray square over what should be a real thumbnail. Only when imaging answers
-     * unhealthy right now — genuinely not configured locally, or down for good — does this fall
-     * back to `placeholderPreviewPng()` at `out_key`, so a design or order-item list never shows
-     * a broken image for want of the imaging service (never remove this mock). Callers (catalog)
-     * still check `isCompanyKey` on both keys first — imaging trusts the backend for company
-     * prefixes (S-11/S-12 model).
+     * T-P2-2 round 2 (B-233, `reviews/T-P2-2-reviewer-r1.md` finding 1): the placeholder below
+     * ran whenever `/health` also failed, which is true both for "imaging isn't configured
+     * locally" and for "imaging is genuinely down" (a restart, saturation, an outage) — those two
+     * cases can't be told apart from here. The tech lead's ruling: a job must never save a
+     * placeholder for a real failure, because nothing re-renders it afterward (only another
+     * design edit triggers the job again), leaving a stale gray square in place indefinitely.
+     * `allowPlaceholder: false` (the render job's choice, `catalog/service.ts`) skips the
+     * fallback below entirely and rethrows every non-permanent failure, so the job sees a normal
+     * error and the queue's existing retry/backoff applies; after the final attempt
+     * `preview_key` stays null and the UI shows its no-image box. `allowPlaceholder` defaults to
+     * `true`, unchanged for direct callers like the seed, which still want a thumbnail rather
+     * than nothing when run against a machine with no imaging service at all. A bad-input
+     * rejection (4xx/422) is permanent either way and always rethrows, never a placeholder.
      */
     preview: async (input: {
       file_key: string;
       out_key: string;
       max_px?: number;
+      allowPlaceholder?: boolean;
     }): Promise<PreviewResult> => {
+      const { allowPlaceholder = true, ...body } = input;
       try {
-        return await call("/preview", input, PreviewResult);
+        return await call("/preview", body, PreviewResult);
       } catch (err) {
         if (err instanceof ImagingError && isPermanentHttpStatus(err.status)) throw err;
+        if (!allowPlaceholder) throw err;
         if (await checkHealthy()) throw err;
         log.warn("imaging unreachable, writing a placeholder thumbnail", {
           outKey: input.out_key,

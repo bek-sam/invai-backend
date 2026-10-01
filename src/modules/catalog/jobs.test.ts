@@ -139,6 +139,9 @@ describe("catalog.renderDesignPreviews job", () => {
     expect(preview.busyAtCall).toEqual([0]);
   });
 
+  // The render job's own contract (propagate, write nothing) with `imaging.preview` mocked
+  // directly; it doesn't exercise the real HTTP client's failure handling — see
+  // `jobs.imaging-down.test.ts` for that (round 2, reviewer r1 finding 1).
   it("a transient imaging failure throws so the job retries, and writes no preview (T-P2-2 AC2)", async () => {
     const design = await onePlacementDesign("JOBTRANS");
     preview.fn.mockRejectedValueOnce(new ImagingError("/preview", 0, "connection refused"));

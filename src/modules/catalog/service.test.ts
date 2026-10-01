@@ -1,11 +1,35 @@
 import { call } from "@orpc/server";
 import { eq } from "drizzle-orm";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import { anonymousContext, permissionsFor } from "../../api/context";
 import { router } from "../../api/router";
 import { withTenant } from "../../db/client";
 import { designFiles } from "../../db/schema";
 import { createCompany, createUser, tenantContext } from "../../test/fixtures";
+
+/*
+ * T-P2-2 round 2: `renderDesignPreviews` now calls `imaging.preview` with `allowPlaceholder:
+ * false` (it's the job's own function), so it no longer falls back to a placeholder when no real
+ * imaging service answers — which is the normal case for a plain `pnpm test` run. Mock `preview`
+ * here so these tests stay about tenant checks and idempotency, not about whether imaging happens
+ * to be running; the real client's own behavior is covered by `imaging/client.test.ts` and
+ * `jobs.imaging-down.test.ts`.
+ */
+vi.mock("../../integrations/imaging/client", async (orig) => {
+  const actual = await orig<typeof import("../../integrations/imaging/client")>();
+  return {
+    ...actual,
+    imaging: {
+      ...actual.imaging,
+      preview: vi.fn(async (input: { out_key: string }) => ({
+        out_key: input.out_key,
+        width_px: 512,
+        height_px: 512,
+      })),
+    },
+  };
+});
+
 import * as svc from "./service";
 
 /**
@@ -217,6 +241,31 @@ describe("catalog service", () => {
     await expect(svc.renderDesignPreviews(companyId, ctx, design.id)).rejects.toMatchObject({
       code: "BAD_REQUEST",
     });
+  });
+
+  it("replacing a design's placements clears the old preview (T-P1-4 AC2)", async () => {
+    const design = await withTenant(companyId, (tx) =>
+      svc.createDesign(tx, ctx, designInput("PV4")),
+    );
+    const rendered = await svc.renderDesignPreviews(companyId, ctx, design.id);
+    expect(rendered.placements[0]?.previewKey).toBeTruthy();
+
+    // A replace is delete+insert (service.ts updateDesign): the new row has no preview of its
+    // own yet, even though it keeps the same placement kind and company prefix as the old file.
+    const replaced = await withTenant(companyId, (tx) =>
+      svc.updateDesign(tx, ctx, {
+        id: design.id,
+        placements: [
+          {
+            placement: "front",
+            fileKey: `${companyId}/design/replacement.png`,
+            widthIn: 11,
+            heightIn: 12,
+          },
+        ],
+      }),
+    );
+    expect(replaced.placements[0]?.previewKey).toBeNull();
   });
 
   it("can't render or read another company's design (B-209 AC6, tenant isolation)", async () => {

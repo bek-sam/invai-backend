@@ -339,11 +339,17 @@ export function designPreviewKey(companyId: string, designFileId: string): strin
  *
  * T-P2-2 (B-233): no DB transaction stays open while `imaging.preview()` is in flight — a short
  * transaction reads the files, every imaging call runs with no transaction held, and each result
- * is written in its own short transaction. `imaging.preview()` itself still falls back to a
- * placeholder when imaging is genuinely unreachable (local mock mode; never remove a mock); a
- * transient failure while imaging is up (timeout, 5xx) throws here so the job retries, and a
- * permanent 4xx/422 (bad input) is logged and leaves that placement's preview key untouched — no
- * placeholder for a real rejection.
+ * is written in its own short transaction.
+ *
+ * T-P2-2 round 2 (`reviews/T-P2-2-reviewer-r1.md` finding 1, tech lead ruling): the job path
+ * passes `allowPlaceholder: false`, so `imaging.preview()` never writes its gray-square
+ * placeholder here — connection refused, a timeout, a 5xx, or imaging answering unhealthy all
+ * throw and propagate so the job retries with the queue's backoff. After the final attempt this
+ * placement's `preview_key` stays null (a warn log, no placeholder; the UI shows its no-image
+ * box) instead of a stale placeholder that nothing ever re-renders. A permanent 4xx/422 (bad
+ * input) is still logged and leaves the key untouched without throwing — a retry can't fix it.
+ * The placeholder itself isn't removed: `allowPlaceholder` defaults to `true` for other direct
+ * callers (the seed), which still want a thumbnail when no imaging service is running at all.
  */
 export async function renderDesignPreviews(
   companyId: string,
@@ -369,7 +375,12 @@ export async function renderDesignPreviews(
     const started = Date.now();
     let out: PreviewResult;
     try {
-      out = await imaging.preview({ file_key: file.fileKey, out_key: outKey, max_px: 512 });
+      out = await imaging.preview({
+        file_key: file.fileKey,
+        out_key: outKey,
+        max_px: 512,
+        allowPlaceholder: false,
+      });
     } catch (err) {
       if (err instanceof ImagingError && isPermanentHttpStatus(err.status)) {
         log.warn("imaging rejected the preview input; leaving no preview", {
