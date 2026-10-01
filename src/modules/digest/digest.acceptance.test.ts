@@ -513,6 +513,26 @@ describe("AC10: cancelled-after-on_sheet and reprints in the snapshot", () => {
     // Only the re-pressed unit's one sale counts (2500 revenue minus its doubled cost nets 500);
     // the cancelled item's 9999 must not appear.
     expect(digest.net?.value).toBe(500);
+    // Round 2 (reviewer r1 finding 1): `net === 500` alone is pure fixture arithmetic -- `saleAt`
+    // writes `profit_lines` revenue/cost directly, so that one assertion passes with or without
+    // decision 0020's "a reprint still counts as a unit" rule (e.g. with the old
+    // `analytics/shared.ts` filtering `not is_reprint` back in, this week would show 0 units and
+    // still net 500 if cost math were otherwise unchanged). Assert the unit count InvAI actually
+    // computes from the cost-bucket rows via the shared `isUnit` filter (`computeNet`, reused by
+    // `getProfit` and the digest's net fact): exactly 1 unit (the re-pressed item; the cancelled
+    // item contributes 0).
+    const from = new Date(monday.getTime() - 7 * DAY_MS);
+    const profit = await withSystem((tx) =>
+      getProfit(
+        tx,
+        { companyId: s.id },
+        { period: { from: from.toISOString(), to: monday.toISOString() }, dimension: "day" },
+      ),
+    );
+    // `totals` is `CostBuckets` (no unit count); `ProfitSummary.rows[].units` is where getProfit
+    // carries it (contract: ProfitRow). Sum across the (at most one, same-day) rows.
+    const units = profit.rows.reduce((a, r) => a + r.units, 0);
+    expect(units).toBe(1);
   });
 });
 
