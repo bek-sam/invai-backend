@@ -38,6 +38,7 @@ import {
   inventoryMovements,
   listings,
   locations,
+  marketSeriesCache,
   orderItems,
   orderItemTransitions,
   orders,
@@ -84,6 +85,14 @@ async function runShopJobs(companyId: string) {
   await runMarketJob(JOB.refreshPricing, { companyId });
   await runMarketJob(JOB.computeSignals, { companyId });
 }
+
+/**
+ * `refreshDemand` (inside `runShopJobs` and the AC8/AC16 blocks' own calls) writes the global,
+ * tenant-less `market_series_cache` (B-221, as 9eae8fd cleaned up in `service.test.ts`): every
+ * describe block below that calls it clears the table in `afterAll`, after its own `await`s, so
+ * no frozen-date row leaks into another file sharing the test database.
+ */
+const clearCache = () => withSystem((tx) => tx.delete(marketSeriesCache));
 
 type AnyProcedure = Parameters<typeof call>[0];
 function procedureAt(path: string): AnyProcedure {
@@ -562,7 +571,10 @@ describe("T-18-3 happy path on a fixture shop (spec AC1, AC3)", () => {
     await weeklySales(s.id, s.etsy, teacher.id, flat(30, 2), now);
     await runShopJobs(s.id);
   }, 120_000);
-  afterAll(() => vi.useRealTimers());
+  afterAll(async () => {
+    vi.useRealTimers();
+    await clearCache();
+  });
 
   it("AC1: after the jobs, every active design has 1–2 taxonomy niches or is unclassified", async () => {
     const { NICHES } = await service();
@@ -654,7 +666,12 @@ describe("T-18-3 own history and comparables (spec AC17, AC19, AC6)", () => {
     tee = await design(s.id, { name: "Dog Mom Life", tags: ["dog mom", "dogs"] });
     // 60 weeks × 3 units: last 4 weeks = 12 units, the same 4 weeks a year earlier = 12 → yoy 0.
     await weeklySales(s.id, s.etsy, tee.id, flat(60, 3), now);
-    // Contamination inside the last 4 weeks: 5 units cancelled after on_sheet, 3 reprints.
+    // Contamination inside the last 4 weeks: 5 units cancelled after on_sheet (a real exclusion;
+    // decision 0020 doesn't change it) and, of the week's own 3 units `weeklySales` already
+    // placed, all 3 later re-pressed. Decision 0020: a reprint is the same unit re-pressed, never
+    // an extra unit, so this flips `is_reprint` on those 3 already-counted items in place instead
+    // of adding 3 more via `sale()` -- the sibling-row fixture `sale({ isReprint: true, ... })`
+    // used to model, which decision 0020 retired (no code path ever inserts such a row).
     await sale(s.id, s.etsy, {
       designId: tee.id,
       weeksAgo: 2,
@@ -663,7 +680,16 @@ describe("T-18-3 own history and comparables (spec AC17, AC19, AC6)", () => {
       cancelledFrom: "on_sheet",
       now,
     });
-    await sale(s.id, s.etsy, { designId: tee.id, weeksAgo: 1, units: 3, isReprint: true, now });
+    const lastWeekStart = weekMonday(now, 1);
+    const lastWeekEnd = new Date(lastWeekStart.getTime() + WEEK);
+    await withSystem((tx) =>
+      tx.execute(sql`
+        update order_items i set is_reprint = true
+        from orders o
+        where o.id = i.order_id and i.company_id = ${s.id} and i.design_id = ${tee.id}
+          and i.state = 'shipped'
+          and o.placed_at >= ${lastWeekStart} and o.placed_at < ${lastWeekEnd}`),
+    );
     custom = await design(s.id, {
       name: "Custom Name Dog Mom",
       tags: ["dog mom", "personalized"],
@@ -676,33 +702,43 @@ describe("T-18-3 own history and comparables (spec AC17, AC19, AC6)", () => {
     await weeklySales(s.id, amazon, custom.id, flat(20, 2), now);
     await runShopJobs(s.id);
   }, 120_000);
-  afterAll(() => vi.useRealTimers());
+  afterAll(async () => {
+    vi.useRealTimers();
+    await clearCache();
+  });
 
-  it("AC17: an item cancelled after on_sheet and a reprint are not sold units (own yoy stays 0)", async () => {
+  it("AC17: an item cancelled after on_sheet is not a sold unit; a reprinted unit keeps its one sale (own yoy stays 0)", async () => {
     const svc = await service();
     const trend = await withTenant(s.id, (tx) =>
       svc.getTrendSignal(tx, s.owner, { designId: tee.id }),
     );
     const own = ownReading(trend);
     expect(own, "an own reading (60 weeks ≥ the 56 yoy needs)").toBeDefined();
-    // 12 real units ÷ 12 last year − 1 = 0. Counting the 8 bad units would give 20 ÷ 12 − 1 = 0.67.
+    // 12 real units ÷ 12 last year − 1 = 0. The 3 reprinted units are 3 of those same 12
+    // (decision 0020: still one sale each), so they don't move this number either way; counting
+    // the 5 cancelled-after-on_sheet units as sold too would give 17 ÷ 12 − 1 ≈ 0.42.
     expect(own?.yoy).toBeCloseTo(0, 6);
     expect(own?.trend).not.toBe("insufficient");
   });
 
-  it("AC17 (hand SQL): the shipped, non-reprint unit count for the last complete ISO week is 3", async () => {
+  it("AC17 (hand SQL): the shipped unit count for the last complete ISO week is 3, all later reprinted and still counted", async () => {
     // The boundary `completeWeeks` itself uses (second pass, QA: a hand-rolled "-4 days" window
-    // didn't match a Tuesday `now`'s real last complete ISO week, so it proved nothing).
+    // didn't match a Tuesday `now`'s real last complete ISO week, so it proved nothing). No
+    // `is_reprint` filter (decision 0020: no reader excludes reprints from sold units) -- the
+    // second assertion instead proves the fixture's reprint flip landed on exactly this week's
+    // units, not that the query drops them.
     const weekStart = weekMonday(new Date(NOW), 1);
     const weekEnd = new Date(weekStart.getTime() + WEEK);
     const rows = await withSystem((tx) =>
-      tx.execute<{ n: number }>(sql`
-        select count(*)::int as n from order_items i join orders o on o.id = i.order_id
+      tx.execute<{ n: number; reprints: number }>(sql`
+        select count(*)::int as n, count(*) filter (where i.is_reprint)::int as reprints
+        from order_items i join orders o on o.id = i.order_id
         where i.company_id = ${s.id} and i.design_id = ${tee.id}
-          and i.state <> 'cancelled' and i.is_reprint = false
+          and i.state <> 'cancelled'
           and o.placed_at >= ${weekStart} and o.placed_at < ${weekEnd}`),
     );
     expect(rows.rows[0]?.n).toBe(3);
+    expect(rows.rows[0]?.reprints).toBe(3);
   });
 
   it("AC19: a personalized design compares only against personalized comparables (mock Amazon)", async () => {
@@ -851,7 +887,10 @@ describe("T-18-3 out-of-stock weeks excluded from the trend fit (spec AC18)", ()
       await weeklySales(s.id, s.etsy, d.id, series, now, { blankVariantId: blankId });
       await runShopJobs(s.id);
     }, 120_000);
-    afterAll(() => vi.useRealTimers());
+    afterAll(async () => {
+      vi.useRealTimers();
+      await clearCache();
+    });
 
     it("AC18: the engine excludes the 2 out-of-stock weeks from the trend, not as zero sales", async () => {
       const svc = await service();
@@ -909,7 +948,10 @@ describe("T-18-3 disagreement and stale reads (spec AC8, AC10)", () => {
     await weeklySales(s.id, s.etsy, d.id, own, now);
     await runMarketJob(JOB.computeSignals, { companyId: s.id });
   }, 180_000);
-  afterAll(() => vi.useRealTimers());
+  afterAll(async () => {
+    vi.useRealTimers();
+    await clearCache();
+  });
 
   it("AC8: own data and the outside mock pointing different ways sets the disagreement flag and caps the band below high", async () => {
     const svc = await service();
@@ -959,7 +1001,10 @@ describe("T-18-3 read-only, credits, corrections (spec AC16, AC21, AC25, AC32 ba
     await weeklySales(s.id, s.etsy, d.id, flat(20, 2), now);
     await profitFor(s.id, d.id, HEALTHY_COSTS);
   }, 120_000);
-  afterAll(() => vi.useRealTimers());
+  afterAll(async () => {
+    vi.useRealTimers();
+    await clearCache();
+  });
 
   it("AC16: the jobs, the reads and a vote write no business table", async () => {
     const before = await digest(s.id, BUSINESS_TABLES);
@@ -1067,7 +1112,10 @@ describe("T-18-3 tenancy and permissions (spec AC23, AC24)", () => {
     await profitFor(a.id, designA.id, { ...HEALTHY_COSTS, ads: 200 });
     await runShopJobs(a.id);
   }, 120_000);
-  afterAll(() => vi.useRealTimers());
+  afterAll(async () => {
+    vi.useRealTimers();
+    await clearCache();
+  });
 
   it("AC23: A's jobs wrote only A's rows; B sees nothing of A in any market tenant table", async () => {
     const svc = await service();
@@ -1199,7 +1247,10 @@ describe("T-18-3 feedback: votes, adoption, outcome (spec AC26, AC27, AC30, AC33
     ({ d: bear, p: bearProduct } = await thinAmazonDesign("Retro Camping Bear", now));
     await runShopJobs(s.id);
   }, 120_000);
-  afterAll(() => vi.useRealTimers());
+  afterAll(async () => {
+    vi.useRealTimers();
+    await clearCache();
+  });
 
   it("AC30 (backend): a recommendation built on mock comparables is flagged mock with a mock source; own-data ones are not", async () => {
     const recs = await listRecs({}, s.owner);

@@ -12,7 +12,14 @@ import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import type { TenantContext } from "../../api/context";
 import { withSystem, withTenant } from "../../db/client";
-import { channelConnections, companies, designs, orderItems, orders } from "../../db/schema";
+import {
+  channelConnections,
+  companies,
+  designs,
+  marketSeriesCache,
+  orderItems,
+  orders,
+} from "../../db/schema";
 import { marketPricingProvider } from "../../integrations/market";
 import { getJob, runJobInline } from "../../lib/queues";
 import { createCompany, createUser, tenantContext } from "../../test/fixtures";
@@ -42,6 +49,14 @@ async function runShopJobs(companyId: string) {
   await runMarketJob("market.refreshPricing", { companyId });
   await runMarketJob("market.computeSignals", { companyId });
 }
+
+/**
+ * `refreshDemand` writes the global, tenant-less `market_series_cache` (B-221). Clear it in
+ * `afterAll`, after awaiting `refreshDemand` itself (via `beforeAll`'s `runShopJobs`, already
+ * awaited above) so the delete never races a write still in flight when the test DB pool closes
+ * ("pool after end").
+ */
+const clearCache = () => withSystem((tx) => tx.delete(marketSeriesCache));
 
 const DAY = 86_400_000;
 const WEEK = 7 * DAY;
@@ -181,7 +196,10 @@ describe("mock visibility rule in production (spec AC29, AC22)", () => {
     await runShopJobs(real.id);
     await runShopJobs(sample.id);
   }, 180_000);
-  afterAll(() => vi.useRealTimers());
+  afterAll(async () => {
+    vi.useRealTimers();
+    await clearCache();
+  });
 
   it("AC29: for a real shop, mockSourcesAllowed is false and no signal, tool or recommendation rests on a mock", async () => {
     expect(await mockSourcesAllowed(real.id)).toBe(false);

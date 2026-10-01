@@ -489,18 +489,20 @@ describe("AC8, AC9: minimum-volume guard and the skip / paused rule", () => {
 });
 
 describe("AC10: cancelled-after-on_sheet and reprints in the snapshot", () => {
-  it("a cancelled item adds no revenue or units; a reprint shows as a reprint, not a sale", async () => {
+  it("a cancelled item adds no revenue or units; a re-pressed unit keeps its one sale, with the reprint's extra cost", async () => {
     const s = await shop({ name: "Cancel Reprint Tees" });
     const monday = mondayPhoenix("2026-11-02");
     const inWeek = new Date(monday.getTime() - 3 * DAY_MS);
     await saleAt(s.id, s.etsy.id, "etsy", inWeek, { state: "cancelled", revenueCents: 9999 });
-    // A free reprint (no charge to the buyer) that still costs a blank: net = 0 - 500 = -500,
-    // computed by `finance/profit.ts`'s `finalize()` from the cost bucket, the same function the
-    // digest reuses — not read back from a chosen `netCents` (see `saleAt`'s doc comment above).
+    // Decision 0020: the reprint is the same unit re-pressed, not a free extra with 0 revenue --
+    // it kept its normal $25 sale to the buyer; the second transfer (blank and film again) only
+    // adds to the cost bucket, doubling it here: net = 2500 - 2000 = 500, computed by
+    // `finance/profit.ts`'s `finalize()` from the cost bucket, the same function the digest
+    // reuses — not read back from a chosen `netCents` (see `saleAt`'s doc comment above).
     await saleAt(s.id, s.etsy.id, "etsy", inWeek, {
       isReprint: true,
-      revenueCents: 0,
-      costCents: 500,
+      revenueCents: 2_500,
+      costCents: 2_000,
     });
 
     freeze(new Date(monday.getTime() + 7 * 60 * 60_000 + 5 * 60_000).toISOString());
@@ -508,8 +510,9 @@ describe("AC10: cancelled-after-on_sheet and reprints in the snapshot", () => {
     // `Digest` has no `glance.netCents`; the glance net is the top-level `net` fact (contract 0.7.0,
     // same shape AC1 already checks), value in cents.
     const digest = await rpc<Digest>("digest.get", { weekKey: "2026-W44" }, s.owner);
-    // Only the reprint's -500 net should count; the cancelled item's 9999 must not appear.
-    expect(digest.net?.value).toBe(-500);
+    // Only the re-pressed unit's one sale counts (2500 revenue minus its doubled cost nets 500);
+    // the cancelled item's 9999 must not appear.
+    expect(digest.net?.value).toBe(500);
   });
 });
 

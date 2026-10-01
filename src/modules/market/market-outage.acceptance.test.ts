@@ -4,7 +4,10 @@
  *
  * The clock here is the latest in the whole acceptance suite (2027-01), so the global cache rows
  * this file writes are newer than any other file's, and "kept the last good rows" can be read
- * off `fetched_at` without interference from other tests sharing the test database.
+ * off `fetched_at` without interference from other tests sharing the test database. `afterAll`
+ * still clears those rows once this file is done with them (B-221): harmless to this file's own
+ * reads (cleanup runs after every `it` here), and it keeps whichever file runs after this one
+ * from inheriting 2027-01-dated rows.
  *
  * Owner: qa-engineer. Implementers don't edit this file; disagreements go in their report.
  */
@@ -12,7 +15,13 @@ import type { MarketTrend } from "@invai/contracts";
 import { sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { withSystem, withTenant } from "../../db/client";
-import { channelConnections, designs, orderItems, orders } from "../../db/schema";
+import {
+  channelConnections,
+  designs,
+  marketSeriesCache,
+  orderItems,
+  orders,
+} from "../../db/schema";
 import { env } from "../../env";
 import { getJob, runJobInline } from "../../lib/queues";
 import { createCompany, createUser, tenantContext } from "../../test/fixtures";
@@ -28,6 +37,9 @@ async function runMarketJob(name: string, input: unknown) {
   if (!job) throw new Error(`job ${name} is not registered (T-18-3 jobs.ts)`);
   return runJobInline(job, input);
 }
+
+/** `refreshDemand` writes the global `market_series_cache` (B-221); see the file header. */
+const clearCache = () => withSystem((tx) => tx.delete(marketSeriesCache));
 
 const DAY = 86_400_000;
 const WEEK = 7 * DAY;
@@ -141,9 +153,10 @@ describe("T-18-3 provider outage (spec AC20)", () => {
     refreshResult = await runMarketJob("market.refreshDemand", {});
     await runMarketJob("market.computeSignals", { companyId: s.id });
   }, 180_000);
-  afterAll(() => {
+  afterAll(async () => {
     env.marketMockFail.delete("google_trends");
     vi.useRealTimers();
+    await clearCache();
   });
 
   it("the refresh does not throw, records the failed source, and other sources still refresh", async () => {
