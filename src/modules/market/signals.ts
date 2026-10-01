@@ -228,6 +228,13 @@ export function seasonalityIndex(months: MonthPoint[]): SeasonalityIndex | null 
   const c = MARKET_CONFIG.seasonality;
   const sorted = [...months].sort((a, b) => a.period.localeCompare(b.period));
   if (sorted.length < c.minYears * 12) return null;
+  // An all-zero (or otherwise undetrendable) series fits a flat ln(y+1) = 0 trend, so every
+  // ratio comes out to exactly 1 and `overall` is 1, not <= 0 — the `overall <= 0` guard below
+  // never catches it. Without this check this returned a flat SI (all months index 1.0) instead
+  // of `null`, which let a niche with no real signal (for example a near-zero-interest Trends
+  // series) short-circuit the own → outside → Census source-priority fallback (`compute.ts`)
+  // before Census ever ran.
+  if (sorted.every((p) => p.value === 0)) return null;
   const { slope, intercept } = ols(sorted.map((p) => Math.log(p.value + 1)));
   const sums = new Array<number>(12).fill(0);
   const counts = new Array<number>(12).fill(0);

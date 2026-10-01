@@ -7,9 +7,10 @@ import { env } from "../../src/env";
 import { assistantTools } from "../../src/modules/ai/assistant-tools";
 import { shopContext } from "../../src/modules/ai/service";
 import type { EvalTenant } from "../lib/fixtures";
+import { deleteEvalTenant } from "../lib/fixtures";
 import { callAssistant } from "../lib/gateway-run";
 import { loadCases } from "../lib/jsonl";
-import type { CaseResult, RouteReport } from "../lib/types";
+import type { CaseResult, EvalCase, RouteReport } from "../lib/types";
 import { createSeededEvalTenant } from "./seed";
 
 const dir = path.dirname(fileURLToPath(import.meta.url));
@@ -44,18 +45,15 @@ function containsAny(text: string, needles: string[] | undefined): boolean | nul
   return needles.some((n) => hay.includes(n.toLowerCase()));
 }
 
+export type AssistantVars = {
+  message: string;
+  tenant?: "seeded";
+  /** Earlier turns, as service.ts `ask` builds them (assistant turns start with the tool line). */
+  history?: { role: "user" | "assistant"; text: string }[];
+};
+
 export async function runAssistantEvals(tenant: EvalTenant): Promise<RouteReport> {
-  const cases = loadCases<
-    {
-      message: string;
-      tenant?: "seeded";
-      /** Earlier turns, as service.ts `ask` builds them (assistant turns start with the tool line). */
-      history?: { role: "user" | "assistant"; text: string }[];
-    },
-    AssistantExpect
-  >(
-    path.join(dir, "cases.jsonl"),
-  );
+  const cases = loadCases<AssistantVars, AssistantExpect>(path.join(dir, "cases.jsonl"));
   const mode: RouteReport["mode"] = env.mocks.ai ? "mock" : "real";
   // Cases with `vars.tenant: "seeded"` run against a second tenant with a small known business
   // (seed.ts, T-17-2): the analyst tools need real numbers, and the empty tenant must stay empty
@@ -63,6 +61,26 @@ export async function runAssistantEvals(tenant: EvalTenant): Promise<RouteReport
   const seeded = cases.some((c) => c.vars.tenant === "seeded")
     ? await createSeededEvalTenant()
     : null;
+  try {
+    return await runSeededCases(cases, tenant, seeded, mode);
+  } finally {
+    // B-165: the "Eval analyst …" tenant this route seeds for itself (seed.ts) is this route's
+    // own throwaway company, separate from the one `evals/run.ts` creates and deletes — delete it
+    // here, on success and on failure, so it isn't left behind after `pnpm evals assistant`.
+    if (seeded) {
+      await deleteEvalTenant(seeded).catch((err) =>
+        console.error(`Could not delete seeded eval tenant ${seeded.companyId}:`, err),
+      );
+    }
+  }
+}
+
+async function runSeededCases(
+  cases: EvalCase<AssistantVars, AssistantExpect>[],
+  tenant: EvalTenant,
+  seeded: EvalTenant | null,
+  mode: RouteReport["mode"],
+): Promise<RouteReport> {
   const results: CaseResult[] = [];
 
   for (const c of cases) {

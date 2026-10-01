@@ -144,6 +144,15 @@ describe("seasonality index and act-by", () => {
     expect(oct).toBeCloseTo(2.1873, 3);
   });
 
+  it("B-131 regression: an all-zero series returns null, not a flat SI, so the Census fallback still runs", () => {
+    // ln(0+1) = 0 for every point, so the OLS trend fit is flat at 0 and every ratio comes out to
+    // exactly 1 — `overall` is 1, not <= 0, so the existing `overall <= 0` guard doesn't catch
+    // this case. Detrending alone (B-131) regressed this: it used to return `null` via the old
+    // raw month-mean path (mean of 12 zeros is 0, caught by the old zero-overall guard).
+    const zeros = months(3).map((p) => ({ ...p, value: 0 }));
+    expect(seasonalityIndex(zeros)).toBeNull();
+  });
+
   it("AC34 (B-131 worked example): a rising niche with a true October factor doesn't read as seasonal everywhere, and deseasonalizing recovers its true growth", () => {
     // Spec Step 3a worked example: a true steady 5%/month compounding trend, true 1.3× October
     // factor, every other month's true factor 1.0 (no other real seasonality). Values as the

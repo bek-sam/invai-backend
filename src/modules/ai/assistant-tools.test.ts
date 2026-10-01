@@ -1311,6 +1311,41 @@ describe("market tools (T-18-4)", () => {
     expect(es.answer).not.toContain("2026-08-04");
   });
 
+  it("B-192: a past act-by date is also suppressed when 0 < weeksToPeak < leadTimeWeeks", async () => {
+    m.getSeasonalitySignal.mockImplementation(async (_tx, _ctx, i) => ({
+      subject: subjectOf(i),
+      confidence: 0.6,
+      band: "medium",
+      stale: false,
+      mock: false,
+      sources: [prov("census", false)],
+      asOf: AS_OF,
+      index: Array.from({ length: 12 }, (_, k) => ({ month: k + 1, index: k === 9 ? 1.6 : 0.95 })),
+      peakMonths: [10],
+      offMonths: [],
+      indexSource: "census_prior",
+      // signals.ts actBy(2026-09-20, [10], 4, "America/Phoenix") returns
+      // { date: "2026-09-03", weeksToPeak: 1.57 }, a date already before today even though the
+      // peak month hasn't begun (weeksToPeak !== 0), because leadTimeWeeks (4) exceeds the
+      // weeks left before the peak starts. B-192's bug printed that past date.
+      actBy: {
+        date: "2026-09-03",
+        peakMonth: 10,
+        weeksToPeak: 1.57,
+        leadTimeWeeks: 4,
+        actNow: true,
+      },
+      yearsUsed: 10,
+    }));
+    const en = await run(a.ctx, "get_seasonality", { niche: "camping" });
+    expect(en.answer).toContain(MARKET_COPY.seasonUnderWay.en);
+    expect(en.answer).not.toContain("2026-09-03");
+    expect(en.answer).not.toContain("Act by");
+    const es = await run(a.ctx, "get_seasonality", { niche: "camping", lang: "es" });
+    expect(es.answer).toContain(MARKET_COPY.seasonUnderWay.es);
+    expect(es.answer).not.toContain("2026-09-03");
+  });
+
   it("niche names match singular or plural, key or label, any case", async () => {
     for (const said of ["dog moms", "Dog Mom", "dog-mom", "Mamá de perro"]) {
       m.getTrendSignal.mockClear();

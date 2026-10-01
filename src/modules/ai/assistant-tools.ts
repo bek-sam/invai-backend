@@ -1026,12 +1026,14 @@ function marketTools(ctx: TenantContext): AssistantTool[] {
             const off = r.offMonths.length
               ? `; ${lang === "es" ? "meses bajos" : "off months"}: ${months(r.offMonths)}`
               : "";
-            // B-192: `weeksToPeak` is clamped to 0 only when the peak month has already begun
-            // (signals.ts `actBy()`); the computed act-by date is then before today, so show
-            // "the season is on now" instead of a stale past date (R1 does the same, rules.ts).
+            // B-192: signals.ts `actBy()` returns `date = peakStart - leadTimeWeeks`. That date
+            // is before today exactly when `weeksToPeak < leadTimeWeeks` (not only when the peak
+            // month has already begun, i.e. weeksToPeak === 0) — the common case of a lead time
+            // longer than the weeks left before the peak starts. Show "the season is on now"
+            // instead of a stale past date in both cases (R1 does the same, rules.ts).
             const act = !r.actBy
               ? ""
-              : r.actBy.weeksToPeak === 0
+              : r.actBy.weeksToPeak < r.actBy.leadTimeWeeks
                 ? ` ${MARKET_COPY.seasonUnderWay[lang]}`
                 : ` ${lang === "es" ? "Actúa antes del" : "Act by"} ${r.actBy.date}: ${weeks(Math.round(r.actBy.weeksToPeak), lang)} ${lang === "es" ? "al pico, tu tiempo de producción es de" : "to the peak, your lead time is"} ${weeks(Math.round(r.actBy.leadTimeWeeks), lang)}.${r.actBy.actNow ? (lang === "es" ? " Hazlo ya." : " Act now.") : ""}`;
             return [
