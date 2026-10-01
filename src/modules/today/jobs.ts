@@ -5,7 +5,7 @@ import { withSystem, withTenant } from "../../db/client";
 import { companies } from "../../db/schema";
 import { env } from "../../env";
 import { errorData, logger } from "../../lib/log";
-import { defineJob, queues } from "../../lib/queues";
+import { defineJob, LIVE_JOB_STATES, queues, safeJobId } from "../../lib/queues";
 import { DIGEST_CONFIG as C } from "../digest/config";
 import { realCompanySql } from "../tenancy/demo-flag";
 import { buildTodayActions } from "./actions";
@@ -67,8 +67,59 @@ export const buildTodayActionsJob = defineJob({
   input: z.object({ companyId: z.uuid(), date: z.iso.date() }),
   jobId: (i) => `today-actions-${i.companyId}-${i.date}`,
   options: { attempts: 3, backoff: { type: "exponential", delay: 60_000, jitter: 0.5 } },
-  handler: async ({ companyId, date }) => buildTodayActions(companyId, date),
+  handler: async ({ companyId, date }, job) => {
+    try {
+      return await buildTodayActions(companyId, date);
+    } catch (err) {
+      log.warn("today actions build failed", {
+        companyId,
+        date,
+        attempt: (job.attemptsMade ?? 0) + 1,
+        attempts: job.opts?.attempts ?? 1,
+        ...errorData(err),
+      });
+      throw err;
+    }
+  },
 });
+
+/**
+ * Enqueue a fresh build unless a job for this (company, date) is already in flight or just
+ * finished. BullMQ ignores an `add` whose jobId already exists: once the build's 3rd attempt
+ * fails, that failed job sits around (`removeOnFail` keeps it 7 days) and blocks every later
+ * sweep from re-adding it, so the panel stays hidden for the rest of the day. A `failed` job is
+ * removed first, then re-enqueued; any live state (waiting, active, delayed, waiting-children,
+ * prioritized) or `completed` is left alone so the sweep never double-builds (architect ruling 4,
+ * `waves/P2/reviews/plan-architect.md`). `job.remove()` throws only while a job is actively
+ * processing; the try/catch covers the race where a second concurrent sweep already removed or
+ * retried the same job between the state check and this call — it should no-op, not fail the
+ * sweep. The `(company_id, date)` row in `buildTodayActions` stays the real idempotency
+ * guarantee either way.
+ */
+export async function requeueBuild(companyId: string, date: string): Promise<boolean> {
+  const rawId = buildTodayActionsJob.jobId?.({ companyId, date });
+  const existing = rawId ? await queues.reports.getJob(safeJobId(rawId)) : undefined;
+  if (existing) {
+    const state = await existing.getState();
+    if ((LIVE_JOB_STATES as readonly string[]).includes(state)) return false;
+    if (state === "failed") {
+      try {
+        await existing.remove();
+      } catch (err) {
+        log.warn("could not remove a failed today-actions job before requeue", {
+          companyId,
+          date,
+          ...errorData(err),
+        });
+        return false;
+      }
+    } else if (state !== "unknown") {
+      return false; // completed (no set row yet would be unexpected, but never double-build)
+    }
+  }
+  await buildTodayActionsJob.enqueue({ companyId, date });
+  return true;
+}
 
 /**
  * Shops whose local today has no action set, one page (keyset on company id). Cross-tenant read
@@ -108,8 +159,7 @@ export async function sweepTodayActions(at: Date = new Date()) {
   for (;;) {
     const page = await shopsMissingToday(at, after, TODAY_SWEEP_PAGE);
     for (const s of page) {
-      await buildTodayActionsJob.enqueue(s);
-      enqueued++;
+      if (await requeueBuild(s.companyId, s.date)) enqueued++;
     }
     if (page.length < TODAY_SWEEP_PAGE) break;
     after = page[page.length - 1]?.companyId ?? null;
