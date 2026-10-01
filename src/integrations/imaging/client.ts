@@ -2,6 +2,7 @@ import { deflateSync } from "node:zlib";
 import { z } from "zod";
 import { env } from "../../env";
 import { logger } from "../../lib/log";
+import { isPermanentHttpStatus } from "../../lib/queues";
 import { putObject } from "../../lib/s3";
 
 const log = logger("imaging");
@@ -272,16 +273,18 @@ export function createImagingClient(
     return parsed.data;
   }
 
+  async function checkHealthy(): Promise<boolean> {
+    try {
+      return (await call("/health", undefined, Health, { method: "GET", timeoutMs: 2_000 })).ok;
+    } catch {
+      return false;
+    }
+  }
+
   return {
     baseUrl,
     health: () => call("/health", undefined, Health, { method: "GET", timeoutMs: 3_000 }),
-    isUp: async () => {
-      try {
-        return (await call("/health", undefined, Health, { method: "GET", timeoutMs: 2_000 })).ok;
-      } catch {
-        return false;
-      }
-    },
+    isUp: checkHealthy,
 
     qaCheck: (input: { file_key: string; target_width_in?: number; target_height_in?: number }) =>
       call("/qa/check", input, QaCheckResult),
@@ -290,11 +293,17 @@ export function createImagingClient(
       call("/qa/clean-alpha", input, KeyResult),
 
     /**
-     * A thumbnail for `out_key`, longest side at most `max_px` (imaging default 512). Never
-     * rejects: when imaging can't be reached, it writes `placeholderPreviewPng()` to `out_key`
-     * itself and returns that instead, so a design or order-item list never shows a broken image
-     * for want of the imaging service. Callers (catalog) still check `isCompanyKey` on both keys
-     * first — imaging trusts the backend for company prefixes (S-11/S-12 model).
+     * A thumbnail for `out_key`, longest side at most `max_px` (imaging default 512).
+     *
+     * T-P2-2 (B-233): a bad-input rejection (4xx/422) and a momentary blip while imaging is
+     * actually up (connection reset, timeout, 5xx) both throw, so the caller can tell a real
+     * rejection from a retry-worthy failure, and a job retries instead of a momentary outage
+     * freezing a gray square over what should be a real thumbnail. Only when imaging answers
+     * unhealthy right now — genuinely not configured locally, or down for good — does this fall
+     * back to `placeholderPreviewPng()` at `out_key`, so a design or order-item list never shows
+     * a broken image for want of the imaging service (never remove this mock). Callers (catalog)
+     * still check `isCompanyKey` on both keys first — imaging trusts the backend for company
+     * prefixes (S-11/S-12 model).
      */
     preview: async (input: {
       file_key: string;
@@ -304,7 +313,9 @@ export function createImagingClient(
       try {
         return await call("/preview", input, PreviewResult);
       } catch (err) {
-        log.warn("imaging preview unavailable, writing a placeholder thumbnail", {
+        if (err instanceof ImagingError && isPermanentHttpStatus(err.status)) throw err;
+        if (await checkHealthy()) throw err;
+        log.warn("imaging unreachable, writing a placeholder thumbnail", {
           outKey: input.out_key,
           error: err instanceof Error ? err.message : String(err),
         });

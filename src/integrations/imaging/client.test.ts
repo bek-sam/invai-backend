@@ -15,6 +15,8 @@ let server: Server;
 let baseUrl: string;
 let busy = 0;
 let seen: IncomingMessage["headers"][] = [];
+/** T-P2-2: force the stand-in's `/preview` response status (imaging stays reachable). */
+let previewStatus: number | null = null;
 
 beforeAll(async () => {
   server = createServer((req, res) => {
@@ -28,6 +30,14 @@ beforeAll(async () => {
       busy--;
       res.writeHead(429, { "content-type": "application/json", "retry-after": "3" });
       return res.end(JSON.stringify({ detail: "imaging is busy; retry later" }));
+    }
+    if (req.url === "/health") {
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ ok: true }));
+    }
+    if (req.url === "/preview" && previewStatus) {
+      res.writeHead(previewStatus, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ detail: `preview rejected (${previewStatus})` }));
     }
     res.writeHead(200, { "content-type": "application/json" });
     if (req.url === "/preview") {
@@ -44,6 +54,7 @@ afterAll(() => new Promise<void>((resolve) => server.close(() => resolve())));
 beforeEach(() => {
   busy = 0;
   seen = [];
+  previewStatus = null;
 });
 
 function client(secret = "s3cret") {
@@ -111,5 +122,25 @@ describe("imaging client (T-9-5)", () => {
     expect(result).toEqual({ out_key: outKey, width_px: 64, height_px: 64 });
     const written = await getObject(outKey);
     expect(written).toEqual(placeholderPreviewPng());
+  });
+
+  it("throws on a 5xx while imaging answers healthy, no placeholder (T-P2-2 AC2)", async () => {
+    previewStatus = 503;
+    const { c } = client();
+    const err = await c
+      .preview({ file_key: "co/design/x.png", out_key: "co/preview/x.png" })
+      .catch((e) => e);
+    expect(err).toBeInstanceOf(ImagingError);
+    expect(err.status).toBe(503);
+  });
+
+  it("throws on a 422 bad-input rejection, no placeholder (T-P2-2 AC2)", async () => {
+    previewStatus = 422;
+    const { c } = client();
+    const err = await c
+      .preview({ file_key: "co/design/x.png", out_key: "co/preview/x.png" })
+      .catch((e) => e);
+    expect(err).toBeInstanceOf(ImagingError);
+    expect(err.status).toBe(422);
   });
 });

@@ -39,6 +39,9 @@ onEvent("design.updated", runDesignQaJob, (e) =>
  * Thumbnails for the design list and order-item artwork (B-209). Runs whenever placements were
  * attached or replaced (the same `qaRequested` signal as the QA job, since that's when the file
  * rows change); a metadata-only update (rename, tags) leaves existing previews alone.
+ *
+ * T-P2-2 (B-233): `renderDesignPreviews` manages its own short transactions (no transaction is
+ * held across the `imaging.preview()` calls), so this handler no longer opens one of its own.
  */
 export const renderDesignPreviewsJob = defineJob({
   queue: "render",
@@ -46,8 +49,20 @@ export const renderDesignPreviewsJob = defineJob({
   input: z.object({ companyId: z.uuid(), designId: z.uuid() }),
   jobId: (i) => `design-preview-${i.designId}`,
   handler: async ({ companyId, designId }) => {
+    const started = Date.now();
+    let imagingMs = 0;
     const ctx = systemContext(companyId);
-    const design = await withTenant(companyId, (tx) => renderDesignPreviews(tx, ctx, designId));
+    const design = await renderDesignPreviews(companyId, ctx, designId, {
+      onImagingMs: (ms) => {
+        imagingMs += ms;
+      },
+    });
+    log.info("render design previews", {
+      companyId,
+      designId,
+      durationMs: Date.now() - started,
+      imagingMs,
+    });
     return { placements: design.placements.length };
   },
 });

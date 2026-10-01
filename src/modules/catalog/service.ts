@@ -8,16 +8,17 @@ import {
 import { and, desc, eq, gt, ilike, inArray, isNotNull, or, type SQL, sql } from "drizzle-orm";
 import type { z } from "zod";
 import type { TenantContext } from "../../api/context";
-import type { Tx } from "../../db/client";
+import { type Tx, withTenant } from "../../db/client";
 import type { QaIssue, QaStatus } from "../../db/schema";
 import { blankVariants, designFiles, designs, orderItems, orders, products } from "../../db/schema";
-import { imaging } from "../../integrations/imaging/client";
+import { ImagingError, imaging, type PreviewResult } from "../../integrations/imaging/client";
 import { audit } from "../../lib/audit";
 import { col, parseCsvObjects } from "../../lib/csv";
 import { badRequest, conflict, notFound, upstream } from "../../lib/errors";
 import { logger } from "../../lib/log";
 import { emit } from "../../lib/outbox";
 import { keyset, type PageInput } from "../../lib/pagination";
+import { isPermanentHttpStatus } from "../../lib/queues";
 import { getObject, isCompanyKey, objectKey, presignGet } from "../../lib/s3";
 
 const log = logger("catalog");
@@ -334,31 +335,64 @@ export function designPreviewKey(companyId: string, designFileId: string): strin
 
 /**
  * Render (or re-render) a thumbnail for every placement of a design, called by the
- * `catalog.renderDesignPreviews` job after create/update. `imaging.preview` never throws (it
- * falls back to a placeholder when imaging is down), so this never leaves a file without a
- * preview key — at worst a gray placeholder until imaging is back.
+ * `catalog.renderDesignPreviews` job after create/update.
+ *
+ * T-P2-2 (B-233): no DB transaction stays open while `imaging.preview()` is in flight — a short
+ * transaction reads the files, every imaging call runs with no transaction held, and each result
+ * is written in its own short transaction. `imaging.preview()` itself still falls back to a
+ * placeholder when imaging is genuinely unreachable (local mock mode; never remove a mock); a
+ * transient failure while imaging is up (timeout, 5xx) throws here so the job retries, and a
+ * permanent 4xx/422 (bad input) is logged and leaves that placement's preview key untouched — no
+ * placeholder for a real rejection.
  */
-export async function renderDesignPreviews(tx: Tx, ctx: TenantContext, id: string) {
-  const files = await tx.select().from(designFiles).where(eq(designFiles.designId, id));
+export async function renderDesignPreviews(
+  companyId: string,
+  ctx: TenantContext,
+  id: string,
+  opts: { onImagingMs?: (ms: number) => void } = {},
+): Promise<Design> {
+  const files = await withTenant(companyId, (tx) =>
+    tx.select().from(designFiles).where(eq(designFiles.designId, id)),
+  );
   if (files.length === 0) throw notFound("design", id);
   for (const file of files) {
-    const outKey = designPreviewKey(ctx.companyId, file.id);
+    const outKey = designPreviewKey(companyId, file.id);
     // Imaging trusts the backend for company prefixes (S-11/S-12 model, T-P1-2 security review):
     // check both keys stay inside this tenant before every call, never pass that trust along.
-    if (!isCompanyKey(ctx.companyId, file.fileKey) || !isCompanyKey(ctx.companyId, outKey)) {
+    if (!isCompanyKey(companyId, file.fileKey) || !isCompanyKey(companyId, outKey)) {
       log.warn("refusing preview for a key outside the tenant", {
         designId: id,
         placement: file.placement,
       });
       throw badRequest("file key is outside the tenant");
     }
-    const out = await imaging.preview({ file_key: file.fileKey, out_key: outKey, max_px: 512 });
-    await tx
-      .update(designFiles)
-      .set({ previewKey: out.out_key })
-      .where(eq(designFiles.id, file.id));
+    const started = Date.now();
+    let out: PreviewResult;
+    try {
+      out = await imaging.preview({ file_key: file.fileKey, out_key: outKey, max_px: 512 });
+    } catch (err) {
+      if (err instanceof ImagingError && isPermanentHttpStatus(err.status)) {
+        log.warn("imaging rejected the preview input; leaving no preview", {
+          designId: id,
+          placement: file.placement,
+          status: err.status,
+        });
+        continue;
+      }
+      throw err; // transient (unreachable, timeout, 5xx): propagate so the job retries
+    } finally {
+      opts.onImagingMs?.(Date.now() - started);
+    }
+    // Write only if the file row still has the same file_key it rendered — a replace landing
+    // mid-render (a new designFiles row, or an in-place file swap) must not get a stale key.
+    await withTenant(companyId, (tx) =>
+      tx
+        .update(designFiles)
+        .set({ previewKey: out.out_key })
+        .where(and(eq(designFiles.id, file.id), eq(designFiles.fileKey, file.fileKey))),
+    );
   }
-  return getDesign(tx, ctx, id);
+  return withTenant(companyId, (tx) => getDesign(tx, ctx, id));
 }
 
 /* ---------------------------------- blanks ---------------------------------- */

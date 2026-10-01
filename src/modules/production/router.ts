@@ -1,7 +1,10 @@
 import { authed } from "../../api/orpc";
 import { withTenant } from "../../db/client";
+import { logger } from "../../lib/log";
 import { sendSheetToVendor } from "../vendors/service";
 import * as svc from "./service";
+
+const log = logger("production.router");
 
 export const productionRouter = authed.production.router({
   batches: {
@@ -108,9 +111,18 @@ export const productionRouter = authed.production.router({
   queue: authed.production.queue.handler(({ input, context: { tenant } }) =>
     withTenant(tenant.companyId, (tx) => svc.stationQueue(tx, tenant, input)),
   ),
-  scan: authed.production.scan.handler(({ input, context: { tenant } }) =>
-    withTenant(tenant.companyId, (tx) => svc.scan(tx, tenant, input)),
-  ),
+  // T-P2-2: duration log only, no behavior change (QA gate root-cause check for render-job
+  // contention, waves/P1/reports/gate-rootcause.md §2).
+  scan: authed.production.scan.handler(async ({ input, context: { tenant } }) => {
+    const started = Date.now();
+    const result = await withTenant(tenant.companyId, (tx) => svc.scan(tx, tenant, input));
+    log.info("scan", {
+      companyId: tenant.companyId,
+      stationId: input.stationId ?? tenant.station?.id ?? null,
+      durationMs: Date.now() - started,
+    });
+    return result;
+  }),
   qc: authed.production.qc.handler(({ input, context: { tenant } }) =>
     withTenant(tenant.companyId, (tx) => svc.qc(tx, tenant, input)),
   ),

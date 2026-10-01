@@ -191,15 +191,13 @@ describe("catalog service", () => {
     const design = await withTenant(companyId, (tx) =>
       svc.createDesign(tx, ctx, designInput("PV1")),
     );
-    const first = await withTenant(companyId, (tx) => svc.renderDesignPreviews(tx, ctx, design.id));
+    const first = await svc.renderDesignPreviews(companyId, ctx, design.id);
     const firstKey = first.placements[0]?.previewKey;
     expect(firstKey).toBeTruthy();
     expect(firstKey).toMatch(new RegExp(`^${companyId}/preview/design/`));
 
     // Re-running (a retry, a duplicate enqueue) writes the same key, not a second object.
-    const second = await withTenant(companyId, (tx) =>
-      svc.renderDesignPreviews(tx, ctx, design.id),
-    );
+    const second = await svc.renderDesignPreviews(companyId, ctx, design.id);
     expect(second.placements[0]?.previewKey).toBe(firstKey);
   });
 
@@ -216,9 +214,9 @@ describe("catalog service", () => {
         .set({ fileKey: `${other}/design/theirs.png` })
         .where(eq(designFiles.designId, design.id)),
     );
-    await expect(
-      withTenant(companyId, (tx) => svc.renderDesignPreviews(tx, ctx, design.id)),
-    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+    await expect(svc.renderDesignPreviews(companyId, ctx, design.id)).rejects.toMatchObject({
+      code: "BAD_REQUEST",
+    });
   });
 
   it("can't render or read another company's design (B-209 AC6, tenant isolation)", async () => {
@@ -228,8 +226,8 @@ describe("catalog service", () => {
     const other = (await createCompany()).id;
     const otherUser = await createUser(other, "designer");
     const otherCtx = tenantContext(other, otherUser.id, "designer");
-    await expect(
-      withTenant(other, (tx) => svc.renderDesignPreviews(tx, otherCtx, design.id)),
-    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    await expect(svc.renderDesignPreviews(other, otherCtx, design.id)).rejects.toMatchObject({
+      code: "NOT_FOUND",
+    });
   });
 });
