@@ -1,6 +1,8 @@
 import { writeFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { eq, sql } from "drizzle-orm";
 import { auth } from "../../auth";
+import { env } from "../../env";
 import { logger } from "../../lib/log";
 import { PLAN_CATALOG } from "../../modules/billing/service";
 import { closeDb, systemDb, withSystem } from "../client";
@@ -51,6 +53,27 @@ async function signUp(email: string, name: string): Promise<string> {
   return res.user.id;
 }
 
+/**
+ * B-219: seeding any database other than the shared dev/CI database `invai` must never overwrite
+ * the shared `seed-output.json` that other agents and the station token depend on (2026-10-01
+ * T-P5-1 overwrote it from a scratch seed). `invai` always writes `seed-output.json` as today,
+ * whatever `SEED_OUTPUT_FILE` is. Checked before any insert so a refusal never comes after the
+ * ~15-minute render-heavy seed has already run.
+ */
+export function assertSafeToSeed(
+  migrationDatabaseUrl: string,
+  seedOutputFile: string | undefined,
+): void {
+  const database = new URL(migrationDatabaseUrl).pathname.slice(1);
+  if (database === "invai") return;
+  if (!seedOutputFile?.trim()) {
+    throw new Error(
+      `[seed] refusing: seeding ${database} would overwrite the shared seed-output.json. ` +
+        "Set SEED_OUTPUT_FILE=<path> for this database.",
+    );
+  }
+}
+
 async function seedGlobals() {
   // Trademark marks are no longer seeded here: `ensureReferenceData` (src/db/reference)
   // upserts them at the end of every `pnpm db:migrate`, which always runs before this script.
@@ -60,6 +83,7 @@ async function seedGlobals() {
 
 async function main() {
   const started = Date.now();
+  assertSafeToSeed(env.MIGRATION_DATABASE_URL, process.env.SEED_OUTPUT_FILE);
   const [existing] = await systemDb
     .select({ id: companies.id })
     .from(companies)
@@ -211,13 +235,18 @@ async function main() {
   );
 }
 
-main()
-  .catch((err) => {
-    console.error(err);
-    process.exitCode = 1;
-  })
-  .finally(async () => {
-    const { closeQueues } = await import("../../lib/queues");
-    await closeQueues().catch(() => {});
-    await closeDb();
-  });
+// Guarded like src/db/reset.ts: only runs main() when this file is the script node/tsx was
+// invoked with (`pnpm db:seed`), never as a side effect of another module importing
+// `assertSafeToSeed` for a unit test.
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+  main()
+    .catch((err) => {
+      console.error(err);
+      process.exitCode = 1;
+    })
+    .finally(async () => {
+      const { closeQueues } = await import("../../lib/queues");
+      await closeQueues().catch(() => {});
+      await closeDb();
+    });
+}

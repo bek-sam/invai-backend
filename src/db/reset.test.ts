@@ -1,7 +1,7 @@
 import { Queue } from "bullmq";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { QUEUE_NAMES, redis } from "../lib/queues";
-import { obliterateQueues } from "./reset";
+import { assertSafeToReset, obliterateQueues } from "./reset";
 
 /*
  * T-20-5 (wave 19 gate issue 6): `pnpm db:reset` empties the app's own BullMQ queues in the
@@ -77,5 +77,48 @@ describe("obliterateQueues", () => {
     } finally {
       process.env.NODE_ENV = before;
     }
+  });
+});
+
+/*
+ * T-P6-1 (B-219): a reset of any database other than the shared `invai` must refuse unless
+ * REDIS_URL already pins a non-zero DB, so a scratch-DB reset can never obliterate the shared
+ * dev/CI queues in Redis DB 0 again (incidents 2026-09-29 T-23-9, 2026-10-01 T-P5-1). `invai`
+ * itself must stay reset-able with any REDIS_URL, including the default (no path = DB 0), so the
+ * gate (`invai-infra/scripts/gate.sh:108`) and CI keep working unchanged.
+ */
+describe("assertSafeToReset", () => {
+  const DB_URL = (name: string) => `postgres://invai:invai@localhost:5432/${name}`;
+
+  it("allows the shared invai database with the default (DB 0) Redis URL", () => {
+    expect(() => assertSafeToReset(DB_URL("invai"), "redis://localhost:6379")).not.toThrow();
+  });
+
+  it("allows the shared invai database with any pinned Redis DB too", () => {
+    expect(() => assertSafeToReset(DB_URL("invai"), "redis://localhost:6379/7")).not.toThrow();
+  });
+
+  it("refuses another database on the default (DB 0) Redis URL", () => {
+    expect(() => assertSafeToReset(DB_URL("invai_p6_reset"), "redis://localhost:6379")).toThrow(
+      /refusing: resetting invai_p6_reset would wipe the queues in the shared Redis DB 0/,
+    );
+  });
+
+  it("refuses another database when REDIS_URL's DB is written as 0 explicitly", () => {
+    expect(() => assertSafeToReset(DB_URL("invai_p6_reset"), "redis://localhost:6379/0")).toThrow(
+      /shared Redis DB 0/,
+    );
+  });
+
+  it("refuses another database when REDIS_URL's DB is not a plain positive integer", () => {
+    for (const bad of ["redis://localhost:6379/0/", "redis://localhost:6379/0x1"]) {
+      expect(() => assertSafeToReset(DB_URL("invai_p6_reset"), bad)).toThrow(/shared Redis DB 0/);
+    }
+  });
+
+  it("allows another database with an explicit non-zero Redis DB index", () => {
+    expect(() =>
+      assertSafeToReset(DB_URL("invai_p6_reset"), "redis://localhost:6379/13"),
+    ).not.toThrow();
   });
 });

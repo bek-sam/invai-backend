@@ -50,6 +50,15 @@ running: each builder phase parks the outbox events it emitted and the last step
 (`src/db/seed/outbox-hold.ts`). Seeding a DB copy? Set `SEED_OUTPUT_FILE=<path>` so the copy's run
 doesn't overwrite the shared `seed-output.json`.
 
+**Resetting or seeding any database other than the shared `invai` refuses up front (B-219), before
+touching Postgres or Redis.** `pnpm db:reset` against another database needs an explicit non-zero
+`REDIS_URL` DB index (`redis://localhost:6379/<n>`, n = 1-15): with no index or `/0` it refuses, so
+a scratch reset can never obliterate the shared dev/CI queues in Redis DB 0 again. `pnpm db:seed`
+against another database needs `SEED_OUTPUT_FILE` set: with it unset it refuses before any insert,
+so a scratch seed can never overwrite the shared `seed-output.json`. The shared `invai` database
+always behaves as before either way. Always set `DATABASE_URL`/`MIGRATION_DATABASE_URL`, `REDIS_URL`
+and `SEED_OUTPUT_FILE` together before the first reset/seed command of a scratch-DB session.
+
 **`pnpm test` gets its own database and Redis DB automatically (T-P1-1, B-228).** Unless you pin
 `TEST_DATABASE_URL`/`TEST_MIGRATION_DATABASE_URL`, `global-setup.ts` (via `src/test/test-db.ts`)
 creates a fresh `invai_test_<pid>` cloned from a migrated template `invai_test_tpl`, and drops it

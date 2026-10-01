@@ -2,6 +2,38 @@ import { fileURLToPath } from "node:url";
 import { Pool } from "pg";
 
 /**
+ * True only when the URL's path is written exactly as a positive integer with no leading zero
+ * (`/1`, `/14`, ...). Mirrors `isPinnedNonZeroDb` in `../env.ts`, duplicated here (not imported)
+ * because `src/env.ts` is outside this card's owned paths and this check must stay a pure,
+ * dependency-free function the test can exercise directly. No path, `/0`, a trailing slash
+ * (`/0/`), a decimal, hex, blank or non-numeric text all count as "unset" (DB 0).
+ */
+function isPinnedNonZeroRedisDb(url: string): boolean {
+  const path = new URL(url).pathname.replace(/^\//, "");
+  return /^[1-9]\d*$/.test(path);
+}
+
+/**
+ * B-219: resetting any database other than the shared dev/CI database `invai` must never
+ * obliterate the queues living in Redis DB 0 (two incidents: 2026-09-29 T-23-9, 2026-10-01 T-P5-1).
+ * `invai` always resets exactly as before, whatever `REDIS_URL` is -- the gate
+ * (`invai-infra/scripts/gate.sh:108`) and CI (`.github/workflows/ci.yml`, `e2e.yml`) run it with
+ * the default `REDIS_URL` (no path, DB 0) and must keep working unchanged. Every other database
+ * needs an explicit non-zero Redis DB index, or this throws before any Postgres or Redis command
+ * runs (it does no I/O itself).
+ */
+export function assertSafeToReset(migrationDatabaseUrl: string, redisUrl: string): void {
+  const database = new URL(migrationDatabaseUrl).pathname.slice(1);
+  if (database === "invai") return;
+  if (!isPinnedNonZeroRedisDb(redisUrl)) {
+    throw new Error(
+      `[reset] refusing: resetting ${database} would wipe the queues in the shared Redis DB 0. ` +
+        "Set REDIS_URL=redis://localhost:6379/<n> (n = 1-15) for this database.",
+    );
+  }
+}
+
+/**
  * Development only: drop and recreate the public schema (and drizzle's migration schema) of the
  * database named in the URL, then make sure the test database exists. Run `db:migrate` next.
  */
@@ -87,6 +119,7 @@ export async function obliterateQueues(opts: { prefix?: string } = {}) {
 
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   const { env } = await import("../env");
+  assertSafeToReset(env.MIGRATION_DATABASE_URL, env.REDIS_URL);
   await resetDatabase(env.MIGRATION_DATABASE_URL);
   const removed = await obliterateQueues();
   console.log(
