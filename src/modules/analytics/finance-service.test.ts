@@ -175,6 +175,33 @@ describe("finance analytics (T-A3)", () => {
     expect(shopify.losingPct).toBeNull(); // 10 orders: below the 30-order minimum
   });
 
+  // T-P3-4 (B-230, verify first): a dev-DB check found losing orders with Units 0 and Revenue
+  // $0. Every item on each was flagged isReprint (floor.ts openReprint flips the same item row,
+  // never adds a sibling): finance/service.ts credits a reprint item no revenue ("reprints earn
+  // nothing"), so an order where every item needed a reprint nets to 0 units and $0 revenue here
+  // too. That matches every other profit table (getProfit, unitEconomics both read the same
+  // profit_lines.revenue_cents and the same not-isReprint unit count), so this is not a query
+  // gap in losingOrders — pinned so a future change doesn't accidentally "fix" it here alone.
+  it("T-P3-4: an order whose every item needed a reprint shows 0 units and $0 revenue, by design", async () => {
+    const c = (await createCompany()).id;
+    const ctxC = tenantContext(c, (await createUser(c, "owner")).id, "owner");
+    const placedAt = new Date("2026-08-20T12:00:00.000Z");
+    const { order } = await addOrder(c, {
+      placedAt,
+      lines: [
+        { revenue: 0, blank: 949, transfer: 90, isReprint: true },
+        { revenue: 0, blank: 949, transfer: 90, isReprint: true },
+      ],
+    });
+    const period = { from: "2026-08-19T00:00:00.000Z", to: "2026-08-21T00:00:00.000Z" };
+    const lo = await withTenant(c, (tx) => svc.losingOrders(tx, ctxC, { period }));
+    expect(lo.orders).toHaveLength(1);
+    expect(lo.orders[0]?.orderId).toBe(order.id);
+    expect(lo.orders[0]?.units).toBe(0);
+    expect(lo.orders[0]?.revenue).toBe(0);
+    expect(lo.orders[0]?.cm2).toBe(-2 * (949 + 90));
+  });
+
   it("AC-A3: shipping margin counts labeled orders, free shipping, and skips voided labels", async () => {
     const sm = await run(a, (tx) =>
       svc.shippingMargin(tx, ctxA, { period: s.current, groupBy: "channel" }),
