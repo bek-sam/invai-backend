@@ -1,8 +1,10 @@
 import { call } from "@orpc/server";
+import { eq } from "drizzle-orm";
 import { beforeAll, describe, expect, it } from "vitest";
 import { anonymousContext, permissionsFor } from "../../api/context";
 import { router } from "../../api/router";
 import { withTenant } from "../../db/client";
+import { designFiles } from "../../db/schema";
 import { createCompany, createUser, tenantContext } from "../../test/fixtures";
 import * as svc from "./service";
 
@@ -182,6 +184,52 @@ describe("catalog service", () => {
       withTenant(companyId, (tx) =>
         svc.bulkImportBlanks(tx, ctx, { fileKey: `${other}/csv/2026/09/blanks.csv` }),
       ),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+  });
+
+  it("renders a design preview and is idempotent on retry (B-209 AC1, AC4, AC5)", async () => {
+    const design = await withTenant(companyId, (tx) =>
+      svc.createDesign(tx, ctx, designInput("PV1")),
+    );
+    const first = await withTenant(companyId, (tx) => svc.renderDesignPreviews(tx, ctx, design.id));
+    const firstKey = first.placements[0]?.previewKey;
+    expect(firstKey).toBeTruthy();
+    expect(firstKey).toMatch(new RegExp(`^${companyId}/preview/design/`));
+
+    // Re-running (a retry, a duplicate enqueue) writes the same key, not a second object.
+    const second = await withTenant(companyId, (tx) =>
+      svc.renderDesignPreviews(tx, ctx, design.id),
+    );
+    expect(second.placements[0]?.previewKey).toBe(firstKey);
+  });
+
+  it("refuses to preview a key outside the tenant, even imaging doesn't check (B-209 AC7)", async () => {
+    const design = await withTenant(companyId, (tx) =>
+      svc.createDesign(tx, ctx, designInput("PV2")),
+    );
+    // Imaging trusts the backend for company prefixes (S-11/S-12); simulate a corrupted row
+    // (today's service always writes a company-prefixed fileKey) to prove the defense in depth.
+    const other = (await createCompany()).id;
+    await withTenant(companyId, (tx) =>
+      tx
+        .update(designFiles)
+        .set({ fileKey: `${other}/design/theirs.png` })
+        .where(eq(designFiles.designId, design.id)),
+    );
+    await expect(
+      withTenant(companyId, (tx) => svc.renderDesignPreviews(tx, ctx, design.id)),
+    ).rejects.toMatchObject({ code: "BAD_REQUEST" });
+  });
+
+  it("can't render or read another company's design (B-209 AC6, tenant isolation)", async () => {
+    const design = await withTenant(companyId, (tx) =>
+      svc.createDesign(tx, ctx, designInput("PV3")),
+    );
+    const other = (await createCompany()).id;
+    const otherUser = await createUser(other, "designer");
+    const otherCtx = tenantContext(other, otherUser.id, "designer");
+    await expect(
+      withTenant(other, (tx) => svc.renderDesignPreviews(tx, otherCtx, design.id)),
     ).rejects.toMatchObject({ code: "NOT_FOUND" });
   });
 });

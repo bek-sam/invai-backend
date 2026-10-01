@@ -3,7 +3,12 @@ import { and, eq, inArray, sql } from "drizzle-orm";
 import { systemContext } from "../../api/context";
 import { imaging } from "../../integrations/imaging/client";
 import { logger } from "../../lib/log";
-import { bulkImportBlanks, createDesign, createProduct } from "../../modules/catalog/service";
+import {
+  bulkImportBlanks,
+  createDesign,
+  createProduct,
+  designPreviewKey,
+} from "../../modules/catalog/service";
 import { recordListingsForCompany } from "../../modules/channels/sku";
 import { shelfFor } from "../../modules/inventory/shelves";
 import { transitionItem } from "../../modules/orders/state-machine";
@@ -483,6 +488,9 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
   if (!imagingUp)
     log.warn("imaging is down: designs get placeholder file keys (no sample art rendered)");
   const designIds = new Map<string, string>();
+  // B-209: the design's current preview key, so order items mapped below (which print straight
+  // off the design file, no personalization) can get a thumbnail at insert time too.
+  const designPreviewByCode = new Map<string, string | null>();
   for (const d of DESIGNS) {
     const fileKey = `${shopId}/design/seed/${d.code.toLowerCase()}.png`;
     let rendered = false;
@@ -517,6 +525,23 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
           d.template === undefined ? null : (templateIds[d.template] ?? null),
       });
       if (rendered) {
+        const [file] = await tx
+          .select({ id: designFiles.id })
+          .from(designFiles)
+          .where(eq(designFiles.designId, design.id));
+        let previewKey: string | null = null;
+        if (file) {
+          try {
+            const preview = await imaging.preview({
+              file_key: fileKey,
+              out_key: designPreviewKey(shopId, file.id),
+              max_px: 512,
+            });
+            previewKey = preview.out_key;
+          } catch (err) {
+            log.warn("preview failed", { design: d.code, error: String(err) });
+          }
+        }
         await tx
           .update(designFiles)
           .set({
@@ -525,8 +550,10 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
             heightPx: Math.round(d.size.heightIn * 300),
             effectiveDpi: 300,
             qaCheckedAt: new Date(),
+            previewKey,
           })
           .where(eq(designFiles.designId, design.id));
+        designPreviewByCode.set(d.code, previewKey);
       }
       return design;
     });
@@ -954,6 +981,12 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
                 artworkKey:
                   personalized && plan.finalState !== "needs_artwork"
                     ? `${shopId}/artwork/seed/${order.id.slice(0, 8)}-${lineNo}-${unit}.png`
+                    : null,
+                // B-209: a non-personalized, mapped item prints straight off the design file, so
+                // its thumbnail is the design's own preview (set above, same as `mapItems`).
+                artworkPreviewKey:
+                  !personalized && !line.needsMapping
+                    ? (designPreviewByCode.get(line.design.code) ?? null)
                     : null,
                 flags: line.needsMapping
                   ? [

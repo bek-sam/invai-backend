@@ -1,7 +1,14 @@
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { createImagingClient, IMAGING_BUSY_RETRIES, ImagingError, retryAfterMs } from "./client";
+import { getObject } from "../../lib/s3";
+import {
+  createImagingClient,
+  IMAGING_BUSY_RETRIES,
+  ImagingError,
+  placeholderPreviewPng,
+  retryAfterMs,
+} from "./client";
 
 // A stand-in imaging: answers the first `busy` POSTs with 429 + Retry-After, then 200.
 let server: Server;
@@ -23,6 +30,11 @@ beforeAll(async () => {
       return res.end(JSON.stringify({ detail: "imaging is busy; retry later" }));
     }
     res.writeHead(200, { "content-type": "application/json" });
+    if (req.url === "/preview") {
+      return res.end(
+        JSON.stringify({ out_key: "server/preview/x.png", width_px: 256, height_px: 128 }),
+      );
+    }
     res.end(JSON.stringify({ sheets: [] }));
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -82,5 +94,22 @@ describe("imaging client (T-9-5)", () => {
     expect(retryAfterMs("junk", now)).toBe(2_000);
     expect(retryAfterMs("0", now)).toBe(100);
     expect(retryAfterMs("3600", now)).toBe(30_000);
+  });
+
+  it("previews a file through the real endpoint (B-209)", async () => {
+    const { c } = client();
+    await expect(
+      c.preview({ file_key: "co/design/x.png", out_key: "co/preview/x.png", max_px: 512 }),
+    ).resolves.toEqual({ out_key: "server/preview/x.png", width_px: 256, height_px: 128 });
+  });
+
+  it("falls back to a placeholder PNG when imaging can't be reached (B-209 AC5)", async () => {
+    // Port 1 is reserved; connecting to it fails immediately without a stand-in server.
+    const unreachable = createImagingClient("http://127.0.0.1:1", 1_000, "s3cret");
+    const outKey = `catalog-client-test/preview/${crypto.randomUUID()}.png`;
+    const result = await unreachable.preview({ file_key: "co/design/x.png", out_key: outKey });
+    expect(result).toEqual({ out_key: outKey, width_px: 64, height_px: 64 });
+    const written = await getObject(outKey);
+    expect(written).toEqual(placeholderPreviewPng());
   });
 });

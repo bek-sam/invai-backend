@@ -1,6 +1,8 @@
+import { deflateSync } from "node:zlib";
 import { z } from "zod";
 import { env } from "../../env";
 import { logger } from "../../lib/log";
+import { putObject } from "../../lib/s3";
 
 const log = logger("imaging");
 
@@ -38,6 +40,68 @@ const QaCheckResult = z.object({
 export type QaCheckResult = z.infer<typeof QaCheckResult>;
 
 const KeyResult = z.object({ key: z.string() });
+
+const PreviewResult = z.object({
+  out_key: z.string(),
+  width_px: z.number(),
+  height_px: z.number(),
+});
+export type PreviewResult = z.infer<typeof PreviewResult>;
+
+/*
+ * T-P1-4 (B-209): `preview` never fails the caller. When imaging can't be reached (T-23-5-style
+ * degrade, but a thumbnail is low enough stakes to synthesize instead of leaving pending), it
+ * writes a small flat-gray placeholder PNG to `out_key` itself and returns that. Built by hand
+ * with `node:zlib` (no image library on the backend side): PNG signature + IHDR/IDAT/IEND
+ * chunks, 8-bit RGB, one filter-0 scanline per row.
+ */
+const PLACEHOLDER_PREVIEW_PX = 64;
+
+const CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+function crc32(buf: Buffer): number {
+  let crc = 0xffffffff;
+  for (const byte of buf) crc = (CRC_TABLE[(crc ^ byte) & 0xff] as number) ^ (crc >>> 8);
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function pngChunk(type: string, data: Buffer): Buffer {
+  const typeBuf = Buffer.from(type, "ascii");
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(data.length);
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(crc32(Buffer.concat([typeBuf, data])));
+  return Buffer.concat([len, typeBuf, data, crc]);
+}
+
+/** A flat gray `size`x`size` 8-bit RGB PNG: valid image bytes, never upstream pixels. */
+export function placeholderPreviewPng(size: number = PLACEHOLDER_PREVIEW_PX): Buffer {
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(size, 0);
+  ihdr.writeUInt32BE(size, 4);
+  ihdr[8] = 8; // bit depth
+  ihdr[9] = 2; // color type: truecolor (RGB)
+  ihdr[10] = 0; // compression
+  ihdr[11] = 0; // filter
+  ihdr[12] = 0; // interlace
+  const row = Buffer.concat([Buffer.from([0]), Buffer.alloc(size * 3, 0xc8)]);
+  const raw = Buffer.concat(Array.from({ length: size }, () => row));
+  const signature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  return Buffer.concat([
+    signature,
+    pngChunk("IHDR", ihdr),
+    pngChunk("IDAT", deflateSync(raw)),
+    pngChunk("IEND", Buffer.alloc(0)),
+  ]);
+}
 
 export const TemplateSlot = z.object({
   name: z.string(),
@@ -224,6 +288,35 @@ export function createImagingClient(
 
     cleanAlpha: (input: { file_key: string; out_key: string; threshold?: number }) =>
       call("/qa/clean-alpha", input, KeyResult),
+
+    /**
+     * A thumbnail for `out_key`, longest side at most `max_px` (imaging default 512). Never
+     * rejects: when imaging can't be reached, it writes `placeholderPreviewPng()` to `out_key`
+     * itself and returns that instead, so a design or order-item list never shows a broken image
+     * for want of the imaging service. Callers (catalog) still check `isCompanyKey` on both keys
+     * first — imaging trusts the backend for company prefixes (S-11/S-12 model).
+     */
+    preview: async (input: {
+      file_key: string;
+      out_key: string;
+      max_px?: number;
+    }): Promise<PreviewResult> => {
+      try {
+        return await call("/preview", input, PreviewResult);
+      } catch (err) {
+        log.warn("imaging preview unavailable, writing a placeholder thumbnail", {
+          outKey: input.out_key,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        const png = placeholderPreviewPng();
+        await putObject(input.out_key, png, "image/png");
+        return {
+          out_key: input.out_key,
+          width_px: PLACEHOLDER_PREVIEW_PX,
+          height_px: PLACEHOLDER_PREVIEW_PX,
+        };
+      }
+    },
 
     renderPersonalization: (input: {
       template: z.infer<typeof RenderTemplate>;

@@ -103,7 +103,16 @@ export async function mapItems(
         flags: withFlags(item.flags, [], ["needs_mapping"]),
         ...(design.templateId
           ? {}
-          : { artworkStatus: "none" as const, artworkKey: null, artworkPreviewKey: null }),
+          : {
+              artworkStatus: "none" as const,
+              artworkKey: null,
+              // B-209: the item prints straight off the design file, so its thumbnail is the
+              // design's current preview. If the preview job hasn't landed yet (rare: mapped in
+              // the same beat the design was created), this stays null until the item is
+              // remapped — see T-P1-4 report for why a backfill-on-preview-ready subscriber is
+              // out of this card's grant.
+              artworkPreviewKey: file?.previewKey ?? null,
+            }),
       })
       .where(eq(orderItems.id, item.id));
     await audit(tx, {

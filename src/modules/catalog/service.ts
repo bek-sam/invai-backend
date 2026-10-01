@@ -323,6 +323,44 @@ export async function runDesignQa(
   return design;
 }
 
+/**
+ * Deterministic preview key for a design file (B-209): a rerun of the preview job for the same
+ * file always writes to the same key, so a retry overwrites instead of leaving a second object
+ * behind. Shared with the seed, which renders previews the same way.
+ */
+export function designPreviewKey(companyId: string, designFileId: string): string {
+  return `${companyId}/preview/design/${designFileId}.png`;
+}
+
+/**
+ * Render (or re-render) a thumbnail for every placement of a design, called by the
+ * `catalog.renderDesignPreviews` job after create/update. `imaging.preview` never throws (it
+ * falls back to a placeholder when imaging is down), so this never leaves a file without a
+ * preview key — at worst a gray placeholder until imaging is back.
+ */
+export async function renderDesignPreviews(tx: Tx, ctx: TenantContext, id: string) {
+  const files = await tx.select().from(designFiles).where(eq(designFiles.designId, id));
+  if (files.length === 0) throw notFound("design", id);
+  for (const file of files) {
+    const outKey = designPreviewKey(ctx.companyId, file.id);
+    // Imaging trusts the backend for company prefixes (S-11/S-12 model, T-P1-2 security review):
+    // check both keys stay inside this tenant before every call, never pass that trust along.
+    if (!isCompanyKey(ctx.companyId, file.fileKey) || !isCompanyKey(ctx.companyId, outKey)) {
+      log.warn("refusing preview for a key outside the tenant", {
+        designId: id,
+        placement: file.placement,
+      });
+      throw badRequest("file key is outside the tenant");
+    }
+    const out = await imaging.preview({ file_key: file.fileKey, out_key: outKey, max_px: 512 });
+    await tx
+      .update(designFiles)
+      .set({ previewKey: out.out_key })
+      .where(eq(designFiles.id, file.id));
+  }
+  return getDesign(tx, ctx, id);
+}
+
 /* ---------------------------------- blanks ---------------------------------- */
 
 export type BlankListInput = PageInput & {
