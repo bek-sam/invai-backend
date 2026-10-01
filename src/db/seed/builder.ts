@@ -8,6 +8,7 @@ import {
   createDesign,
   createProduct,
   designPreviewKey,
+  runDesignQa,
 } from "../../modules/catalog/service";
 import { recordListingsForCompany } from "../../modules/channels/sku";
 import { shelfFor } from "../../modules/inventory/shelves";
@@ -66,6 +67,7 @@ import {
   TEMPLATES,
 } from "./data";
 import { holdOutbox, releaseOutbox } from "./outbox-hold";
+import { planSortAt, utcStartOfDay } from "./plan-order";
 
 /*
  * The reusable shop-data builder behind `pnpm db:seed` (Desert Bloom Tees) and tenancy.demo (a
@@ -153,6 +155,12 @@ export type ShopSeedOptions = {
    * keeps filling in a few seconds.
    */
   closedHistory?: boolean;
+  /**
+   * B-208: run the real design QA inline before the outbox is released, so the hand-over already
+   * holds what the worker would compute from the held `design.updated` events. Full seed only
+   * (about 40 imaging calls); `tenancy.demo` keeps its request-time fill as it was.
+   */
+  settleQa?: boolean;
 };
 
 export type ShopSeedResult = {
@@ -440,8 +448,22 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
       ),
     }),
   );
-  const blanks = await run((tx) =>
-    tx.select().from(blankVariants).where(eq(blankVariants.companyId, shopId)),
+  // B-249: every pick below (`random.pick` over colors, `candidates[0]`, low-stock by index)
+  // depends on this list's order, so fix it to the import order instead of the heap's.
+  const blankRank = new Map(
+    BLANK_STYLES.flatMap((style) =>
+      style.colors.flatMap((color) =>
+        SIZES.map((size) => `${style.styleCode}|${color.code}|${size.code}`),
+      ),
+    ).map((k, i) => [k, i]),
+  );
+  const blanks = (
+    await run((tx) => tx.select().from(blankVariants).where(eq(blankVariants.companyId, shopId)))
+  ).sort(
+    (a, b) =>
+      (blankRank.get(`${a.styleCode}|${a.colorCode}|${a.sizeCode}`) ?? Number.MAX_SAFE_INTEGER) -
+        (blankRank.get(`${b.styleCode}|${b.colorCode}|${b.sizeCode}`) ?? Number.MAX_SAFE_INTEGER) ||
+      a.sku.localeCompare(b.sku),
   );
   await run((tx) =>
     tx
@@ -542,17 +564,35 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
             log.warn("preview failed", { design: d.code, error: String(err) });
           }
         }
+        // B-208 (architect ruling R2): with `settleQa`, the real print-file QA, the same call the
+        // worker makes for the released `design.updated` event, so the hand-over already holds
+        // its result and a sheet build sees the same pool before and after the worker drains.
+        // Otherwise the old stand-in "passed" (the worker's QA run corrects it later).
         await tx
           .update(designFiles)
-          .set({
-            qaStatus: "passed",
-            widthPx: Math.round(d.size.widthIn * 300),
-            heightPx: Math.round(d.size.heightIn * 300),
-            effectiveDpi: 300,
-            qaCheckedAt: new Date(),
-            previewKey,
-          })
+          .set(
+            opts.settleQa
+              ? { previewKey }
+              : {
+                  qaStatus: "passed",
+                  widthPx: Math.round(d.size.widthIn * 300),
+                  heightPx: Math.round(d.size.heightIn * 300),
+                  effectiveDpi: 300,
+                  qaCheckedAt: new Date(),
+                  previewKey,
+                },
+          )
           .where(eq(designFiles.designId, design.id));
+        if (opts.settleQa) {
+          try {
+            await runDesignQa(tx, ctx, design.id);
+          } catch (err) {
+            log.warn("design QA failed, left for the worker", {
+              design: d.code,
+              error: String(err),
+            });
+          }
+        }
         designPreviewByCode.set(d.code, previewKey);
       }
       return design;
@@ -647,7 +687,7 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
 
   /* ---- orders ---- */
   const now = Date.now();
-  const startOfToday = new Date(new Date().toISOString().slice(0, 10)).getTime();
+  const startOfToday = utcStartOfDay(now);
   const channelWeights: [string, number][] = [
     ["etsy", 0.4],
     ["shopify", 0.25],
@@ -680,6 +720,8 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
     hold?: boolean;
     cancel?: boolean;
     qcFail?: boolean;
+    /** B-249: ordering key that doesn't move with the time of day (`./plan-order`). */
+    sortAt: number;
   };
   const plans_: Plan[] = [];
   for (let i = 0; i < opts.volume.historicalOrders; i++) {
@@ -732,6 +774,7 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
       hold,
       cancel,
       qcFail: random.chance(0.03),
+      sortAt: planSortAt(placedAt.getTime(), now, true),
     });
   }
   // Open orders due today or tomorrow (60 in the full seed).
@@ -757,9 +800,15 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
       "pressed",
       "packed",
     ] as const);
-    plans_.push({ placedAt, shipBy, channel, finalState });
+    plans_.push({
+      placedAt,
+      shipBy,
+      channel,
+      finalState,
+      sortAt: planSortAt(placedAt.getTime(), now, false),
+    });
   }
-  plans_.sort((a, b) => a.placedAt.getTime() - b.placedAt.getTime());
+  plans_.sort((a, b) => a.sortAt - b.sortAt);
 
   const PATH: OrderItemState[] = [
     "ready",
@@ -1509,6 +1558,8 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
             inArray(orderItems.state, ["pressed", "packed", "shipped", "delivered"]),
           ),
         )
+        // B-249: a stable pick (an unordered LIMIT returns whatever the join order gives).
+        .orderBy(orders.placedAt, orders.orderNo, orderItems.lineNo, orderItems.unitNo)
         .limit(260);
       const press1 = stationIds["Press 1"] as string;
       const press2 = stationIds["Press 2"] as string;
@@ -1549,9 +1600,12 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
       // the overall reprint share in AC1's 2-4%-of-pressed-items band (real QC failures hit
       // ~3% of pressed items per the reprint-cost research).
       const HISTORICAL_REPRINT_TARGET = 160;
+      // B-249: the same orders and lines on every run. Orders are taken in md5(order_no) order
+      // (spread over the 18 months like the old hash order, but repeatable) and the reprinted
+      // unit is the order's first line and unit, not `min(id)` over random UUIDs.
       const multiItemOrders = await tx
         .select({
-          itemId: sql<string>`min(${orderItems.id}::text)`,
+          itemId: sql<string>`(array_agg(${orderItems.id} order by ${orderItems.lineNo}, ${orderItems.unitNo}))[1]::text`,
           itemCount: sql<number>`count(*)`,
         })
         .from(orderItems)
@@ -1565,6 +1619,7 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
         )
         .groupBy(orderItems.orderId)
         .having(sql`count(*) >= 2`)
+        .orderBy(sql`md5(min(${orders.orderNo}))`)
         .limit(HISTORICAL_REPRINT_TARGET);
       const reprintCandidates = multiItemOrders.map((r) => ({ id: r.itemId }));
       if (reprintCandidates.length) {
@@ -1731,10 +1786,18 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
     const [vendor] = await tx
       .select()
       .from(vendorConnections)
-      .where(eq(vendorConnections.companyId, shopId))
+      // B-249: the default (portal) vendor by id; a bare `limit(1)` could return either of the two.
+      .where(
+        and(
+          eq(vendorConnections.companyId, shopId),
+          eq(vendorConnections.id, vendorConnectionIds[0]),
+        ),
+      )
       .limit(1);
     if (!vendor) throw new Error("vendor");
-    const sorted = [...productionItems].sort((a, b) => a.placedAt.getTime() - b.placedAt.getTime());
+    // Already in plan order (B-249: re-sorting by the real placedAt would regroup the chunks
+    // below differently at every time of day).
+    const sorted = productionItems;
     const PER_SHEET = 24;
     let physicalSheetNo = 0;
     let fellBackTo = 0;
@@ -2297,6 +2360,7 @@ export async function buildShopData(opts: ShopSeedOptions): Promise<ShopSeedResu
           sql`${orders.shipBy} < now() + interval '24 hours'`,
         ),
       )
+      .orderBy(orders.shipBy, orders.orderNo)
       .limit(6);
     if (atRisk.length) {
       await upsertAlerts(
@@ -2349,6 +2413,11 @@ async function upsertAlerts(tx: Tx, rows: (typeof alerts.$inferInsert)[]) {
 /**
  * Spread each order's transitions over the hours after it was placed, and set the items'
  * `state_changed_at` to match. Scoped to the orders just built and to this company.
+ *
+ * B-249: one batch's transitions all carry the same `now()`, so the old tie-break on a random
+ * UUID put them in a random order (a delivered unit could show "delivered" before "ready").
+ * `cmin` is the inserting statement's number within its transaction, i.e. the walk's order; it
+ * still holds here because nothing has updated these rows yet.
  */
 async function backdateTimelines(
   opts: ShopSeedOptions,
@@ -2360,7 +2429,7 @@ async function backdateTimelines(
     for (const { orderId, placedAt } of batch) {
       await tx.execute(sql`
         with numbered as (
-          select id, row_number() over (partition by order_item_id order by created_at, id) as n
+          select id, row_number() over (partition by order_item_id order by created_at, cmin::text::bigint, id) as n
           from order_item_transitions where order_id = ${orderId} and company_id = ${companyId}
         )
         update order_item_transitions t

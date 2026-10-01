@@ -178,6 +178,8 @@ async function main() {
     // T-A1 (B-168): 18 months of closed order history for analytics, bulk-inserted (see
     // `buildShopData`'s "closed history" section). Full seed only.
     closedHistory: true,
+    // B-208: real design QA before the outbox is released (settled hand-over).
+    settleQa: true,
   });
 
   // B-207: build this week's digest now, the same way the hourly sweep would once the shop's
