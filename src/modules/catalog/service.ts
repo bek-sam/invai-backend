@@ -8,9 +8,18 @@ import {
 import { and, desc, eq, gt, ilike, inArray, isNotNull, or, type SQL, sql } from "drizzle-orm";
 import type { z } from "zod";
 import type { TenantContext } from "../../api/context";
-import { type Tx, withTenant } from "../../db/client";
+import { afterCommit, type Tx, withTenant } from "../../db/client";
 import type { QaIssue, QaStatus } from "../../db/schema";
-import { blankVariants, designFiles, designs, orderItems, orders, products } from "../../db/schema";
+import {
+  blankVariants,
+  designFiles,
+  designs,
+  gangSheets,
+  itemArtwork,
+  orderItems,
+  orders,
+  products,
+} from "../../db/schema";
 import { ImagingError, imaging, type PreviewResult } from "../../integrations/imaging/client";
 import { audit } from "../../lib/audit";
 import { col, parseCsvObjects } from "../../lib/csv";
@@ -19,7 +28,8 @@ import { logger } from "../../lib/log";
 import { emit } from "../../lib/outbox";
 import { keyset, type PageInput } from "../../lib/pagination";
 import { isPermanentHttpStatus } from "../../lib/queues";
-import { getObject, isCompanyKey, objectKey, presignGet } from "../../lib/s3";
+import { deleteObject, getObject, isCompanyKey, objectKey, presignGet } from "../../lib/s3";
+import { backfillItemPreviews } from "../orders/preview-backfill";
 
 const log = logger("catalog");
 
@@ -227,6 +237,21 @@ export async function updateDesign(
   let qaRequested = false;
   if (input.placements) {
     assertOwnFiles(ctx, input.placements);
+    // Collect the old files' preview keys before they're gone, so a replace can clean up the
+    // objects nothing references any more (T-P5-2, architect ruling R2). A key only ever
+    // qualifies if it's this tenant's and sits in the design-preview prefix: an original art
+    // file, a sheet or a label can never be deleted here even if some future bug points one at
+    // this column.
+    const previewPrefix = `${ctx.companyId}/preview/design/`;
+    const oldFiles = await tx
+      .select({ previewKey: designFiles.previewKey })
+      .from(designFiles)
+      .where(eq(designFiles.designId, input.id));
+    const oldPreviewKeys = oldFiles
+      .map((f) => f.previewKey)
+      .filter(
+        (k): k is string => !!k && isCompanyKey(ctx.companyId, k) && k.startsWith(previewPrefix),
+      );
     await tx.delete(designFiles).where(eq(designFiles.designId, input.id));
     await tx.insert(designFiles).values(
       input.placements.map((p) => ({
@@ -239,9 +264,57 @@ export async function updateDesign(
       })),
     );
     qaRequested = true;
+    if (oldPreviewKeys.length > 0) {
+      afterCommit(tx, () => cleanupOldPreviewKeys(ctx.companyId, oldPreviewKeys));
+    }
   }
   await emit(tx, ctx.companyId, "design.updated", { designId: input.id, qaRequested });
   return getDesign(tx, ctx, input.id);
+}
+
+/**
+ * Delete design-preview objects that no row references any more, after a placement replace
+ * commits (T-P5-2, B-233 rest). Checked across every column that can hold a design preview key
+ * (architect ruling R2): `design_files.preview_key`, `order_items.artwork_preview_key`,
+ * `item_artwork.preview_key` and `gang_sheets.preview_key`. A key still referenced anywhere —
+ * including an item's history thumbnail in any state, shipped included — stays. Runs outside any
+ * transaction; a storage error is a warn log and never fails the update that already committed.
+ */
+async function cleanupOldPreviewKeys(companyId: string, keys: string[]): Promise<void> {
+  if (keys.length === 0) return;
+  const stillReferenced = await withTenant(companyId, async (tx) => {
+    const [fromFiles, fromItems, fromArtwork, fromSheets] = await Promise.all([
+      tx
+        .select({ key: designFiles.previewKey })
+        .from(designFiles)
+        .where(inArray(designFiles.previewKey, keys)),
+      tx
+        .select({ key: orderItems.artworkPreviewKey })
+        .from(orderItems)
+        .where(inArray(orderItems.artworkPreviewKey, keys)),
+      tx
+        .select({ key: itemArtwork.previewKey })
+        .from(itemArtwork)
+        .where(inArray(itemArtwork.previewKey, keys)),
+      tx
+        .select({ key: gangSheets.previewKey })
+        .from(gangSheets)
+        .where(inArray(gangSheets.previewKey, keys)),
+    ]);
+    return new Set(
+      [...fromFiles, ...fromItems, ...fromArtwork, ...fromSheets]
+        .map((r) => r.key)
+        .filter((k): k is string => !!k),
+    );
+  });
+  for (const key of keys) {
+    if (stillReferenced.has(key)) continue;
+    try {
+      await deleteObject(key);
+    } catch (err) {
+      log.warn("failed to delete an orphaned design preview", { companyId, error: String(err) });
+    }
+  }
 }
 
 export async function setDesignStatus(
@@ -395,13 +468,24 @@ export async function renderDesignPreviews(
       opts.onImagingMs?.(Date.now() - started);
     }
     // Write only if the file row still has the same file_key it rendered — a replace landing
-    // mid-render (a new designFiles row, or an in-place file swap) must not get a stale key.
-    await withTenant(companyId, (tx) =>
-      tx
+    // mid-render (a new designFiles row, or an in-place file swap) must not get a stale key. In
+    // that same short transaction, backfill any item that was mapped to this design+placement
+    // before this preview existed (T-P5-2, architect ruling R2): mapping.ts copies the design
+    // file's previewKey at map time, which was still null then.
+    await withTenant(companyId, async (tx) => {
+      const updated = await tx
         .update(designFiles)
         .set({ previewKey: out.out_key })
-        .where(and(eq(designFiles.id, file.id), eq(designFiles.fileKey, file.fileKey))),
-    );
+        .where(and(eq(designFiles.id, file.id), eq(designFiles.fileKey, file.fileKey)))
+        .returning({ id: designFiles.id });
+      if (updated.length > 0) {
+        await backfillItemPreviews(tx, companyId, {
+          designId: id,
+          placement: file.placement,
+          previewKey: out.out_key,
+        });
+      }
+    });
   }
   return withTenant(companyId, (tx) => getDesign(tx, ctx, id));
 }

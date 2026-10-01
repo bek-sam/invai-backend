@@ -4,8 +4,16 @@ import { beforeAll, describe, expect, it, vi } from "vitest";
 import { anonymousContext, permissionsFor } from "../../api/context";
 import { router } from "../../api/router";
 import { withTenant } from "../../db/client";
-import { designFiles } from "../../db/schema";
-import { createCompany, createUser, tenantContext } from "../../test/fixtures";
+import { designFiles, orderItems } from "../../db/schema";
+import { headObject, putObject } from "../../lib/s3";
+import {
+  createCompany,
+  createConnection,
+  createLocation,
+  createOrder,
+  createUser,
+  tenantContext,
+} from "../../test/fixtures";
 
 /*
  * T-P2-2 round 2: `renderDesignPreviews` now calls `imaging.preview` with `allowPlaceholder:
@@ -266,6 +274,101 @@ describe("catalog service", () => {
       }),
     );
     expect(replaced.placements[0]?.previewKey).toBeNull();
+  });
+
+  it("deletes the orphaned preview object from storage once a replace commits (T-P5-2 AC1)", async () => {
+    const design = await withTenant(companyId, (tx) =>
+      svc.createDesign(tx, ctx, designInput("PV5")),
+    );
+    const rendered = await svc.renderDesignPreviews(companyId, ctx, design.id);
+    const oldKey = rendered.placements[0]?.previewKey;
+    if (!oldKey) throw new Error("fixture preview missing");
+    // The mocked imaging client returns an out_key without writing bytes; put a real object so
+    // the delete is observable against MinIO, the way a real render would have left one.
+    await putObject(oldKey, "png", "image/png");
+    expect((await headObject(oldKey)).exists).toBe(true);
+
+    await withTenant(companyId, (tx) =>
+      svc.updateDesign(tx, ctx, {
+        id: design.id,
+        placements: [
+          {
+            placement: "front",
+            fileKey: `${companyId}/design/replacement5.png`,
+            widthIn: 11,
+            heightIn: 12,
+          },
+        ],
+      }),
+    );
+
+    expect((await headObject(oldKey)).exists).toBe(false);
+  });
+
+  it("keeps the old preview object when an order item still references it (T-P5-2 AC2)", async () => {
+    const design = await withTenant(companyId, (tx) =>
+      svc.createDesign(tx, ctx, designInput("PV6")),
+    );
+    const rendered = await svc.renderDesignPreviews(companyId, ctx, design.id);
+    const oldKey = rendered.placements[0]?.previewKey;
+    if (!oldKey) throw new Error("fixture preview missing");
+    await putObject(oldKey, "png", "image/png");
+
+    const conn = await createConnection(companyId);
+    await createLocation(companyId);
+    const { items } = await createOrder(companyId, conn.id, { units: 1 });
+    const itemId = items[0]?.id;
+    if (!itemId) throw new Error("fixture item missing");
+    // The item's history thumbnail points at the old key (as an item that printed straight off
+    // this design, or a shipped order's timeline thumbnail, would).
+    await withTenant(companyId, (tx) =>
+      tx.update(orderItems).set({ artworkPreviewKey: oldKey }).where(eq(orderItems.id, itemId)),
+    );
+
+    await withTenant(companyId, (tx) =>
+      svc.updateDesign(tx, ctx, {
+        id: design.id,
+        placements: [
+          {
+            placement: "front",
+            fileKey: `${companyId}/design/replacement6.png`,
+            widthIn: 11,
+            heightIn: 12,
+          },
+        ],
+      }),
+    );
+
+    expect((await headObject(oldKey)).exists).toBe(true);
+  });
+
+  it("backfills an item mapped before its design had a preview, without a remap (T-P5-2 AC3)", async () => {
+    const design = await withTenant(companyId, (tx) =>
+      svc.createDesign(tx, ctx, designInput("PV7")),
+    );
+    const conn = await createConnection(companyId);
+    await createLocation(companyId);
+    const { items } = await createOrder(companyId, conn.id, { units: 1 });
+    const itemId = items[0]?.id;
+    if (!itemId) throw new Error("fixture item missing");
+    // Simulate mapItems having run while the design had no preview yet (mapping.ts leaves
+    // artworkPreviewKey null in that case): designId and placement set, no artwork of its own.
+    await withTenant(companyId, (tx) =>
+      tx
+        .update(orderItems)
+        .set({ designId: design.id, placement: "front" })
+        .where(eq(orderItems.id, itemId)),
+    );
+
+    await svc.renderDesignPreviews(companyId, ctx, design.id);
+
+    const [row] = await withTenant(companyId, (tx) =>
+      tx
+        .select({ artworkPreviewKey: orderItems.artworkPreviewKey })
+        .from(orderItems)
+        .where(eq(orderItems.id, itemId)),
+    );
+    expect(row?.artworkPreviewKey).toMatch(new RegExp(`^${companyId}/preview/design/`));
   });
 
   it("can't render or read another company's design (B-209 AC6, tenant isolation)", async () => {
