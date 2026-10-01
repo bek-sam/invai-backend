@@ -155,7 +155,7 @@ function losingCte(ctx: Ctx, input: LosingOrdersInput): SQL {
         sum(pl.packaging_cost_cents) as packaging, sum(pl.labor_cost_cents) as labor,
         sum(pl.refunds_cents) as line_refunds,
         sum(pl.net_cents + pl.ads_cost_cents) as cm2_lines,
-        count(*) filter (where not pl.is_reprint) as units,
+        count(*) as units,
         bool_or(cardinality(pl.estimated) > 0) as estimated
       from profit_lines pl
       where pl.company_id = ${ctx.companyId}
@@ -209,7 +209,7 @@ export async function losingOrders(
       left join lateral (
         select p2.design_id from profit_lines p2
         where p2.company_id = ${ctx.companyId} and p2.order_id = x.order_id
-          and not p2.is_reprint and p2.design_id is not null
+          and p2.design_id is not null
         group by p2.design_id order by count(*) desc, p2.design_id limit 1) top on true
       left join designs d on d.id = top.design_id
       where x.cm2 < 0
@@ -546,8 +546,8 @@ export async function profitBridge(
     );
     const [r] = await rows(
       tx,
-      sql`select (count(*) filter (where ${inBase} and not pl.is_reprint))::int as u0,
-          (count(*) filter (where ${inCur} and not pl.is_reprint))::int as u1,
+      sql`select (count(*) filter (where ${inBase}))::int as u0,
+          (count(*) filter (where ${inCur}))::int as u1,
           coalesce(sum(pl.net_cents) filter (where ${inBase}), 0)::bigint as cm0,
           coalesce(sum(pl.net_cents) filter (where ${inCur}), 0)::bigint as cm1,
           ${sql.join(sel, sql`, `)}
@@ -581,9 +581,9 @@ export async function profitBridge(
     const list = await rows(
       tx,
       sql`select ${key} as key,
-          (count(*) filter (where ${inBase} and not pl.is_reprint))::int as u0,
+          (count(*) filter (where ${inBase}))::int as u0,
           coalesce(sum(pl.net_cents) filter (where ${inBase}), 0)::bigint as cm0,
-          (count(*) filter (where ${inCur} and not pl.is_reprint))::int as u1,
+          (count(*) filter (where ${inCur}))::int as u1,
           coalesce(sum(pl.net_cents) filter (where ${inCur}), 0)::bigint as cm1,
           max(d.name) as name
         from profit_lines pl

@@ -92,7 +92,7 @@ describe("finance analytics (T-A3)", () => {
     }
     expect(ue.totals.cm3).toBe(profit.totals.net);
     expect(ue.totals.revenue).toBe(profit.totals.revenue);
-    // 37 orders with a profit line in the current week, 36 units (reprint and cancel excluded).
+    // 37 orders with a profit line in the current week, 36 units (the cancel excluded; the re-pressed unit counts).
     expect(ue.totals.orders).toBe(37);
     expect(ue.totals.units).toBe(36);
     // 7 of 36 units carry an estimated blank (channel-fee estimates don't count).
@@ -396,7 +396,7 @@ describe("finance analytics (T-A3)", () => {
     const cents = Object.fromEntries(lk.waterfall.map((w) => [w.component, w.cents]));
     expect(cents.discounts).toBe(5 * 300);
     expect(cents.refunds).toBe(1000);
-    expect(cents.reprints).toBe(300 + 75); // blank consumed + half the transfer
+    expect(cents.reprints).toBe(300 + 150); // blank consumed + one of the item's two transfers
     // Fully computed period: nothing missing.
     const base = await run(a, (tx) => svc.leakage(tx, ctxA, { period: s.base }));
     expect(base.ordersWithoutProfitLine).toBe(0);

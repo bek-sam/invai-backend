@@ -525,12 +525,13 @@ async function applyLineEdits(
   n: NormalizedOrder,
   run: Run,
 ): Promise<string[]> {
-  const all = await tx
+  // A re-pressed unit (isReprint) is still the same sale unit (decision 0020): it counts toward
+  // the line's quantity, so a re-import never adds a second one.
+  const units = await tx
     .select()
     .from(orderItems)
     .where(eq(orderItems.orderId, o.id))
     .orderBy(orderItems.lineNo, orderItems.unitNo);
-  const units = all.filter((i) => !i.isReprint);
   const byLine = new Map<number, ItemRow[]>();
   for (const u of units) byLine.set(u.lineNo, [...(byLine.get(u.lineNo) ?? []), u]);
   const pending: ExistingLine[] = [...byLine.entries()].map(([lineNo, us]) => ({
@@ -681,13 +682,7 @@ async function applyLineEdits(
       await tx
         .update(orderItems)
         .set({ unitsInLine: line.quantity })
-        .where(
-          and(
-            eq(orderItems.orderId, o.id),
-            eq(orderItems.lineNo, ex.lineNo),
-            eq(orderItems.isReprint, false),
-          ),
-        );
+        .where(and(eq(orderItems.orderId, o.id), eq(orderItems.lineNo, ex.lineNo)));
   }
 
   // Lines the channel no longer lists (API/webhook payloads are the whole order).
@@ -865,13 +860,7 @@ export async function cancelLineFromChannel(
   const units = await tx
     .select()
     .from(orderItems)
-    .where(
-      and(
-        eq(orderItems.orderId, o.id),
-        eq(orderItems.channelLineId, line.channelLineId),
-        eq(orderItems.isReprint, false),
-      ),
-    );
+    .where(and(eq(orderItems.orderId, o.id), eq(orderItems.channelLineId, line.channelLineId)));
   const active = units.filter((u) => u.state !== "cancelled");
   const flags: { item: ItemRow; message: string; fingerprint: string }[] = [];
   const took = cancelCheapest(active, active.length, flags, "line cancelled");

@@ -126,7 +126,7 @@ export async function designLifecycle(
           from order_items oi
           join orders o on o.company_id = ${ctx.companyId} and o.id = oi.order_id
           where oi.company_id = ${ctx.companyId} and oi.design_id is not null
-            and not oi.is_reprint and oi.state <> 'cancelled'
+            and oi.state <> 'cancelled'
             and o.placed_at < ${t}::timestamptz and o.placed_at >= ${t}::timestamptz - interval '365 days' ${channel}
           group by 1),
         listed as (

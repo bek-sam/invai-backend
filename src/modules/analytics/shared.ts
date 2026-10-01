@@ -57,8 +57,8 @@ export type NetResult = {
 /** Buckets that make a unit "estimated" for `estimatedShare` (contracts `ContributionLadder`). */
 const ESTIMATE_FLAGS = ["blankCost", "transferCost", "labelCost", "adsCost"];
 
-/** getProfit's unit rule: not a reprint and not a cancel reversal. */
-const isUnit = sql`not ${profitLines.isReprint} and ${profitLines.refundsCents} = 0`;
+/** getProfit's unit rule: not a cancel reversal (a re-pressed unit is still a sale, decision 0020). */
+const isUnit = sql`${profitLines.refundsCents} = 0`;
 
 const sums = {
   revenue: sql<number>`coalesce(sum(${profitLines.revenueCents}), 0)::int`,

@@ -602,11 +602,13 @@ async function computeChunk(
   for (const order of chunk) {
     const its = items.filter((i) => i.orderId === order.id);
     if (!its.length) continue;
-    const sellable = its.filter((i) => !i.isReprint);
+    // Every unit is a sale: isReprint only means "re-pressed" (decision 0020); its cost is in
+    // the extra transfers, never a lost sale.
+    const sellable = its;
     const active = its.filter((i) => i.state !== "cancelled");
-    const activeSellable = sellable.filter((i) => i.state !== "cancelled");
+    const activeSellable = active;
 
-    // Revenue: unit price − discount share + shipping share (reprints earn nothing).
+    // Revenue: unit price − discount share + shipping share.
     const discount = allocate(
       order.discountCents,
       sellable.map((i) => i.unitPriceCents),
@@ -1031,9 +1033,9 @@ export async function orderProfit(
 
   // Fee breakdown from the same settings the lines used (kept units only).
   const settings = await ensureCostSettings(tx, ctx.companyId);
-  const kept = lines.filter((l) => !l.isReprint && l.refundsCents === 0);
+  const kept = lines.filter((l) => l.refundsCents === 0);
   const keptRevenue = kept.reduce((a, l) => a + l.revenueCents, 0);
-  const fullRevenue = lines.filter((l) => !l.isReprint).reduce((a, l) => a + l.revenueCents, 0);
+  const fullRevenue = lines.reduce((a, l) => a + l.revenueCents, 0);
   const taxShare = fullRevenue > 0 ? Math.round((order.taxCents * keptRevenue) / fullRevenue) : 0;
   const fees = orderFees(feeTableFor(feeTablesOf(settings), order.channel), {
     revenueCents: keptRevenue,

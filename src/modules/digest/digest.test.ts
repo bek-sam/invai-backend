@@ -343,12 +343,17 @@ describe("content (AC6, AC7, AC9, AC10)", () => {
     expect(latest.digest?.status).toBe("skipped_quiet");
   });
 
-  it("AC10: a cancelled item adds nothing; a reprint counts its cost, not a sale", async () => {
+  it("AC10: a cancelled item adds nothing; a re-pressed unit is one sale with its reprint cost", async () => {
     const s = await shop();
     const inWeek = new Date(W39_FROM.getTime() + 2 * DAY);
     await sale(s, inWeek, { status: "cancelled", netCents: 9_999 });
-    await sale(s, inWeek, { isReprint: true, netCents: -500, revenueCents: 0, status: "shipped" });
-    await sale(s, inWeek, { netCents: 1_000, revenueCents: 2_500, status: "shipped" });
+    // Decision 0020: the reprint is the same unit re-pressed; its second transfer lowers net.
+    await sale(s, inWeek, {
+      isReprint: true,
+      netCents: 500,
+      revenueCents: 2_500,
+      status: "shipped",
+    });
     await buildDigest(s.id, "2026-W39", MON_0705);
     const d = await call(
       router.digest.get,
@@ -364,7 +369,7 @@ describe("content (AC6, AC7, AC9, AC10)", () => {
     );
     expect(d.net?.value).toBe(profit.totals.net);
     expect(d.glance.find((g) => g.metric === "revenue")?.current.value).toBe(2_500);
-    // Units count sales only: the reprint and the cancelled item add none.
+    // The re-pressed unit keeps its sale; the cancelled item adds none.
     expect(profit.totals.revenue).toBe(2_500);
   });
 });

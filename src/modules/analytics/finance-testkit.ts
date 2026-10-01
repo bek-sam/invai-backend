@@ -108,6 +108,7 @@ export async function addOrder(companyId: string, spec: OrderSpec) {
           title: "Test tee",
           unitPriceCents: 2500,
           designId: lines[i]?.designId ?? null,
+          isReprint: lines[i]?.isReprint ?? false,
           shipBy: order.shipBy,
           state: "shipped" as const,
         })),
@@ -346,15 +347,13 @@ export async function buildScenario(companyId: string) {
     labeledAt: at("2026-08-13", 17),
   });
 
-  // Reprint: the second line is the reprint's extra cost.
+  // Reprint (decision 0020): the same unit re-pressed. It keeps its sale; the second transfer
+  // adds its cost to the same line.
   const rp = await addOrder(companyId, {
     channel: "etsy",
     placedAt: at("2026-08-13", 19),
     subtotal: 2800,
-    lines: [
-      { revenue: 2800, ...REG, designId: x },
-      { revenue: 0, blank: 300, transfer: 150, designId: x, isReprint: true },
-    ],
+    lines: [{ revenue: 2800, ...REG, transfer: REG.transfer * 2, designId: x, isReprint: true }],
   });
   await addReprint(companyId, rp.items[0]?.id as string, at("2026-08-14", 17));
 

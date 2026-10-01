@@ -164,7 +164,7 @@ async function sizeMixGaps(tx: Tx, ctx: Ctx, windowStart: Date): Promise<SizeMix
           select oi.blank_variant_id, count(*)::int as units
           from order_items oi
           join orders o on o.company_id = ${ctx.companyId} and o.id = oi.order_id
-          where oi.company_id = ${ctx.companyId} and not oi.is_reprint and oi.state <> 'cancelled'
+          where oi.company_id = ${ctx.companyId} and oi.state <> 'cancelled'
             and oi.blank_variant_id is not null and o.placed_at >= ${windowStart}
           group by 1),
         stock as (

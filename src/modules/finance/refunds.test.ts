@@ -139,6 +139,39 @@ describe("finance refunds (T-7-2)", () => {
     ).rejects.toMatchObject({ data: { remainingCents: 2500 } });
   });
 
+  it("counts a reprinted unit as a sale unit in refund scope (B-242)", async () => {
+    // Decision 0020: a re-pressed unit is still the buyer's unit; cancelled, it's refunded.
+    const { order, items } = await shippedOrder("amazon", 2); // 2 x $25, no tax
+    await withSystem((tx) =>
+      tx
+        .update(orderItems)
+        .set({ isReprint: true, state: "cancelled" })
+        .where(eq(orderItems.id, items[0]?.id as string)),
+    );
+    await withTenant(companyId, (tx) => svc.recomputeProfit(tx, ctx, { orderIds: [order.id] }));
+    const rec = (amountCents: number, orderItemId: string | null = null) =>
+      withTenant(companyId, (tx) =>
+        recordRefund(tx, ctx, {
+          orderId: order.id,
+          orderItemId,
+          amountCents,
+          refundedAt: new Date().toISOString(),
+          note: null,
+        }),
+      );
+    await expect(rec(2600)).rejects.toMatchObject({ data: { remainingCents: 2500 } });
+    // A reprinted unit that shipped takes a refund on its own line.
+    await withSystem((tx) =>
+      tx
+        .update(orderItems)
+        .set({ isReprint: true })
+        .where(eq(orderItems.id, items[1]?.id as string)),
+    );
+    await withTenant(companyId, (tx) => svc.recomputeProfit(tx, ctx, { orderIds: [order.id] }));
+    const ev = await rec(2500, items[1]?.id as string);
+    expect(ev).toMatchObject({ orderItemId: items[1]?.id, amountCents: 2500 });
+  });
+
   it("voids a manual refund: audited, dated, and out of profit", async () => {
     const { order } = await shippedOrder("amazon", 2);
     const ev = await withTenant(companyId, (tx) =>

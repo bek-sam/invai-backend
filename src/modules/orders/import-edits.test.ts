@@ -439,3 +439,72 @@ describe("channel holds (B-12)", () => {
     expect(o?.holdNote).toMatch(/TikTok/);
   });
 });
+
+describe("re-import after a reprint (B-242, decision 0020)", () => {
+  // What `openReprint` does to a unit: the same row is flagged re-pressed, back to "ready".
+  const reprint = (id: string) =>
+    withTenant(companyId, (tx) =>
+      tx
+        .update(orderItems)
+        .set({ isReprint: true, state: "ready", transferId: null, gangSheetId: null })
+        .where(eq(orderItems.id, id)),
+    );
+
+  it("a quantity-1 line whose unit was reprinted gets no second unit", async () => {
+    seq++;
+    const lines = [
+      { id: "a", sku: "DB001-G64000-BLK-M", qty: 1 },
+      { id: "b", sku: "DB019-G64000-BLK-L", qty: 1 },
+    ];
+    const id = (await run([order(lines)])).orderIds[0] as string;
+    const before = await unitsOf(id);
+    await reprint(before[0]?.id as string);
+    expect(await run([order(lines)])).toMatchObject({ updated: 0, skipped: 1 });
+    const after = await unitsOf(id);
+    expect(after.map((u) => [u.id, u.lineNo, u.unitNo, u.state, u.isReprint])).toEqual([
+      [before[0]?.id, 1, 1, "ready", true],
+      [before[1]?.id, 2, 1, "ready", false],
+    ]);
+    expect((await orderRow(id))?.itemCount).toBe(2);
+  });
+
+  it("a quantity-2 line with one unit reprinted keeps two units", async () => {
+    seq++;
+    const lines = [{ id: "a", sku: "DB001-G64000-BLK-M", qty: 2 }];
+    const id = (await run([order(lines)])).orderIds[0] as string;
+    const before = await unitsOf(id);
+    await reprint(before[1]?.id as string);
+    expect(await run([order(lines)])).toMatchObject({ updated: 0, skipped: 1 });
+    const after = await unitsOf(id);
+    expect(after.map((u) => [u.id, u.unitNo, u.state, u.isReprint])).toEqual([
+      [before[0]?.id, 1, "ready", false],
+      [before[1]?.id, 2, "ready", true],
+    ]);
+    // A real quantity drop to 1 still counts the reprinted unit (one unit is cancelled, not none).
+    await run([order([{ id: "a", sku: "DB001-G64000-BLK-M", qty: 1 }])]);
+    expect((await unitsOf(id)).filter((u) => u.state !== "cancelled")).toHaveLength(1);
+  });
+
+  it("a channel line-cancel cancels the reprinted unit too", async () => {
+    seq++;
+    const n = order([
+      { id: "a", sku: "DB001-G64000-BLK-M", qty: 2 },
+      { id: "b", sku: "DB019-G64000-BLK-L", qty: 1 },
+    ]);
+    const id = (await run([n], "csv")).orderIds[0] as string;
+    const u = await unitsOf(id);
+    await reprint(u[0]?.id as string);
+    const cancel = { channelOrderId: n.channelOrderId, channelLineId: "a" };
+    const res = await run([], "csv", conn, { source: "csv", cancelledLines: [cancel] });
+    expect(res.cancelled).toBe(1);
+    const after = await unitsOf(id);
+    expect(after.map((x) => [x.state, x.isReprint])).toEqual([
+      ["cancelled", true],
+      ["cancelled", false],
+      ["ready", false],
+    ]);
+    expect(
+      (await run([], "csv", conn, { source: "csv", cancelledLines: [cancel] })).cancelled,
+    ).toBe(0);
+  });
+});

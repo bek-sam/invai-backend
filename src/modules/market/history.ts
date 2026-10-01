@@ -57,7 +57,6 @@ export async function ownWeekly(
         isNotNull(orderItems.designId),
         sql`${orderItems.state} <> 'cancelled'`,
         sql`${orders.status} <> 'cancelled'`,
-        eq(orderItems.isReprint, false),
         gte(orders.placedAt, from),
         designIds?.length ? inArray(orderItems.designId, designIds) : undefined,
       ),
@@ -96,7 +95,6 @@ export async function ownPricePoints(
         eq(orders.channel, channel),
         sql`${orderItems.state} <> 'cancelled'`,
         sql`${orders.status} <> 'cancelled'`,
-        eq(orderItems.isReprint, false),
         gte(orders.placedAt, from),
       ),
     )

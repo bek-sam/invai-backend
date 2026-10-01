@@ -51,7 +51,6 @@ type Unit = {
   id: string;
   channelLineId: string;
   cancelled: boolean;
-  isReprint: boolean;
   saleCents: number;
   category: ReturnType<typeof feeCategoryOf>;
 };
@@ -63,7 +62,6 @@ async function orderUnits(tx: Tx, orderId: string): Promise<Unit[]> {
       id: orderItems.id,
       channelLineId: orderItems.channelLineId,
       state: orderItems.state,
-      isReprint: orderItems.isReprint,
       unitPrice: orderItems.unitPriceCents,
       revenue: profitLines.revenueCents,
       style: blankVariants.style,
@@ -78,7 +76,6 @@ async function orderUnits(tx: Tx, orderId: string): Promise<Unit[]> {
     id: r.id,
     channelLineId: r.channelLineId,
     cancelled: r.state === "cancelled",
-    isReprint: r.isReprint,
     saleCents: r.revenue ?? r.unitPrice,
     category: feeCategoryOf(r.style ? `${r.style} ${r.styleName ?? ""}` : null),
   }));
@@ -140,13 +137,11 @@ export async function recordRefund(
     .for("update");
   if (!order) throw notFound("order", input.orderId);
   const units = await orderUnits(tx, order.id);
-  let scope = units.filter((u) => !u.isReprint && !u.cancelled);
+  let scope = units.filter((u) => !u.cancelled);
   const live = (await listRefunds(tx, order.id)).items.filter((r) => !r.voidedAt);
   // What's left to refund: the order's sale (before tax) less live refunds and the units
   // cancelled before shipping (profit already books those as refunded).
-  const cancelled = units
-    .filter((u) => u.cancelled && !u.isReprint)
-    .reduce((a, u) => a + u.saleCents, 0);
+  const cancelled = units.filter((u) => u.cancelled).reduce((a, u) => a + u.saleCents, 0);
   let remaining =
     Math.max(0, order.totalCents - order.taxCents) -
     cancelled -
@@ -269,7 +264,7 @@ export async function ingestChannelRefunds(
       units = await orderUnits(tx, orderId);
       unitsCache.set(orderId, units);
     }
-    const kept = units.filter((u) => !u.isReprint && !u.cancelled);
+    const kept = units.filter((u) => !u.cancelled);
     let scope = kept;
     let orderItemId: string | null = null;
     if (r.channelLineId) {
