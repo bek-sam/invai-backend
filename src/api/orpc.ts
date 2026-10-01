@@ -156,6 +156,33 @@ export const AI_CHEAP_READS: ReadonlySet<string> = new Set([
   "ai.assistant.conversation",
 ]);
 
+/**
+ * Non-GET procedures that are a pure, side-effect-free read (T-P3-1, B-236; root cause
+ * `waves/P2/reports/gate-rootcause.md`): a body param forces REST method POST/PATCH/PUT even
+ * though nothing is written, so the old `method === "GET" ? "reads" : "writes"` rule put them
+ * in `writes` alongside real mutations. `files.downloadUrl` is the one that broke the floor:
+ * the thumbnail list calls it once per item, draining the 120/min `writes` bucket and 429'ing
+ * the next real `production.scan` right behind it.
+ *
+ * This set was built by walking every non-GET procedure whose permission ends in `.read`
+ * (`contract-dump` in the report) and reading its handler. Each entry here has no DB write, no
+ * outbox emit, no job enqueue, no signed upload and no outbound/paid call -- see
+ * `src/api/buckets.test.ts` for the full walk, including the "stays writes" list with a reason
+ * for every procedure that looked like a read by permission but isn't one in effect.
+ * `ai.*` and `auth: "station"` procedures are untouched (AC2): they're governed by
+ * `AI_CHEAP_READS` and the `auth` bucket respectively, decided before this set is even checked.
+ */
+export const NON_GET_READS: ReadonlySet<string> = new Set([
+  // Presigns a GET url for a file that already exists in storage. No write.
+  "files.downloadUrl",
+  // Dry-runs a SKU rule's pattern against one sample string: regex capture + an in-memory
+  // catalog-index lookup, no DB write.
+  "skuRules.test",
+  // Reads unmapped order items and the catalog index to propose mappings; computes and returns,
+  // never persists a rule or a mapping.
+  "skuRules.suggest",
+]);
+
 export function bucketFor(
   path: readonly string[],
   meta: ProcedureMeta,
@@ -163,7 +190,8 @@ export function bucketFor(
 ): RateBucket {
   if (path[0] === "ai") return AI_CHEAP_READS.has(path.join(".")) ? "reads" : "ai";
   if (meta.auth === "station") return "auth";
-  return method === "GET" ? "reads" : "writes";
+  if (method === "GET") return "reads";
+  return NON_GET_READS.has(path.join(".")) ? "reads" : "writes";
 }
 
 const rateLimit = os.middleware(async ({ context, next, procedure, path }) => {
