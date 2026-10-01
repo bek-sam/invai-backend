@@ -609,7 +609,11 @@ describe("happy path on a fixture shop (AC1, AC3) with shaped test providers", (
     await sales(s, s.etsy, teacher.id, flat(30, 2), now);
     await runAll(s.id);
   }, 120_000);
-  afterAll(() => vi.useRealTimers());
+  afterAll(async () => {
+    vi.useRealTimers();
+    // refreshDemand (inside runAll) writes the global cache: leave it empty for other files.
+    await clearCache();
+  });
 
   it("maps niches by stems and computes own and outside signals with provenance", async () => {
     const n = await withTenant(s.id, (tx) =>
@@ -724,7 +728,11 @@ describe("price position, simulate_price, R2/R3 (AC4–AC6, AC19)", () => {
     await sales(s, amazon, custom.id, flat(20, 2), now, { priceCents: 1999 });
     await runAll(s.id);
   }, 120_000);
-  afterAll(() => vi.useRealTimers());
+  afterAll(async () => {
+    vi.useRealTimers();
+    // refreshDemand (inside runAll) writes the global cache: leave it empty for other files.
+    await clearCache();
+  });
 
   it("Etsy has no compliant source, Walmart isn't connected, Amazon answers from ≥ 8 comparables", async () => {
     const at = (channel: Channel, designId = tee.id) =>
@@ -855,7 +863,12 @@ describe("mock visibility rule (AC29, AC22)", () => {
   beforeAll(() => {
     saved = { isProd: env.isProd, allowMocks: env.allowMocks };
   });
-  afterAll(() => setEnv(saved));
+  afterAll(async () => {
+    setEnv(saved);
+    // The second test's runAll (inside its try/finally) writes the global cache: leave it
+    // empty for other files.
+    await clearCache();
+  });
 
   it("the predicate: dev yes; production real shop no; ALLOW_MOCKS yes; sample workspace yes", async () => {
     const s = await shop();
@@ -1079,7 +1092,11 @@ describe("recommendations: tenancy, votes, shown, feedback, digest (AC23, AC24, 
     await sales(a, amazon, fox.id, flat(30, 4), now, { priceCents: 2499 });
     await runAll(a.id);
   }, 120_000);
-  afterAll(() => vi.useRealTimers());
+  afterAll(async () => {
+    vi.useRealTimers();
+    // refreshDemand (inside runAll) writes the global cache: leave it empty for other files.
+    await clearCache();
+  });
 
   it("another shop sees none of A's market rows and gets NOT_FOUND for A's ids", async () => {
     for (const t of [
