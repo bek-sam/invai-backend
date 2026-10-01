@@ -647,7 +647,8 @@ async function* mockAssistant(
   return { usage, model: MOCK_MODEL, stopReason: "end_turn" };
 }
 
-export const mockProvider: AiProvider = {
+/** Typed with the mock's own `assistant`, which never yields provider-internal `round` events. */
+export const mockProvider: Omit<AiProvider, "assistant"> & { assistant: typeof mockAssistant } = {
   name: "mock",
   async structured<V, O>(prompt: PromptDef<V, O>, vars: V): Promise<StructuredResult<O>> {
     let output: unknown;

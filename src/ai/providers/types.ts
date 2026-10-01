@@ -51,6 +51,21 @@ export type AssistantStreamEvent =
   | { type: "tool_call"; name: string; input: Record<string, unknown> }
   | { type: "tool_result"; name: string; summary: string; meta?: ToolMeta };
 
+/**
+ * Provider-internal (T-P7-5, B-115): yielded once per finished model round with the running token
+ * total of this pass. The gateway records spend and re-checks the caps on it before pulling the
+ * next round, and never passes it on to the service or the web. The mock never yields it.
+ */
+export type AssistantRoundEvent = {
+  type: "round";
+  usage: TokenUsage;
+  model: string;
+  stopReason: string | null;
+};
+
+/** What a provider's `assistant` generator yields: the stream events plus round markers. */
+export type ProviderAssistantEvent = AssistantStreamEvent | AssistantRoundEvent;
+
 export type AssistantFinal = { usage: TokenUsage; model: string; stopReason: string | null };
 
 export type AssistantRun = {
@@ -79,7 +94,7 @@ export interface AiProvider {
   assistant(
     run: AssistantRun,
     onUsage?: (usage: TokenUsage) => void,
-  ): AsyncGenerator<AssistantStreamEvent, AssistantFinal>;
+  ): AsyncGenerator<ProviderAssistantEvent, AssistantFinal>;
 }
 
 /** The model declined (stop_reason `refusal`, after the server-side fallback also declined). */

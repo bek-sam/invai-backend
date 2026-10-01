@@ -11,6 +11,7 @@ import {
   type AssistantFinal,
   type AssistantRun,
   type AssistantStreamEvent,
+  type ProviderAssistantEvent,
   type StructuredResult,
   type TokenUsage,
 } from "./types";
@@ -95,7 +96,7 @@ export function assistantSystem(run: Pick<AssistantRun, "system" | "context">) {
 async function* assistant(
   run: AssistantRun,
   onUsage?: (usage: TokenUsage) => void,
-): AsyncGenerator<AssistantStreamEvent, AssistantFinal> {
+): AsyncGenerator<ProviderAssistantEvent, AssistantFinal> {
   const route = ROUTES.assistant;
   const pending: AssistantStreamEvent[] = [];
   const tools = run.tools.map((t) =>
@@ -148,6 +149,14 @@ async function* assistant(
     last = { model: message.model, stopReason: message.stop_reason };
     onUsage?.({ ...total });
     checkStop(message.stop_reason, message.stop_details);
+    // The runner sends the next request only when this generator is pulled again, so the gateway
+    // can stop the run here (spend caps, credits) before another model call goes out.
+    yield {
+      type: "round",
+      usage: { ...total },
+      model: message.model,
+      stopReason: message.stop_reason,
+    };
   }
   while (pending.length) yield pending.shift() as AssistantStreamEvent;
   return { usage: total, model: last.model, stopReason: last.stopReason };

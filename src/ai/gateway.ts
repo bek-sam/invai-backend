@@ -1,3 +1,4 @@
+import { ORPCError } from "@orpc/server";
 import { eq } from "drizzle-orm";
 import { withTenant } from "../db/client";
 import { aiJobs } from "../db/schema";
@@ -21,6 +22,7 @@ import {
   type AssistantRun,
   type AssistantStreamEvent,
   type AssistantTool,
+  type ProviderAssistantEvent,
 } from "./providers/types";
 import {
   describeIssues,
@@ -115,6 +117,8 @@ async function finishJob(
   aiJobId: string,
   result: { usage: AssistantFinal["usage"]; model: string; stopReason: string | null },
   output: Record<string, unknown>,
+  /** Cents this run already added to the spend counters round by round (T-P7-5). */
+  alreadyRecordedCents = 0,
 ) {
   const credits = tokensToCredits(result.usage);
   // A sample workspace's calls also come back with `model === MOCK_MODEL` (aiProvider() above),
@@ -148,8 +152,9 @@ async function finishJob(
       userId: meta.userId,
     });
   });
-  // After the commit: a Valkey side effect never runs inside the DB transaction.
-  await recordSpend(meta.companyId, costCents);
+  // After the commit: a Valkey side effect never runs inside the DB transaction. Only what the
+  // rounds have not recorded yet, so the counters end at exactly `costCents` for the run.
+  await recordSpend(meta.companyId, Math.max(0, costCents - alreadyRecordedCents));
   return credits;
 }
 
@@ -259,6 +264,57 @@ export async function* runAssistant(
   };
   let gen = provider.assistant(clean, track);
   let settled = false;
+  // The ai_jobs row is finished (and charged) by a mid-run stop; the catch must not fail it.
+  let jobFinished = false;
+  // Spend this run already put on the daily counters, and the model of the last round seen.
+  let recordedCents = 0;
+  let lastModel: string | null = null;
+
+  /**
+   * After each real model round (B-115): record the round's spend at once, so a parallel question
+   * sees it, then, when the model wants another round, re-check the daily caps and the credits
+   * before the runner may send it. Spend is the cumulative cost minus what is already recorded,
+   * never a sum of rounded per-round costs. Credits are charged once in finishJob; here the
+   * balance hasn't moved, so the check is "what this run used so far + 1 for the next round".
+   */
+  const afterRound = async (e: Extract<ProviderAssistantEvent, { type: "round" }>) => {
+    usageSoFar = add(usageDone, e.usage);
+    if (provider.name === "mock" || e.model === MOCK_MODEL) return;
+    lastModel = e.model;
+    const cum = tokensToCostCents(usageSoFar, e.model);
+    if (cum > recordedCents) {
+      await recordSpend(meta.companyId, cum - recordedCents);
+      recordedCents = cum;
+    }
+    if (e.stopReason !== "tool_use" && e.stopReason !== "pause_turn") return;
+    await assertSpendAvailable(meta.companyId);
+    await withTenant(meta.companyId, (tx) =>
+      assertCredits(tx, meta.companyId, tokensToCredits(usageSoFar) + 1),
+    );
+  };
+
+  /**
+   * A cap tripped between rounds: close the provider (the runner's `finally` aborts, no request
+   * goes out), finish the job with the usage of the rounds made, then let the caller rethrow.
+   */
+  const stopMidRun = async (err: unknown) => {
+    settled = true;
+    const dummy: AssistantFinal = { usage: usageSoFar, model: "", stopReason: null };
+    await gen.return(dummy).catch(() => undefined);
+    const model = lastModel ?? provider.name;
+    const stopReason = stopReasonOf(err);
+    const credits = await finishJob(
+      meta,
+      aiJobId,
+      { usage: usageSoFar, model, stopReason },
+      { text: sanitizeText(text.slice(0, 4000)) },
+      recordedCents,
+    );
+    jobFinished = true;
+    log.warn("assistant stopped between rounds", { companyId: meta.companyId, stopReason });
+    onSettle?.({ credits, model, aiJobId });
+  };
+
   try {
     // Answer guard (spec market-signals Step 6): once a market tool is called, the answer text is
     // held back, checked against this turn's tool outputs, regenerated once on a failure and
@@ -268,6 +324,16 @@ export async function* runAssistant(
     let step = await gen.next();
     while (!step.done) {
       const e = step.value;
+      if (e.type === "round") {
+        try {
+          await afterRound(e);
+        } catch (err) {
+          await stopMidRun(err);
+          throw err;
+        }
+        step = await gen.next();
+        continue;
+      }
       if (e.type === "tool_call" && MARKET_TOOL_NAMES.has(e.name)) guarded = true;
       if (e.type === "text" && guarded) held += e.text;
       else {
@@ -289,23 +355,64 @@ export async function* runAssistant(
         };
         const firstIssues = issues.map((i) => i.kind);
         held = "";
-        gen = provider.assistant(retry, track);
-        let r = await gen.next();
-        // The second pass re-reads the same tools; its events stay internal (the UI already has
-        // the chips and vote cards from the first pass).
-        while (!r.done) {
-          if (r.value.type === "text") held += r.value.text;
-          r = await gen.next();
+        // The regeneration is one more model call: re-check the caps first. If they are spent, or
+        // trip between its rounds, the turn ends with the tools' own answer instead of an error.
+        let capped = false;
+        let capReason = "spend_cap";
+        try {
+          if (provider.name !== "mock") {
+            await assertSpendAvailable(meta.companyId);
+            await withTenant(meta.companyId, (tx) =>
+              assertCredits(tx, meta.companyId, tokensToCredits(usageDone) + 1),
+            );
+          }
+        } catch (err) {
+          if (!isCapError(err)) throw err;
+          capped = true;
+          capReason = stopReasonOf(err);
         }
-        final = { ...r.value, usage: r.value.usage };
-        issues = validateAnswer(held, outputs, extra);
-        outcome = issues.length ? "fallback" : "regenerated";
-        if (issues.length) held = fallbackAnswer(outputs, clean.message);
+        if (!capped) {
+          gen = provider.assistant(retry, track);
+          let r = await gen.next();
+          // The second pass re-reads the same tools; its events stay internal (the UI already has
+          // the chips and vote cards from the first pass).
+          while (!r.done) {
+            if (r.value.type === "round") {
+              try {
+                await afterRound(r.value);
+              } catch (err) {
+                if (!isCapError(err)) throw err;
+                capped = true;
+                capReason = stopReasonOf(err);
+                await gen
+                  .return({ usage: usageSoFar, model: "", stopReason: null })
+                  .catch(() => {});
+                break;
+              }
+            } else if (r.value.type === "text") held += r.value.text;
+            r = await gen.next();
+          }
+          if (!capped && r.done) final = { ...r.value, usage: r.value.usage };
+        }
+        if (capped) {
+          // Usage of the second pass so far (none when it never started) is in usageSoFar.
+          final = {
+            usage: { tokensIn: 0, tokensOut: 0, cacheReadTokens: 0 },
+            model: lastModel ?? final.model,
+            stopReason: capReason,
+          };
+          usageDone = usageSoFar;
+          held = "";
+        }
+        issues = capped ? [] : validateAnswer(held, outputs, extra);
+        outcome = capped || issues.length ? "fallback" : "regenerated";
+        if (capped || issues.length) held = fallbackAnswer(outputs, clean.message);
         log.warn("assistant answer failed the check", {
           companyId: meta.companyId,
           outcome,
           firstIssues,
           secondIssues: issues.map((i) => i.kind),
+          ...(capped ? { skipped: capReason } : {}),
         });
       }
       log.info("assistant answer check", { companyId: meta.companyId, outcome });
@@ -319,28 +426,45 @@ export async function* runAssistant(
       aiJobId,
       { ...final, usage },
       { text: sanitizeText(text.slice(0, 4000)) },
+      recordedCents,
     );
     const result = { credits, model: final.model, aiJobId };
     onSettle?.(result);
     return result;
   } catch (err) {
     settled = true;
-    await failJob(meta.companyId, aiJobId, err);
+    if (!jobFinished) await failJob(meta.companyId, aiJobId, err);
     throw err;
   } finally {
     if (!settled) {
       const dummy: AssistantFinal = { usage: usageSoFar, model: "", stopReason: null };
       await gen.return(dummy).catch(() => undefined);
-      const model = provider.name === "mock" ? MOCK_MODEL : provider.name;
+      const model = provider.name === "mock" ? MOCK_MODEL : (lastModel ?? provider.name);
       const credits = await finishJob(
         meta,
         aiJobId,
         { usage: usageSoFar, model, stopReason: "aborted" },
         { text: sanitizeText(text.slice(0, 4000)) },
+        recordedCents,
       );
       onSettle?.({ credits, model, aiJobId });
     }
   }
+}
+
+/** The two typed stops a between-rounds check can raise (breaker.ts, credits.ts). */
+function isCapError(err: unknown): boolean {
+  return (
+    err instanceof ORPCError &&
+    (err.code === "AI_SPEND_CAP_REACHED" || err.code === "CREDITS_EXHAUSTED")
+  );
+}
+
+/** `ai_jobs.stop_reason` for a run stopped between rounds. */
+function stopReasonOf(err: unknown): string {
+  return err instanceof ORPCError && err.code === "CREDITS_EXHAUSTED"
+    ? "credits_exhausted"
+    : "spend_cap";
 }
 
 /** Keeps each tool result of the turn (before the data envelope) for the answer check. */
