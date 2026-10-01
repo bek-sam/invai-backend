@@ -235,6 +235,8 @@ async function alertLostDelivery(
       titleEs: copy.titleEs,
       messageEs: copy.messageEs,
     },
+    messageCode: d.outcome === "unknown" ? "vendor_email_unconfirmed" : "vendor_email_failed",
+    params: { sheetName: sheet, vendorName: vendor },
   });
 }
 

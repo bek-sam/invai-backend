@@ -1,8 +1,10 @@
 import {
   type Address,
+  CANCEL_REASONS,
   CHANNEL_RULES,
   CHANNELS,
   type ChannelPerformance,
+  HOLD_REASONS,
   ITEM_FLAG_CODES,
   ORDER_STATUSES,
   type Order,
@@ -10,8 +12,11 @@ import {
   type OrderItemState,
   type OrderWithItems,
   PRE_SHIPPED_STATES,
+  REPRINT_REASONS,
   STATIONS,
   type TimelineEntry,
+  type TimelineReasonCode,
+  type TimelineReasonParams,
 } from "@invai/contracts";
 import {
   and,
@@ -560,6 +565,76 @@ const AUDIT_KIND: Record<string, TimelineEntry["kind"]> = {
 
 const STATION_SET = new Set<string>(STATIONS);
 
+const HOLD_REASON_SET = new Set<string>(HOLD_REASONS);
+const CANCEL_REASON_SET = new Set<string>(CANCEL_REASONS);
+const REPRINT_REASON_SET = new Set<string>(REPRINT_REASONS);
+
+/** Exact stored reason -> code of the same meaning (ruling R1, rule 3). */
+const EXACT_REASON_CODES: Record<string, TimelineReasonCode> = {
+  unknown_sku: "unknown_sku",
+  mapped: "mapped",
+  not_personalized: "not_personalized",
+  artwork_uploaded: "artwork_uploaded",
+  artwork_approved: "artwork_approved",
+  artwork_edited: "artwork_edited",
+  artwork_rerendered: "artwork_rerendered",
+  artwork_rendered: "artwork_rendered",
+  artwork_failed: "artwork_failed",
+  artwork_flagged: "artwork_flagged",
+  released: "released",
+  qc_fail: "qc_fail",
+  "scan match": "scan_match",
+  "QC pass": "qc_pass",
+  "tracking pushed": "tracking_pushed",
+  "carrier accepted the package": "carrier_accepted",
+  "carrier delivered": "carrier_delivered",
+};
+
+const ON_SHEET_RE = /^on sheet (.+)$/;
+const SHEET_RECEIVED_RE = /^sheet (.+) received$/;
+const REPRINT_RE = /^reprint: (.+)$/;
+
+/**
+ * 0.11.0 (B-238): maps a stored `item_transitions.reason` to a `TimelineReasonCode`, derived at
+ * read time (no producer change). Rules, in order (ruling R1, `waves/P5/reviews/plan-architect.md`):
+ * null/empty -> no code; the target state decides `held`/`cancelled` first (their reasons overlap
+ * with other lists); then exact strings; then sheet/reprint patterns; anything else -> no code, so
+ * the client falls back to `message`.
+ */
+export function reasonCodeFor(
+  to: OrderItemState | null,
+  reason: string | null,
+): { reasonCode?: TimelineReasonCode; reasonParams?: TimelineReasonParams } {
+  if (!reason) return {};
+  if (to === "on_hold" && HOLD_REASON_SET.has(reason))
+    return {
+      reasonCode: "held",
+      reasonParams: { holdReason: reason as TimelineReasonParams["holdReason"] },
+    };
+  if (to === "cancelled" && CANCEL_REASON_SET.has(reason))
+    return {
+      reasonCode: "cancelled",
+      reasonParams: { cancelReason: reason as TimelineReasonParams["cancelReason"] },
+    };
+  const exact = EXACT_REASON_CODES[reason];
+  if (exact) return { reasonCode: exact };
+  const onSheet = ON_SHEET_RE.exec(reason);
+  if (onSheet) return { reasonCode: "on_sheet", reasonParams: { sheetName: onSheet[1] } };
+  const received = SHEET_RECEIVED_RE.exec(reason);
+  if (received) return { reasonCode: "sheet_received", reasonParams: { sheetName: received[1] } };
+  const reprint = REPRINT_RE.exec(reason);
+  if (reprint) {
+    const r = reprint[1] ?? "";
+    return REPRINT_REASON_SET.has(r)
+      ? {
+          reasonCode: "reprint",
+          reasonParams: { reprintReason: r as TimelineReasonParams["reprintReason"] },
+        }
+      : { reasonCode: "reprint" };
+  }
+  return {};
+}
+
 export async function timeline(
   tx: Tx,
   _ctx: TenantContext,
@@ -638,6 +713,7 @@ export async function timeline(
       to: t.toState,
       message: `${t.fromState ?? "new"} → ${t.toState}${t.reason ? ` (${t.reason})` : ""}`,
       meta: t.data,
+      ...reasonCodeFor(t.toState, t.reason),
     })),
     ...aRows.map(({ a, userName, stationKind }) => ({
       _at: a.createdAt,

@@ -37,6 +37,8 @@ export const stuckSubmittingPoJob = defineJob({
           entityId: po.id,
           dedupeKey: `po-stuck-submitting-${po.id}`,
           data: { poNo: po.poNo, supplier: po.supplier },
+          messageCode: "po_stuck_submitting",
+          params: { poNo: po.poNo, supplierName: po.supplier },
         });
       }
       return { stuck: stuck.length };

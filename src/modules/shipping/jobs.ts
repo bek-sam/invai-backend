@@ -581,6 +581,16 @@ const STUCK_ALERTS: Record<StuckKind, { title: string; message: string }> = {
   },
 };
 
+// B-224: the stuck-intent kind, as the message code the web picks its line from (no params).
+const STUCK_MESSAGE_CODE: Record<
+  StuckKind,
+  "label_buy_stuck" | "label_void_stuck" | "tracking_push_stuck"
+> = {
+  buy: "label_buy_stuck",
+  void: "label_void_stuck",
+  push: "tracking_push_stuck",
+};
+
 async function alertStuck(companyId: string, shipmentId: string, kind: StuckKind, why: string) {
   const a = STUCK_ALERTS[kind];
   await withTenant(companyId, (tx) =>
@@ -594,6 +604,8 @@ async function alertStuck(companyId: string, shipmentId: string, kind: StuckKind
       entityId: shipmentId,
       dedupeKey: `stuck-intent-${kind}-${shipmentId}`,
       data: { intent: kind, detail: why.slice(0, 300) },
+      messageCode: STUCK_MESSAGE_CODE[kind],
+      params: {},
     }),
   );
 }

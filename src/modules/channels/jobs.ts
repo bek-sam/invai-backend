@@ -164,6 +164,8 @@ export async function flagStuckWebhookDeliveries(now = new Date()) {
             "An order update from your store arrived but wasn't processed. Run a sync on the connection to pick it up.",
           dedupeKey: `webhook_stuck:${row.id}`,
           data: { channel: row.channel, deliveryId: row.deliveryId },
+          messageCode: "webhook_stuck",
+          params: { channel: row.channel },
         }),
       );
       alerted++;

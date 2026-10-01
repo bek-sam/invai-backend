@@ -1,4 +1,4 @@
-import type { Alert, TodaySummary } from "@invai/contracts";
+import { type Alert, AlertMessageCode, AlertParams, type TodaySummary } from "@invai/contracts";
 import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import type { TenantContext } from "../../api/context";
 import type { Tx } from "../../db/client";
@@ -194,7 +194,18 @@ export async function summary(tx: Tx, ctx: Ctx, input: { date?: string }): Promi
 type AlertRow = typeof alerts.$inferSelect;
 type Severity = AlertRow["severity"];
 
+/**
+ * 0.11.0 (B-224): `messageCode`/`params` live nested in `data` (no migration) so they can't
+ * collide with a kind's other `data` keys (`available`, `intent`, `deliveryId`…). They only come
+ * back out when the code is still known to this build and its params still validate; an old row,
+ * a worker/AI alert (title-only) or a future code this build doesn't know yet just shows
+ * title/message, same as before.
+ */
 function toAlert(r: AlertRow): Alert {
+  const stored = (r.data ?? {}) as Record<string, unknown>;
+  const code = AlertMessageCode.safeParse(stored.messageCode);
+  const params = code.success ? AlertParams.safeParse(stored.params) : undefined;
+  const known = code.success && params?.success;
   return {
     id: r.id,
     kind: r.kind as Alert["kind"],
@@ -204,6 +215,9 @@ function toAlert(r: AlertRow): Alert {
     entity: r.entityType && r.entityId ? { type: r.entityType, id: r.entityId } : null,
     readAt: r.readAt?.toISOString() ?? null,
     createdAt: r.createdAt.toISOString(),
+    ...(known && code.success && params?.success
+      ? { messageCode: code.data, params: params.data }
+      : {}),
   };
 }
 
@@ -216,6 +230,9 @@ export type AlertInput = {
   entityId?: string | null;
   dedupeKey: string;
   data?: Record<string, unknown>;
+  /** 0.11.0: which translated line the web should show, with the values it needs. */
+  messageCode?: Alert["messageCode"];
+  params?: AlertParams;
 };
 
 /**
@@ -223,6 +240,12 @@ export type AlertInput = {
  * reopened as unread. Returns whether it is new. Any module may call this.
  */
 export async function raiseAlert(tx: Tx, companyId: string, a: AlertInput) {
+  // Nested, never top-level, so a code's params can't collide with the kind's own data keys.
+  const data: Record<string, unknown> = { ...(a.data ?? {}) };
+  if (a.messageCode) {
+    data.messageCode = a.messageCode;
+    data.params = a.params ?? {};
+  }
   const [row] = await tx
     .insert(alerts)
     .values({
@@ -234,7 +257,7 @@ export async function raiseAlert(tx: Tx, companyId: string, a: AlertInput) {
       entityType: a.entityType ?? null,
       entityId: a.entityId ?? null,
       dedupeKey: a.dedupeKey,
-      data: a.data ?? {},
+      data,
     })
     .onConflictDoUpdate({
       target: [alerts.companyId, alerts.dedupeKey],
@@ -242,7 +265,7 @@ export async function raiseAlert(tx: Tx, companyId: string, a: AlertInput) {
         severity: a.severity,
         title: a.title,
         message: a.message,
-        data: a.data ?? {},
+        data,
         readAt: sql`case when ${alerts.status} = 'resolved' or ${alerts.severity} <> ${a.severity} then null else ${alerts.readAt} end`,
         status: "open",
         resolvedAt: null,
@@ -323,6 +346,8 @@ export async function generateAlerts(tx: Tx, ctx: Ctx) {
         entityType: "order",
         entityId: o.id,
         dedupeKey: `order_overdue:${o.id}`,
+        messageCode: "order_overdue",
+        params: { orderNo: o.order_no, shipBy: shipBy.toISOString(), timeZone: timezone },
       });
     } else {
       const hours = Math.max(0, Math.round((shipBy.getTime() - Date.now()) / 3_600_000));
@@ -334,6 +359,8 @@ export async function generateAlerts(tx: Tx, ctx: Ctx) {
         entityType: "order",
         entityId: o.id,
         dedupeKey: `order_at_risk:${o.id}`,
+        messageCode: "order_at_risk",
+        params: { orderNo: o.order_no, shipBy: shipBy.toISOString(), timeZone: timezone, hours },
       });
     }
   }
@@ -351,6 +378,8 @@ export async function generateAlerts(tx: Tx, ctx: Ctx) {
       entityType: "connection",
       entityId: c.id,
       dedupeKey: `sync_broken:${c.id}`,
+      messageCode: "sync_broken",
+      params: { connectionName: c.name },
     });
   }
 
@@ -367,6 +396,12 @@ export async function generateAlerts(tx: Tx, ctx: Ctx) {
       entityType: "gang_sheet",
       entityId: s.id,
       dedupeKey: `sheet_stuck:${s.id}`,
+      messageCode: "sheet_stuck",
+      params: {
+        sheetName: s.name,
+        hours: Math.round((Date.now() - new Date(s.sent_at).getTime()) / 3_600_000),
+        sheetStatus: s.status as "sent" | "acknowledged",
+      },
     });
   }
 
@@ -381,6 +416,13 @@ export async function generateAlerts(tx: Tx, ctx: Ctx) {
       entityId: s.blankVariantId,
       dedupeKey: `stock_low:${s.blankVariantId}`,
       data: { available: s.available, reorderPoint: s.reorderPoint },
+      messageCode: "stock_low",
+      params: {
+        blankName: label,
+        available: s.available,
+        reorderPoint: s.reorderPoint ?? undefined,
+        incoming: s.incoming ?? 0,
+      },
     });
   }
 
@@ -398,6 +440,15 @@ export async function generateAlerts(tx: Tx, ctx: Ctx) {
       entityType: "billing",
       entityId: null,
       dedupeKey: `plan_limit:${period}:orders`,
+      messageCode: ordersMeter.limitReached ? "plan_limit_reached" : "plan_limit_near",
+      params: ordersMeter.limitReached
+        ? { used: ordersMeter.used, limit: ordersMeter.limit, planName: billing.plan.name }
+        : {
+            usedPct: Math.round((ordersMeter.ratio ?? 0) * 100),
+            used: ordersMeter.used,
+            limit: ordersMeter.limit,
+            planName: billing.plan.name,
+          },
     });
   }
 
