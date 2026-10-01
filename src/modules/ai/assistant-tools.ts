@@ -583,8 +583,12 @@ async function resolveNiche(companyId: string, raw: string, lang: Lang2): Promis
 }
 type Lang2 = "en" | "es";
 
-/** The shop's best-selling designs over 90 days (own catalog rows only), with their top channel. */
-async function topDesigns(tx: Tx, companyId: string, limit: number, channel?: Channel) {
+/**
+ * The shop's best-selling designs over 90 days (own catalog rows only, reprints counted as a
+ * sale: decision 0020), with their top channel. `units` is returned mainly for tests; callers
+ * use it only to rank and pick a design.
+ */
+export async function topDesigns(tx: Tx, companyId: string, limit: number, channel?: Channel) {
   const since = new Date(Date.now() - 90 * 86_400_000);
   const sold = await tx
     .select({
@@ -598,7 +602,6 @@ async function topDesigns(tx: Tx, companyId: string, limit: number, channel?: Ch
         eq(profitLines.companyId, companyId),
         gte(profitLines.placedAt, since),
         isNotNull(profitLines.designId),
-        eq(profitLines.isReprint, false),
         channel ? eq(profitLines.channel, channel) : undefined,
       ),
     )
@@ -626,7 +629,11 @@ async function topDesigns(tx: Tx, companyId: string, limit: number, channel?: Ch
   const order = (id: string) => (ids.includes(id) ? ids.indexOf(id) : ids.length);
   return rows
     .sort((a, b) => order(a.id) - order(b.id))
-    .map((d) => ({ ...d, channel: byDesign.get(d.id)?.channel ?? null }));
+    .map((d) => ({
+      ...d,
+      channel: byDesign.get(d.id)?.channel ?? null,
+      units: byDesign.get(d.id)?.units ?? 0,
+    }));
 }
 
 async function designById(tx: Tx, companyId: string, id: string): Promise<DesignRef | null> {

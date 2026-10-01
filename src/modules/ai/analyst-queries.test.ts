@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { withTenant } from "../../db/client";
 import { createCompany, createConnection, createOrder, tenantContext } from "../../test/fixtures";
+import { addDesign, addOrder } from "../analytics/finance-testkit";
 import {
   adPerformance,
   comparePeriods,
@@ -81,6 +82,44 @@ describe("analyst queries", () => {
     // B's context inside A's transaction still filters on B's company id.
     const mixed = await withTenant(a.shop.id, (tx) => fulfillmentHealth(tx, ctxB, r));
     expect(mixed.totals.itemsPlaced).toBe(0);
+  });
+
+  it("counts a reprinted unit as a sale in cross-listing gaps (decision 0020)", async () => {
+    const shop = await createCompany();
+    const ctx = tenantContext(shop.id, null, "owner");
+    const designId = await addDesign(shop.id, "Gap Design");
+    const now = new Date();
+    // An order with 2 units, one reprinted: one profit line has isReprint=true on the same
+    // order_items row (a re-press, not a sibling "extra" row); the other is a normal unit.
+    await addOrder(shop.id, {
+      channel: "etsy",
+      placedAt: now,
+      lines: [
+        { designId, isReprint: true, revenue: 2500 },
+        { designId, isReprint: false, revenue: 2500 },
+      ],
+    });
+    // A third, non-reprint unit on the same design and channel only clears the >=3-unit
+    // (MIN_UNITS) gate so the gap is visible either way; whether it reaches 3 at all is exactly
+    // what the isReprint filter decides.
+    await addOrder(shop.id, {
+      channel: "etsy",
+      placedAt: now,
+      lines: [{ designId, isReprint: false, revenue: 2500 }],
+    });
+    // A second connected channel the design is neither sold on nor listed on: the gap.
+    await createConnection(shop.id, "shopify");
+
+    const r = {
+      from: new Date(now.getTime() - DAY).toISOString(),
+      to: new Date(now.getTime() + DAY).toISOString(),
+    };
+    const result = await withTenant(shop.id, (tx) => designInsights(tx, ctx, r));
+    const gap = result.crossListingGaps.find((g) => g.designId === designId);
+    expect(gap).toBeDefined();
+    // 3, not 2: the reprinted unit counts as a sale alongside the other two.
+    expect(gap?.soldOn).toEqual([{ channel: "etsy", units: 3 }]);
+    expect(gap?.missingOn).toEqual(["shopify"]);
   });
 
   it("period helpers", () => {

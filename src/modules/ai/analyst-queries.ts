@@ -368,7 +368,8 @@ export async function designInsights(tx: Tx, ctx: Ctx, input: DesignInsightsInpu
       margin,
     }));
 
-  // Cross-listing gaps: units per design and channel (sold, not reprints or refunded).
+  // Cross-listing gaps: units per design and channel (sold, including reprints: decision 0020
+  // says a re-pressed unit is still a sale; not refunded).
   const sold = await tx
     .select({
       designId: sql<string>`${profitLines.designId}::text`,
@@ -382,7 +383,6 @@ export async function designInsights(tx: Tx, ctx: Ctx, input: DesignInsightsInpu
         gte(profitLines.placedAt, new Date(cur.from)),
         lt(profitLines.placedAt, new Date(cur.to)),
         isNotNull(profitLines.designId),
-        eq(profitLines.isReprint, false),
         eq(profitLines.refundsCents, 0),
       ),
     )

@@ -10,7 +10,7 @@ import {
   type TurnToolOutput,
   validateAnswer,
 } from "../../ai/validators/answer";
-import { withSystem } from "../../db/client";
+import { withSystem, withTenant } from "../../db/client";
 import {
   adSpend,
   type Channel,
@@ -25,8 +25,9 @@ import {
   reprints,
 } from "../../db/schema";
 import { createCompany, createConnection, createUser, tenantContext } from "../../test/fixtures";
+import { addDesign, addOrder } from "../analytics/finance-testkit";
 import * as market from "../market/service";
-import { assistantTools, previousPeriod } from "./assistant-tools";
+import { assistantTools, previousPeriod, topDesigns } from "./assistant-tools";
 
 // T-18-4: the market service (T-18-3's unit) is replaced by contract-shaped fixtures in the
 // "market tools" block below; the taxonomy is a small fixed list. Nothing above uses it.
@@ -1672,5 +1673,27 @@ describe("market tools (T-18-4)", () => {
     expect(plan("How much profit did I make last week?").map((c) => c.tool)).toEqual([
       "get_profit",
     ]);
+  });
+});
+
+describe("topDesigns reprint units (T-P4-4, decision 0020)", () => {
+  it("counts a reprinted unit as a sale, not an extra non-sale unit", async () => {
+    const co = await createCompany();
+    const designId = await addDesign(co.id, "Reprint Design");
+    // An order with 2 units, one reprinted: the reprint is isReprint=true on the same
+    // order_items row (a re-press), not a sibling "extra" row.
+    await addOrder(co.id, {
+      channel: "etsy",
+      placedAt: new Date(),
+      lines: [
+        { designId, isReprint: true, revenue: 2500 },
+        { designId, isReprint: false, revenue: 2500 },
+      ],
+    });
+    const rows = await withTenant(co.id, (tx) => topDesigns(tx, co.id, 10));
+    const row = rows.find((r) => r.id === designId);
+    expect(row).toBeDefined();
+    // 2, not 1: the reprinted unit counts as a sale alongside the other unit.
+    expect(row?.units).toBe(2);
   });
 });
