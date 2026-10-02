@@ -205,6 +205,44 @@ const ComposeResult = z.object({
 });
 export type ComposeResult = z.infer<typeof ComposeResult>;
 
+/* ---- Listing photos (T-26-2 routes, consumed by modules/photos, ADR 0023) ---------------- */
+
+export const PhotoPaletteResult = z.object({
+  colors: z.array(z.object({ hex: z.string(), share: z.number() })),
+  light_share: z.number(),
+  dark_share: z.number(),
+  transparent_share: z.number(),
+});
+export type PhotoPaletteResult = z.infer<typeof PhotoPaletteResult>;
+
+const PrintArea = z.object({ w_in: z.number(), h_in: z.number() });
+export const PhotoTemplate = z.object({
+  garment: z.string(),
+  view: z.string(),
+  placement: z.string().optional(),
+  print_areas: z.object({ front: PrintArea.optional(), back: PrintArea.optional() }),
+  drawn: z.boolean(),
+});
+export type PhotoTemplate = z.infer<typeof PhotoTemplate>;
+
+export const PhotoRenderResult = z.object({
+  key: z.string(),
+  width_px: z.number().int(),
+  height_px: z.number().int(),
+  format: z.string(),
+  print_box_px: z.array(z.number()),
+  checks: z.object({
+    passes: z.boolean(),
+    failures: z.array(z.string()),
+    background_pure_white: z.boolean().nullable(),
+    fill_ratio: z.number().nullable(),
+    longest_side_px: z.number().int().nullable(),
+  }),
+});
+export type PhotoRenderResult = z.infer<typeof PhotoRenderResult>;
+
+export const PhotoZipResult = z.object({ key: z.string(), bytes: z.number().int() });
+
 export type ImagingClient = ReturnType<typeof createImagingClient>;
 
 /** Imaging answers 429 + Retry-After when its heavy-job slots are full (T-9-5, B-19). */
@@ -396,6 +434,32 @@ export function createImagingClient(
       dpi?: number;
       color_hex: string;
     }) => call("/sample-art", input, KeyResult),
+
+    photoPalette: (input: { design_key: string }) =>
+      call("/photo/palette", input, PhotoPaletteResult, { timeoutMs: 60_000 }),
+
+    photoTemplates: () =>
+      call("/photo/templates", undefined, z.array(PhotoTemplate), {
+        method: "GET",
+        timeoutMs: 10_000,
+      }),
+
+    photoRender: (input: {
+      design_key: string;
+      design_width_in: number;
+      design_height_in: number;
+      placement: "front" | "back";
+      garment: string;
+      view: string;
+      blank_hex: string;
+      underbase_preview: boolean;
+      preset: string;
+      out_key: string;
+      xmp_subjects: string[];
+    }) => call("/photo/render", input, PhotoRenderResult, { timeoutMs: 120_000 }),
+
+    photoZip: (input: { items: { key: string; name: string }[]; out_key: string }) =>
+      call("/photo/zip", input, PhotoZipResult, { timeoutMs: 300_000 }),
   };
 }
 

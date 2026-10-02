@@ -20,3 +20,4 @@ import "./today/jobs";
 import "./privacy/jobs";
 import "./market/jobs";
 import "./digest/jobs";
+import "./photos/jobs";

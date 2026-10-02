@@ -11,6 +11,7 @@ export * from "./market";
 export * from "./notifications";
 export * from "./orders";
 export * from "./personalization";
+export * from "./photos";
 export * from "./privacy";
 export * from "./production";
 export * from "./shipping";

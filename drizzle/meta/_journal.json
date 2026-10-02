@@ -281,6 +281,13 @@
       "when": 1790972630844,
       "tag": "0039_ai_photos",
       "breakpoints": true
+    },
+    {
+      "idx": 40,
+      "version": "7",
+      "when": 1790973083937,
+      "tag": "0040_photos_sets",
+      "breakpoints": true
     }
   ]
 }
