@@ -134,6 +134,33 @@ describe("photos: credits", () => {
     const after = await withTenant(company.id, (tx) => creditBalance(tx, company.id));
     expect(after.remaining).toBeGreaterThanOrEqual(0);
   });
+
+  // S-51 r2: two createSets racing past the open-commitments check (neither sees the other's
+  // rows yet) and rendering in parallel still never go negative, and failed images cost nothing.
+  it("concurrent createSets on one set's worth of credits charge at most that and never go negative", async () => {
+    const { company, ctx, design } = await shop();
+    await withTenant(company.id, async (tx) => {
+      const b = await creditBalance(tx, company.id);
+      await chargeCredits(tx, {
+        companyId: company.id,
+        kind: "listing_draft",
+        credits: b.remaining - 8,
+        model: null,
+        usage: null,
+      });
+    });
+    const results = await Promise.allSettled([
+      call(router.photos.createSet, spec(design.id), { context: ctx }),
+      call(router.photos.createSet, spec(design.id), { context: ctx }),
+    ]);
+    const ids = results.flatMap((r) => (r.status === "fulfilled" ? [r.value.id] : []));
+    expect(ids.length).toBeGreaterThanOrEqual(1);
+    await Promise.all(ids.map((id) => renderAll(company.id, id)));
+    const after = await withTenant(company.id, (tx) => creditBalance(tx, company.id));
+    expect(after.remaining).toBeGreaterThanOrEqual(0);
+    const imgs = await withTenant(company.id, (tx) => tx.select().from(photoImages));
+    for (const i of imgs.filter((x) => x.status === "failed")) expect(i.key).toBeNull();
+  });
 });
 
 describe("photos: tenancy", () => {
