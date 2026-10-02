@@ -566,6 +566,106 @@
       "latencyMsMedian": 6,
       "latencyMsP95": 10,
       "cacheHitRate": 0
+    },
+    {
+      "route": "photo_analysis",
+      "mode": "mock",
+      "cases": 16,
+      "plumbingPass": 16,
+      "qualityPass": null,
+      "qualityAssessed": 0,
+      "byTag": {
+        "light-art": {
+          "plumbingPass": 1,
+          "qualityPass": 0,
+          "total": 1
+        },
+        "basic": {
+          "plumbingPass": 2,
+          "qualityPass": 0,
+          "total": 2
+        },
+        "dark-art": {
+          "plumbingPass": 1,
+          "qualityPass": 0,
+          "total": 1
+        },
+        "text-heavy": {
+          "plumbingPass": 1,
+          "qualityPass": 0,
+          "total": 1
+        },
+        "multi-color": {
+          "plumbingPass": 1,
+          "qualityPass": 0,
+          "total": 1
+        },
+        "transparent": {
+          "plumbingPass": 1,
+          "qualityPass": 0,
+          "total": 1
+        },
+        "brand-like": {
+          "plumbingPass": 3,
+          "qualityPass": 0,
+          "total": 3
+        },
+        "trademark": {
+          "plumbingPass": 1,
+          "qualityPass": 0,
+          "total": 1
+        },
+        "evasion": {
+          "plumbingPass": 1,
+          "qualityPass": 0,
+          "total": 1
+        },
+        "injection": {
+          "plumbingPass": 2,
+          "qualityPass": 0,
+          "total": 2
+        },
+        "mid-tone": {
+          "plumbingPass": 1,
+          "qualityPass": 0,
+          "total": 1
+        },
+        "single-color": {
+          "plumbingPass": 1,
+          "qualityPass": 0,
+          "total": 1
+        },
+        "empty": {
+          "plumbingPass": 1,
+          "qualityPass": 0,
+          "total": 1
+        },
+        "oversized": {
+          "plumbingPass": 1,
+          "qualityPass": 0,
+          "total": 1
+        },
+        "spanish": {
+          "plumbingPass": 1,
+          "qualityPass": 0,
+          "total": 1
+        },
+        "character": {
+          "plumbingPass": 1,
+          "qualityPass": 0,
+          "total": 1
+        },
+        "pii": {
+          "plumbingPass": 1,
+          "qualityPass": 0,
+          "total": 1
+        }
+      },
+      "costCentsMedian": 0,
+      "costCentsP95": 0,
+      "latencyMsMedian": 7,
+      "latencyMsP95": 30,
+      "cacheHitRate": 0
     }
   ]
 }

@@ -10,6 +10,7 @@ import { printOverall, printRoute, type RouteSummary } from "./lib/report";
 import type { RouteReport } from "./lib/types";
 import { runListingCopy } from "./listing_copy/run";
 import { runPersonalizationCheck } from "./personalization_check/run";
+import { runPhotoAnalysis } from "./photo_analysis/run";
 import { runTrademarkJudge } from "./trademark_judge/run";
 
 /*
@@ -32,7 +33,11 @@ const ROUTES: Record<string, (tenant: EvalTenant) => Promise<RouteReport>> = {
   assistant: runAssistantEvals,
   personalization_check: runPersonalizationCheck,
   digest_narrative: runDigestNarrative,
+  photo_analysis: runPhotoAnalysis,
 };
+
+/** The card's spelling (`pnpm evals photo-analysis`) for the underscore route ids. */
+const ALIASES: Record<string, string> = { "photo-analysis": "photo_analysis" };
 
 /** Always closes the db pool and the redis client — ioredis/pg keep an open handle that stops
  *  the process from exiting on its own, so every return path (including an early bad-arg exit)
@@ -51,7 +56,7 @@ async function main() {
   const argv = process.argv.slice(2);
   const jsonOut = jsonArg(argv);
   const requested = argv.filter((a, i) => !a.startsWith("-") && argv[i - 1] !== "--json");
-  const names = requested.length ? requested : Object.keys(ROUTES);
+  const names = (requested.length ? requested : Object.keys(ROUTES)).map((n) => ALIASES[n] ?? n);
   for (const n of names) {
     if (!(n in ROUTES)) {
       console.error(`Unknown route "${n}". Known routes: ${Object.keys(ROUTES).join(", ")}`);
