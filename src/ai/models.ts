@@ -11,7 +11,8 @@ export type AiRoute =
   | "trademark_judge"
   | "assistant"
   | "market_niche"
-  | "digest_narrative";
+  | "digest_narrative"
+  | "photo_analysis";
 
 export type RouteConfig = {
   model: string;
@@ -40,6 +41,10 @@ export const ROUTES: Record<AiRoute, RouteConfig> = {
   // over data. 2,000 caps thinking plus a headline and up to ~7 items of 280 chars, and keeps the
   // worst-case estimate (about 6¢) under DIGEST_MAX_CENTS_PER_WEEK (10¢).
   digest_narrative: { model: DEFAULT_MODEL, effort: "low", maxTokens: 2_000 },
+  // Wave 26 (T-26-3, ADR 0023): one vision call per design (cached until refresh) describing the
+  // preview and writing short alt text. Medium like listing copy (decision 0007): the alt text is
+  // listing copy. 8,000 covers thinking plus ~3 KB of JSON (8 colors, 8 scenes, 5 alt texts).
+  photo_analysis: { model: DEFAULT_MODEL, effort: "medium", maxTokens: 8_000 },
 };
 
 /* ------------------------------ OpenAI routes ------------------------------ */
@@ -69,6 +74,7 @@ export const OPENAI_ROUTES: Record<AiRoute, OpenAiRouteConfig> = {
   assistant: { model: OPENAI_SOL_MODEL, effort: "high", maxTokens: 32_000 },
   market_niche: { model: OPENAI_LUNA_MODEL, effort: "none", maxTokens: 512 },
   digest_narrative: { model: OPENAI_SOL_MODEL, effort: "low", maxTokens: 2_000 },
+  photo_analysis: { model: OPENAI_SOL_MODEL, effort: "medium", maxTokens: 8_000 },
 };
 
 /**

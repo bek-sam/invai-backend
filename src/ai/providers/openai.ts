@@ -20,6 +20,7 @@ import {
   type AssistantFinal,
   type AssistantRun,
   type AssistantTool,
+  type ImageInput,
   type ProviderAssistantEvent,
   type StructuredResult,
   type TokenUsage,
@@ -125,12 +126,32 @@ function toolDef(t: AssistantTool): FunctionTool {
 }
 
 export function createOpenAiProvider(client: () => OpenAI): AiProvider {
-  async function structured<V, O>(prompt: PromptDef<V, O>, vars: V): Promise<StructuredResult<O>> {
+  async function structured<V, O>(
+    prompt: PromptDef<V, O>,
+    vars: V,
+    images?: ImageInput[],
+  ): Promise<StructuredResult<O>> {
     const route = OPENAI_ROUTES[prompt.route];
+    const text = stripPii(prompt.user(vars));
     const res = await client().responses.create({
       model: route.model,
       instructions: prompt.system,
-      input: [{ role: "user", content: stripPii(prompt.user(vars)) }],
+      input: [
+        {
+          role: "user",
+          // Images first, then the text; a text-only route keeps its plain string.
+          content: images?.length
+            ? [
+                ...images.map((img) => ({
+                  type: "input_image" as const,
+                  detail: "auto" as const,
+                  image_url: `data:${img.mediaType};base64,${img.data}`,
+                })),
+                { type: "input_text" as const, text },
+              ]
+            : text,
+        },
+      ],
       max_output_tokens: route.maxTokens,
       reasoning: { effort: route.effort },
       text: { format: zodTextFormat(prompt.schema, prompt.id) },

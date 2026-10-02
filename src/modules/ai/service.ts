@@ -8,7 +8,12 @@ import type {
   TrademarkCheck,
   ValidationResult,
 } from "@invai/contracts";
-import { CHANNEL_RULES, RecommendationRef } from "@invai/contracts";
+import {
+  CHANNEL_RULES,
+  MAX_PHOTO_IMAGES_PER_LISTING,
+  PHOTO_CHANNELS,
+  RecommendationRef,
+} from "@invai/contracts";
 import { ORPCError } from "@orpc/server";
 import { and, asc, desc, eq, gte, ilike, inArray, lte, or, type SQL, sql } from "drizzle-orm";
 import type { z } from "zod";
@@ -17,6 +22,7 @@ import { runAssistant, runStructured, sanitizeDeep, sanitizeText } from "../../a
 import { ASSISTANT_PROMPT, type ListingCopy, listingCopyPrompt } from "../../ai/prompts";
 import {
   describeIssues,
+  IMAGE_AI_DISCLOSURE,
   normalizeListing,
   validateListing,
   withDisclosures,
@@ -42,7 +48,7 @@ import { logger } from "../../lib/log";
 import { emit } from "../../lib/outbox";
 import { keyset, type PageInput } from "../../lib/pagination";
 import { publish } from "../../lib/realtime";
-import { objectKey, presignGet, putObject } from "../../lib/s3";
+import { isCompanyKey, objectKey, presignGet, putObject } from "../../lib/s3";
 import { recordRecommendationsShown } from "../market/service";
 import { assistantTools } from "./assistant-tools";
 import { assertTrademarkGate, checkTrademarks, type TmInput } from "./trademark";
@@ -624,6 +630,93 @@ export async function updateDraft(
   return getDraftFromRow(tx, updated as DraftRow);
 }
 
+/* ------------------------------ listing photos ------------------------------ */
+
+export type AttachPhotosInput = {
+  draftId: string;
+  /** Storage keys of approved photos, in slot order. */
+  imageKeys: string[];
+  /** Any of these images is an AI scene (wave 27): sets the Etsy AI-use disclosure. */
+  aiGenerated: boolean;
+  /** Any of these images shows a photoreal AI person: Amazon `contains-synthetic-performer`. */
+  syntheticPerformer: boolean;
+  /** The images' channel when the caller knows it; a mismatch with the draft is refused. */
+  channel?: Channel | null;
+};
+
+/**
+ * Attaches approved listing photos to a draft (T-26-3, ADR 0023): appends the keys to
+ * `mockupKeys` (no duplicates, order kept, at most MAX_PHOTO_IMAGES_PER_LISTING) and records the
+ * image disclosures in their own column, never in `content` (which regeneration rebuilds).
+ * Disclosures only ever turn on: a later template-only attach can't clear an AI image's flags.
+ * Re-attaching the same keys changes nothing. Another company's draft is NOT_FOUND.
+ */
+export async function attachPhotosToDraft(
+  tx: Tx,
+  ctx: Ctx,
+  input: AttachPhotosInput,
+): Promise<ListingDraft> {
+  const row = await loadDraft(tx, ctx, input.draftId, true);
+  if (row.status === "publishing")
+    throw conflict("This listing is being published; attach the photos when it finishes", {
+      draftId: row.id,
+      status: row.status,
+    });
+  if (!(PHOTO_CHANNELS as readonly string[]).includes(row.channel))
+    throw badRequest(`Photos can't be attached to a ${row.channel} listing`, {
+      channel: row.channel,
+    });
+  if (input.channel && input.channel !== row.channel)
+    throw badRequest(
+      `These photos are for ${input.channel}, but the listing is for ${row.channel}`,
+      {
+        channel: input.channel,
+        draftChannel: row.channel,
+      },
+    );
+  if (input.imageKeys.some((k) => !isCompanyKey(ctx.companyId, k)))
+    throw badRequest("A photo doesn't belong to this shop");
+  const keys = [...row.mockupKeys];
+  for (const k of input.imageKeys) if (!keys.includes(k)) keys.push(k);
+  if (keys.length > MAX_PHOTO_IMAGES_PER_LISTING)
+    throw badRequest(
+      `A listing holds at most ${MAX_PHOTO_IMAGES_PER_LISTING} photos (this would make ${keys.length})`,
+      { count: keys.length, max: MAX_PHOTO_IMAGES_PER_LISTING },
+    );
+  const before = row.imageDisclosures;
+  const imageDisclosures = {
+    aiGenerated: before.aiGenerated || input.aiGenerated,
+    syntheticPerformer: before.syntheticPerformer || input.syntheticPerformer,
+  };
+  const added = keys.length - row.mockupKeys.length;
+  const changed =
+    added > 0 ||
+    imageDisclosures.aiGenerated !== before.aiGenerated ||
+    imageDisclosures.syntheticPerformer !== before.syntheticPerformer;
+  if (!changed) return getDraftFromRow(tx, row);
+  const [updated] = await tx
+    .update(listingDrafts)
+    .set({ mockupKeys: keys, imageDisclosures })
+    .where(and(eq(listingDrafts.companyId, ctx.companyId), eq(listingDrafts.id, row.id)))
+    .returning();
+  await audit(tx, {
+    companyId: ctx.companyId,
+    actor: ctx.actor,
+    action: "listing_draft.attach_photos",
+    entityType: "listing_draft",
+    entityId: row.id,
+    summary: `Attached ${added} photo${added === 1 ? "" : "s"} to the ${row.channel} listing`,
+    data: { added, total: keys.length, imageDisclosures },
+  });
+  afterCommit(tx, async () => {
+    await publish(ctx.companyId, {
+      type: "listing_draft.updated",
+      data: { draftId: row.id, status: row.status },
+    });
+  });
+  return getDraftFromRow(tx, updated as DraftRow);
+}
+
 async function getDraftFromRow(tx: Tx, row: DraftRow) {
   const [d] = await mapDrafts(tx, [row]);
   return d as ListingDraft;
@@ -765,6 +858,8 @@ export type ExportRow = {
   color: string;
   size: string;
   etsyPartnerId?: string | null;
+  /** The draft has an attached AI-generated photo (`image_disclosures.aiGenerated`, ADR 0023). */
+  imageAiGenerated?: boolean;
 };
 
 export function exportCsv(channel: Channel, rows: ExportRow[]): string {
@@ -773,9 +868,13 @@ export function exportCsv(channel: Channel, rows: ExportRow[]): string {
 
   if (channel === "etsy") {
     return toCsv(
-      rows.map(({ content: c, sku, etsyPartnerId }) => ({
+      rows.map(({ content: c, sku, etsyPartnerId, imageAiGenerated }) => ({
         title: c.title,
-        description: description(c),
+        // Etsy Creativity Standards: AI-generated photos are disclosed in the description, as
+        // their own sentence (never by reusing AI_DISCLOSURE, which is about the design).
+        description: imageAiGenerated
+          ? [description(c), IMAGE_AI_DISCLOSURE].join("\n\n")
+          : description(c),
         price: price(c),
         quantity: 999,
         sku,
@@ -947,6 +1046,7 @@ async function variantRowsForDraft(
     color: v.color,
     size: v.size,
     etsyPartnerId,
+    imageAiGenerated: row.imageDisclosures.aiGenerated,
   }));
 }
 

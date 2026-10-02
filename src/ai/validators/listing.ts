@@ -102,6 +102,17 @@ export const PARTNER_DISCLOSURE = bi(
   "Hecho por encargo: diseñado por nosotros, impreso como transferencia DTF por nuestro socio de producción y prensado en nuestro taller.",
 );
 
+/**
+ * Etsy Creativity Standards (same source as AI_DISCLOSURE): AI use must be disclosed in the
+ * description. This one is about the *photos* (an AI-generated scene, ADR 0023), added to the Etsy
+ * export only when an attached image is AI-generated; the design itself stays the shop's own.
+ * Wording pending compliance-officer review in wave 27.
+ */
+export const IMAGE_AI_DISCLOSURE = bi(
+  "Some product photos are AI-generated scenes; the design is our own.",
+  "Algunas fotos del producto son escenas generadas con IA; el diseño es nuestro.",
+);
+
 export function validateListing(
   channel: Channel,
   content: Partial<ListingContent>,

@@ -11,6 +11,7 @@ import {
   type AssistantFinal,
   type AssistantRun,
   type AssistantStreamEvent,
+  type ImageInput,
   type ProviderAssistantEvent,
   type StructuredResult,
   type TokenUsage,
@@ -52,7 +53,27 @@ function checkStop(
   if (stopReason === "max_tokens") throw new AiOutputError("Model output was cut off (max_tokens)");
 }
 
-async function structured<V, O>(prompt: PromptDef<V, O>, vars: V): Promise<StructuredResult<O>> {
+/**
+ * The user turn: images first (vision routes), then the text, as the vision docs recommend. A
+ * text-only call keeps the plain string so existing routes send exactly what they sent before.
+ */
+export function userContent(text: string, images: ImageInput[] = []) {
+  if (!images.length) return text;
+  return [
+    ...images.map((img) => ({
+      type: "image" as const,
+      source: { type: "base64" as const, media_type: img.mediaType, data: img.data },
+    })),
+    { type: "text" as const, text },
+  ];
+}
+
+async function structured<V, O>(
+  client: () => Anthropic,
+  prompt: PromptDef<V, O>,
+  vars: V,
+  images?: ImageInput[],
+): Promise<StructuredResult<O>> {
   const route = ROUTES[prompt.route];
   const format = betaZodOutputFormat(prompt.schema);
   const common = {
@@ -61,14 +82,16 @@ async function structured<V, O>(prompt: PromptDef<V, O>, vars: V): Promise<Struc
     system: [
       { type: "text" as const, text: prompt.system, cache_control: { type: "ephemeral" as const } },
     ],
-    messages: [{ role: "user" as const, content: stripPii(prompt.user(vars)) }],
+    messages: [
+      { role: "user" as const, content: userContent(stripPii(prompt.user(vars)), images) },
+    ],
   };
   // Haiku 4.5 (effort null) rejects `effort` and adaptive thinking, and the refusal-fallback beta
   // is for the Opus/Fable tier: such a route sends only the output format. `stop_reason` is still
   // checked below either way.
   const res = await (route.effort == null
-    ? anthropic().beta.messages.parse({ ...common, output_config: { format } })
-    : anthropic().beta.messages.parse({
+    ? client().beta.messages.parse({ ...common, output_config: { format } })
+    : client().beta.messages.parse({
         ...common,
         thinking: { type: "adaptive" },
         output_config: { effort: route.effort, format },
@@ -97,6 +120,7 @@ export function assistantSystem(run: Pick<AssistantRun, "system" | "context">) {
 }
 
 async function* assistant(
+  client: () => Anthropic,
   run: AssistantRun,
   onUsage?: (usage: TokenUsage) => void,
 ): AsyncGenerator<ProviderAssistantEvent, AssistantFinal> {
@@ -115,7 +139,7 @@ async function* assistant(
       },
     }),
   );
-  const runner = anthropic().beta.messages.toolRunner({
+  const runner = client().beta.messages.toolRunner({
     model: route.model,
     max_tokens: route.maxTokens,
     max_iterations: ASSISTANT_MAX_ITERATIONS,
@@ -165,4 +189,13 @@ async function* assistant(
   return { usage: total, model: last.model, stopReason: last.stopReason };
 }
 
-export const anthropicProvider: AiProvider = { name: "anthropic", structured, assistant };
+/** A provider over a given client (tests pass a stubbed-fetch client, as for OpenAI). */
+export function createAnthropicProvider(client: () => Anthropic): AiProvider {
+  return {
+    name: "anthropic",
+    structured: (prompt, vars, images) => structured(client, prompt, vars, images),
+    assistant: (run, onUsage) => assistant(client, run, onUsage),
+  };
+}
+
+export const anthropicProvider: AiProvider = createAnthropicProvider(anthropic);

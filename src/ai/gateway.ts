@@ -23,6 +23,7 @@ import {
   type AssistantRun,
   type AssistantStreamEvent,
   type AssistantTool,
+  type ImageInput,
   type ProviderAssistantEvent,
 } from "./providers/types";
 import {
@@ -207,17 +208,30 @@ export async function runStructured<V, O>(
   meta: CallMeta,
   prompt: PromptDef<V, O>,
   vars: V,
+  /** Vision routes only: never stored on ai_jobs (only type and size are), never PII-scrubbed. */
+  images: ImageInput[] = [],
 ): Promise<{ output: O; credits: number; model: string; aiJobId: string }> {
   const provider = await aiProvider(meta.companyId);
   await assertSpend(meta, provider);
   const clean = stripPiiDeep(sanitizeDeep(vars));
   const aiJobId = await startJob(
     meta,
-    { prompt: promptRef(prompt), vars: clean as Record<string, unknown> },
+    {
+      prompt: promptRef(prompt),
+      vars: clean as Record<string, unknown>,
+      ...(images.length
+        ? {
+            images: images.map((i) => ({
+              mediaType: i.mediaType,
+              bytes: Math.floor((i.data.length * 3) / 4),
+            })),
+          }
+        : {}),
+    },
     provider,
   );
   try {
-    const res = await provider.structured(prompt, clean);
+    const res = await provider.structured(prompt, clean, images);
     const output = sanitizeDeep(res.output);
     const credits = await finishJob(meta, aiJobId, res, output as Record<string, unknown>);
     return { output, credits, model: res.model, aiJobId };

@@ -4,6 +4,20 @@ import type { PromptDef } from "../prompts";
 
 export type TokenUsage = { tokensIn: number; tokensOut: number; cacheReadTokens: number };
 
+/**
+ * An image for a vision route (T-26-3): the design's small preview, base64, never the print
+ * file and never buyer data. Kept out of the prompt vars so the PII scrub can't mangle the bytes
+ * and the ai_jobs row records only its size.
+ */
+export type ImageInput = {
+  mediaType: "image/png" | "image/jpeg" | "image/webp" | "image/gif";
+  /** Base64, no data-URL prefix. */
+  data: string;
+};
+
+/** Anthropic vision docs: at most 5 MB per image through the API (OpenAI allows more). */
+export const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+
 export type StructuredResult<O> = {
   output: O;
   usage: TokenUsage;
@@ -85,7 +99,11 @@ export type AssistantRun = {
 
 export interface AiProvider {
   name: "anthropic" | "openai" | "mock";
-  structured<V, O>(prompt: PromptDef<V, O>, vars: V): Promise<StructuredResult<O>>;
+  structured<V, O>(
+    prompt: PromptDef<V, O>,
+    vars: V,
+    images?: ImageInput[],
+  ): Promise<StructuredResult<O>>;
   /**
    * `onUsage` is called with the running token total after each completed turn (before the final
    * one), so a caller that tears this generator down early (its own caller disconnected) can still

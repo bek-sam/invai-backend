@@ -11,10 +11,12 @@ import type {
   ListingVars,
   NicheClassification,
   NicheVars,
+  PhotoAnalysisVars,
   PromptDef,
   TrademarkJudgement,
   TrademarkJudgeVars,
 } from "../prompts";
+import { mockPhotoAnalysis } from "./mock-photo";
 import type {
   AiProvider,
   AssistantFinal,
@@ -665,6 +667,7 @@ export const mockProvider: Omit<AiProvider, "assistant"> & { assistant: typeof m
     } else if (prompt.id === "market_niche") output = mockNiche(vars as NicheVars);
     else if (prompt.id === "digest_narrative")
       output = mockDigestNarrative(vars as DigestNarrativeVars);
+    else if (prompt.id === "photo_analysis") output = mockPhotoAnalysis(vars as PhotoAnalysisVars);
     else {
       // Unknown prompt id (a new route, or a typo): don't 500 the request — warn and hand back a
       // schema-valid placeholder so callers exercise the real path end to end (B-45 hardening).
