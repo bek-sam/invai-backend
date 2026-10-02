@@ -10,6 +10,7 @@ import { inventoryRouter } from "../modules/inventory/router";
 import { marketRouter } from "../modules/market/router";
 import { orderItemsRouter, ordersRouter } from "../modules/orders/router";
 import { personalizationRouter } from "../modules/personalization/router";
+import { photosRouter } from "../modules/photos/router";
 import { privacyRouter } from "../modules/privacy/router";
 import { productionRouter } from "../modules/production/router";
 import { shippingRouter } from "../modules/shipping/router";
@@ -61,6 +62,7 @@ export const router = os.router({
   market: marketRouter,
   digest: digestRouter,
   analytics: analyticsRouter,
+  photos: photosRouter,
 });
 
 export type Router = typeof router;

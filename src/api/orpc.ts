@@ -181,6 +181,15 @@ export const NON_GET_READS: ReadonlySet<string> = new Set([
   // Reads unmapped order items and the catalog index to propose mappings; computes and returns,
   // never persists a rule or a mapping.
   "skuRules.suggest",
+  // Counts compositions, images and credits for a photo-set spec; no write, no job, no call.
+  "photos.estimate",
+]);
+
+/** Non-`ai.*` procedures that spend AI credits or call a model provider (ADR 0023 §8). */
+export const AI_BUCKET_PROCEDURES: ReadonlySet<string> = new Set([
+  "photos.analyzeDesign",
+  "photos.createSet",
+  "photos.pushToShopify",
 ]);
 
 export function bucketFor(
@@ -189,6 +198,7 @@ export function bucketFor(
   method: string | undefined,
 ): RateBucket {
   if (path[0] === "ai") return AI_CHEAP_READS.has(path.join(".")) ? "reads" : "ai";
+  if (AI_BUCKET_PROCEDURES.has(path.join("."))) return "ai";
   if (meta.auth === "station") return "auth";
   if (method === "GET") return "reads";
   return NON_GET_READS.has(path.join(".")) ? "reads" : "writes";

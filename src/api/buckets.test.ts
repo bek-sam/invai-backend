@@ -5,7 +5,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 import { checkRateLimit, RATE_BUCKET_LIMITS } from "../lib/ratelimit";
 import { createCompany, createUser } from "../test/fixtures";
 import { anonymousContext, type Context, permissionsFor } from "./context";
-import { AI_CHEAP_READS, bucketFor, NON_GET_READS } from "./orpc";
+import { AI_BUCKET_PROCEDURES, AI_CHEAP_READS, bucketFor, NON_GET_READS } from "./orpc";
 import { router } from "./router";
 
 /*
@@ -52,6 +52,13 @@ describe("bucketFor (B-133)", () => {
     expect(bucketFor(["orders", "list"], meta(), "GET")).toBe("reads");
     expect(bucketFor(["orders", "hold"], meta(), "POST")).toBe("writes");
     expect(bucketFor(["floor", "login"], meta("station"), "POST")).toBe("auth");
+  });
+
+  it("routes the credit-spending photos procedures to ai and the photo estimate to reads (ADR 0023)", () => {
+    for (const name of AI_BUCKET_PROCEDURES)
+      expect(bucketFor(name.split("."), meta(), "POST")).toBe("ai");
+    expect(bucketFor(["photos", "estimate"], meta(), "POST")).toBe("reads");
+    expect(bucketFor(["photos", "reviewImages"], meta(), "POST")).toBe("writes");
   });
 
   it("25 credit-balance reads in a minute do not block an ask; the 21st ask is still limited", async () => {
