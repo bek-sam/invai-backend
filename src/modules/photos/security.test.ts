@@ -109,7 +109,7 @@ describe("photos: credits", () => {
   // S-51 (Medium): createSet asserts the balance but reserves nothing, and the render charge
   // never re-checks it, so N sets each passing the same assert render and charge N times the
   // balance. Flip `it.fails` to `it` with the fix.
-  it.fails("two sets created against a balance that covers one never take credits below zero", async () => {
+  it("two sets created against a balance that covers one never take credits below zero", async () => {
     const { company, ctx, design } = await shop();
     await withTenant(company.id, async (tx) => {
       const b = await creditBalance(tx, company.id);

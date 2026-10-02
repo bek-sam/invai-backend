@@ -20,8 +20,8 @@ import {
   presetFor,
   TEMPLATE_VIEWS,
 } from "@invai/contracts";
-import { and, asc, eq, inArray, notInArray, sql } from "drizzle-orm";
-import { assertCredits, chargeCredits, creditBalance } from "../../ai/credits";
+import { and, asc, eq, inArray, isNull, notInArray, sql } from "drizzle-orm";
+import { assertCredits, chargeCredits, creditBalance, creditsExhausted } from "../../ai/credits";
 import { PHOTO_TEMPLATE_CREDITS } from "../../ai/models";
 import type { TenantContext } from "../../api/context";
 import { systemContext } from "../../api/context";
@@ -54,6 +54,27 @@ type TemplateView = (typeof TEMPLATE_VIEWS)[number];
 const ANALYSIS_STALE_MS = 15 * 60_000;
 const DONE_IMAGE: ImageRow["status"][] = ["rendered", "approved", "rejected"];
 const OPEN_IMAGE: ImageRow["status"][] = ["queued", "rendering"];
+const CREDITS_USED_UP = "AI credits are used up.";
+
+/**
+ * Credits promised to open sets (S-51): compositions with an image still to render and no charge
+ * yet. createSet counts them against the balance so two sets can't both spend the same credits.
+ */
+async function openCommitments(tx: Tx): Promise<number> {
+  const [r] = await tx
+    .select({ n: sql<number>`count(distinct ${photoImages.compositionId})::int` })
+    .from(photoImages)
+    .innerJoin(photoCompositions, eq(photoCompositions.id, photoImages.compositionId))
+    .where(and(inArray(photoImages.status, OPEN_IMAGE), isNull(photoCompositions.chargedAt)));
+  return (r?.n ?? 0) * PHOTO_TEMPLATE_CREDITS;
+}
+
+/** Serializes photo charges per company, so two sets' render jobs can't both spend the last credits. */
+async function lockCompanyCharges(tx: Tx, companyId: string) {
+  await tx.execute(
+    sql`select pg_advisory_xact_lock(hashtextextended(${`photos.charge:${companyId}`}, 0))`,
+  );
+}
 
 /* ---- Enqueuers (set by jobs.ts; avoids a service <-> jobs import cycle) ------------------ */
 
@@ -530,7 +551,10 @@ export async function createSet(
 
   const p = await plan(tx, ctx, input);
   const credits = p.planned.length * PHOTO_TEMPLATE_CREDITS;
-  await assertCredits(tx, ctx.companyId, credits);
+  const committed = await openCommitments(tx);
+  const balance = await creditBalance(tx, ctx.companyId);
+  const available = balance.remaining - committed;
+  if (available < credits) throw creditsExhausted(Math.max(0, available), balance.periodEnd);
 
   const [analysisRow] = await tx
     .select({ analysis: photoAnalyses.analysis, status: photoAnalyses.status })
@@ -1085,6 +1109,24 @@ export async function renderComposition(
       .from(photoImages)
       .where(and(eq(photoImages.compositionId, c.id), inArray(photoImages.status, OPEN_IMAGE)));
     if (open.length === 0) return { c, s, open, file: null };
+    if (!c.chargedAt) {
+      // Claim step (S-51): no render, and no charge, once the balance can't pay for this composition.
+      const b = await creditBalance(tx, companyId);
+      if (b.remaining < PHOTO_TEMPLATE_CREDITS) {
+        const failed = open.map((o) => ({
+          imageId: o.id,
+          ok: false as const,
+          error: CREDITS_USED_UP,
+        }));
+        return {
+          c,
+          s,
+          open: [],
+          file: null,
+          noCredits: await recordRenders(tx, companyId, c.id, failed),
+        };
+      }
+    }
     const { front, back } = await printFile(tx, ctx, s.designId);
     const file = c.placement === "back" ? back : front;
     await tx
@@ -1096,6 +1138,11 @@ export async function renderComposition(
     return { c, s, open, file: file ?? null };
   });
   if (!prep) return { rendered: 0, failed: 0, charged: false, skipped: true };
+  if ("noCredits" in prep && prep.noCredits) {
+    log.warn("photo render skipped: credits used up", { companyId, compositionId });
+    void publishSet(companyId, prep.s.id);
+    return prep.noCredits;
+  }
   const { c, s, open, file } = prep;
 
   const outcomes: RenderOutcome[] = [];
@@ -1158,7 +1205,8 @@ async function recordRenders(
     .from(photoCompositions)
     .where(eq(photoCompositions.id, compositionId));
   if (!c0) return { rendered: 0, failed: 0, charged: false };
-  // Lock order: set, then composition (every writer of both takes them in this order).
+  await lockCompanyCharges(tx, companyId);
+  // Lock order: company charge lock, set, then composition (every writer of both takes them in this order).
   const [s] = await tx.select().from(photoSets).where(eq(photoSets.id, c0.setId)).for("update");
   const [c] = await tx
     .select()
@@ -1193,6 +1241,19 @@ async function recordRenders(
   let charged = false;
   if (!c.chargedAt && imgs.some((i) => DONE_IMAGE.includes(i.status))) {
     const credits = PHOTO_TEMPLATE_CREDITS;
+    const b = await creditBalance(tx, companyId);
+    if (b.remaining < credits) {
+      // Another set spent the credits while this one rendered (S-51): keep nothing, charge nothing.
+      const voided = await tx
+        .update(photoImages)
+        .set({ status: "failed", key: null, error: CREDITS_USED_UP })
+        .where(and(eq(photoImages.compositionId, c.id), eq(photoImages.status, "rendered")))
+        .returning({ id: photoImages.id });
+      rendered = Math.max(0, rendered - voided.length);
+      failed += voided.length;
+      await finalizeSet(tx, companyId, s.id);
+      return { rendered, failed, charged: false };
+    }
     await chargeCredits(tx, {
       companyId,
       kind: "photo_image",

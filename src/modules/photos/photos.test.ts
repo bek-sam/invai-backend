@@ -675,3 +675,81 @@ describe("tenancy", () => {
     expect(full.images.find((i) => i.id === victim.id)?.url).toBeNull();
   });
 });
+
+describe("credits held by open sets (S-51)", () => {
+  async function leaveCredits(companyId: string, left: number) {
+    await withTenant(companyId, async (tx) => {
+      const b = await creditBalance(tx, companyId);
+      await chargeCredits(tx, {
+        companyId,
+        kind: "listing_draft",
+        credits: b.remaining - left,
+        model: null,
+        usage: null,
+      });
+    });
+  }
+  const balance = (companyId: string) =>
+    withTenant(companyId, (tx) => creditBalance(tx, companyId)).then((b) => b.remaining);
+  const photoCharges = (companyId: string) =>
+    withTenant(companyId, (tx) =>
+      tx.select().from(aiCreditLedger).where(eq(aiCreditLedger.refType, "photo_composition")),
+    );
+
+  it("createSet counts an open set's uncharged compositions: a second set on the same 8 credits is refused", async () => {
+    const { company, ctx, design } = await shop();
+    await leaveCredits(company.id, 8);
+    const input = spec(design.id);
+    const a = await withTenant(company.id, (tx) => svc.createSet(tx, ctx, input));
+    const second = { ...input, idempotencyKey: crypto.randomUUID() };
+    const err = await codeOf(withTenant(company.id, (tx) => svc.createSet(tx, ctx, second)));
+    expect(err.code).toBe("CREDITS_EXHAUSTED");
+    expect(err.data).toMatchObject({ remaining: 0 });
+    // Retrying the first request is still idempotent (no new commitment counted against itself).
+    const again = await withTenant(company.id, (tx) => svc.createSet(tx, ctx, input));
+    expect(again.id).toBe(a.id);
+    await renderAll(company.id, a.id);
+    expect(await balance(company.id)).toBe(0);
+    expect(await photoCharges(company.id)).toHaveLength(8);
+    const sets = await withTenant(company.id, (tx) => tx.select().from(photoSets));
+    expect(sets).toHaveLength(1);
+  });
+
+  it("claim step: a composition the balance can't pay fails with 'AI credits are used up', no render, no charge; a rerun changes nothing", async () => {
+    const { company, ctx, design } = await shop();
+    const set = await withTenant(company.id, (tx) => svc.createSet(tx, ctx, spec(design.id)));
+    await leaveCredits(company.id, 0);
+    await renderAll(company.id, set.id);
+    for (const c of set.compositions)
+      await runJobInline(renderCompositionJob, { companyId: company.id, compositionId: c.id });
+    expect(imaging.photoRender).not.toHaveBeenCalled();
+    const after = await withTenant(company.id, (tx) => svc.getSet(tx, ctx, { id: set.id }));
+    expect(after.status).toBe("failed");
+    expect(after.counts.failed).toBe(16);
+    expect(after.images.every((i) => i.error === "AI credits are used up." && i.key === null)).toBe(
+      true,
+    );
+    expect(await photoCharges(company.id)).toHaveLength(0);
+    expect(await balance(company.id)).toBe(0);
+  });
+
+  it("charge step: credits spent elsewhere during the render void that composition's photos and charge nothing", async () => {
+    const { company, ctx, design } = await shop();
+    const set = await withTenant(company.id, (tx) => svc.createSet(tx, ctx, spec(design.id)));
+    const first = nn(set.compositions[0]);
+    vi.mocked(imaging.photoRender).mockImplementationOnce(async (i) => {
+      await leaveCredits(company.id, 0); // another set's jobs spent the rest meanwhile
+      return renderOk(i);
+    });
+    await runJobInline(renderCompositionJob, { companyId: company.id, compositionId: first.id });
+    const after = await withTenant(company.id, (tx) => svc.getSet(tx, ctx, { id: set.id }));
+    const imgs = after.images.filter((i) => i.compositionId === first.id);
+    expect(imgs).toHaveLength(2);
+    expect(imgs.every((i) => i.status === "failed" && i.error === "AI credits are used up.")).toBe(
+      true,
+    );
+    expect(after.compositions.find((c) => c.id === first.id)?.chargedAt).toBeNull();
+    expect(await photoCharges(company.id)).toHaveLength(0);
+    expect(await balance(company.id)).toBe(0);
+  });
+});
