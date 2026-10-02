@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import type { DigestNarrative, DigestNarrativeVars } from "../../src/ai/prompts";
 import { digestNarrativePrompt } from "../../src/ai/prompts";
 import { validateNarrative } from "../../src/ai/validators/digest";
-import { env } from "../../src/env";
+import { evalMode } from "../lib/mode";
 import type { EvalTenant } from "../lib/fixtures";
 import { callStructured } from "../lib/gateway-run";
 import { loadCases } from "../lib/jsonl";
@@ -35,7 +35,7 @@ const PLACEHOLDER = /\{\{\s*[A-Za-z0-9_.:-]+\s*\}\}/g;
 
 export async function runDigestNarrative(tenant: EvalTenant): Promise<RouteReport> {
   const cases = loadCases<CaseVars, CaseExpect>(path.join(dir, "cases.jsonl"));
-  const mode: RouteReport["mode"] = env.mocks.ai ? "mock" : "real";
+  const mode: RouteReport["mode"] = evalMode();
   const results: CaseResult[] = [];
   for (const c of cases) {
     const v = c.vars;
@@ -70,7 +70,7 @@ export async function runDigestNarrative(tenant: EvalTenant): Promise<RouteRepor
     const forbidHit = c.expect.forbid ? new RegExp(c.expect.forbid, "iu").test(own) : false;
     const rendered = check?.ok ? check.rendered.text : "";
     const renderOk = !check?.ok || !c.expect.mustRender || rendered.includes(c.expect.mustRender);
-    const plumbingPass = res.error == null && check != null && (mode === "real" || check.ok);
+    const plumbingPass = res.error == null && check != null && (mode !== "mock" || check.ok);
     const qualityPass =
       mode === "mock"
         ? null

@@ -1,6 +1,6 @@
 import { writeFileSync } from "node:fs";
 import { closeDb } from "../../src/db/client";
-import { env } from "../../src/env";
+import { describeMode, evalMode } from "../lib/mode";
 import { closeQueues } from "../../src/lib/queues";
 import { printOverall, printRoute } from "../lib/report";
 import { runMarketEvals } from "./run";
@@ -15,7 +15,7 @@ async function main() {
   const argv = process.argv.slice(2);
   const i = argv.indexOf("--json");
   const jsonOut = i >= 0 ? (argv[i + 1] ?? null) : null;
-  console.log(`AI eval harness (market) — mode: ${env.mocks.ai ? "mock (no ANTHROPIC_API_KEY)" : "real"}`);
+  console.log(`AI eval harness (market) — mode: ${describeMode()}`);
   const report = await runMarketEvals();
   if (report.mode === "skipped") console.log(`market: skipped — ${report.skippedReason}`);
   const summary = printRoute(report);
@@ -23,7 +23,7 @@ async function main() {
   if (jsonOut)
     writeFileSync(
       jsonOut,
-      `${JSON.stringify({ generatedAt: new Date().toISOString(), mode: env.mocks.ai ? "mock" : "real", routes: [summary] }, null, 2)}\n`,
+      `${JSON.stringify({ generatedAt: new Date().toISOString(), mode: evalMode(), routes: [summary] }, null, 2)}\n`,
     );
   if (report.mode !== "skipped" && summary.plumbingPass < summary.cases) process.exitCode = 1;
 }

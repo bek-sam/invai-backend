@@ -14,6 +14,7 @@ import { stripPii, stripPiiDeep } from "./pii";
 import { ASSISTANT_PROMPT, type PromptDef, promptRef } from "./prompts";
 import { anthropicProvider } from "./providers/anthropic";
 import { mockProvider } from "./providers/mock";
+import { openaiProvider } from "./providers/openai";
 import {
   AiOutputError,
   type AiProvider,
@@ -33,9 +34,10 @@ import {
 } from "./validators/answer";
 
 /**
- * AI gateway. Every Claude call goes through here so it is metered per company (ai_jobs +
+ * AI gateway. Every model call goes through here so it is metered per company (ai_jobs +
  * ai_credit_ledger), validated against its schema, logged, and free of buyer personal data.
- * The mock provider is used automatically when ANTHROPIC_API_KEY is missing (`env.mocks.ai`).
+ * Provider order (decision 0021): Anthropic when ANTHROPIC_API_KEY is set, else OpenAI when
+ * OPENAI_API_KEY is set, else the mock (`env.mocks.ai`).
  * See invai-docs/architecture.md section 8.
  */
 
@@ -45,14 +47,29 @@ export type AiJobKind = (typeof aiJobs.$inferInsert)["kind"];
 
 /**
  * A sample workspace (T-6-5's `isSampleWorkspace`) never reaches the real model, even when
- * `ANTHROPIC_API_KEY` is set: it always gets the mock provider, so it can never spend the
- * platform's Anthropic key. See `finishJob` for why the cost check also no longer trusts
+ * an AI key is set: it always gets the mock provider, so it can never spend the platform's key. See `finishJob` for why the cost check also no longer trusts
  * `env.mocks.ai` alone.
  */
 export async function aiProvider(companyId: string): Promise<AiProvider> {
   if (env.mocks.ai) return mockProvider;
-  return (await isSampleWorkspace(companyId)) ? mockProvider : anthropicProvider;
+  return (await isSampleWorkspace(companyId)) ? mockProvider : realProvider();
 }
+
+/**
+ * The real provider when AI keys exist: Anthropic wins, OpenAI only without an Anthropic key.
+ * With neither key `env.mocks.ai` is true and this isn't reached (tests that clear the flag by
+ * hand still get Anthropic, as before decision 0021).
+ */
+function realProvider(): AiProvider {
+  return !env.ANTHROPIC_API_KEY && env.OPENAI_API_KEY ? openaiProvider : anthropicProvider;
+}
+
+/** The name shown in an UPSTREAM_FAILED error. */
+const PROVIDER_LABEL: Record<AiProvider["name"], string> = {
+  anthropic: "Claude",
+  openai: "OpenAI",
+  mock: "AI",
+};
 
 type CallMeta = {
   companyId: string;
@@ -106,9 +123,10 @@ async function failJob(companyId: string, aiJobId: string, err: unknown) {
  */
 export { sanitizeDeep, sanitizeText };
 
-function toApiError(err: unknown): unknown {
-  if (err instanceof AiRefusalError) return upstream("Claude", err.message);
-  if (err instanceof AiOutputError) return upstream("Claude", err.message);
+function toApiError(err: unknown, provider: AiProvider): unknown {
+  const label = PROVIDER_LABEL[provider.name];
+  if (err instanceof AiRefusalError) return upstream(label, err.message);
+  if (err instanceof AiOutputError) return upstream(label, err.message);
   return err;
 }
 
@@ -206,7 +224,7 @@ export async function runStructured<V, O>(
   } catch (err) {
     await failJob(meta.companyId, aiJobId, err);
     log.warn("structured call failed", { prompt: prompt.id, error: (err as Error).message });
-    throw toApiError(err);
+    throw toApiError(err, provider);
   }
 }
 

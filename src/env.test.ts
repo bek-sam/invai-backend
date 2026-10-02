@@ -160,3 +160,44 @@ describe("DIGEST_EMAIL_ENABLED default (T-19-4 round 2)", () => {
     expect(res.out).toContain('"digestEmailEnabled":false');
   });
 });
+
+describe("AI provider keys (decision 0021)", () => {
+  const { ANTHROPIC_API_KEY: _a, ...noAnthropic } = ALL_KEYS;
+
+  it("OPENAI_API_KEY satisfies the production AI key; with neither key the AI key is missing", () => {
+    expect(missingProductionKeys({ ...noAnthropic, OPENAI_API_KEY: "sk-real" })).toEqual([]);
+    expect(missingProductionKeys(noAnthropic)).toEqual(["ANTHROPIC_API_KEY"]);
+    expect(missingProductionKeys({ ...noAnthropic, OPENAI_API_KEY: "  " })).toEqual([
+      "ANTHROPIC_API_KEY",
+    ]);
+  });
+
+  it("production boots on an OpenAI key alone, with the AI mock off", async () => {
+    const res = await boot({
+      NODE_ENV: "production",
+      ...noAnthropic,
+      SMTP_URL: "smtp://mail:25",
+      OPENAI_API_KEY: "sk-real",
+    });
+    expect(res.ok).toBe(true);
+    expect(res.out).toContain('"ai":false');
+  });
+
+  it("the AI mock is on only when neither key is set (development)", async () => {
+    expect((await boot({ NODE_ENV: "development" })).out).toContain('"ai":true');
+    expect((await boot({ NODE_ENV: "development", OPENAI_API_KEY: "sk-real" })).out).toContain(
+      '"ai":false',
+    );
+  });
+
+  it("a test run ignores AI keys, so no test can reach a paid model", async () => {
+    const res = await boot({
+      NODE_ENV: "test",
+      OPENAI_API_KEY: "sk-real",
+      ANTHROPIC_API_KEY: "sk-ant-real",
+    });
+    expect(res.out).toContain('"ai":true');
+    expect(env.OPENAI_API_KEY).toBeUndefined();
+    expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+  });
+});

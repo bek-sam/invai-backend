@@ -2,7 +2,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { TrademarkJudgeVars } from "../../src/ai/prompts";
 import { trademarkJudgePrompt } from "../../src/ai/prompts";
-import { env } from "../../src/env";
+import { evalMode } from "../lib/mode";
 import type { EvalTenant } from "../lib/fixtures";
 import { callStructured } from "../lib/gateway-run";
 import { loadCases } from "../lib/jsonl";
@@ -26,7 +26,7 @@ export type TrademarkExpect = {
 
 export async function runTrademarkJudge(tenant: EvalTenant): Promise<RouteReport> {
   const cases = loadCases<TrademarkJudgeVars, TrademarkExpect>(path.join(dir, "cases.jsonl"));
-  const mode: RouteReport["mode"] = env.mocks.ai ? "mock" : "real";
+  const mode: RouteReport["mode"] = evalMode();
   const results: CaseResult[] = [];
 
   for (const c of cases) {
@@ -55,7 +55,7 @@ export async function runTrademarkJudge(tenant: EvalTenant): Promise<RouteReport
       results.push({
         ...base,
         plumbingPass: false,
-        qualityPass: mode === "real" ? false : null,
+        qualityPass: mode !== "mock" ? false : null,
         note: res.error ?? "no output",
       });
       continue;
@@ -72,7 +72,7 @@ export async function runTrademarkJudge(tenant: EvalTenant): Promise<RouteReport
     let note = plumbingPass
       ? `judgements: ${judgements.map((j) => j.judgement).join(", ")}`
       : `cardinality/mark mismatch: got ${judgements.length} for ${c.vars.candidates.length} candidates`;
-    const qualityPass = mode === "real" ? matches : null;
+    const qualityPass = mode !== "mock" ? matches : null;
     if (mode === "mock" && !matches)
       note += ` (expect ${expected.join("|")} — mock always answers "possible"; informational)`;
 

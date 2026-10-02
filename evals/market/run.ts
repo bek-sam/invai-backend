@@ -5,7 +5,7 @@ import type { AssistantTool } from "../../src/ai/providers/types";
 import { type TurnToolOutput, validateAnswer } from "../../src/ai/validators/answer";
 import { systemContext } from "../../src/api/context";
 import { withTenant } from "../../src/db/client";
-import { env } from "../../src/env";
+import { evalMode } from "../lib/mode";
 import { assistantTools } from "../../src/modules/ai/assistant-tools";
 import { shopContext } from "../../src/modules/ai/service";
 import { callAssistant } from "../lib/gateway-run";
@@ -43,7 +43,7 @@ const lower = (s: string) => s.toLowerCase();
 
 export async function runMarketEvals(): Promise<RouteReport> {
   const cases = loadCases<Vars, MarketExpect>(path.join(dir, "cases.jsonl"));
-  const mode: RouteReport["mode"] = env.mocks.ai ? "mock" : "real";
+  const mode: RouteReport["mode"] = evalMode();
   const seeded = await seedMarketTenants();
   if ("skipped" in seeded) return { route: "market", mode: "skipped", skippedReason: seeded.skipped, cases: [] };
 
@@ -76,7 +76,7 @@ export async function runMarketEvals(): Promise<RouteReport> {
       model: res.model,
     };
     if (res.error) {
-      results.push({ ...base, plumbingPass: false, qualityPass: mode === "real" ? false : null, note: res.error });
+      results.push({ ...base, plumbingPass: false, qualityPass: mode !== "mock" ? false : null, note: res.error });
       continue;
     }
     const called = res.events.flatMap((e) => (e.type === "tool_call" ? [e.name] : []));
@@ -99,7 +99,7 @@ export async function runMarketEvals(): Promise<RouteReport> {
     const structuralOk = text.trim().length > 0 && toolOk && recsOk && numberIssues.length === 0 && sampleOk;
     const contentOk = must && !mustNot && allowedOk;
     const plumbingPass = structuralOk && (c.expect.deterministic ? contentOk : true);
-    const qualityPass = mode === "real" || c.expect.deterministic ? structuralOk && contentOk : null;
+    const qualityPass = mode !== "mock" || c.expect.deterministic ? structuralOk && contentOk : null;
     const note = [
       `tools: ${called.join(", ") || "(none)"}`,
       !toolOk ? `expected one of: ${c.expect.anyTool?.join(", ")}` : null,

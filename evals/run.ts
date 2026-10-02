@@ -1,6 +1,6 @@
 import { writeFileSync } from "node:fs";
 import { closeDb } from "../src/db/client";
-import { env } from "../src/env";
+import { describeMode, evalMode } from "./lib/mode";
 import { closeQueues } from "../src/lib/queues";
 import { runAssistantEvals } from "./assistant/run";
 import { runDigestNarrative } from "./digest_narrative/run";
@@ -16,11 +16,11 @@ import { runTrademarkJudge } from "./trademark_judge/run";
  * Eval harness entry point (T-8-5, B-48; invai-docs/decisions/0007-ai-model-policy.md). One eval
  * set per AI route, run through the real gateway (src/ai/gateway.ts) against a throwaway tenant.
  *
- * Mode: with no ANTHROPIC_API_KEY (CI, and any local run without one), env.mocks.ai is true and
+ * Mode: with neither ANTHROPIC_API_KEY nor OPENAI_API_KEY (CI, and any local run without one), env.mocks.ai is true and
  * every call goes to the mock provider automatically (gateway.ts's aiProvider()) — this run then
  * checks the plumbing (schema-valid output, correct cardinality, the gateway/validator wiring)
  * rather than model quality, which a fixed mock can't demonstrate either way. With a key it calls
- * the real model and scores against each case's `expect`.
+ * the real model (Anthropic first, else OpenAI: decision 0021, `evals/lib/mode.ts`) and scores against each case's `expect`.
  *
  * Usage: `pnpm evals` (all routes) or `pnpm evals listing_copy trademark_judge` (a subset).
  * `--json <path>` also writes the route summaries as JSON (used to regenerate `evals/baseline.json`).
@@ -60,7 +60,7 @@ async function main() {
     }
   }
 
-  console.log(`AI eval harness — mode: ${env.mocks.ai ? "mock (no ANTHROPIC_API_KEY)" : "real"}`);
+  console.log(`AI eval harness — mode: ${describeMode()}`);
   const tenant = await createEvalTenant();
   console.log(`Eval tenant (companyId): ${tenant.companyId}`);
 
@@ -79,7 +79,7 @@ async function main() {
     if (jsonOut) {
       writeFileSync(
         jsonOut,
-        `${JSON.stringify({ generatedAt: new Date().toISOString(), mode: env.mocks.ai ? "mock" : "real", routes: summaries }, null, 2)}\n`,
+        `${JSON.stringify({ generatedAt: new Date().toISOString(), mode: evalMode(), routes: summaries }, null, 2)}\n`,
       );
       console.log(`\nWrote ${jsonOut}`);
     }

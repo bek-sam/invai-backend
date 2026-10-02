@@ -45,7 +45,7 @@ export const aiJobs = pgTable(
     kind: text(enumText(AI_JOB_KINDS)).notNull(),
     status: text(enumText(AI_JOB_STATUSES)).notNull().default("queued"),
     model: text(),
-    provider: text(enumText(["anthropic", "mock"] as const))
+    provider: text(enumText(["anthropic", "openai", "mock"] as const))
       .notNull()
       .default("mock"),
     input: jsonObject<Record<string, unknown>>(),

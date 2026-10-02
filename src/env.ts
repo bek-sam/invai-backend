@@ -76,6 +76,8 @@ const raw = createEnv({
     FIELD_ENCRYPTION_KEY: z.string().min(40),
 
     ANTHROPIC_API_KEY: secret(z.string()),
+    /** Second AI provider (decision 0021): used only when ANTHROPIC_API_KEY is unset. */
+    OPENAI_API_KEY: secret(z.string()),
     /**
      * Operator token for the internal DLQ/redrive routes (`X-Internal-Token`, api/internal.ts).
      * Never shipped to a browser. Unset turns the routes off (every call 404s); set it wherever an
@@ -237,10 +239,17 @@ export const PRODUCTION_KEYS = [
   "IMAGING_SHARED_SECRET",
 ] as const;
 
+/**
+ * Either AI key satisfies the AI requirement (decision 0021); with neither set, the missing key is
+ * reported as ANTHROPIC_API_KEY, the preferred provider.
+ */
 export function missingProductionKeys(
-  values: Partial<Record<(typeof PRODUCTION_KEYS)[number], string | undefined>>,
+  values: Partial<Record<(typeof PRODUCTION_KEYS)[number] | "OPENAI_API_KEY", string | undefined>>,
 ): string[] {
-  return PRODUCTION_KEYS.filter((key) => !values[key]?.trim());
+  const hasOpenAi = !!values.OPENAI_API_KEY?.trim();
+  return PRODUCTION_KEYS.filter(
+    (key) => !values[key]?.trim() && !(key === "ANTHROPIC_API_KEY" && hasOpenAi),
+  );
 }
 
 const missingInProd = isProd ? missingProductionKeys(raw) : [];
@@ -248,7 +257,8 @@ if (missingInProd.length && !raw.ALLOW_MOCKS) {
   throw new Error(
     `Refusing to start in production: missing ${missingInProd.join(", ")}. ` +
       "Without them InvAI would use mock providers and fake success. Set the keys, or set " +
-      "ALLOW_MOCKS=true for a demo or staging stage only.",
+      "ALLOW_MOCKS=true for a demo or staging stage only. OPENAI_API_KEY can stand in for " +
+      "ANTHROPIC_API_KEY.",
   );
 }
 if (missingInProd.length) {
@@ -290,6 +300,12 @@ export const env = {
       ? assertTestRedisDbPinned(raw.TEST_REDIS_URL)
       : withTestRedisDb(raw.REDIS_URL)
     : raw.REDIS_URL,
+  /**
+   * Under test the AI keys from .env are dropped (decision 0021): a test run must never reach a
+   * paid model or send test data out. Tests that exercise a real provider stub its HTTP layer.
+   */
+  ANTHROPIC_API_KEY: isTest ? undefined : raw.ANTHROPIC_API_KEY,
+  OPENAI_API_KEY: isTest ? undefined : raw.OPENAI_API_KEY,
   FLOOR_TOKEN_SECRET: raw.FLOOR_TOKEN_SECRET ?? raw.BETTER_AUTH_SECRET,
   /** Undefined only in production with ALLOW_MOCKS=true; the mailer then logs instead of sending. */
   SMTP_URL: raw.SMTP_URL ?? (isProd ? undefined : "smtp://localhost:1025"),
@@ -313,7 +329,8 @@ export const env = {
   /** ALLOW_MOCKS=true: production may boot on mock providers (demo or staging stages only). */
   allowMocks: raw.ALLOW_MOCKS,
   mocks: {
-    ai: !raw.ANTHROPIC_API_KEY,
+    /** The mock only when neither AI key is set; Anthropic wins when both are (gateway.ts). */
+    ai: isTest || (!raw.ANTHROPIC_API_KEY && !raw.OPENAI_API_KEY),
     carrier: !raw.EASYPOST_API_KEY,
     shopify: !raw.SHOPIFY_API_KEY || !raw.SHOPIFY_API_SECRET,
     supplier: !raw.SS_ACTIVEWEAR_ACCOUNT || !raw.SS_ACTIVEWEAR_API_KEY,

@@ -1,3 +1,4 @@
+import type { EvalMode } from "./mode";
 /** Shared types for the eval harness (T-8-5, B-48). See invai-docs/decisions/0007. */
 
 export type EvalCase<V = unknown, E = unknown> = {
@@ -27,13 +28,18 @@ export type CaseResult = {
 
 export type RouteReport = {
   route: string;
-  mode: "mock" | "real" | "skipped";
+  mode: EvalMode | "skipped";
   skippedReason?: string;
   cases: CaseResult[];
 };
 
+/**
+ * Share of input served from the cache. `tokensIn` excludes cache reads for both providers (the
+ * gateway's TokenUsage), so the denominator is their sum, as in the cost-review query.
+ */
 export function cacheHitRate(cases: CaseResult[]): number {
   const tokensIn = cases.reduce((a, c) => a + c.tokensIn, 0);
   const cacheRead = cases.reduce((a, c) => a + c.cacheReadTokens, 0);
-  return tokensIn > 0 ? cacheRead / tokensIn : 0;
+  const total = tokensIn + cacheRead;
+  return total > 0 ? cacheRead / total : 0;
 }

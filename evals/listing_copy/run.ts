@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import type { ListingVars } from "../../src/ai/prompts";
 import { listingCopyPrompt } from "../../src/ai/prompts";
 import { validateListing } from "../../src/ai/validators/listing";
-import { env } from "../../src/env";
+import { evalMode } from "../lib/mode";
 import type { EvalTenant } from "../lib/fixtures";
 import { callStructured } from "../lib/gateway-run";
 import { loadCases } from "../lib/jsonl";
@@ -37,7 +37,7 @@ export type ListingExpect = {
 
 export async function runListingCopy(tenant: EvalTenant): Promise<RouteReport> {
   const cases = loadCases<ListingVars, ListingExpect>(path.join(dir, "cases.jsonl"));
-  const mode: RouteReport["mode"] = env.mocks.ai ? "mock" : "real";
+  const mode: RouteReport["mode"] = evalMode();
   const results: CaseResult[] = [];
 
   for (const c of cases) {
@@ -66,7 +66,7 @@ export async function runListingCopy(tenant: EvalTenant): Promise<RouteReport> {
       results.push({
         ...base,
         plumbingPass: false,
-        qualityPass: mode === "real" ? false : null,
+        qualityPass: mode !== "mock" ? false : null,
         note: res.error ?? "no output",
       });
       continue;
@@ -84,7 +84,7 @@ export async function runListingCopy(tenant: EvalTenant): Promise<RouteReport> {
       : `validator: ${validation.errors.map((e) => e.rule).join(", ")}`;
 
     let qualityPass: boolean | null = null;
-    if (mode === "real") {
+    if (mode !== "mock") {
       const hay = JSON.stringify(res.output).toLowerCase();
       const forbidden = (c.expect.forbiddenSubstrings ?? []).filter((s) =>
         hay.includes(s.toLowerCase()),

@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import { ASSISTANT_PROMPT } from "../../src/ai/prompts";
 import { permissionsFor, systemContext } from "../../src/api/context";
 import { withTenant } from "../../src/db/client";
-import { env } from "../../src/env";
+import { evalMode } from "../lib/mode";
 import { assistantTools } from "../../src/modules/ai/assistant-tools";
 import { shopContext } from "../../src/modules/ai/service";
 import type { EvalTenant } from "../lib/fixtures";
@@ -54,7 +54,7 @@ export type AssistantVars = {
 
 export async function runAssistantEvals(tenant: EvalTenant): Promise<RouteReport> {
   const cases = loadCases<AssistantVars, AssistantExpect>(path.join(dir, "cases.jsonl"));
-  const mode: RouteReport["mode"] = env.mocks.ai ? "mock" : "real";
+  const mode: RouteReport["mode"] = evalMode();
   // Cases with `vars.tenant: "seeded"` run against a second tenant with a small known business
   // (seed.ts, T-17-2): the analyst tools need real numbers, and the empty tenant must stay empty
   // for the zero-state cases above.
@@ -124,7 +124,7 @@ async function runSeededCases(
       results.push({
         ...base,
         plumbingPass: false,
-        qualityPass: mode === "real" ? false : null,
+        qualityPass: mode !== "mock" ? false : null,
         note: res.error,
       });
       continue;
@@ -154,7 +154,7 @@ async function runSeededCases(
     const structuralOk = hasText && toolOk;
     const plumbingPass = structuralOk && (c.expect.deterministic ? contentOk : true);
     const qualityPass =
-      mode === "real" || c.expect.deterministic ? structuralOk && contentOk : null;
+      mode !== "mock" || c.expect.deterministic ? structuralOk && contentOk : null;
 
     const note = [
       `tools: ${gotToolNames.join(", ") || "(none)"}`,

@@ -25,7 +25,7 @@ import type {
 } from "./types";
 
 /*
- * Mock provider (no ANTHROPIC_API_KEY). Deterministic and schema-valid: listing copy is built
+ * Mock provider (neither ANTHROPIC_API_KEY nor OPENAI_API_KEY). Deterministic and schema-valid: listing copy is built
  * from the design name, tags and blank; the assistant really calls the company-scoped tools and
  * writes its answer from their results, streamed as text deltas.
  */

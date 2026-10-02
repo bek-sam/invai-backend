@@ -84,7 +84,7 @@ export type AssistantRun = {
 };
 
 export interface AiProvider {
-  name: "anthropic" | "mock";
+  name: "anthropic" | "openai" | "mock";
   structured<V, O>(prompt: PromptDef<V, O>, vars: V): Promise<StructuredResult<O>>;
   /**
    * `onUsage` is called with the running token total after each completed turn (before the final

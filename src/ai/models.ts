@@ -42,6 +42,35 @@ export const ROUTES: Record<AiRoute, RouteConfig> = {
   digest_narrative: { model: DEFAULT_MODEL, effort: "low", maxTokens: 2_000 },
 };
 
+/* ------------------------------ OpenAI routes ------------------------------ */
+
+/**
+ * Decision 0021: when only OPENAI_API_KEY is set, the same routes run on OpenAI's Responses API.
+ * Ids and prices checked on developers.openai.com/api/docs/models and /pricing, 2026-10-01.
+ * GPT-6.1 Sol ("near-Astra performance at a lower cost") stands in for Opus 5; GPT-6 Luna
+ * ("focused, high-volume tasks") for Haiku on the one bulk route. Effort maps one to one; Luna's
+ * `none` turns reasoning off like the Haiku route. The prompts were tuned on Claude: these routes
+ * are unproven until `pnpm evals` runs in openai mode (decision 0021).
+ */
+export const OPENAI_SOL_MODEL = "gpt-6.1-sol";
+export const OPENAI_LUNA_MODEL = "gpt-6-luna";
+
+export type OpenAiRouteConfig = {
+  model: string;
+  /** Responses API `reasoning.effort`. */
+  effort: "none" | Effort;
+  /** `max_output_tokens`; on OpenAI it includes reasoning tokens, as `max_tokens` does thinking. */
+  maxTokens: number;
+};
+
+export const OPENAI_ROUTES: Record<AiRoute, OpenAiRouteConfig> = {
+  listing_copy: { model: OPENAI_SOL_MODEL, effort: "medium", maxTokens: 16_000 },
+  trademark_judge: { model: OPENAI_SOL_MODEL, effort: "low", maxTokens: 4_000 },
+  assistant: { model: OPENAI_SOL_MODEL, effort: "high", maxTokens: 32_000 },
+  market_niche: { model: OPENAI_LUNA_MODEL, effort: "none", maxTokens: 512 },
+  digest_narrative: { model: OPENAI_SOL_MODEL, effort: "low", maxTokens: 2_000 },
+};
+
 /**
  * Server-side refusal fallback: on a classifier decline the API re-runs the request on the
  * model Anthropic recommends for that refusal category. `stop_reason` is still checked.
@@ -125,7 +154,43 @@ export const MODEL_PRICES: Record<string, ModelPriceCents> = {
     batchInputPerMTok: 50,
     batchOutputPerMTok: 250,
   },
+  // OpenAI (decision 0021), Standard tier, short context (under 272K input tokens; every route
+  // here is far below it). OpenAI has one cache-write rate, so both TTL fields carry it. Source:
+  // developers.openai.com/api/docs/pricing, checked 2026-10-01.
+  [OPENAI_SOL_MODEL]: {
+    // GPT-6.1 Sol: $2.00 in / $0.10 cached / $2.50 cache write / $10.00 out per MTok.
+    inputPerMTok: 200,
+    outputPerMTok: 1_000,
+    cacheWrite5mPerMTok: 250,
+    cacheWrite1hPerMTok: 250,
+    cacheReadPerMTok: 10,
+    batchInputPerMTok: 100,
+    batchOutputPerMTok: 500,
+  },
+  [OPENAI_LUNA_MODEL]: {
+    // GPT-6 Luna: $0.10 in / $0.01 cached / $0.125 cache write / $0.50 out per MTok.
+    inputPerMTok: 10,
+    outputPerMTok: 50,
+    cacheWrite5mPerMTok: 12.5,
+    cacheWrite1hPerMTok: 12.5,
+    cacheReadPerMTok: 1,
+    batchInputPerMTok: 5,
+    batchOutputPerMTok: 25,
+  },
 };
+
+/**
+ * The price row for a model id: exact, else the longest table id it starts with (a dated
+ * snapshot such as `gpt-6.1-sol-2026-09-01` prices as `gpt-6.1-sol`), else undefined.
+ */
+export function priceFor(model: string): ModelPriceCents | undefined {
+  const exact = MODEL_PRICES[model];
+  if (exact) return exact;
+  const key = Object.keys(MODEL_PRICES)
+    .filter((k) => model.startsWith(`${k}-`))
+    .sort((a, b) => b.length - a.length)[0];
+  return key ? MODEL_PRICES[key] : undefined;
+}
 
 /**
  * List-price cost of a call, in cents, read from `MODEL_PRICES`. `model` defaults to
@@ -143,7 +208,7 @@ export function tokensToCostCents(
   model: string = DEFAULT_MODEL,
   opts: { batch?: boolean; cacheTtl?: "5m" | "1h" } = {},
 ): number {
-  const price = MODEL_PRICES[model] ?? MODEL_PRICES[DEFAULT_MODEL];
+  const price = priceFor(model) ?? MODEL_PRICES[DEFAULT_MODEL];
   if (!price) throw new Error("MODEL_PRICES is missing DEFAULT_MODEL");
   const batchDiscount = opts.batch ? 0.5 : 1;
   const cacheWriteRate =
