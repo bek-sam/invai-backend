@@ -1,0 +1,2 @@
+ALTER TABLE "listing_drafts" ADD COLUMN "image_disclosures" jsonb DEFAULT '{"aiGenerated":false,"syntheticPerformer":false}'::jsonb NOT NULL;--> statement-breakpoint
+CREATE UNIQUE INDEX "ai_credit_ledger_photo_ref_uq" ON "ai_credit_ledger" USING btree ("company_id","ref_type","ref_id") WHERE ref_type LIKE 'photo_%';

@@ -93,6 +93,7 @@ async function toDraft(row: DraftRow, designName: string): Promise<ListingDraft>
         }
       : null,
     mockupKeys: row.mockupKeys,
+    imageDisclosures: row.imageDisclosures,
     model: row.model,
     creditsUsed: row.creditsUsed,
     approvedBy: row.approvedBy,

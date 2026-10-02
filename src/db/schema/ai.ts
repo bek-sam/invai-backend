@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import {
   foreignKey,
   index,
@@ -33,6 +34,8 @@ export const AI_JOB_KINDS = [
   "market_niche",
   // Wave 19 (T-19-2): the weekly digest AI summary (enumText: no migration).
   "digest_narrative",
+  // Wave 26 (T-26-3): the design analysis for listing photos (enumText: no migration).
+  "photo_analysis",
 ] as const;
 export const AI_JOB_STATUSES = ["queued", "running", "done", "failed"] as const;
 
@@ -124,6 +127,11 @@ export const listingDrafts = pgTable(
     trademarkReviewedAt: timestamp({ withTimezone: true }),
     trademarkReviewNote: text(),
     mockupKeys: text().array().notNull().default([]),
+    /** Contracts ImageDisclosures; set by attached AI images, never cleared by later template attaches. */
+    imageDisclosures: jsonb()
+      .$type<{ aiGenerated: boolean; syntheticPerformer: boolean }>()
+      .notNull()
+      .default({ aiGenerated: false, syntheticPerformer: false }),
     model: text(),
     creditsUsed: integer().notNull().default(0),
     brief: text(),
@@ -183,6 +191,8 @@ export const CREDIT_KINDS = [
   "mockup",
   "market_niche", // contracts 0.6.1; the niche route still charges sku_suggestion until switched
   "digest_narrative", // contracts 0.7.0 (T-19-1, A5); one charge per digest, ref = the digest
+  "photo_image", // contracts 0.12.0 (ADR 0023): one template composition, ref = the photo image
+  "photo_scene", // contracts 0.12.0: one AI scene image (wave 27)
 ] as const;
 
 /** Per-company AI credit ledger: allowance/packs in (+), every job out (−). */
@@ -208,6 +218,10 @@ export const aiCreditLedger = pgTable(
   (t) => [
     index().on(t.companyId, t.period),
     index().on(t.companyId, t.createdAt),
+    // One photo charge per image: a retried render job can't charge twice (ADR 0023).
+    uniqueIndex("ai_credit_ledger_photo_ref_uq")
+      .on(t.companyId, t.refType, t.refId)
+      .where(sql`ref_type LIKE 'photo_%'`),
     foreignKey({
       name: "ai_credit_ledger_ai_job_id_fk",
       columns: [t.companyId, t.aiJobId],

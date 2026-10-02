@@ -80,6 +80,13 @@ export const REFUSAL_FALLBACK = {
   fallbacks: "default",
 } as const;
 
+/**
+ * Listing photos (ADR 0023): fixed credits per image, charged once per image (the ledger's partial
+ * unique index on `ref_type LIKE 'photo_%'`). Owner may change them (OI-25).
+ */
+export const PHOTO_TEMPLATE_CREDITS = 1;
+export const PHOTO_SCENE_CREDITS = 10;
+
 /** Mock provider label stored on ai_jobs / drafts when no API key is configured. */
 export const MOCK_MODEL = "mock-claude-opus-5";
 
