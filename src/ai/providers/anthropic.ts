@@ -24,7 +24,10 @@ import {
 
 let client: Anthropic | null = null;
 function anthropic(): Anthropic {
-  client ??= new Anthropic({ apiKey: env.ANTHROPIC_API_KEY, maxRetries: 2 });
+  // Same guard as the OpenAI provider (S-49): no SDK fallback to process.env under test.
+  const apiKey = env.ANTHROPIC_API_KEY;
+  if (!apiKey) throw new Error("ANTHROPIC_API_KEY is not configured");
+  client ??= new Anthropic({ apiKey, maxRetries: 2 });
   return client;
 }
 

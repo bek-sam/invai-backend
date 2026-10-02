@@ -41,7 +41,11 @@ const log = logger("ai.openai");
 
 let defaultClient: OpenAI | null = null;
 function openai(): OpenAI {
-  defaultClient ??= new OpenAI({ apiKey: env.OPENAI_API_KEY, maxRetries: 2, timeout: 120_000 });
+  // The SDK would fall back to process.env.OPENAI_API_KEY (filled from .env outside production)
+  // when env drops the key under test; only env's resolved key may build a client (S-49).
+  const apiKey = env.OPENAI_API_KEY;
+  if (!apiKey) throw new Error("OPENAI_API_KEY is not configured");
+  defaultClient ??= new OpenAI({ apiKey, maxRetries: 2, timeout: 120_000 });
   return defaultClient;
 }
 

@@ -491,3 +491,19 @@ describe("OpenAI provider (decision 0021)", () => {
     });
   });
 });
+
+describe("S-49: no client without env's resolved key", () => {
+  it("the default OpenAI provider refuses to build a client when env has no key, even if process.env has one", async () => {
+    const saved = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = "sk-from-dotenv-should-be-ignored";
+    try {
+      expect(realEnv.OPENAI_API_KEY).toBeUndefined();
+      await expect(openaiProvider.structured(trademarkJudgePrompt, JUDGE_VARS)).rejects.toThrow(
+        "OPENAI_API_KEY is not configured",
+      );
+    } finally {
+      if (saved === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = saved;
+    }
+  });
+});
