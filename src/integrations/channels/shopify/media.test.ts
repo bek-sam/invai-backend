@@ -448,6 +448,25 @@ describe("Shopify pushProductImages (productUpdate media, API 2026-07)", () => {
     }
   });
 
+  it("S-52: a 5xx on productUpdate is not re-sent (error reaches the caller); reads still retry", async () => {
+    const restore = setShopifySleep(async () => {});
+    try {
+      let reads = 0;
+      const { calls } = stubShopify((c) => {
+        if (isUpdate(c)) return { status: 502, body: { errors: [{ message: "bad gateway" }] } };
+        reads++;
+        return reads === 1 ? { status: 503, body: {} } : mediaRead([]);
+      });
+      const err = await shopifyLive.pushProductImages?.(conn, input()).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(Error);
+      expect((err as Error).message).toContain("502");
+      expect(calls.filter(isUpdate)).toHaveLength(1);
+      expect(reads).toBe(2);
+    } finally {
+      restore();
+    }
+  });
+
   it("refuses bad input before any call: filename must be the URL's last segment, https, unique", async () => {
     const { fetchMock } = stubShopify(() => mediaRead([]));
     const cases: PushProductImagesInput[] = [

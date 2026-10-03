@@ -271,7 +271,8 @@ async function push(
         mediaContentType: "IMAGE",
       })),
     },
-    { cost: 270 },
+    // No 5xx retry: the mutation may already be applied; the caller's retry reads media first (S-52).
+    { cost: 270, retryServerErrors: false },
   );
   const { product, userErrors } = res.productUpdate;
   const beforeIds = new Set(before.map((n) => n.id));

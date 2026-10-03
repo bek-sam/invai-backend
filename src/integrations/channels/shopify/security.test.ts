@@ -27,7 +27,7 @@ describe("S-52: product image push is not repeated by the client's 5xx retry", (
 
   // Shopify applies productUpdate, then a gateway answers 502. The client re-sends the mutation
   // without the read-back, so the product gets the photo twice. Remove `.fails` once fixed.
-  it.fails("a 502 after the mutation was applied does not send productUpdate again", async () => {
+  it("a 502 after the mutation was applied does not send productUpdate again", async () => {
     const stored: { id: string; alt: string; status: string; mediaContentType: string }[] = [];
     let mutations = 0;
     vi.stubGlobal(

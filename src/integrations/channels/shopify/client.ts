@@ -99,6 +99,11 @@ function backoffMs(attempt: number, retryAfter: string | null) {
 export type GraphqlOptions = {
   /** Expected query cost, used to wait before the call when the bucket is low. */
   cost?: number;
+  /**
+   * Retry a 5xx answer (default true). Non-idempotent mutations set false: Shopify may have applied
+   * the call before the gateway failed, so the caller must read state back before trying again (S-52).
+   */
+  retryServerErrors?: boolean;
 };
 
 export async function shopifyGraphql<T>(
@@ -134,7 +139,7 @@ export async function shopifyGraphql<T>(
       continue;
     }
     if (res.status >= 500) {
-      if (attempt < MAX_ATTEMPTS - 1) {
+      if (opts.retryServerErrors !== false && attempt < MAX_ATTEMPTS - 1) {
         await sleep(backoffMs(attempt, null));
         continue;
       }
