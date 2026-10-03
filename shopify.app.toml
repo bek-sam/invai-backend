@@ -10,8 +10,9 @@ application_url = "https://app.invai.example"
 embedded = false
 
 [access_scopes]
-# Keep in sync with SHOPIFY_SCOPES (common.ts).
-scopes = "read_orders,write_orders,read_merchant_managed_fulfillment_orders,write_merchant_managed_fulfillment_orders,read_products,read_inventory,write_inventory,read_locations"
+# Keep in sync with SHOPIFY_SCOPES (common.ts). write_products (T-27-4, product photo push) was
+# added 2026-10-03: shops installed before it must re-consent before photos can be pushed.
+scopes = "read_orders,write_orders,read_merchant_managed_fulfillment_orders,write_merchant_managed_fulfillment_orders,read_products,write_products,read_inventory,write_inventory,read_locations"
 
 [auth]
 redirect_urls = ["https://api.invai.example/webhooks/shopify/oauth/callback"]

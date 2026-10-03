@@ -190,6 +190,40 @@ export function header(headers: HeaderBag, name: string): string | null {
   return key ? (headers[key] ?? null) : null;
 }
 
+/** One image to add to a channel product (T-27-4). `filename` is the last path segment of `url`. */
+export type ProductImage = { url: string; alt: string; filename: string };
+
+export type PushProductImagesInput = {
+  /** `gid://shopify/Product/<id>` (the backend maps `listings.channelListingId` to it). */
+  productGid: string;
+  images: ProductImage[];
+  /** Stable per push intent: a retry of the same push reuses it. */
+  idempotencyKey: string;
+};
+
+export type PushProductImagesResult = {
+  pushed: { filename: string; mediaId: string }[];
+  /** Already on the product (an earlier push or attempt): nothing was added for these. */
+  skipped: { filename: string; mediaId: string | null; reason: "already_pushed" }[];
+};
+
+/**
+ * A product image push the caller should not retry as is. `outcome` says whether the channel
+ * may have acted: `not_done` (nothing added) or `partial` (some media may exist; a retry reads
+ * back first, so it is safe). Transient failures (timeouts, 5xx, throttling) stay `UPSTREAM_FAILED`.
+ * Messages are written for the shop owner.
+ */
+export class ProductImagePushError extends Error {
+  constructor(
+    public readonly code: "product_not_found" | "reconnect_needed" | "rejected" | "invalid_input",
+    message: string,
+    public readonly outcome: "not_done" | "partial" = "not_done",
+  ) {
+    super(message);
+    this.name = "ProductImagePushError";
+  }
+}
+
 export interface ChannelAdapter {
   channel: Channel;
   /** True when the marketplace app is not approved yet (API calls fail, CSV works). */
@@ -213,4 +247,14 @@ export interface ChannelAdapter {
   disconnect?(conn: ChannelConn, uri: string): Promise<ChannelDisconnectResult>;
   /** Fetch one order by its channel id (webhook `order_ref` events). */
   fetchOrder?(conn: ChannelConn, channelOrderId: string): Promise<FetchedOrder>;
+  /**
+   * Add images to a channel product (T-27-4, Shopify only). Images already on the product
+   * (matched by filename, or by alt while Shopify is still processing them) come back as
+   * `skipped`, so a retry never duplicates. Throws `ProductImagePushError` for a missing
+   * product, a missing OAuth scope or a rejected image.
+   */
+  pushProductImages?(
+    conn: ChannelConn,
+    input: PushProductImagesInput,
+  ): Promise<PushProductImagesResult>;
 }

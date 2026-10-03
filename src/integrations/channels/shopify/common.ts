@@ -10,6 +10,8 @@ export const SHOPIFY_SCOPES = [
   "read_merchant_managed_fulfillment_orders",
   "write_merchant_managed_fulfillment_orders",
   "read_products",
+  // T-27-4: product image push (productUpdate media). Added 2026-10-03: existing shops re-consent.
+  "write_products",
   "read_inventory",
   "write_inventory",
   "read_locations",

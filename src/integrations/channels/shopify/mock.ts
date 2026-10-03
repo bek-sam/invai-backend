@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { NormalizedOrder } from "@invai/contracts";
 import {
   BLANK_STYLES,
@@ -12,8 +13,15 @@ import {
   TEMPLATES,
 } from "../../../db/seed/data";
 import { logger } from "../../../lib/log";
-import { type ChannelAdapter, type ChannelRefund, normalizeAvailability } from "../types";
+import {
+  type ChannelAdapter,
+  type ChannelRefund,
+  normalizeAvailability,
+  ProductImagePushError,
+  type PushProductImagesResult,
+} from "../types";
 import { parseShopifyWebhook, SHOPIFY_WEBHOOK_TOPICS, verifyShopifyHmac } from "./common";
+import { validateProductImages } from "./media";
 
 const log = logger("channels.shopify.mock");
 
@@ -127,6 +135,26 @@ export function mockShopifySubscriptions(connectionId: string): string[] {
   return mockSubscriptions.get(connectionId) ?? [];
 }
 
+/**
+ * Product images the mock store holds, per connection, product id and filename (lowercase) →
+ * media gid. A product "exists" when its id has 10+ digits, like real Shopify ids and the ids
+ * the seed and mock orders use; a shorter id (e.g. `MOCK_SHOPIFY_MISSING_PRODUCT`) is unknown.
+ */
+const mockMedia = new Map<string, Map<string, string>>();
+export const MOCK_SHOPIFY_MISSING_PRODUCT = "gid://shopify/Product/404";
+
+export function mockShopifyProductMedia(connectionId: string, productGid: string): string[] {
+  const id = productGid.split("/").pop() ?? "";
+  return [...(mockMedia.get(`${connectionId}:${id}`)?.values() ?? [])];
+}
+
+export function resetMockShopifyMedia() {
+  mockMedia.clear();
+}
+
+const mockMediaId = (key: string) =>
+  `gid://shopify/MediaImage/${BigInt(`0x${createHash("sha256").update(key).digest("hex").slice(0, 12)}`)}`;
+
 export const shopifyMock: ChannelAdapter = {
   channel: "shopify",
   pendingApproval: false,
@@ -199,5 +227,40 @@ export const shopifyMock: ChannelAdapter = {
       unsubscribed: ids.length,
     });
     return { unsubscribed: ids.length, uninstalled: true, errors: [] };
+  },
+
+  async pushProductImages(conn, input) {
+    const productId = validateProductImages(input);
+    if (productId.length < 10)
+      throw new ProductImagePushError(
+        "product_not_found",
+        "This Shopify product no longer exists. Re-sync your Shopify listings and try again.",
+      );
+    const storeKey = `${conn.id}:${productId}`;
+    const store = mockMedia.get(storeKey) ?? new Map<string, string>();
+    mockMedia.set(storeKey, store);
+    const result: PushProductImagesResult = { pushed: [], skipped: [] };
+    for (const img of input.images) {
+      const file = img.filename.toLowerCase();
+      const existing = store.get(file);
+      if (existing) {
+        result.skipped.push({
+          filename: img.filename,
+          mediaId: existing,
+          reason: "already_pushed",
+        });
+        continue;
+      }
+      const mediaId = mockMediaId(`${storeKey}:${file}`);
+      store.set(file, mediaId);
+      result.pushed.push({ filename: img.filename, mediaId });
+    }
+    log.info("mock shopify product images", {
+      connectionId: conn.id,
+      idempotencyKey: input.idempotencyKey,
+      pushed: result.pushed.length,
+      skipped: result.skipped.length,
+    });
+    return result;
   },
 };

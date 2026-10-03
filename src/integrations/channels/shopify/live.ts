@@ -10,13 +10,14 @@ import {
 import { ShopifyAuthError, shopifyGraphql } from "./client";
 import { parseShopifyWebhook, SHOPIFY_SCOPES, verifyShopifyHmac } from "./common";
 import { setShopifyAvailability } from "./inventory";
+import { pushShopifyProductImages } from "./media";
 import { fetchShopifyOrders, gid } from "./orders";
 import { disconnectShopify, ensureShopifyWebhooks } from "./subscriptions";
 
 /*
  * Shopify Admin GraphQL API (2026-07). Orders are pulled with an `updated_at` watermark plus
  * page cursors, tracking goes through fulfillment orders + `fulfillmentCreate`, availability
- * through `inventorySetQuantities`. Access tokens are offline tokens from the OAuth install.
+ * through `inventorySetQuantities`, product images through `productUpdate` media (media.ts). Access tokens are offline tokens from the OAuth install.
  */
 
 const FULFILLMENT_ORDERS_QUERY = /* GraphQL */ `
@@ -92,6 +93,10 @@ export const shopifyLive: ChannelAdapter = {
 
   async disconnect(conn, uri) {
     return disconnectShopify(conn, uri);
+  },
+
+  async pushProductImages(conn, input) {
+    return pushShopifyProductImages(conn, input);
   },
 };
 

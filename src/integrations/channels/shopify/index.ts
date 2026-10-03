@@ -11,7 +11,14 @@ export {
 } from "./auth";
 export * from "./common";
 export { finishShopifyInstall, shopifyAuthorizeUrl } from "./live";
-export { mockShopifyOrder, mockShopifySubscriptions } from "./mock";
+export { SHOPIFY_IMAGE_SCOPE, shopifyProductId } from "./media";
+export {
+  MOCK_SHOPIFY_MISSING_PRODUCT,
+  mockShopifyOrder,
+  mockShopifyProductMedia,
+  mockShopifySubscriptions,
+  resetMockShopifyMedia,
+} from "./mock";
 
 /** The live adapter when SHOPIFY_API_KEY/SECRET are set, else the mock store. */
 export function shopifyAdapter(

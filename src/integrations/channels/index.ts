@@ -11,6 +11,7 @@ import { type HeaderBag, header } from "./types";
 import { walmartAdapter } from "./walmart";
 
 export type * from "./types";
+export { ProductImagePushError } from "./types";
 
 /**
  * The adapter for a channel. Shopify and Etsy pick live or mock from the provider (and the env
