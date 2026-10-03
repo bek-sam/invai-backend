@@ -97,28 +97,40 @@ function rng(seed: number) {
 /** Scales `src` to fit (W, H) preserving aspect, centered; uncovered pixels are transparent. */
 function fitInto(src: Rgba, W: number, H: number): Rgba {
   const scale = Math.min(W / src.width, H / src.height);
-  const w = src.width * scale;
-  const h = src.height * scale;
-  const ox = (W - w) / 2;
-  const oy = (H - h) / 2;
+  const ox = (W - src.width * scale) / 2;
+  const oy = (H - src.height * scale) / 2;
   const out = new Uint8Array(W * H * 4);
+  const sd = src.data;
+  // Per-column source indices and weights, computed once.
+  const cx0 = new Int32Array(W);
+  const cx1 = new Int32Array(W);
+  const cfx = new Float32Array(W);
+  const cin = new Uint8Array(W);
+  for (let x = 0; x < W; x++) {
+    const sx = (x + 0.5 - ox) / scale - 0.5;
+    cin[x] = sx >= -0.5 && sx <= src.width - 0.5 ? 1 : 0;
+    const x0 = Math.max(0, Math.min(src.width - 1, Math.floor(sx)));
+    cx0[x] = x0 * 4;
+    cx1[x] = Math.min(src.width - 1, x0 + 1) * 4;
+    cfx[x] = Math.max(0, Math.min(1, sx - x0));
+  }
   for (let y = 0; y < H; y++) {
     const sy = (y + 0.5 - oy) / scale - 0.5;
     if (sy < -0.5 || sy > src.height - 0.5) continue;
     const y0 = Math.max(0, Math.min(src.height - 1, Math.floor(sy)));
-    const y1 = Math.min(src.height - 1, y0 + 1);
+    const r0 = y0 * src.width * 4;
+    const r1 = Math.min(src.height - 1, y0 + 1) * src.width * 4;
     const fy = Math.max(0, Math.min(1, sy - y0));
     for (let x = 0; x < W; x++) {
-      const sx = (x + 0.5 - ox) / scale - 0.5;
-      if (sx < -0.5 || sx > src.width - 0.5) continue;
-      const x0 = Math.max(0, Math.min(src.width - 1, Math.floor(sx)));
-      const x1 = Math.min(src.width - 1, x0 + 1);
-      const fx = Math.max(0, Math.min(1, sx - x0));
+      if (!cin[x]) continue;
+      const a = cx0[x] ?? 0;
+      const b = cx1[x] ?? 0;
+      const fx = cfx[x] ?? 0;
+      const o = (y * W + x) * 4;
       for (let k = 0; k < 4; k++) {
-        const p = (yy: number, xx: number) => src.data[(yy * src.width + xx) * 4 + k] ?? 0;
-        const top = p(y0, x0) * (1 - fx) + p(y0, x1) * fx;
-        const bot = p(y1, x0) * (1 - fx) + p(y1, x1) * fx;
-        out[(y * W + x) * 4 + k] = Math.round(top * (1 - fy) + bot * fy);
+        const top = (sd[r0 + a + k] ?? 0) * (1 - fx) + (sd[r0 + b + k] ?? 0) * fx;
+        const bot = (sd[r1 + a + k] ?? 0) * (1 - fx) + (sd[r1 + b + k] ?? 0) * fx;
+        out[o + k] = Math.round(top * (1 - fy) + bot * fy);
       }
     }
   }
@@ -212,10 +224,22 @@ export function renderMockScene(input: GenerateSceneInput, drift: boolean): Rgba
       const sceneW = isBg * (1 - protectedW);
       // Whole-frame re-render: slight light falloff and +-2 noise everywhere.
       const falloff = 1 - 0.025 * (Math.abs(x / W - 0.5) + Math.abs(t - 0.5));
-      const noise = () => Math.floor(rand() * 5) - 2;
-      out[i] = clamp((b.data[i] ?? 0) * (1 - sceneW) + sr * sceneW, falloff, noise());
-      out[i + 1] = clamp((b.data[i + 1] ?? 0) * (1 - sceneW) + sg * sceneW, falloff, noise());
-      out[i + 2] = clamp((b.data[i + 2] ?? 0) * (1 - sceneW) + sb * sceneW, falloff, noise());
+
+      out[i] = clamp(
+        (b.data[i] ?? 0) * (1 - sceneW) + sr * sceneW,
+        falloff,
+        Math.floor(rand() * 5) - 2,
+      );
+      out[i + 1] = clamp(
+        (b.data[i + 1] ?? 0) * (1 - sceneW) + sg * sceneW,
+        falloff,
+        Math.floor(rand() * 5) - 2,
+      );
+      out[i + 2] = clamp(
+        (b.data[i + 2] ?? 0) * (1 - sceneW) + sb * sceneW,
+        falloff,
+        Math.floor(rand() * 5) - 2,
+      );
       out[i + 3] = 255;
     }
   }

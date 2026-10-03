@@ -85,35 +85,25 @@ export function decodePng(buf: Buffer): Rgba {
   }
   const data = new Uint8Array(width * height * 4);
   const step = depth / 8; // 16-bit samples: keep the high byte
-  for (let i = 0; i < width * height; i++) {
-    const s = i * bpp;
-    const sample = (k: number) => px[s + k * step] ?? 0;
-    let r: number;
-    let g: number;
-    let b: number;
-    let a = 255;
-    if (colorType === 0) {
-      r = g = b = sample(0);
-    } else if (colorType === 4) {
-      r = g = b = sample(0);
-      a = sample(1);
-    } else if (colorType === 2) {
-      r = sample(0);
-      g = sample(1);
-      b = sample(2);
-    } else if (colorType === 6) {
-      r = sample(0);
-      g = sample(1);
-      b = sample(2);
-      a = sample(3);
+  for (let i = 0, s = 0, o = 0; i < width * height; i++, s += bpp, o += 4) {
+    if (colorType === 3) {
+      const idx = px[s] ?? 0;
+      data[o] = palette?.[idx * 3] ?? 0;
+      data[o + 1] = palette?.[idx * 3 + 1] ?? 0;
+      data[o + 2] = palette?.[idx * 3 + 2] ?? 0;
+      data[o + 3] = trns && idx < trns.length ? (trns[idx] ?? 255) : 255;
+    } else if (colorType === 0 || colorType === 4) {
+      const v = px[s] ?? 0;
+      data[o] = v;
+      data[o + 1] = v;
+      data[o + 2] = v;
+      data[o + 3] = colorType === 4 ? (px[s + step] ?? 0) : 255;
     } else {
-      const idx = sample(0);
-      r = palette?.[idx * 3] ?? 0;
-      g = palette?.[idx * 3 + 1] ?? 0;
-      b = palette?.[idx * 3 + 2] ?? 0;
-      a = trns && idx < trns.length ? (trns[idx] ?? 255) : 255;
+      data[o] = px[s] ?? 0;
+      data[o + 1] = px[s + step] ?? 0;
+      data[o + 2] = px[s + 2 * step] ?? 0;
+      data[o + 3] = colorType === 6 ? (px[s + 3 * step] ?? 0) : 255;
     }
-    data.set([r, g, b, a], i * 4);
   }
   return { width, height, data };
 }

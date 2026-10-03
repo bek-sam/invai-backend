@@ -11,6 +11,7 @@ import type { RouteReport } from "./lib/types";
 import { runListingCopy } from "./listing_copy/run";
 import { runPersonalizationCheck } from "./personalization_check/run";
 import { runPhotoAnalysis } from "./photo_analysis/run";
+import { runScenePrompts } from "./scene_prompts/run";
 import { runTrademarkJudge } from "./trademark_judge/run";
 
 /*
@@ -34,10 +35,14 @@ const ROUTES: Record<string, (tenant: EvalTenant) => Promise<RouteReport>> = {
   personalization_check: runPersonalizationCheck,
   digest_narrative: runDigestNarrative,
   photo_analysis: runPhotoAnalysis,
+  scene_prompts: runScenePrompts,
 };
 
 /** The card's spelling (`pnpm evals photo-analysis`) for the underscore route ids. */
-const ALIASES: Record<string, string> = { "photo-analysis": "photo_analysis" };
+const ALIASES: Record<string, string> = {
+  "photo-analysis": "photo_analysis",
+  "scene-prompts": "scene_prompts",
+};
 
 /** Always closes the db pool and the redis client — ioredis/pg keep an open handle that stops
  *  the process from exiting on its own, so every return path (including an early bad-arg exit)
