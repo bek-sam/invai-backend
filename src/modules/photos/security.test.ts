@@ -310,7 +310,7 @@ describe("photos: AI scene spend (T-27-3 security co-review)", () => {
   // transient S3 failure after a paid scene call throws RetryLater with no ai_jobs row, so that
   // call's cost never reaches the spend counters or the daily shop cap, and the retry pays the
   // provider again. Every billed call must be recorded. Flip `it.fails` to `it` with the fix.
-  it.fails("a scene call whose upload fails is still recorded as spend before the retry pays again", async () => {
+  it("a scene call whose upload fails is still recorded as spend before the retry pays again", async () => {
     const { company, office, design } = await shop();
     const ctx = tenantContext(company.id, office.id, "office");
     h.on = true;

@@ -353,7 +353,7 @@ async function ensureScene(
     });
     throw isTransient(err) ? new RetryLater(err) : err;
   }
-  await step(() => putObject(key, result.image, "image/png"));
+  // Spend first (S-55): a failed upload retries and pays again, so this call must already count.
   await recordImageGen({
     companyId: c.companyId,
     userId: p.createdBy,
@@ -363,6 +363,7 @@ async function ensureScene(
     entity,
     startedAt,
   });
+  await step(() => putObject(key, result.image, "image/png"));
   await save({ containsPerson: result.containsPerson, sceneModel: result.model });
   return { key, containsPerson: result.containsPerson, model: result.model };
 }
