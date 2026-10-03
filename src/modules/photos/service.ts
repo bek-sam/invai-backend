@@ -12,6 +12,8 @@ import {
   type PhotoComposition,
   type PhotoEstimate,
   type PhotoImage,
+  type PhotoPush,
+  type PhotoSceneKind,
   type PhotoSet,
   type PhotoSetCreateInput,
   type PhotoSetSpec,
@@ -20,13 +22,20 @@ import {
   presetFor,
   TEMPLATE_VIEWS,
 } from "@invai/contracts";
-import { and, asc, eq, inArray, isNull, notInArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, ne, notInArray, sql } from "drizzle-orm";
 import { assertCredits, chargeCredits, creditBalance, creditsExhausted } from "../../ai/credits";
-import { PHOTO_TEMPLATE_CREDITS } from "../../ai/models";
+import { assertImageGenAllowed, sceneContainsPerson } from "../../ai/images";
+import { PHOTO_SCENE_CREDITS, PHOTO_TEMPLATE_CREDITS } from "../../ai/models";
 import type { TenantContext } from "../../api/context";
 import { systemContext } from "../../api/context";
 import { afterCommit, type Tx, withTenant } from "../../db/client";
-import { photoAnalyses, photoCompositions, photoImages, photoSets } from "../../db/schema";
+import {
+  photoAnalyses,
+  photoCompositions,
+  photoImages,
+  photoPushes,
+  photoSets,
+} from "../../db/schema";
 import { ImagingError, imaging, type PhotoRenderResult } from "../../integrations/imaging/client";
 import { audit } from "../../lib/audit";
 import { sha256Hex } from "../../lib/crypto";
@@ -42,6 +51,7 @@ import { attachPhotosToDraft } from "../ai/photo-attach";
 import { getDraft } from "../ai/service";
 import { blankFacets, getDesign } from "../catalog/service";
 import { contrastWarnings } from "./contrast";
+import { appendToStoredZip, readmeEntries } from "./zip-readme";
 
 const log = logger("photos");
 
@@ -52,25 +62,71 @@ type TemplateView = (typeof TEMPLATE_VIEWS)[number];
 
 /** An analysis still `pending` after this long is treated as lost and re-enqueued. */
 const ANALYSIS_STALE_MS = 15 * 60_000;
-const DONE_IMAGE: ImageRow["status"][] = ["rendered", "approved", "rejected"];
-const OPEN_IMAGE: ImageRow["status"][] = ["queued", "rendering"];
-const CREDITS_USED_UP = "AI credits are used up.";
+export const DONE_IMAGE: ImageRow["status"][] = ["rendered", "approved", "rejected"];
+export const OPEN_IMAGE: ImageRow["status"][] = ["queued", "rendering"];
+export const CREDITS_USED_UP = "AI credits are used up.";
+/** Scene base and provider size: square; imaging cover-fits and upscales to each channel preset. */
+export const SCENE_SIZE_PX = 1024;
+
+/** The design's analysis when ready (scene kinds, person suggestions, alt text), else null. */
+export async function readyAnalysis(tx: Tx, designId: string): Promise<DesignPhotoAnalysis | null> {
+  const [row] = await tx
+    .select({ analysis: photoAnalyses.analysis, status: photoAnalyses.status })
+    .from(photoAnalyses)
+    .where(eq(photoAnalyses.designId, designId))
+    .limit(1);
+  return row?.status === "ready" ? row.analysis : null;
+}
+
+export const creditsFor = (source: CompositionRow["source"]) =>
+  source === "ai_scene" ? PHOTO_SCENE_CREDITS : PHOTO_TEMPLATE_CREDITS;
+
+/** Uncharged work with images in `statuses`: template compositions, and scenes with or without a stored scene yet. */
+export type OpenWork = { templates: number; scenesStored: number; scenesPending: number };
+
+export async function openWork(
+  tx: Tx,
+  statuses: ImageRow["status"][] = OPEN_IMAGE,
+  excludeCompositionId?: string,
+): Promise<OpenWork> {
+  const rows = await tx
+    .selectDistinct({
+      id: photoCompositions.id,
+      source: photoCompositions.source,
+      sceneKey: photoCompositions.sceneKey,
+    })
+    .from(photoImages)
+    .innerJoin(photoCompositions, eq(photoCompositions.id, photoImages.compositionId))
+    .where(
+      and(
+        inArray(photoImages.status, statuses),
+        isNull(photoCompositions.chargedAt),
+        excludeCompositionId ? ne(photoCompositions.id, excludeCompositionId) : undefined,
+      ),
+    );
+  const w: OpenWork = { templates: 0, scenesStored: 0, scenesPending: 0 };
+  for (const r of rows) {
+    if (r.source !== "ai_scene") w.templates++;
+    else if (r.sceneKey) w.scenesStored++;
+    else w.scenesPending++;
+  }
+  return w;
+}
+
+export const workCredits = (w: OpenWork) =>
+  w.templates * PHOTO_TEMPLATE_CREDITS + (w.scenesStored + w.scenesPending) * PHOTO_SCENE_CREDITS;
 
 /**
  * Credits promised to open sets (S-51): compositions with an image still to render and no charge
- * yet. createSet counts them against the balance so two sets can't both spend the same credits.
+ * yet (a scene counts PHOTO_SCENE_CREDITS). createSet and estimate count them against the balance
+ * so two sets can't both spend the same credits.
  */
 async function openCommitments(tx: Tx): Promise<number> {
-  const [r] = await tx
-    .select({ n: sql<number>`count(distinct ${photoImages.compositionId})::int` })
-    .from(photoImages)
-    .innerJoin(photoCompositions, eq(photoCompositions.id, photoImages.compositionId))
-    .where(and(inArray(photoImages.status, OPEN_IMAGE), isNull(photoCompositions.chargedAt)));
-  return (r?.n ?? 0) * PHOTO_TEMPLATE_CREDITS;
+  return workCredits(await openWork(tx));
 }
 
 /** Serializes photo charges per company, so two sets' render jobs can't both spend the last credits. */
-async function lockCompanyCharges(tx: Tx, companyId: string) {
+export async function lockCompanyCharges(tx: Tx, companyId: string) {
   await tx.execute(
     sql`select pg_advisory_xact_lock(hashtextextended(${`photos.charge:${companyId}`}, 0))`,
   );
@@ -91,13 +147,20 @@ let enqueueAnalysis: (i: AnalysisJobInput) => Promise<void> = async () => {
 let enqueueZip: (i: ZipJobInput) => Promise<void> = async () => {
   throw new Error("photos jobs not registered");
 };
+export type PushJobInput = { companyId: string; pushId: string };
+let enqueuePush: (i: PushJobInput) => Promise<void> = async () => {
+  throw new Error("photos jobs not registered");
+};
 export function setPhotoEnqueuers(fns: {
   analysis: typeof enqueueAnalysis;
   zip: typeof enqueueZip;
+  push?: typeof enqueuePush;
 }) {
   enqueueAnalysis = fns.analysis;
   enqueueZip = fns.zip;
+  if (fns.push) enqueuePush = fns.push;
 }
+export const pushEnqueuer = () => enqueuePush;
 
 function photoBadRequest(reason: PhotoBadRequestReason, count: number | null, message: string) {
   return badRequest(message, { reason, count });
@@ -218,7 +281,7 @@ async function toSummary(
     colors: s.colors,
     views: s.views.filter((v): v is TemplateView => v !== "lifestyle"),
     channels: s.channels,
-    lifestyle: null,
+    lifestyle: s.lifestyle ?? null,
     counts: agg.counts,
     creditsEstimated: s.creditsEstimated,
     creditsCharged: agg.creditsCharged,
@@ -247,7 +310,7 @@ function leadOf(s: SetRow, images: ImageRow[]): ImageRow | undefined {
   return done.find((i) => i.channel === s.channels[0]) ?? done[0];
 }
 
-async function loadSetRow(tx: Tx, id: string): Promise<SetRow> {
+export async function loadSetRow(tx: Tx, id: string): Promise<SetRow> {
   const [row] = await tx.select().from(photoSets).where(eq(photoSets.id, id)).limit(1);
   if (!row) throw notFound("photo set", id);
   return row;
@@ -255,7 +318,7 @@ async function loadSetRow(tx: Tx, id: string): Promise<SetRow> {
 
 /* ---- Design analysis ---------------------------------------------------------------------- */
 
-async function printFile(tx: Tx, ctx: TenantContext, designId: string) {
+export async function printFile(tx: Tx, ctx: TenantContext, designId: string) {
   const design = await getDesign(tx, ctx, designId);
   const front = design.placements.find((p) => p.placement === "front");
   const back = design.placements.find((p) => p.placement === "back");
@@ -281,6 +344,10 @@ export async function analyzeDesign(
     if (row.status === "ready" && row.analysis) return { status: "ready", analysis: row.analysis };
     if (row.status === "pending" && Date.now() - row.updatedAt.getTime() < ANALYSIS_STALE_MS)
       return { status: "pending", jobId: row.jobId };
+    // A failed analysis stays failed until the shop asks again with `refresh` (a poll loop never
+    // restarts imaging and the AI route by itself).
+    if (row.status === "failed")
+      return { status: "failed", error: row.error ?? "The design analysis could not finish." };
   }
   await assertCredits(tx, ctx.companyId, 1);
   const jobId = crypto.randomUUID();
@@ -495,8 +562,52 @@ async function plan(tx: Tx, ctx: TenantContext, spec: PhotoSetSpec) {
     );
   if (planned.length === 0)
     throw photoBadRequest("view_not_available", 0, "None of the chosen views can be shown");
+  const scenes = spec.lifestyle?.count ?? 0;
+  // A scene composites the front print file (imaging's scene composite is front only).
+  if (scenes > 0 && !front)
+    throw photoBadRequest(
+      "view_not_available",
+      scenes,
+      "Lifestyle scenes need a front print file on the design",
+    );
   const channels = [...new Set(spec.channels)];
-  return { design, front, back, planned, skipped, channels, colors, garments, views };
+  const credits = planned.length * PHOTO_TEMPLATE_CREDITS + scenes * PHOTO_SCENE_CREDITS;
+  return {
+    design,
+    front,
+    back,
+    planned,
+    skipped,
+    channels,
+    colors,
+    garments,
+    views,
+    scenes,
+    credits,
+  };
+}
+
+/** Scene kinds when the shop names none: the analysis' suggestions in order, then a fixed mix. */
+const DEFAULT_SCENE_KINDS: PhotoSceneKind[] = ["studio", "outdoor", "home", "street", "cafe"];
+
+type PlannedScene = Planned & { sceneKind: PhotoSceneKind; sceneIndex: number };
+
+function planScenes(
+  p: Awaited<ReturnType<typeof plan>>,
+  lifestyle: PhotoSetSpec["lifestyle"],
+  analysis: DesignPhotoAnalysis | null,
+): PlannedScene[] {
+  if (!lifestyle || p.scenes === 0) return [];
+  const named = lifestyle.sceneKinds?.length ? lifestyle.sceneKinds : [];
+  const suggested = analysis?.sceneSuggestions.map((s) => s.kind) ?? [];
+  const kinds = named.length ? named : suggested.length ? suggested : DEFAULT_SCENE_KINDS;
+  return Array.from({ length: p.scenes }, (_, i) => ({
+    garment: p.garments[i % p.garments.length] as PlannedScene["garment"],
+    color: p.colors[i % p.colors.length] as BlankColor,
+    view: "front_flat" as TemplateView,
+    sceneKind: kinds[i % kinds.length] as PhotoSceneKind,
+    sceneIndex: i + 1,
+  }));
 }
 
 export async function estimate(
@@ -505,14 +616,16 @@ export async function estimate(
   spec: PhotoSetSpec,
 ): Promise<PhotoEstimate> {
   const p = await plan(tx, ctx, spec);
-  const credits = p.planned.length * PHOTO_TEMPLATE_CREDITS;
   const balance = await creditBalance(tx, ctx.companyId);
+  // Same rule as createSet (S-51): credits promised to open sets are not available.
+  const available = balance.remaining - (await openCommitments(tx));
+  const compositions = p.planned.length + p.scenes;
   return {
-    compositions: p.planned.length,
-    images: p.planned.length * p.channels.length,
-    credits,
-    creditsRemaining: balance.remaining,
-    canAfford: balance.remaining >= credits,
+    compositions,
+    images: compositions * p.channels.length,
+    credits: p.credits,
+    creditsRemaining: available,
+    canAfford: available >= p.credits,
     skipped: p.skipped,
   };
 }
@@ -526,6 +639,15 @@ function specHash(spec: PhotoSetSpec): string {
       views: spec.views,
       channels: spec.channels,
       underbasePreview: spec.underbasePreview,
+      // Only when present, so a template-only key keeps the hash it had before phase B.
+      ...(spec.lifestyle
+        ? {
+            lifestyle: {
+              count: spec.lifestyle.count,
+              sceneKinds: spec.lifestyle.sceneKinds ?? [],
+            },
+          }
+        : {}),
     }),
   );
 }
@@ -550,18 +672,28 @@ export async function createSet(
   if (existing) return sameKey(tx, ctx, existing, hash);
 
   const p = await plan(tx, ctx, input);
-  const credits = p.planned.length * PHOTO_TEMPLATE_CREDITS;
-  const committed = await openCommitments(tx);
-  const balance = await creditBalance(tx, ctx.companyId);
-  const available = balance.remaining - committed;
-  if (available < credits) throw creditsExhausted(Math.max(0, available), balance.periodEnd);
+  const credits = p.credits;
+  const templateCredits = p.planned.length * PHOTO_TEMPLATE_CREDITS;
+  if (p.scenes > 0) {
+    // Phase B, before anything is written or enqueued: the daily scene cap (scenes still waiting
+    // in open sets count too), credits including what open sets hold, then the spend cap.
+    const open = await openWork(tx);
+    await assertImageGenAllowed(tx, ctx.companyId, p.scenes + open.scenesPending, {
+      heldCredits:
+        open.templates * PHOTO_TEMPLATE_CREDITS +
+        open.scenesStored * PHOTO_SCENE_CREDITS +
+        templateCredits,
+      sizePx: SCENE_SIZE_PX,
+    });
+  } else {
+    const committed = await openCommitments(tx);
+    const balance = await creditBalance(tx, ctx.companyId);
+    const available = balance.remaining - committed;
+    if (available < credits) throw creditsExhausted(Math.max(0, available), balance.periodEnd);
+  }
 
-  const [analysisRow] = await tx
-    .select({ analysis: photoAnalyses.analysis, status: photoAnalyses.status })
-    .from(photoAnalyses)
-    .where(eq(photoAnalyses.designId, p.design.id))
-    .limit(1);
-  const analysis = analysisRow?.status === "ready" ? analysisRow.analysis : null;
+  const analysis = await readyAnalysis(tx, p.design.id);
+  const scenes = planScenes(p, input.lifestyle, analysis);
 
   const [set] = await tx
     .insert(photoSets)
@@ -576,6 +708,7 @@ export async function createSet(
       views: p.views,
       channels: p.channels,
       underbasePreview: input.underbasePreview,
+      lifestyle: input.lifestyle ?? null,
       creditsEstimated: credits,
       createdBy: ctx.userId,
     })
@@ -607,6 +740,26 @@ export async function createSet(
       })),
     )
     .returning();
+  const sceneComps = scenes.length
+    ? await tx
+        .insert(photoCompositions)
+        .values(
+          scenes.map((c) => ({
+            companyId: ctx.companyId,
+            setId: set.id,
+            source: "ai_scene" as const,
+            garment: c.garment,
+            view: "lifestyle" as const,
+            colorName: c.color.name,
+            colorHex: c.color.hex,
+            placement: "front" as const,
+            sceneKind: c.sceneKind,
+            sceneIndex: c.sceneIndex,
+            containsPerson: sceneContainsPerson(analysis, c.sceneKind),
+          })),
+        )
+        .returning()
+    : [];
   const gIdx = (g: string) => p.garments.indexOf(g as never);
   const cIdx = (hex: string) => p.colors.findIndex((c) => c.hex === hex);
   const images: (typeof photoImages.$inferInsert)[] = [];
@@ -618,6 +771,7 @@ export async function createSet(
         gIdx(a.garment) - gIdx(b.garment) ||
         cIdx(a.colorHex) - cIdx(b.colorHex),
     );
+    const alt = analysis?.altText?.[channel]?.slice(0, 250) ?? null;
     ordered.forEach((c, slot) => {
       images.push({
         companyId: ctx.companyId,
@@ -627,15 +781,32 @@ export async function createSet(
         preset: presetFor(channel, slot),
         slot,
         drawnTemplate: true,
-        altText: analysis?.altText?.[channel]?.slice(0, 250) ?? null,
+        altText: alt,
       });
     });
+    // Scenes follow the templates, so a channel's main image (slot 0) is never an AI scene.
+    sceneComps
+      .sort((a, b) => a.sceneIndex - b.sceneIndex)
+      .forEach((c, i) => {
+        const slot = ordered.length + i;
+        images.push({
+          companyId: ctx.companyId,
+          setId: set.id,
+          compositionId: c.id,
+          channel,
+          preset: presetFor(channel, slot),
+          slot,
+          drawnTemplate: false,
+          altText: alt,
+        });
+      });
   }
   await tx.insert(photoImages).values(images);
+  const allComps = [...comps, ...sceneComps];
   await emit(tx, ctx.companyId, "photo_set.created", {
     setId: set.id,
     designId: set.designId,
-    compositionIds: comps.map((c) => c.id),
+    compositionIds: allComps.map((c) => c.id),
   });
   await audit(tx, {
     companyId: ctx.companyId,
@@ -643,8 +814,13 @@ export async function createSet(
     action: "photos.set_created",
     entityType: "photo_set",
     entityId: set.id,
-    summary: `Listing photo set: ${comps.length} compositions, ${images.length} images`,
-    data: { compositions: comps.length, images: images.length, credits },
+    summary: `Listing photo set: ${allComps.length} compositions (${sceneComps.length} AI scenes), ${images.length} images`,
+    data: {
+      compositions: allComps.length,
+      scenes: sceneComps.length,
+      images: images.length,
+      credits,
+    },
   });
   publishSetAfterCommit(tx, ctx.companyId, set.id);
   return getSet(tx, ctx, { id: set.id });
@@ -714,7 +890,11 @@ export async function getSet(tx: Tx, ctx: TenantContext, input: { id: string }):
     .select()
     .from(photoCompositions)
     .where(eq(photoCompositions.setId, s.id))
-    .orderBy(asc(photoCompositions.createdAt), asc(photoCompositions.id));
+    .orderBy(
+      asc(photoCompositions.sceneIndex),
+      asc(photoCompositions.createdAt),
+      asc(photoCompositions.id),
+    );
   const imgs = await tx
     .select()
     .from(photoImages)
@@ -735,11 +915,36 @@ export async function getSet(tx: Tx, ctx: TenantContext, input: { id: string }):
   );
   const leadUrl = lead ? (images.find((i) => i.id === lead.id)?.url ?? null) : null;
   const zipUrl = s.zipStatus === "ready" ? await signed(ctx.companyId, s.zipKey) : null;
+  const pushes = await tx
+    .select()
+    .from(photoPushes)
+    .where(eq(photoPushes.setId, s.id))
+    .orderBy(desc(photoPushes.createdAt), desc(photoPushes.id))
+    .limit(MAX_PUSHES_SHOWN);
   return {
     ...(await toSummary(s, agg, leadUrl, zipUrl)),
     compositions: comps.map(toComposition),
     images,
-    pushes: [],
+    pushes: pushes.map(toPush),
+  };
+}
+
+/** getSet shows the latest pushes only (each one is idempotent; older ones stay in the table). */
+const MAX_PUSHES_SHOWN = 50;
+
+export function toPush(p: typeof photoPushes.$inferSelect): PhotoPush {
+  return {
+    id: p.id,
+    setId: p.setId,
+    connectionId: p.connectionId,
+    listingId: p.listingId,
+    status: p.status,
+    pushed: p.pushed,
+    skipped: p.skipped,
+    error: p.error,
+    requestedBy: p.requestedBy,
+    requestedAt: p.createdAt.toISOString(),
+    completedAt: p.completedAt?.toISOString() ?? null,
   };
 }
 
@@ -814,7 +1019,8 @@ const slug = (s: string) =>
 /** `<channel>/<slot>-<garment>-<view>-<color>.jpg`, slot zero-padded (00 is the main image). */
 export function zipName(i: ImageRow, c: CompositionRow): string {
   const ext = i.format === "png" ? "png" : "jpg";
-  return `${i.channel}/${String(i.slot).padStart(2, "0")}-${c.garment}-${c.view}-${slug(c.colorName)}.${ext}`;
+  const view = c.source === "ai_scene" ? `lifestyle-${c.sceneKind ?? "scene"}` : c.view;
+  return `${i.channel}/${String(i.slot).padStart(2, "0")}-${c.garment}-${view}-${slug(c.colorName)}.${ext}`;
 }
 
 export async function exportZip(
@@ -924,7 +1130,12 @@ export async function runZip(
     return {
       items: imgs
         .filter(({ i }) => i.key && isCompanyKey(companyId, i.key))
-        .map(({ i, c }) => ({ key: i.key as string, name: zipName(i, c) })),
+        .map(({ i, c }) => ({
+          key: i.key as string,
+          name: zipName(i, c),
+          aiGenerated: i.aiGenerated,
+          syntheticPerson: i.containsSyntheticPerson,
+        })),
     };
   });
   if (!prep) return { status: "skipped" };
@@ -936,7 +1147,14 @@ export async function runZip(
   const outKey = `${companyId}/photos/${setId}/zip/${zipJobId}.zip`;
   let res: { key: string; bytes: number };
   try {
-    res = await imaging.photoZip({ items: prep.items, out_key: outKey });
+    res = await imaging.photoZip({
+      items: prep.items.map((i) => ({ key: i.key, name: i.name })),
+      out_key: outKey,
+    });
+    // README.txt per channel folder (disclosures, en + es). A retry rebuilds the zip first, so
+    // the README is never appended twice.
+    const bytes = await appendToStoredZip(res.key, readmeEntries(prep.items));
+    if (bytes) res = { key: res.key, bytes };
   } catch (err) {
     const permanent =
       err instanceof ImagingError && err.status > 0 && isPermanentHttpStatus(err.status);
@@ -983,6 +1201,13 @@ export async function attachToDraft(
 }> {
   const s = await loadSetRow(tx, input.setId);
   const draft = await getDraft(tx, ctx, input.draftId);
+  // A set's photos show its design only: another design's draft is refused (CONFLICT until the
+  // contract has a reason code for it, B-281).
+  if (draft.designId !== s.designId)
+    throw conflict("This listing draft is for another design", {
+      draftId: draft.id,
+      designId: draft.designId,
+    });
   const ids = [...new Set(input.imageIds)];
   const rows = await tx
     .select()
@@ -1038,15 +1263,25 @@ export async function attachToDraft(
 
 /* ---- Render (one job per composition) ----------------------------------------------------- */
 
-/** Composition ids of a set that still have images to render (the dispatch job's input). */
-export async function openCompositions(companyId: string, setId: string): Promise<string[]> {
-  return withTenant(companyId, async (tx) => {
-    const rows = await tx
-      .selectDistinct({ id: photoImages.compositionId })
+/** Compositions of a set that still have images to render, with their source (the dispatch job's input). */
+export async function openCompositionsBySource(
+  companyId: string,
+  setId: string,
+): Promise<{ id: string; source: CompositionRow["source"] }[]> {
+  return withTenant(companyId, (tx) =>
+    tx
+      .selectDistinct({ id: photoCompositions.id, source: photoCompositions.source })
       .from(photoImages)
-      .where(and(eq(photoImages.setId, setId), inArray(photoImages.status, OPEN_IMAGE)));
-    return rows.map((r) => r.id);
-  });
+      .innerJoin(photoCompositions, eq(photoCompositions.id, photoImages.compositionId))
+      .where(and(eq(photoImages.setId, setId), inArray(photoImages.status, OPEN_IMAGE))),
+  );
+}
+
+/** Template composition ids of a set that still have images to render. */
+export async function openCompositions(companyId: string, setId: string): Promise<string[]> {
+  return (await openCompositionsBySource(companyId, setId))
+    .filter((c) => c.source === "template")
+    .map((c) => c.id);
 }
 
 const CHECK_CODES = new Set<string>(PHOTO_CHECK_CODES);
@@ -1081,9 +1316,32 @@ function readableImagingError(err: unknown): { message: string; transient: boole
   return { message: "The image service is not responding. Try again later.", transient: true };
 }
 
-type RenderOutcome =
+/** What a successful render or scene composite writes on the image row. */
+export type RenderedImage = {
+  key: string;
+  widthPx: number | null;
+  heightPx: number | null;
+  format: "jpeg" | "png";
+  checks: PhotoChecks;
+  /** Scene fields (phase B); templates leave the defaults. */
+  scene?: { designLockScore: number | null; containsSyntheticPerson: boolean; model: string };
+};
+
+export type RenderOutcome =
   | { imageId: string; ok: true; res: PhotoRenderResult }
-  | { imageId: string; ok: false; error: string };
+  | { imageId: string; ok: true; image: RenderedImage }
+  | { imageId: string; ok: false; error: string; checks?: PhotoChecks };
+
+function renderedFields(o: RenderOutcome & { ok: true }): RenderedImage {
+  if ("image" in o) return o.image;
+  return {
+    key: o.res.key,
+    widthPx: o.res.width_px,
+    heightPx: o.res.height_px,
+    format: o.res.format === "png" ? "png" : "jpeg",
+    checks: toChecks(o.res.checks),
+  };
+}
 
 /**
  * Renders every open image of one composition, then charges the composition once.
@@ -1102,7 +1360,8 @@ export async function renderComposition(
       .from(photoCompositions)
       .where(eq(photoCompositions.id, compositionId))
       .limit(1);
-    if (!c) return null;
+    // AI scenes run in their own job (scenes.ts); this one draws templates only.
+    if (c?.source !== "template") return null;
     const s = await loadSetRow(tx, c.setId);
     const open = await tx
       .select()
@@ -1194,7 +1453,7 @@ export async function renderComposition(
   return result;
 }
 
-async function recordRenders(
+export async function recordRenders(
   tx: Tx,
   companyId: string,
   compositionId: string,
@@ -1217,17 +1476,28 @@ async function recordRenders(
   let rendered = 0;
   let failed = 0;
   for (const o of outcomes) {
-    const set: Partial<typeof photoImages.$inferInsert> = o.ok
-      ? {
-          status: "rendered",
-          key: isCompanyKey(companyId, o.res.key) ? o.res.key : null,
-          widthPx: o.res.width_px,
-          heightPx: o.res.height_px,
-          format: o.res.format === "png" ? "png" : "jpeg",
-          checks: toChecks(o.res.checks),
-          error: null,
-        }
-      : { status: "failed", error: o.error };
+    let set: Partial<typeof photoImages.$inferInsert>;
+    if (o.ok) {
+      const r = renderedFields(o);
+      set = {
+        status: "rendered",
+        key: isCompanyKey(companyId, r.key) ? r.key : null,
+        widthPx: r.widthPx,
+        heightPx: r.heightPx,
+        format: r.format,
+        checks: r.checks,
+        error: null,
+        ...(r.scene
+          ? {
+              aiGenerated: true,
+              drawnTemplate: false,
+              containsSyntheticPerson: r.scene.containsSyntheticPerson,
+              designLockScore: r.scene.designLockScore,
+              model: r.scene.model,
+            }
+          : {}),
+      };
+    } else set = { status: "failed", error: o.error, ...(o.checks ? { checks: o.checks } : {}) };
     const updated = await tx
       .update(photoImages)
       .set(set)
@@ -1240,7 +1510,8 @@ async function recordRenders(
   const imgs = await tx.select().from(photoImages).where(eq(photoImages.compositionId, c.id));
   let charged = false;
   if (!c.chargedAt && imgs.some((i) => DONE_IMAGE.includes(i.status))) {
-    const credits = PHOTO_TEMPLATE_CREDITS;
+    const credits = creditsFor(c.source);
+    const scene = c.source === "ai_scene";
     const b = await creditBalance(tx, companyId);
     if (b.remaining < credits) {
       // Another set spent the credits while this one rendered (S-51): keep nothing, charge nothing.
@@ -1256,11 +1527,11 @@ async function recordRenders(
     }
     await chargeCredits(tx, {
       companyId,
-      kind: "photo_image",
+      kind: scene ? "photo_scene" : "photo_image",
       credits,
-      model: null,
+      model: scene ? c.sceneModel : null,
       usage: null,
-      ref: { type: "photo_composition", id: c.id },
+      ref: { type: scene ? "photo_scene" : "photo_composition", id: c.id },
       userId: s.createdBy,
     });
     await tx
@@ -1331,7 +1602,7 @@ export async function failComposition(companyId: string, compositionId: string, 
 
 /* ---- Realtime ----------------------------------------------------------------------------- */
 
-async function publishSet(companyId: string, setId: string) {
+export async function publishSet(companyId: string, setId: string) {
   try {
     const payload = await withTenant(companyId, async (tx) => {
       const [s] = await tx.select().from(photoSets).where(eq(photoSets.id, setId)).limit(1);
@@ -1356,6 +1627,6 @@ async function publishSet(companyId: string, setId: string) {
   }
 }
 
-function publishSetAfterCommit(tx: Tx, companyId: string, setId: string) {
+export function publishSetAfterCommit(tx: Tx, companyId: string, setId: string) {
   afterCommit(tx, () => publishSet(companyId, setId));
 }

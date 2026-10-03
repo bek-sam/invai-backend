@@ -243,6 +243,34 @@ export type PhotoRenderResult = z.infer<typeof PhotoRenderResult>;
 
 export const PhotoZipResult = z.object({ key: z.string(), bytes: z.number().int() });
 
+/* ---- Listing photos phase B (T-27-2 routes, consumed by modules/photos, T-27-3) ---------- */
+
+const PrintBoxPx = z.array(z.number().int()).length(4);
+
+export const PhotoSceneBaseResult = z.object({
+  key: z.string(),
+  mask_key: z.string(),
+  print_box_px: PrintBoxPx,
+  width_px: z.number().int().optional(),
+  height_px: z.number().int().optional(),
+});
+export type PhotoSceneBaseResult = z.infer<typeof PhotoSceneBaseResult>;
+
+/** `key` is null when a design-lock check failed: imaging writes nothing then. */
+export const PhotoSceneCompositeResult = z.object({
+  key: z.string().nullable(),
+  checks: z.object({
+    passes: z.boolean(),
+    failures: z.array(z.string()),
+    region_unchanged_score: z.number().nullable(),
+    design_lock_score: z.number().nullable(),
+  }),
+  width_px: z.number().int().nullable().optional(),
+  height_px: z.number().int().nullable().optional(),
+  format: z.string().nullable().optional(),
+});
+export type PhotoSceneCompositeResult = z.infer<typeof PhotoSceneCompositeResult>;
+
 export type ImagingClient = ReturnType<typeof createImagingClient>;
 
 /** Imaging answers 429 + Retry-After when its heavy-job slots are full (T-9-5, B-19). */
@@ -460,6 +488,30 @@ export function createImagingClient(
 
     photoZip: (input: { items: { key: string; name: string }[]; out_key: string }) =>
       call("/photo/zip", input, PhotoZipResult, { timeoutMs: 300_000 }),
+
+    photoSceneBase: (input: {
+      garment: string;
+      view: "on_model_white" | "lifestyle_base";
+      blank_hex: string;
+      size_px: number | [number, number];
+      out_key: string;
+      mask_out_key: string;
+    }) => call("/photo/scene-base", input, PhotoSceneBaseResult, { timeoutMs: 60_000 }),
+
+    photoSceneComposite: (input: {
+      scene_key: string;
+      base_key: string;
+      print_box_px: number[];
+      design_key: string;
+      design_width_in: number;
+      design_height_in: number;
+      placement: "front";
+      blank_hex: string;
+      preset: string;
+      out_key: string;
+      xmp_subjects: string[];
+      underbase_preview?: boolean;
+    }) => call("/photo/scene-composite", input, PhotoSceneCompositeResult, { timeoutMs: 120_000 }),
   };
 }
 

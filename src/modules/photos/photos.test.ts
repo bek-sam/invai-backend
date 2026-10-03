@@ -81,6 +81,12 @@ vi.mock("../ai/service", async (importOriginal) => {
   };
 });
 
+// The README append reads and writes S3; lifestyle.test.ts covers it (and the zip format).
+vi.mock("./zip-readme", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./zip-readme")>()),
+  appendToStoredZip: vi.fn(async () => 0),
+}));
+
 const zipEnqueued: unknown[] = [];
 const analysisEnqueued: unknown[] = [];
 

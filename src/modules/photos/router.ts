@@ -1,15 +1,19 @@
-import { contract } from "@invai/contracts";
-import { authed, stubRouter } from "../../api/orpc";
+import { authed } from "../../api/orpc";
 import { withTenant } from "../../db/client";
+import * as push from "./push";
 import * as svc from "./service";
 
 /*
- * Listing photos (T-26-4, ADR 0023): one line per handler. The guard already enforced auth and
- * `photos.read` / `photos.manage` from the contract meta. Phase B (`pushTargets`,
- * `pushToShopify`) stays NOT_IMPLEMENTED until wave 27.
+ * Listing photos (T-26-4, T-27-3, ADR 0023): one line per handler. The guard already enforced
+ * auth and `photos.read` / `photos.manage` from the contract meta.
  */
 export const photosRouter = authed.photos.router({
-  ...stubRouter(authed.photos, contract.photos, ["photos"]),
+  pushTargets: authed.photos.pushTargets.handler(({ input, context: { tenant } }) =>
+    withTenant(tenant.companyId, (tx) => push.pushTargets(tx, tenant, input)),
+  ),
+  pushToShopify: authed.photos.pushToShopify.handler(({ input, context: { tenant } }) =>
+    withTenant(tenant.companyId, (tx) => push.pushToShopify(tx, tenant, input)),
+  ),
   analyzeDesign: authed.photos.analyzeDesign.handler(({ input, context: { tenant } }) =>
     withTenant(tenant.companyId, (tx) => svc.analyzeDesign(tx, tenant, input)),
   ),
