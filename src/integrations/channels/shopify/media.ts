@@ -96,8 +96,22 @@ function basename(path: string): string {
   }
 }
 
+/**
+ * Hosts the MOCK adapter accepts over plain http: local MinIO presigned URLs
+ * (`http://localhost:9000/...`) in dev, CI and tests. Narrow on purpose (not "any http when not
+ * production"): the mock is also exercised by the gate and E2E against whatever env a shop's demo
+ * or CI happens to run in, and a blanket non-production exception would let a non-local http host
+ * (easy to get wrong in a staging config) slip through unnoticed. The LIVE adapter never takes
+ * this option: real Shopify fetches the URL itself, over the public internet, so it stays
+ * https-only regardless of our own env (T-27-4 follow-up).
+ */
+const MOCK_HTTP_HOSTS = new Set(["localhost", "127.0.0.1"]);
+
 /** Checks the input both adapters share; throws `invalid_input` / `product_not_found`. */
-export function validateProductImages(input: PushProductImagesInput): string {
+export function validateProductImages(
+  input: PushProductImagesInput,
+  opts: { allowLocalHttp?: boolean } = {},
+): string {
   const id = shopifyProductId(input.productGid);
   if (!id) throw new ProductImagePushError("product_not_found", msg.notFound);
   if (!input.idempotencyKey.trim())
@@ -130,7 +144,10 @@ export function validateProductImages(input: PushProductImagesInput): string {
       throw new ProductImagePushError("invalid_input", `Photo link is not valid: ${img.filename}`);
     }
     // Shopify names the file after the URL's last segment, and dedupe matches on that name.
-    if (url.protocol !== "https:" || basename(url.pathname) !== img.filename)
+    const isHttps = url.protocol === "https:";
+    const isMockLocalHttp =
+      opts.allowLocalHttp && url.protocol === "http:" && MOCK_HTTP_HOSTS.has(url.hostname);
+    if ((!isHttps && !isMockLocalHttp) || basename(url.pathname) !== img.filename)
       throw new ProductImagePushError(
         "invalid_input",
         `Photo link must be https and end in ${img.filename}`,

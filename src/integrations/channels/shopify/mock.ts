@@ -230,7 +230,9 @@ export const shopifyMock: ChannelAdapter = {
   },
 
   async pushProductImages(conn, input) {
-    const productId = validateProductImages(input);
+    // Mock-only: accept local MinIO presigned http URLs (T-27-4 follow-up), never a non-local
+    // http host. The LIVE adapter never sees this option; see MOCK_HTTP_HOSTS in media.ts.
+    const productId = validateProductImages(input, { allowLocalHttp: true });
     if (productId.length < 10)
       throw new ProductImagePushError(
         "product_not_found",

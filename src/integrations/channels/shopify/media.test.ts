@@ -530,6 +530,42 @@ describe("Shopify mock pushProductImages", () => {
     expect(err.code).toBe("product_not_found");
   });
 
+  it("accepts a local MinIO http URL (localhost/127.0.0.1), but not any other http host", async () => {
+    const localUrl = (host: string, f: string) =>
+      `http://${host}:9000/invai-local/c1/photos/${f}?X-Amz-Signature=abc`;
+    const localhost = await shopifyMock.pushProductImages?.(
+      conn,
+      input({ images: [{ url: localUrl("localhost", IMG_A), alt: "x", filename: IMG_A }] }),
+    );
+    expect(localhost?.pushed.map((p) => p.filename)).toEqual([IMG_A]);
+    const loopback = await shopifyMock.pushProductImages?.(
+      { ...conn, id: "00000000-0000-4000-8000-000000000098" },
+      input({ images: [{ url: localUrl("127.0.0.1", IMG_B), alt: "x", filename: IMG_B }] }),
+    );
+    expect(loopback?.pushed.map((p) => p.filename)).toEqual([IMG_B]);
+    const nonLocal = await rejection(
+      shopifyMock.pushProductImages?.(
+        conn,
+        input({
+          images: [{ url: localUrl("minio.example.com", IMG_A), alt: "x", filename: IMG_A }],
+        }),
+      ) ?? Promise.resolve(),
+    );
+    expect(nonLocal.code).toBe("invalid_input");
+  });
+
+  it("still rejects junk links for the mock: not a URL, or a non-http(s) scheme", async () => {
+    const cases: PushProductImagesInput[] = [
+      input({ images: [{ url: "not a url", alt: "x", filename: IMG_A }] }),
+      input({ images: [{ url: `ftp://localhost/${IMG_A}`, alt: "x", filename: IMG_A }] }),
+      input({ images: [{ url: `file:///etc/${IMG_A}`, alt: "x", filename: IMG_A }] }),
+    ];
+    for (const c of cases)
+      expect(
+        (await rejection(shopifyMock.pushProductImages?.(conn, c) ?? Promise.resolve())).code,
+      ).toBe("invalid_input");
+  });
+
   it("only Shopify implements it", () => {
     for (const a of [
       amazonAdapter,
