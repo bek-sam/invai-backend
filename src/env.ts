@@ -87,6 +87,15 @@ const raw = createEnv({
     /** Daily (UTC) real-model AI spend caps in cents (src/ai/breaker.ts); 0 turns a scope off. */
     AI_DAILY_PLATFORM_CAP_CENTS: z.coerce.number().int().min(0).default(50_000),
     AI_DAILY_TENANT_CAP_CENTS: z.coerce.number().int().min(0).default(5_000),
+    /**
+     * Listing photos phase B (T-27-1, ADR 0023): which image model draws AI scenes. `openai` is used
+     * only with OPENAI_API_KEY set and never for a sample workspace (src/ai/images); the owner
+     * turns it on (OI-25). Per-shop daily cap on AI scene images (UTC day, mock calls count too).
+     * IMAGE_GEN_MOCK_DRIFT=1 makes the mock alter the protected print region (tests only).
+     */
+    IMAGE_GEN_PROVIDER: z.enum(["mock", "openai"]).default("mock"),
+    IMAGE_GEN_DAILY_CAP_PER_SHOP: z.coerce.number().int().min(0).default(30),
+    IMAGE_GEN_MOCK_DRIFT: z.enum(["0", "1"]).optional(),
     EASYPOST_API_KEY: secret(z.string()),
     /** EasyPost webhook HMAC secret (`X-Hmac-Signature`); unset uses the mock dev secret. */
     EASYPOST_WEBHOOK_SECRET: secret(z.string()),
@@ -252,6 +261,16 @@ export function missingProductionKeys(
   );
 }
 
+if (isProd && raw.IMAGE_GEN_PROVIDER === "openai" && !raw.OPENAI_API_KEY) {
+  throw new Error(
+    "Refusing to start in production: IMAGE_GEN_PROVIDER=openai needs OPENAI_API_KEY. Set the " +
+      "key, or set IMAGE_GEN_PROVIDER=mock to keep sample scenes.",
+  );
+}
+if (raw.IMAGE_GEN_MOCK_DRIFT !== undefined && !isTest) {
+  throw new Error("IMAGE_GEN_MOCK_DRIFT is a test-only switch; unset it outside NODE_ENV=test.");
+}
+
 const missingInProd = isProd ? missingProductionKeys(raw) : [];
 if (missingInProd.length && !raw.ALLOW_MOCKS) {
   throw new Error(
@@ -347,6 +366,8 @@ export const env = {
    * empty in production, whatever MARKET_MOCK_FAIL is set to: it exists to test the "no compliant
    * source" fallback, never to disable a real source in a real shop's account.
    */
+  /** Test-only: the mock image provider alters the protected print region (drift path). */
+  imageGenMockDrift: isTest && raw.IMAGE_GEN_MOCK_DRIFT === "1",
   marketMockFail: new Set(
     isProd
       ? []
