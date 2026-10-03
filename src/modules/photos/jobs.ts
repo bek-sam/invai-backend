@@ -1,7 +1,9 @@
 import { z } from "zod";
+import { env } from "../../env";
 import { BULK_PRIORITY } from "../../lib/fairness";
-import { logger } from "../../lib/log";
-import { defineJob, isFinalAttempt, onEvent, RETRY_BACKOFF } from "../../lib/queues";
+import { errorData, logger } from "../../lib/log";
+import { defineJob, isFinalAttempt, onEvent, queues, RETRY_BACKOFF } from "../../lib/queues";
+import { purgePhotoFiles } from "./purge";
 import { failPush, runPush } from "./push";
 import { renderScene } from "./scenes";
 import {
@@ -125,3 +127,29 @@ setPhotoEnqueuers({
     await pushImagesJob.enqueue(input);
   },
 });
+
+/** Retention (ADR 0023 §9): raw scenes after 7 days, zips after 30. Nightly; safe to run twice. */
+export const purgePhotoFilesJob = defineJob({
+  queue: "reports",
+  name: "photos.purgeFiles",
+  input: z.object({}).passthrough(),
+  handler: async () => {
+    const res = await purgePhotoFiles();
+    log.info("photo files purge", res);
+    return res;
+  },
+});
+
+export async function schedulePhotoPurge() {
+  await queues.reports.upsertJobScheduler(
+    "photos-files-purge",
+    { pattern: "45 4 * * *", tz: "UTC" },
+    { name: purgePhotoFilesJob.name, data: {} },
+  );
+}
+
+if (!env.isTest) {
+  schedulePhotoPurge().catch((err) =>
+    log.warn("could not register the photo purge scheduler", errorData(err)),
+  );
+}

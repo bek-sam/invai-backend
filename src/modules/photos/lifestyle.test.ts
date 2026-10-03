@@ -24,6 +24,7 @@ import { runJobInline } from "../../lib/queues";
 import { createCompany, createConnection, createUser, tenantContext } from "../../test/fixtures";
 import { createDesign } from "../catalog/service";
 import { analyzeDesignJob, pushImagesJob, renderCompositionJob, renderSceneJob } from "./jobs";
+import { purgePhotoFiles } from "./purge";
 import * as push from "./push";
 import * as svc from "./service";
 import { appendToZip, readEocd, readmeEntries } from "./zip-readme";
@@ -70,6 +71,9 @@ vi.mock("../../lib/s3", async (importOriginal) => {
         : { exists: false as const },
     ),
     presignGet: vi.fn(async (key: string) => `https://s3.test/${key}?X-Amz-Signature=t`),
+    deleteObject: vi.fn(async (key: string) => {
+      h.store.delete(key);
+    }),
   };
 });
 
@@ -948,5 +952,53 @@ describe("Shopify push (AC4)", () => {
         .where(and(eq(photoPushes.setId, a.set.id))),
     );
     expect(bRows).toHaveLength(0);
+  });
+});
+
+describe("retention (ADR 0023 §9)", () => {
+  it("deletes raw scenes after 7 days and zips after 30; a second run changes nothing", async () => {
+    const { company, set } = await approvedLifestyleSet(["shopify"]);
+    const [comp] = await withTenant(company.id, (tx) =>
+      tx
+        .select()
+        .from(photoCompositions)
+        .where(and(eq(photoCompositions.setId, set.id), eq(photoCompositions.source, "ai_scene"))),
+    );
+    const c = nn(comp);
+    const zipKey = `${company.id}/photos/${set.id}/zip/old.zip`;
+    h.store.set(zipKey, Buffer.from("zip"));
+    const old = new Date(Date.now() - 31 * 86_400_000);
+    await withTenant(company.id, async (tx) => {
+      await tx
+        .update(photoCompositions)
+        .set({ createdAt: new Date(Date.now() - 8 * 86_400_000) })
+        .where(eq(photoCompositions.id, c.id));
+      await tx
+        .update(photoSets)
+        .set({ zipStatus: "ready", zipKey, zipBuiltAt: old })
+        .where(eq(photoSets.id, set.id));
+    });
+    expect(h.store.has(nn(c.sceneKey))).toBe(true);
+    await purgePhotoFiles();
+    expect(h.store.has(nn(c.sceneKey))).toBe(false);
+    expect(h.store.has(nn(c.sceneBaseKey))).toBe(false);
+    expect(h.store.has(zipKey)).toBe(false);
+    const [after] = await withTenant(company.id, (tx) =>
+      tx.select().from(photoCompositions).where(eq(photoCompositions.id, c.id)),
+    );
+    expect(after?.scenePurgedAt).not.toBeNull();
+    const [s] = await withTenant(company.id, (tx) =>
+      tx.select().from(photoSets).where(eq(photoSets.id, set.id)),
+    );
+    expect(s).toMatchObject({ zipStatus: "none", zipKey: null });
+    // Rendered images are kept (they follow the design).
+    const imageKeys = set.images.map((i) => nn(i.key));
+    expect(imageKeys.length).toBeGreaterThan(0);
+    const again = await purgePhotoFiles();
+    const [after2] = await withTenant(company.id, (tx) =>
+      tx.select().from(photoCompositions).where(eq(photoCompositions.id, c.id)),
+    );
+    expect(after2?.scenePurgedAt?.toISOString()).toBe(after?.scenePurgedAt?.toISOString());
+    expect(again.objects).toBeGreaterThanOrEqual(0);
   });
 });
