@@ -38,7 +38,7 @@ const REFUSAL_CODE = /moderation|content_policy|safety/i;
 function mapError(err: unknown): Error {
   if (err instanceof ImageGenError || err instanceof ImageRefusalError) return err;
   if (err instanceof APIConnectionTimeoutError) {
-    return new ImageGenError("OpenAI image request timed out", false, null);
+    return new ImageGenError("OpenAI image request timed out", false, null, true);
   }
   if (err instanceof APIError) {
     const status = typeof err.status === "number" ? err.status : null;
@@ -47,7 +47,7 @@ function mapError(err: unknown): Error {
     }
     if (status === 429) return new ImageGenError("OpenAI image rate limit reached", true, 429);
     if (status !== null && status >= 500) {
-      return new ImageGenError(`OpenAI image service error (${status})`, false, status);
+      return new ImageGenError(`OpenAI image service error (${status})`, false, status, true);
     }
     return new ImageGenError(
       `OpenAI rejected the image request (${status ?? "no status"})`,
@@ -55,7 +55,12 @@ function mapError(err: unknown): Error {
       status,
     );
   }
-  return new ImageGenError(`OpenAI image request failed: ${(err as Error).message}`, false, null);
+  return new ImageGenError(
+    `OpenAI image request failed: ${(err as Error).message}`,
+    false,
+    null,
+    true,
+  );
 }
 
 function isRetryable5xx(err: unknown): boolean {
@@ -102,10 +107,10 @@ export function createOpenAiImageProvider(getClient: () => OpenAI = client): Ima
         }
       }
       const b64 = res.data?.[0]?.b64_json;
-      if (!b64) throw new ImageGenError("OpenAI returned no image", false);
+      if (!b64) throw new ImageGenError("OpenAI returned no image", false, null, true);
       const image = Buffer.from(b64, "base64");
       if (!isPng(image))
-        throw new ImageGenError("OpenAI returned an image that is not a PNG", false);
+        throw new ImageGenError("OpenAI returned an image that is not a PNG", false, null, true);
       const dims = pngSize(image);
       return {
         image,

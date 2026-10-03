@@ -603,4 +603,57 @@ describe("assertImageGenAllowed / recordImageGen (AC4)", () => {
     });
     await redis.del(tKey, platformSpendKey(day));
   });
+
+  it("S-53: a failed call that may be billed records the estimate and counts toward the cap; rejected ones don't", async () => {
+    menv.IMAGE_GEN_DAILY_CAP_PER_SHOP = 30;
+    const shop = await createCompany();
+    const day = spendDay(new Date());
+    const tKey = tenantSpendKey(shop.id, day);
+    const fail = (provider: ImageProvider, error: unknown) =>
+      recordImageGen({ companyId: shop.id, userId: null, prompt, provider, result: null, error });
+    try {
+      // Rejected before any work, never sent, or the mock: 0 cents and not counted.
+      await fail(priced, new ImageGenError("OpenAI rejected the image request (400)", false, 400));
+      await fail(priced, new ImageGenError("OpenAI image rate limit reached", true, 429));
+      await fail(priced, new ImageRefusalError("moderation_blocked"));
+      await fail(priced, new ImageGenError("base and mask must be PNG images", false));
+      await fail(mockImageProvider, new Error("boom"));
+      expect(await redis.get(tKey)).toBeNull();
+      expect(await withTenant(shop.id, (tx) => imagesUsedToday(tx, shop.id))).toBe(0);
+      // Reached OpenAI (timeout, 5xx, unusable body) or unknown: charged at the estimate.
+      await fail(priced, new ImageGenError("OpenAI image request timed out", false, null, true));
+      await fail(priced, new ImageGenError("OpenAI image service error (502)", false, 502, true));
+      await fail(priced, new Error("socket hang up"));
+      expect(await redis.get(tKey)).toBe("33");
+      expect(await withTenant(shop.id, (tx) => imagesUsedToday(tx, shop.id))).toBe(3);
+      const rows = await withTenant(shop.id, (tx) =>
+        tx.select().from(aiJobs).where(eq(aiJobs.companyId, shop.id)),
+      );
+      expect(rows.every((r) => r.status === "failed")).toBe(true);
+      expect(rows.map((r) => r.costCents).sort((a, b) => a - b)).toEqual([
+        0, 0, 0, 0, 0, 11, 11, 11,
+      ]);
+    } finally {
+      await redis.del(tKey, platformSpendKey(day));
+    }
+  });
+
+  it("S-53: the OpenAI provider marks only failures after the request reached it as maybe billed", async () => {
+    const png = makeBase(64);
+    const errFor = async (replies: Reply[], timeout?: number) => {
+      const { client } = stubClient(replies, timeout);
+      return (await createOpenAiImageProvider(() => client)
+        .generateScene({ baseImage: png.base, mask: png.mask, prompt, sizePx: 1024 })
+        .catch((e) => e)) as ImageGenError;
+    };
+    expect((await errFor(["hang"], 50)).mayBeBilled).toBe(true);
+    expect((await errFor([{ status: 500, json: {} }])).mayBeBilled).toBe(true);
+    expect((await errFor([{ status: 200, json: { data: [] } }])).mayBeBilled).toBe(true);
+    expect(
+      (await errFor([{ status: 400, json: { error: { message: "bad size" } } }])).mayBeBilled,
+    ).toBe(false);
+    expect(
+      (await errFor([{ status: 429, json: { error: { message: "slow down" } } }])).mayBeBilled,
+    ).toBe(false);
+  });
 });

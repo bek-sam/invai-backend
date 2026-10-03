@@ -55,7 +55,7 @@ function tinyPng(): Buffer {
 }
 
 describe("image spend controls (security, S-53)", () => {
-  it.fails("a timed-out paid call is charged conservatively and counts toward the shop cap", async () => {
+  it("a timed-out paid call is charged conservatively and counts toward the shop cap", async () => {
     menv.IMAGE_GEN_DAILY_CAP_PER_SHOP = 2;
     menv.AI_DAILY_PLATFORM_CAP_CENTS = 0;
     menv.AI_DAILY_TENANT_CAP_CENTS = 0;

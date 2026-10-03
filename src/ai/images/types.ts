@@ -59,6 +59,8 @@ export class ImageGenError extends AiOutputError {
     message: string,
     public readonly retryable: boolean,
     public readonly status: number | null = null,
+    /** True when the request reached the provider and may have been billed (timeout, 5xx, bad body). */
+    public readonly mayBeBilled = false,
   ) {
     super(message);
     this.name = "ImageGenError";
