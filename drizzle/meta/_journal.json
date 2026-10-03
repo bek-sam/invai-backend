@@ -288,6 +288,13 @@
       "when": 1790973083937,
       "tag": "0040_photos_sets",
       "breakpoints": true
+    },
+    {
+      "idx": 41,
+      "version": "7",
+      "when": 1791037465611,
+      "tag": "0041_photos_lifestyle",
+      "breakpoints": true
     }
   ]
 }

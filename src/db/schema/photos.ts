@@ -1,10 +1,17 @@
-import type { BlankColor, DesignPhotoAnalysis, PhotoChecks } from "@invai/contracts";
+import type {
+  BlankColor,
+  DesignPhotoAnalysis,
+  PhotoChecks,
+  PhotoPush,
+  PhotoSetSpec,
+} from "@invai/contracts";
 import {
   GARMENT_TYPES,
   PHOTO_CHANNELS,
   PHOTO_IMAGE_SOURCES,
   PHOTO_IMAGE_STATUSES,
   PHOTO_PRESETS,
+  PHOTO_PUSH_STATUSES,
   PHOTO_SCENE_KINDS,
   PHOTO_SET_STATUSES,
   PHOTO_VIEWS,
@@ -79,6 +86,8 @@ export const photoSets = pgTable(
     views: jsonArray<(typeof PHOTO_VIEWS)[number]>(),
     channels: jsonArray<(typeof PHOTO_CHANNELS)[number]>(),
     underbasePreview: boolean().notNull().default(true),
+    /** Phase B: the lifestyle request as given (count, scene kinds); null for template-only sets. */
+    lifestyle: jsonb().$type<NonNullable<PhotoSetSpec["lifestyle"]>>(),
     creditsEstimated: integer().notNull().default(0),
     error: text(),
     completedAt: timestamp({ withTimezone: true }),
@@ -124,13 +133,28 @@ export const photoCompositions = pgTable(
     colorHex: text().notNull(),
     placement: text(enumText(["front", "back"] as const)).notNull(),
     sceneKind: text(enumText(PHOTO_SCENE_KINDS)),
+    /** 0 for templates; 1..n for the set's AI scenes (several scenes may share garment and color). */
+    sceneIndex: integer().notNull().default(0),
+    /** Phase B: imaging's blank base + edit mask for this scene, and the base's print box. */
+    sceneBaseKey: text(),
+    sceneMaskKey: text(),
+    scenePrintBoxPx: jsonb().$type<number[]>(),
+    /** Provider attempt the scene is on (1, or 2 after one drift); 0 before the first. */
+    sceneAttempt: integer().notNull().default(0),
+    /** The stored raw scene of `sceneAttempt`: once set, the provider is never called for it again. */
+    sceneKey: text(),
+    /** From the requested scene kind (ADR 0023 §3), never from the output. */
+    containsPerson: boolean().notNull().default(false),
+    sceneModel: text(),
+    /** Raw scene, base and mask are deleted 7 days after creation (ADR 0023 §9). */
+    scenePurgedAt: timestamp({ withTimezone: true }),
     creditsCharged: integer().notNull().default(0),
     chargedAt: timestamp({ withTimezone: true }),
     ...timestamps,
   },
   (t) => [
     tenantKey("photo_compositions", t),
-    uniqueIndex().on(t.companyId, t.setId, t.garment, t.view, t.colorHex),
+    uniqueIndex().on(t.companyId, t.setId, t.garment, t.view, t.colorHex, t.sceneIndex),
     foreignKey({
       name: "photo_compositions_set_fk",
       columns: [t.companyId, t.setId],
@@ -183,5 +207,45 @@ export const photoImages = pgTable(
       foreignColumns: [photoCompositions.companyId, photoCompositions.id],
     }).onDelete("cascade"),
     tenantPolicy("photo_images"),
+  ],
+).enableRLS();
+
+/**
+ * A push of approved images to one Shopify product (phase B, T-27-3). Idempotent on the client
+ * key. The product is a `listings` row of the same company and connection, checked by the service
+ * under the tenant (no FK into the channels module's tables). Ids only, no buyer data.
+ */
+export const photoPushes = pgTable(
+  "photo_pushes",
+  {
+    id: id(),
+    companyId: companyId(),
+    setId: uuid().notNull(),
+    connectionId: uuid().notNull(),
+    listingId: uuid().notNull(),
+    /** `gid://shopify/Product/<channelListingId>` at request time. */
+    productGid: text().notNull(),
+    idempotencyKey: text().notNull(),
+    /** Hash of (set, connection, listing, image ids): the same key with another request is a CONFLICT. */
+    requestHash: text().notNull(),
+    status: text(enumText(PHOTO_PUSH_STATUSES)).notNull().default("queued"),
+    /** Approved images to send, in slot order. */
+    imageIds: jsonArray<string>(),
+    pushed: jsonArray<{ imageId: string; mediaId: string }>(),
+    skipped: jsonb().$type<PhotoPush["skipped"]>().notNull().default([]),
+    error: text(),
+    requestedBy: uuid().references(() => users.id, { onDelete: "set null" }),
+    completedAt: timestamp({ withTimezone: true }),
+    ...timestamps,
+  },
+  (t) => [
+    uniqueIndex().on(t.companyId, t.idempotencyKey),
+    index().on(t.companyId, t.setId, t.createdAt),
+    foreignKey({
+      name: "photo_pushes_set_fk",
+      columns: [t.companyId, t.setId],
+      foreignColumns: [photoSets.companyId, photoSets.id],
+    }).onDelete("cascade"),
+    tenantPolicy("photo_pushes"),
   ],
 ).enableRLS();
