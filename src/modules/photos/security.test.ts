@@ -1,21 +1,69 @@
 import { call, ORPCError } from "@orpc/server";
+import { and, eq, gt } from "drizzle-orm";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { chargeCredits, creditBalance } from "../../ai/credits";
+import { IMAGE_JOB_KIND, type ImageProvider } from "../../ai/images";
 import { anonymousContext, type Context, permissionsFor } from "../../api/context";
 import { router } from "../../api/router";
 import { withTenant } from "../../db/client";
-import { photoImages } from "../../db/schema";
+import { aiJobs, photoImages } from "../../db/schema";
 import { imaging } from "../../integrations/imaging/client";
 import { runJobInline } from "../../lib/queues";
 import { createCompany, createUser, tenantContext } from "../../test/fixtures";
 import { createDesign } from "../catalog/service";
-import { renderCompositionJob } from "./jobs";
+import { renderCompositionJob, renderSceneJob } from "./jobs";
 import * as svc from "./service";
 
 /*
  * Security suite for listing photos (T-26-4 security co-review). Imaging is a test double; the
  * database is invai_test with RLS on.
  */
+
+// S-55 doubles: off unless a test turns them on, so the other tests use the real modules.
+const h = vi.hoisted(() => ({
+  on: false,
+  provider: null as unknown,
+  store: new Map<string, Buffer>(),
+  failPut: [] as string[],
+}));
+
+vi.mock("../../ai/images", async (importOriginal) => {
+  const real = await importOriginal<typeof import("../../ai/images")>();
+  return {
+    ...real,
+    getImageProvider: vi.fn(async (companyId: string) =>
+      h.provider ? (h.provider as ImageProvider) : real.getImageProvider(companyId),
+    ),
+  };
+});
+
+vi.mock("../../lib/s3", async (importOriginal) => {
+  const real = await importOriginal<typeof import("../../lib/s3")>();
+  return {
+    ...real,
+    getObject: vi.fn(async (key: string) => {
+      if (!h.on) return real.getObject(key);
+      const b = h.store.get(key);
+      if (!b) throw new Error(`no object ${key}`);
+      return b;
+    }),
+    putObject: vi.fn(async (key: string, body: Buffer, type?: string) => {
+      if (!h.on) return real.putObject(key, body, type as never);
+      if (h.failPut.some((k) => key.endsWith(k))) {
+        h.failPut = h.failPut.filter((k) => !key.endsWith(k));
+        throw new Error("S3 503 SlowDown");
+      }
+      h.store.set(key, Buffer.from(body));
+      return key;
+    }),
+    headObject: vi.fn(async (key: string) => {
+      if (!h.on) return real.headObject(key);
+      return h.store.has(key)
+        ? { exists: true as const, size: 1, contentType: null }
+        : { exists: false as const };
+    }),
+  };
+});
 
 type Role = "office" | "presser" | "packer" | "receiver";
 
@@ -102,6 +150,10 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  h.on = false;
+  h.provider = null;
+  h.store.clear();
+  h.failPut = [];
   vi.restoreAllMocks();
 });
 
@@ -251,4 +303,82 @@ describe("photos: roles", () => {
       for (const c of calls) expect(await codeOf(c)).toBe("FORBIDDEN");
     },
   );
+});
+
+describe("photos: AI scene spend (T-27-3 security co-review)", () => {
+  // S-55 (Medium): renderScene stores the provider's scene (putObject) before recordImageGen. A
+  // transient S3 failure after a paid scene call throws RetryLater with no ai_jobs row, so that
+  // call's cost never reaches the spend counters or the daily shop cap, and the retry pays the
+  // provider again. Every billed call must be recorded. Flip `it.fails` to `it` with the fix.
+  it.fails("a scene call whose upload fails is still recorded as spend before the retry pays again", async () => {
+    const { company, office, design } = await shop();
+    const ctx = tenantContext(company.id, office.id, "office");
+    h.on = true;
+    let calls = 0;
+    h.provider = {
+      name: "openai",
+      model: "fake-image",
+      estimateCents: () => 4,
+      async generateScene() {
+        calls++;
+        return {
+          image: Buffer.from(`scene-${calls}`),
+          widthPx: 1024,
+          heightPx: 1024,
+          provider: "openai",
+          model: "fake-image",
+          costCents: 4,
+          containsPerson: false,
+        };
+      },
+    } satisfies ImageProvider;
+    vi.spyOn(imaging, "photoSceneBase").mockImplementation(async (i) => {
+      h.store.set(i.out_key, Buffer.from("base"));
+      h.store.set(i.mask_out_key, Buffer.from("mask"));
+      return { key: i.out_key, mask_key: i.mask_out_key, print_box_px: [400, 300, 224, 300] };
+    });
+    vi.spyOn(imaging, "photoSceneComposite").mockImplementation(async (i) => ({
+      key: i.out_key,
+      checks: { passes: true, failures: [], region_unchanged_score: 0.97, design_lock_score: 0.96 },
+      width_px: 2048,
+      height_px: 2048,
+      format: "jpeg",
+    }));
+    const set = await withTenant(company.id, (tx) =>
+      svc.createSet(tx, ctx, {
+        designId: design.id,
+        garments: ["tee"],
+        colors: [{ name: "Black", hex: "#000000" }],
+        views: ["front_flat"],
+        channels: ["shopify"],
+        underbasePreview: true,
+        idempotencyKey: `key-${crypto.randomUUID()}`,
+        lifestyle: { count: 1 },
+      }),
+    );
+    const sceneIds = (await svc.openCompositionsBySource(company.id, set.id))
+      .filter((c) => c.source === "ai_scene")
+      .map((c) => c.id);
+    expect(sceneIds).toHaveLength(1);
+    const input = { companyId: company.id, compositionId: sceneIds[0] as string };
+    h.failPut = ["-a1.png"];
+    await expect(
+      runJobInline(renderSceneJob, input, { attempt: 1, attempts: 3 }),
+    ).rejects.toThrow();
+    await runJobInline(renderSceneJob, input, { attempt: 2, attempts: 3 });
+    const billed = await withTenant(company.id, (tx) =>
+      tx
+        .select()
+        .from(aiJobs)
+        .where(
+          and(
+            eq(aiJobs.companyId, company.id),
+            eq(aiJobs.kind, IMAGE_JOB_KIND),
+            gt(aiJobs.costCents, 0),
+          ),
+        ),
+    );
+    expect(calls).toBe(2);
+    expect(billed).toHaveLength(calls);
+  });
 });
