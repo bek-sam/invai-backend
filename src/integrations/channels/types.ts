@@ -249,7 +249,8 @@ export interface ChannelAdapter {
   fetchOrder?(conn: ChannelConn, channelOrderId: string): Promise<FetchedOrder>;
   /**
    * Add images to a channel product (T-27-4, Shopify only). Images already on the product
-   * (matched by filename, or by alt while Shopify is still processing them) come back as
+   * (matched by filename, or by a per-image alt marker while Shopify is still processing them,
+   * each media matching at most one image) come back as
    * `skipped`, so a retry never duplicates. Throws `ProductImagePushError` for a missing
    * product, a missing OAuth scope or a rejected image.
    */

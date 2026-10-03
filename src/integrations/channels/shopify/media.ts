@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { isORPCError } from "../../../lib/errors";
 import { logger } from "../../../lib/log";
 import {
@@ -23,7 +24,11 @@ const log = logger("channels.shopify.media");
  * - https://shopify.dev/docs/apps/build/product-merchandising/products-and-collections/manage-media
  * `productCreateMedia` is deprecated; `productUpdate` has no `@idempotent` directive. Dedupe is a
  * read-back: before adding, the product's media are read and any image already there is skipped
- * (by filename once Shopify has processed it, by exact alt while it is still processing). A
+ * (by filename once Shopify has processed it, by alt marker while it is still processing). While
+ * a media is processing, `image` is null and the MediaImage docs promise no other per-file field
+ * (`originalSource` is not documented as readable then), and every image of a photo set shares
+ * one alt text, so the alt we send ends in a marker derived from the filename stem
+ * (`altMarker`), which Shopify stores as given. Each existing media matches at most one image. A
  * failed media (Shopify could not download it) does not count as pushed. A product holds at most
  * 250 media, so `media(first: 250)` reads all of them.
  */
@@ -152,13 +157,37 @@ export function shopifyUrlHasFile(cdnUrl: string, filename: string): boolean {
   return got === stem(filename);
 }
 
-/** The existing media node that already holds this image, if any. */
-function findExisting(nodes: MediaNode[], img: ProductImage): MediaNode | undefined {
-  const live = nodes.filter((n) => n.status !== "FAILED" && n.mediaContentType === "IMAGE");
+/** Short per-image marker from the filename stem, e.g. `[img a1b2c3d4]`; not a secret. */
+export function altMarker(filename: string): string {
+  return `[img ${createHash("sha256").update(stem(filename)).digest("hex").slice(0, 8)}]`;
+}
+
+/** The alt sent to Shopify: the shop's alt (cut to fit) followed by the image's marker. */
+export function shopifyAlt(img: ProductImage): string {
+  const marker = altMarker(img.filename);
+  const base = img.alt
+    .trim()
+    .slice(0, MAX_ALT - marker.length - 1)
+    .trimEnd();
+  return base ? `${base} ${marker}` : marker;
+}
+
+const hasMarker = (n: MediaNode, img: ProductImage) =>
+  (n.alt ?? "").endsWith(altMarker(img.filename));
+
+/** The existing media node that already holds this image, if any and not already claimed. */
+function findExisting(
+  nodes: MediaNode[],
+  img: ProductImage,
+  claimed: Set<string>,
+): MediaNode | undefined {
+  const live = nodes.filter(
+    (n) => n.status !== "FAILED" && n.mediaContentType === "IMAGE" && !claimed.has(n.id),
+  );
   return (
     live.find((n) => n.image?.url && shopifyUrlHasFile(n.image.url, img.filename)) ??
-    // Still processing (no URL yet): a node with the exact alt is taken as the earlier attempt.
-    live.find((n) => !n.image?.url && n.alt === img.alt)
+    // Still processing (no URL yet): only this image's marker identifies the earlier attempt.
+    live.find((n) => !n.image?.url && hasMarker(n, img))
   );
 }
 
@@ -214,11 +243,13 @@ async function push(
   const before = await readMedia(conn, input.productGid);
   const skipped: PushProductImagesResult["skipped"] = [];
   const todo: ProductImage[] = [];
+  const claimed = new Set<string>();
   for (const img of input.images) {
-    const found = findExisting(before, img);
-    if (found)
+    const found = findExisting(before, img, claimed);
+    if (found) {
+      claimed.add(found.id);
       skipped.push({ filename: img.filename, mediaId: found.id, reason: "already_pushed" });
-    else todo.push(img);
+    } else todo.push(img);
   }
   if (todo.length === 0) return { pushed: [], skipped };
   if (before.length + todo.length > MAX_MEDIA)
@@ -236,7 +267,7 @@ async function push(
       product: { id: input.productGid },
       media: todo.map((img) => ({
         originalSource: img.url,
-        alt: img.alt,
+        alt: shopifyAlt(img),
         mediaContentType: "IMAGE",
       })),
     },
@@ -261,12 +292,12 @@ async function push(
     );
   }
 
-  // New media come back in input order; alt and filename are checked first in case they don't.
+  // New media come back in input order; filename and marker are checked first in case they don't.
   const free = [...added];
   const pushed: PushProductImagesResult["pushed"] = [];
   for (const img of todo) {
     const i = free.findIndex(
-      (n) => (n.image?.url && shopifyUrlHasFile(n.image.url, img.filename)) || n.alt === img.alt,
+      (n) => (n.image?.url && shopifyUrlHasFile(n.image.url, img.filename)) || hasMarker(n, img),
     );
     const node = i >= 0 ? free.splice(i, 1)[0] : free.shift();
     if (!node)

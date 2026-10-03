@@ -2,11 +2,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { amazonAdapter } from "../amazon";
 import { etsyAdapter } from "../etsy";
 import { tiktokAdapter } from "../tiktok";
-import { type ChannelConn, ProductImagePushError, type PushProductImagesInput } from "../types";
+import {
+  type ChannelConn,
+  type ProductImage,
+  ProductImagePushError,
+  type PushProductImagesInput,
+} from "../types";
 import { walmartAdapter } from "../walmart";
 import { resetShopifyThrottle, setShopifySleep } from "./client";
 import { shopifyLive } from "./live";
-import { shopifyUrlHasFile } from "./media";
+import { altMarker, shopifyAlt, shopifyUrlHasFile } from "./media";
 import {
   MOCK_SHOPIFY_MISSING_PRODUCT,
   mockShopifyProductMedia,
@@ -109,12 +114,12 @@ describe("Shopify pushProductImages (productUpdate media, API 2026-07)", () => {
             old,
             {
               id: "gid://shopify/MediaImage/21",
-              alt: input().images[0]?.alt ?? "",
+              alt: shopifyAlt(input().images[0] as ProductImage),
               status: "UPLOADED",
             },
             {
               id: "gid://shopify/MediaImage/22",
-              alt: input().images[1]?.alt ?? "",
+              alt: shopifyAlt(input().images[1] as ProductImage),
               status: "UPLOADED",
             },
           ])
@@ -136,8 +141,16 @@ describe("Shopify pushProductImages (productUpdate media, API 2026-07)", () => {
     expect(update?.variables).toEqual({
       product: { id: PRODUCT },
       media: [
-        { originalSource: url(IMG_A), alt: input().images[0]?.alt, mediaContentType: "IMAGE" },
-        { originalSource: url(IMG_B), alt: input().images[1]?.alt, mediaContentType: "IMAGE" },
+        {
+          originalSource: url(IMG_A),
+          alt: shopifyAlt(input().images[0] as ProductImage),
+          mediaContentType: "IMAGE",
+        },
+        {
+          originalSource: url(IMG_B),
+          alt: shopifyAlt(input().images[1] as ProductImage),
+          mediaContentType: "IMAGE",
+        },
       ],
     });
   });
@@ -152,10 +165,10 @@ describe("Shopify pushProductImages (productUpdate media, API 2026-07)", () => {
           status: "READY",
           url: `https://cdn.shopify.com/s/files/1/0001/files/${IMG_A.replace(".jpg", "")}_0f8fad5b-d9cb-469f-a165-70867728950e.webp?v=2`,
         },
-        // Still processing: no URL yet, the exact alt identifies the earlier attempt.
+        // Still processing: no URL yet, the alt marker identifies the earlier attempt.
         {
           id: "gid://shopify/MediaImage/32",
-          alt: input().images[1]?.alt ?? "",
+          alt: shopifyAlt(input().images[1] as ProductImage),
           status: "PROCESSING",
         },
       ]),
@@ -171,36 +184,135 @@ describe("Shopify pushProductImages (productUpdate media, API 2026-07)", () => {
     expect(calls.some(isUpdate)).toBe(false);
   });
 
+  describe("a photo set shares one alt text: the per-image marker keeps matches one-to-one", () => {
+    const ALT = "Desert Sun tee";
+    const IMG_C = "5b0c1f4e-1111-4a2b-9c3d-000000000003.jpg";
+    const IMG_D = "5b0c1f4e-1111-4a2b-9c3d-000000000004.jpg";
+    const set = (files: string[]) => files.map((f) => ({ url: url(f), alt: ALT, filename: f }));
+    const processing = (id: number, f: string): Node => ({
+      id: `gid://shopify/MediaImage/${id}`,
+      alt: shopifyAlt({ url: url(f), alt: ALT, filename: f }),
+      status: "PROCESSING",
+    });
+
+    it("new set pushed while an earlier same-alt set is still processing: all new photos are added", async () => {
+      const earlier = [processing(51, IMG_A), processing(52, IMG_B)];
+      const { calls } = stubShopify((c) =>
+        isUpdate(c)
+          ? updateOk([...earlier, processing(53, IMG_C), processing(54, IMG_D)])
+          : mediaRead(earlier),
+      );
+      const res = await shopifyLive.pushProductImages?.(
+        conn,
+        input({ images: set([IMG_C, IMG_D]), idempotencyKey: "push-2" }),
+      );
+      expect(res).toEqual({
+        pushed: [
+          { filename: IMG_C, mediaId: "gid://shopify/MediaImage/53" },
+          { filename: IMG_D, mediaId: "gid://shopify/MediaImage/54" },
+        ],
+        skipped: [],
+      });
+      const media = calls.find(isUpdate)?.variables.media as { alt: string }[];
+      expect(media.map((m) => m.alt)).toEqual([
+        `${ALT} ${altMarker(IMG_C)}`,
+        `${ALT} ${altMarker(IMG_D)}`,
+      ]);
+    });
+
+    it("partial: only the photo whose marker is processing is skipped, the other is added", async () => {
+      const earlier = [processing(61, IMG_A)];
+      const { calls } = stubShopify((c) =>
+        isUpdate(c) ? updateOk([...earlier, processing(62, IMG_B)]) : mediaRead(earlier),
+      );
+      const res = await shopifyLive.pushProductImages?.(
+        conn,
+        input({ images: set([IMG_A, IMG_B]) }),
+      );
+      expect(res).toEqual({
+        pushed: [{ filename: IMG_B, mediaId: "gid://shopify/MediaImage/62" }],
+        skipped: [
+          { filename: IMG_A, mediaId: "gid://shopify/MediaImage/61", reason: "already_pushed" },
+        ],
+      });
+      const media = calls.find(isUpdate)?.variables.media as { originalSource: string }[];
+      expect(media.map((m) => m.originalSource)).toEqual([url(IMG_B)]);
+    });
+
+    it("retry while all are processing: each photo maps to its own media id, nothing re-added", async () => {
+      const { calls } = stubShopify(() =>
+        mediaRead([processing(73, IMG_C), processing(71, IMG_A), processing(72, IMG_B)]),
+      );
+      const res = await shopifyLive.pushProductImages?.(
+        conn,
+        input({ images: set([IMG_A, IMG_B, IMG_C]) }),
+      );
+      expect(res).toEqual({
+        pushed: [],
+        skipped: [
+          { filename: IMG_A, mediaId: "gid://shopify/MediaImage/71", reason: "already_pushed" },
+          { filename: IMG_B, mediaId: "gid://shopify/MediaImage/72", reason: "already_pushed" },
+          { filename: IMG_C, mediaId: "gid://shopify/MediaImage/73", reason: "already_pushed" },
+        ],
+      });
+      expect(calls.some(isUpdate)).toBe(false);
+    });
+
+    it("a processing media with the plain shared alt (no marker) is not taken as any photo", async () => {
+      const { calls } = stubShopify((c) =>
+        isUpdate(c)
+          ? updateOk([
+              { id: "gid://shopify/MediaImage/81", alt: ALT, status: "PROCESSING" },
+              processing(82, IMG_A),
+            ])
+          : mediaRead([{ id: "gid://shopify/MediaImage/81", alt: ALT, status: "PROCESSING" }]),
+      );
+      const res = await shopifyLive.pushProductImages?.(conn, input({ images: set([IMG_A]) }));
+      expect(res?.pushed).toEqual([{ filename: IMG_A, mediaId: "gid://shopify/MediaImage/82" }]);
+      expect(calls.some(isUpdate)).toBe(true);
+    });
+
+    it("marker is stable per file, differs between files, and the sent alt stays within 512", () => {
+      expect(altMarker(IMG_A)).toBe(altMarker(IMG_A.replace(".jpg", ".png")));
+      expect(altMarker(IMG_A)).not.toBe(altMarker(IMG_B));
+      expect(altMarker(IMG_A)).toMatch(/^\[img [0-9a-f]{8}\]$/);
+      const long = shopifyAlt({ url: url(IMG_A), alt: "a".repeat(512), filename: IMG_A });
+      expect(long.length).toBeLessThanOrEqual(512);
+      expect(long.endsWith(` ${altMarker(IMG_A)}`)).toBe(true);
+      expect(shopifyAlt({ url: url(IMG_A), alt: "  ", filename: IMG_A })).toBe(altMarker(IMG_A));
+    });
+  });
+
   it("a media Shopify failed to download doesn't count: only that image is added again", async () => {
     const { calls } = stubShopify((c) =>
       isUpdate(c)
         ? updateOk([
             {
               id: "gid://shopify/MediaImage/41",
-              alt: input().images[0]?.alt ?? "",
+              alt: shopifyAlt(input().images[0] as ProductImage),
               status: "FAILED",
             },
             {
               id: "gid://shopify/MediaImage/42",
-              alt: input().images[1]?.alt ?? "",
+              alt: shopifyAlt(input().images[1] as ProductImage),
               status: "READY",
               url: `https://cdn.shopify.com/s/files/1/0001/files/${IMG_B}`,
             },
             {
               id: "gid://shopify/MediaImage/43",
-              alt: input().images[0]?.alt ?? "",
+              alt: shopifyAlt(input().images[0] as ProductImage),
               status: "UPLOADED",
             },
           ])
         : mediaRead([
             {
               id: "gid://shopify/MediaImage/41",
-              alt: input().images[0]?.alt ?? "",
+              alt: shopifyAlt(input().images[0] as ProductImage),
               status: "FAILED",
             },
             {
               id: "gid://shopify/MediaImage/42",
-              alt: input().images[1]?.alt ?? "",
+              alt: shopifyAlt(input().images[1] as ProductImage),
               status: "READY",
               url: `https://cdn.shopify.com/s/files/1/0001/files/${IMG_B}`,
             },
@@ -316,12 +428,12 @@ describe("Shopify pushProductImages (productUpdate media, API 2026-07)", () => {
             ? updateOk([
                 {
                   id: "gid://shopify/MediaImage/51",
-                  alt: input().images[0]?.alt ?? "",
+                  alt: shopifyAlt(input().images[0] as ProductImage),
                   status: "UPLOADED",
                 },
                 {
                   id: "gid://shopify/MediaImage/52",
-                  alt: input().images[1]?.alt ?? "",
+                  alt: shopifyAlt(input().images[1] as ProductImage),
                   status: "UPLOADED",
                 },
               ])
