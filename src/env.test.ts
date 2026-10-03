@@ -201,3 +201,33 @@ describe("AI provider keys (decision 0021)", () => {
     expect(env.ANTHROPIC_API_KEY).toBeUndefined();
   });
 });
+
+describe("image generation switches (T-27-1)", () => {
+  const prod = { NODE_ENV: "production", ...ALL_KEYS, SMTP_URL: "smtp://mail:25" };
+
+  it("defaults to the mock provider with a cap of 30 scenes per shop per day", () => {
+    expect(env.IMAGE_GEN_PROVIDER).toBe("mock");
+    expect(env.IMAGE_GEN_DAILY_CAP_PER_SHOP).toBe(30);
+    expect(env.imageGenMockDrift).toBe(false);
+  });
+
+  it("production with IMAGE_GEN_PROVIDER=openai and no OpenAI key refuses to boot; a blank key counts as unset", async () => {
+    const missing = await boot({ ...prod, IMAGE_GEN_PROVIDER: "openai" });
+    expect(missing.ok).toBe(false);
+    expect(missing.out).toContain("IMAGE_GEN_PROVIDER=openai needs OPENAI_API_KEY");
+    const blank = await boot({ ...prod, IMAGE_GEN_PROVIDER: "openai", OPENAI_API_KEY: "   " });
+    expect(blank.ok).toBe(false);
+    expect(
+      (await boot({ ...prod, IMAGE_GEN_PROVIDER: "openai", OPENAI_API_KEY: "sk-real" })).ok,
+    ).toBe(true);
+    expect((await boot(prod)).ok).toBe(true);
+  });
+
+  it("IMAGE_GEN_MOCK_DRIFT is refused outside NODE_ENV=test", async () => {
+    const dev = await boot({ NODE_ENV: "development", IMAGE_GEN_MOCK_DRIFT: "1" });
+    expect(dev.ok).toBe(false);
+    expect(dev.out).toContain("IMAGE_GEN_MOCK_DRIFT is a test-only switch");
+    expect((await boot({ ...prod, IMAGE_GEN_MOCK_DRIFT: "1" })).ok).toBe(false);
+    expect((await boot({ NODE_ENV: "test", IMAGE_GEN_MOCK_DRIFT: "1" })).ok).toBe(true);
+  });
+});

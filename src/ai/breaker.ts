@@ -67,6 +67,8 @@ export async function assertSpendAvailable(
   companyId: string,
   now = new Date(),
   caps: { platform: number; tenant: number } = spendCaps(),
+  /** A priced call (an AI scene) is refused when spent + estimate would pass the cap. */
+  estimateCents = 0,
 ): Promise<void> {
   if (caps.platform <= 0 && caps.tenant <= 0) return;
   const day = spendDay(now);
@@ -83,10 +85,12 @@ export async function assertSpendAvailable(
   }
   const tenantSpent = Number(values[0] ?? 0);
   const platformSpent = Number(values[1] ?? 0);
-  if (caps.tenant > 0 && tenantSpent >= caps.tenant) {
+  const over = (spent: number, cap: number) =>
+    estimateCents > 0 ? spent + estimateCents > cap : spent >= cap;
+  if (caps.tenant > 0 && over(tenantSpent, caps.tenant)) {
     await capReached(companyId, "tenant", caps.tenant, tenantSpent, now);
   }
-  if (caps.platform > 0 && platformSpent >= caps.platform) {
+  if (caps.platform > 0 && over(platformSpent, caps.platform)) {
     await capReached(companyId, "platform", caps.platform, platformSpent, now);
   }
 }

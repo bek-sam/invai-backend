@@ -236,3 +236,50 @@ export function tokensToCostCents(
     1_000_000;
   return Math.round(cents);
 }
+
+/* ------------------------------ image generation ------------------------------ */
+
+/**
+ * Listing photos phase B (T-27-1, ADR 0023): AI scenes are drawn by OpenAI's Images API edit
+ * endpoint (base + mask) when the owner sets IMAGE_GEN_PROVIDER=openai (OI-25); else the mock.
+ * `gpt-image-2` because its per-image prices are published (the 2.5 models are priced per token
+ * only, with no per-image table yet); a move to `gpt-image-2.5-*` is a `model-upgrade` with evals.
+ * Medium quality: the scene is a backdrop, and imaging composites the design at full quality.
+ */
+export const OPENAI_IMAGE_MODEL = "gpt-image-2";
+export const OPENAI_IMAGE_QUALITY = "medium" as const;
+export const MOCK_IMAGE_MODEL = "mock-image";
+
+/** The sizes every GPT Image model accepts (newer ones take more; we stay on these). */
+export const IMAGE_SIZES = ["1024x1024", "1536x1024", "1024x1536"] as const;
+export type ImageSize = (typeof IMAGE_SIZES)[number];
+
+/**
+ * Cents per output image at `OPENAI_IMAGE_QUALITY`, list price. Source: "Calculating costs" table,
+ * developers.openai.com/api/docs/guides/image-generation, read 2026-10-03 (GPT Image 2, medium:
+ * $0.053 at 1024x1024, $0.041 at 1024x1536 and 1536x1024).
+ */
+export const IMAGE_OUTPUT_PRICES: Record<string, Record<ImageSize, number>> = {
+  [OPENAI_IMAGE_MODEL]: { "1024x1024": 5.3, "1536x1024": 4.1, "1024x1536": 4.1 },
+};
+
+/**
+ * Input side of an edit call, added to every image: the base and mask go in as image tokens
+ * (gpt-image-2 always reads inputs at high fidelity) plus the prompt's text tokens. The guide gives
+ * no per-image input figure, so this is a conservative allowance: about 6,000 image input tokens at
+ * $8.00 per MTok (developers.openai.com/api/docs/pricing, 2026-10-03: the standard image-input rate
+ * listed for GPT Image 2.5; GPT Image 2's batch rate there equals 2.5's). Re-check against the
+ * first real invoice.
+ */
+export const IMAGE_INPUT_ALLOWANCE_CENTS = 5;
+
+/** Whole cents charged to spend counters for one image, rounded up so caps stay conservative. */
+export function imageCostCents(model: string, size: ImageSize): number {
+  const row =
+    IMAGE_OUTPUT_PRICES[model] ??
+    Object.entries(IMAGE_OUTPUT_PRICES).find(([k]) => model.startsWith(`${k}-`))?.[1];
+  // An unknown id is priced at the most expensive size in the table, never at 0.
+  const output =
+    row?.[size] ?? Math.max(...Object.values(IMAGE_OUTPUT_PRICES).flatMap((r) => Object.values(r)));
+  return Math.ceil(output + IMAGE_INPUT_ALLOWANCE_CENTS);
+}

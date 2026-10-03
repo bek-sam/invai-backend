@@ -36,6 +36,8 @@ export const AI_JOB_KINDS = [
   "digest_narrative",
   // Wave 26 (T-26-3): the design analysis for listing photos (enumText: no migration).
   "photo_analysis",
+  // Wave 27 (T-27-1): one AI scene image from the image provider (enumText: no migration).
+  "image_scene",
 ] as const;
 export const AI_JOB_STATUSES = ["queued", "running", "done", "failed"] as const;
 
