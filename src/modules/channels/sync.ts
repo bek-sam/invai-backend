@@ -538,6 +538,12 @@ export async function syncConnection(
 ) {
   const ctx = systemContext(companyId);
   const conn = await withTenant(companyId, (tx) => getConnectionRow(tx, connectionId));
+  // B-261: a poll tick can sit queued for minutes; the setting is read now, not at enqueue.
+  // Manual syncs (they carry a jobId) are the shop asking, so they still run.
+  if (!jobId && (conn.settings as { autoImport?: boolean } | null)?.autoImport === false) {
+    log.debug("poll sync skipped: auto-import is off", { companyId, connectionId });
+    return { imported: 0, skipped: true };
+  }
   if (conn.mode !== "api" || conn.status === "disconnected" || conn.status === "pending") {
     await setJob(companyId, jobId, {
       status: "done",
