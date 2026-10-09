@@ -117,12 +117,29 @@ ships without an eval diff.
 ## Production build and required keys
 
 ```
-pnpm build        # tsup (tsup.config.ts): dist/server.js (api) and dist/index.js (worker)
-pnpm start:api    # node dist/server.js
-pnpm start:worker # node dist/index.js
+pnpm build        # tsup (tsup.config.ts): the five entry points below, shared code in dist/chunk-*.js
+pnpm start:api    # node dist/api/server.js
+pnpm start:worker # node dist/worker/index.js
 ```
 
-`@invai/contracts` is bundled; every other dependency loads from `node_modules`.
+`@invai/contracts` is bundled; every other dependency loads from `node_modules`. The image keeps
+`drizzle/` next to `dist/` (`/app/drizzle`).
+
+### Release steps (run before every rollout, in this order)
+
+The SST `Migrate` task runs `node dist/db/bootstrap-cli.js && node dist/db/migrate-cli.js && node
+dist/db/reference-seed-cli.js`. Each step connects as the owner role (`MIGRATION_DATABASE_URL`,
+user `invai`), is safe to run again, prints one line, and exits 1 with one secret-free line on
+failure (no stack trace).
+
+| Step | What it does |
+|---|---|
+| `bootstrap-cli` | Creates or updates `invai_app` from `DATABASE_URL` (or `APP_DB_PASSWORD`): `LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE`, `CONNECT` on the database and `USAGE` on schema `public`, nothing else. Table grants and REVOKEs stay in the migrations. The password is sent as a SCRAM verifier, and only changed when the server rejects the configured one. Refuses any app role but `invai_app` and any owner but `invai`. Reads only those three variables (no `.env`). |
+| `migrate-cli` | Every pending migration from `<app>/drizzle` under the migration advisory lock, then the reference data. Also `pnpm db:migrate` (from source). |
+| `reference-seed-cli` | Plans and trademark marks only (no tenant rows). |
+
+Locally `pnpm db:migrate` is all you need (`invai-infra/local/init.sql` creates `invai_app`). To try
+the compiled steps, use a throwaway Postgres, never the shared one: roles are cluster-wide.
 
 With `NODE_ENV=production` the api and worker refuse to start, with one message listing every
 missing key, unless all of these are set: `EASYPOST_API_KEY`, `STRIPE_SECRET_KEY`,
