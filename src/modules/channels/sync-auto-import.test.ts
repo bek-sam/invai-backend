@@ -1,7 +1,7 @@
 import { eq } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
 import { withSystem, withTenant } from "../../db/client";
-import { channelConnections, jobs, orders } from "../../db/schema";
+import { channelConnections, DEFAULT_CONNECTION_SETTINGS, jobs, orders } from "../../db/schema";
 import { createCompany } from "../../test/fixtures";
 import { syncConnection } from "./sync";
 
@@ -19,7 +19,7 @@ async function mockShopify(companyId: string, autoImport: boolean) {
         mode: "api",
         provider: "mock",
         externalShopId: `t285-${crypto.randomUUID()}.myshopify.com`,
-        settings: { autoImport },
+        settings: { ...DEFAULT_CONNECTION_SETTINGS, autoImport },
       })
       .returning(),
   );
@@ -38,7 +38,7 @@ const setAutoImport = (id: string, autoImport: boolean) =>
   withSystem((tx) =>
     tx
       .update(channelConnections)
-      .set({ settings: { autoImport } })
+      .set({ settings: { ...DEFAULT_CONNECTION_SETTINGS, autoImport } })
       .where(eq(channelConnections.id, id)),
   );
 
@@ -51,7 +51,7 @@ describe("syncConnection with auto-import off", () => {
     expect(res).toMatchObject({ imported: 0, skipped: true });
     expect(await orderCount(co)).toBe(0);
     const after = await reload(co, conn.id);
-    expect(after?.lastSyncAt).toEqual(before?.lastSyncAt);
+    expect(after?.lastPollAt).toEqual(before?.lastPollAt);
     expect(after?.status).toBe("connected");
     expect(after?.lastError ?? null).toBe(before?.lastError ?? null);
     // run twice: still nothing
@@ -73,7 +73,7 @@ describe("syncConnection with auto-import off", () => {
     expect(res.skipped).not.toBe(true);
     const [row] = await withTenant(co, (tx) => tx.select().from(jobs).where(eq(jobs.id, job.id)));
     expect(row?.status).toBe("done");
-    expect((await reload(co, conn.id))?.lastSyncAt).not.toBeNull();
+    expect((await reload(co, conn.id))?.lastPollAt).not.toBeNull();
   });
 
   it("reads the setting when the job runs: on at enqueue, off at run", async () => {
@@ -90,6 +90,6 @@ describe("syncConnection with auto-import off", () => {
     const conn = await mockShopify(co, true);
     const res = await syncConnection(co, conn.id);
     expect(res.skipped).not.toBe(true);
-    expect((await reload(co, conn.id))?.lastSyncAt).not.toBeNull();
+    expect((await reload(co, conn.id))?.lastPollAt).not.toBeNull();
   });
 });
