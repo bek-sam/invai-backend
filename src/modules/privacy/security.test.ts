@@ -116,7 +116,7 @@ describe("buyer-text purge: storage deletes stay inside the unit's own objects (
   // photo key into the artwork editor, so one photo reused for two units (a reorder, a second
   // order from the same buyer) loses its object when the first unit's clock runs out, and the
   // unit still in production can no longer be re-rendered. Remove `.fails` when fixed.
-  it.fails("keeps a buyer photo that a unit still in production uses", async () => {
+  it("keeps a buyer photo that a unit still in production uses", async () => {
     const c = (await createCompany()).id;
     const conn = await createConnection(c);
     const tpl = await createNameTemplate(c);

@@ -290,7 +290,14 @@ describe("buyer text on the 30-day clock", () => {
     const res = await withTenant(other, (tx) =>
       redactBuyerText(tx, [again.orderId], { scope: "all" }),
     );
-    expect(res).toEqual({ personalizedItems: 0, artwork: 0, notes: 0, files: [], failedFiles: [] });
+    expect(res).toEqual({
+      personalizedItems: 0,
+      artwork: 0,
+      notes: 0,
+      files: [],
+      failedFiles: [],
+      sharedPhotosKept: 0,
+    });
     expectKept(await readBack(companyId, again.orderId, again.a), again.artA);
   });
 });

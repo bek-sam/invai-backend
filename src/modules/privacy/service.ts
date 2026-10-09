@@ -145,6 +145,8 @@ export type BuyerTextRedacted = {
   files: string[];
   /** Keys whose delete failed: their items were left as they were for the next run. */
   failedFiles: string[];
+  /** Buyer-photo keys kept because a unit outside this run still uses them (S-59). */
+  sharedPhotosKept: number;
 };
 
 /**
@@ -191,6 +193,7 @@ export async function redactBuyerText(
     notes: 0,
     files: [],
     failedFiles: [],
+    sharedPhotosKept: 0,
   };
   if (orderIds.length === 0) return res;
   const items = await tx
@@ -256,6 +259,7 @@ export async function redactBuyerText(
     art: boolean;
     reprintIds: string[];
     keys: string[];
+    photos: string[];
   };
   const plans: Plan[] = [];
   for (const i of items) {
@@ -267,6 +271,7 @@ export async function redactBuyerText(
     const reprintIds = reprintsByItem.get(i.id) ?? [];
     if (!answers && !art && reprintIds.length === 0) continue;
     const keys = new Set<string>();
+    const photos = new Set<string>();
     if (art) {
       const own = (k: string | null | undefined): k is string =>
         !!k && isCompanyKey(i.companyId, k);
@@ -276,14 +281,38 @@ export async function redactBuyerText(
         // A photo slot's value is the storage key of the buyer's photo.
         for (const slot of row.slots ?? []) {
           const v = row.a.values[slot.name];
-          if (slot.kind === "photo" && own(v) && v.startsWith(`${i.companyId}/photo/`)) keys.add(v);
+          if (slot.kind === "photo" && own(v) && v.startsWith(`${i.companyId}/photo/`))
+            photos.add(v);
         }
       }
       for (const k of [i.artworkKey, i.artworkPreviewKey])
         if (k && itemKeys.has(k) && !shared.has(k)) keys.add(k);
     }
-    plans.push({ item: i, answers, art, reprintIds, keys: [...keys] });
+    plans.push({ item: i, answers, art, reprintIds, keys: [...keys], photos: [...photos] });
   }
+
+  // A buyer photo another unit's artwork still uses (a reorder, a second order) stays until the
+  // last unit using it is purged (S-59).
+  const photoKeys = [...new Set(plans.flatMap((p) => p.photos))];
+  const sharedPhotos = new Set<string>();
+  if (photoKeys.length) {
+    const purging = plans.filter((p) => p.art).map((p) => p.item.id);
+    const list = sql.join(
+      photoKeys.map((k) => sql`${k}`),
+      sql`, `,
+    );
+    const ids = sql.join(
+      purging.map((k) => sql`${k}::uuid`),
+      sql`, `,
+    );
+    const users = await tx.execute<{ k: string }>(sql`select distinct v.value as k
+      from item_artwork a cross join lateral jsonb_each_text(
+        case when jsonb_typeof(a."values") = 'object' then a."values" else '{}'::jsonb end) v
+      where v.value in (${list}) and a.order_item_id not in (${ids})`);
+    for (const r of users.rows) sharedPhotos.add(r.k);
+    res.sharedPhotosKept = sharedPhotos.size;
+  }
+  for (const p of plans) p.keys.push(...p.photos.filter((k) => !sharedPhotos.has(k)));
 
   // Storage first.
   const failed = new Set<string>();

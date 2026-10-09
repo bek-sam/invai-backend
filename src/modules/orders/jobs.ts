@@ -7,6 +7,11 @@ import { errorData, logger } from "../../lib/log";
 import { defineJob, queues } from "../../lib/queues";
 import { deleteObject, listKeysOlderThan } from "../../lib/s3";
 import { forgetFiles } from "../files/service";
+import {
+  companiesWithPurgedSheets,
+  purgeSheetFiles,
+  sweepOrphanRenders,
+} from "../privacy/print-files";
 import { holdsBuyerText, redactBuyerText } from "../privacy/service";
 
 const log = logger("orders.jobs");
@@ -24,8 +29,17 @@ export type BuyerPiiPurge = {
   artwork: number;
   notes: number;
   files: number;
+  /** Object deletes that failed (units and sheets wait for the next night). */
   failedFiles: number;
   failedCompanies: number;
+  /** Buyer photos kept because another unit still uses them (S-59). */
+  sharedPhotosKept: number;
+  /** Gang sheets whose print files were deleted after a unit on them was purged (decision 0031). */
+  sheetFilesPurged: number;
+  /** Sheets holding a purged unit that are still in production; their files wait. */
+  sheetsWaiting: number;
+  /** Age in days of the oldest waiting sheet, null when none waits. */
+  oldestSheetWaitingDays: number | null;
 };
 
 /**
@@ -81,7 +95,12 @@ export async function purgeBuyerPii(now = new Date()): Promise<BuyerPiiPurge> {
     files: 0,
     failedFiles: 0,
     failedCompanies: 0,
+    sharedPhotosKept: 0,
+    sheetFilesPurged: 0,
+    sheetsWaiting: 0,
+    oldestSheetWaitingDays: null,
   };
+  const failed = new Set<string>();
   const byCompany = new Map<string, typeof due>();
   for (const d of due) byCompany.set(d.companyId, [...(byCompany.get(d.companyId) ?? []), d]);
   for (const [companyId, list] of byCompany) {
@@ -123,23 +142,48 @@ export async function purgeBuyerPii(now = new Date()): Promise<BuyerPiiPurge> {
           res.notes += text.notes;
           res.files += text.files.length;
           res.failedFiles += text.failedFiles.length;
+          res.sharedPhotosKept += text.sharedPhotosKept;
         });
       }
     } catch (err) {
-      res.failedCompanies++;
+      failed.add(companyId);
       log.error("buyer PII purge failed for a company", { companyId, ...errorData(err) });
     }
   }
+  // After the unit purge, so a unit purged tonight frees its sheet tonight (decision 0031).
+  for (const companyId of await companiesWithPurgedSheets()) {
+    try {
+      const s = await purgeSheetFiles(companyId, now);
+      res.sheetFilesPurged += s.sheetFilesPurged;
+      res.sheetsWaiting += s.sheetsWaiting;
+      res.failedFiles += s.failedSheets;
+      if (s.oldestSheetWaitingDays !== null)
+        res.oldestSheetWaitingDays = Math.max(
+          res.oldestSheetWaitingDays ?? 0,
+          s.oldestSheetWaitingDays,
+        );
+    } catch (err) {
+      failed.add(companyId);
+      log.error("sheet file purge failed for a company", { companyId, ...errorData(err) });
+    }
+  }
+  res.failedCompanies = failed.size;
   return res;
 }
 
-/** Object kinds that carry buyer data: raw channel payloads, uploaded order CSVs, label PDFs. */
+/**
+ * Object kinds that carry buyer data: raw channel payloads, uploaded order CSVs, label PDFs.
+ * `sheet`, `preview`, `artwork`, `photo` and `design` never join: this sweep deletes by age
+ * alone and would remove the files of `ready` sheets and catalog previews. Those follow the
+ * unit clocks (`redactBuyerText`, `purgeSheetFiles`) and the orphan sweep (decision 0031).
+ */
 export const PII_OBJECT_KINDS = ["raw", "csv", "label"] as const;
 
 /**
  * Retention sweep for S3 (cross-tenant): objects of the PII kinds older than 30 days are
  * deleted under every company prefix (`{companyId}/{kind}/...`), and their `files` rows go too.
- * This also catches merged batch-label PDFs and CSVs that no table points at.
+ * This also catches merged batch-label PDFs and CSVs that no table points at. Then renders,
+ * sheet files and previews older than 2 days that no row points at go (`sweepOrphanRenders`).
  */
 export async function purgePiiObjects(now = new Date(), only?: string[]) {
   const cutoff = new Date(now.getTime() - PII_RETENTION_DAYS * 86400_000);
@@ -147,6 +191,8 @@ export async function purgePiiObjects(now = new Date(), only?: string[]) {
     ? only.map((id) => ({ id }))
     : await withSystem((tx) => tx.select({ id: companies.id }).from(companies));
   let deleted = 0;
+  let orphanRendersDeleted = 0;
+  let orphanRendersFailed = 0;
   for (const { id } of companyIds) {
     const keys: string[] = [];
     for (const kind of PII_OBJECT_KINDS)
@@ -160,8 +206,16 @@ export async function purgePiiObjects(now = new Date(), only?: string[]) {
       }
     }
     if (keys.length) await withTenant(id, (tx) => forgetFiles(tx, keys));
+    try {
+      const o = await sweepOrphanRenders(id, now);
+      orphanRendersDeleted += o.orphanRendersDeleted;
+      orphanRendersFailed += o.orphanRendersFailed;
+    } catch (err) {
+      orphanRendersFailed++;
+      log.error("orphan render sweep failed for a company", { companyId: id, ...errorData(err) });
+    }
   }
-  return { objects: deleted };
+  return { objects: deleted, orphanRendersDeleted, orphanRendersFailed };
 }
 
 export const purgeBuyerPiiJob = defineJob({
