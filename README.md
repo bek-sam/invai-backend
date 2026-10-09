@@ -35,11 +35,11 @@ Better Auth (`src/auth.ts`, under `/api/auth/*`) handles sign-in, sign-up, passw
 
 | Code | Status | When |
 | --- | --- | --- |
-| `ACCOUNT_LOCKED` | 423, body `AccountLockedBody` (`retryAfterSec`), `Retry-After` header | `/sign-in/email` after `ACCOUNT_LOCK_THRESHOLD` (10) wrong passwords in a row for that email, for `ACCOUNT_LOCK_MINUTES` (30). Unknown emails lock the same way. One "locked" email per lock; a password reset unlocks. Separate from the 20/min per-IP limit (decision 0008). `src/lib/account-lockout.ts` |
+| `ACCOUNT_LOCKED` | 423, body `AccountLockedBody` (`retryAfterSec`), `Retry-After` header | `/sign-in/email` after `ACCOUNT_LOCK_THRESHOLD` (10) wrong passwords in a row for that email (attempts are counted before the password check, so a parallel burst tests at most 10), for `ACCOUNT_LOCK_MINUTES` (30). Unknown emails lock the same way. One "locked" email per lock; a password reset unlocks. Separate from the 20/min per-IP limit (decision 0008). `src/lib/account-lockout.ts` |
 | `PASSWORD_REUSED` | 400 | `/change-password` or `/reset-password` with the current password or one of the previous 9 (hashes only, `password_history`). `src/lib/password-history.ts` |
 | `MFA_DISABLE_NOT_ALLOWED` | 403 | `/two-factor/disable` by a user for whom two-step sign-in is required |
 
-Required two-step sign-in (`src/lib/mfa.ts`): a user with an active owner or admin membership in any org that isn't a sample workspace must turn it on within `MFA_GRACE_DAYS` (7) of `users.mfa_grace_starts_at` (restarted when they become required). After that, every oRPC procedure except `me.get` and `me.switchOrg` answers `MFA_REQUIRED` (403, `data.deadline`) for their web sessions; `me.get` returns `mfa: { required, enabled, deadline }`. Better Auth routes, floor PIN and station sessions, webhooks, SSE `/events` and `/l` links are not affected.
+Required two-step sign-in (`src/lib/mfa.ts`): a user with an active owner or admin membership in any org that isn't a sample workspace must turn it on within `MFA_GRACE_DAYS` (7) of `users.mfa_grace_starts_at` (restarted when they become required, at most once per user: `users.mfa_required_since`). After that, every oRPC procedure except `me.get` and `me.switchOrg` answers `MFA_REQUIRED` (403, `data.deadline`) for their web sessions; `me.get` returns `mfa: { required, enabled, deadline }`. Better Auth routes, floor PIN and station sessions, webhooks, SSE `/events` and `/l` links are not affected.
 
 ## Local development
 
