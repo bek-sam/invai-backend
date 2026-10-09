@@ -887,6 +887,35 @@ async function handleWebhook(
   let orderIds: string[] = [];
   for (const conn of live) {
     const ctx = systemContext(conn.companyId);
+    // T-29-4 (decision 0030): with auto-import off, a webhook for an order we do not have is
+    // acknowledged and skipped. Updates for known orders still apply. The cursor is untouched,
+    // so a manual Sync now picks the order up.
+    if (
+      (event.kind === "order_upsert" || event.kind === "order_ref") &&
+      (conn.settings as { autoImport?: boolean } | null)?.autoImport === false
+    ) {
+      const channelOrderId =
+        event.kind === "order_upsert" ? event.order.channelOrderId : event.channelOrderId;
+      const known = await withTenant(conn.companyId, async (tx) => {
+        const [row] = await tx
+          .select({ id: orders.id })
+          .from(orders)
+          .where(and(eq(orders.channel, conn.channel), eq(orders.channelOrderId, channelOrderId)))
+          .limit(1);
+        // A delivery still proves the webhook route works (health), cursor untouched.
+        if (!row) await markConnection(tx, conn.id, { kind: "webhook" });
+        return !!row;
+      });
+      if (!known) {
+        log.info("webhook skipped: auto-import is off", {
+          companyId: conn.companyId,
+          connectionId: conn.id,
+          channel,
+          topic: event.topic,
+        });
+        continue;
+      }
+    }
     // Webhook as a trigger: fetch the order by id outside any transaction.
     let fetched: FetchedOrder | null = null;
     if (event.kind === "order_ref") {
