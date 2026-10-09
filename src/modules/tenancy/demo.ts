@@ -186,6 +186,7 @@ async function switchTo(context: RequestContext, companyId: string): Promise<Me>
       name: companies.name,
       type: companies.type,
       role: members.role,
+      demo: companies.demo,
     })
     .from(members)
     .innerJoin(companies, eq(companies.id, members.organizationId))

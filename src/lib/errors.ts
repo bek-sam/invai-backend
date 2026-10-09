@@ -26,6 +26,15 @@ export function emailNotVerified() {
   return new ORPCError("EMAIL_NOT_VERIFIED", { status: 403, message: "Verify your email first" });
 }
 
+/** Two-step sign-in is required and its grace period ended (T-28-2, ADR 0025, src/lib/mfa.ts). */
+export function mfaRequired(deadline: Date | null) {
+  return new ORPCError("MFA_REQUIRED", {
+    status: 403,
+    message: "Turn on two-step sign-in to continue",
+    data: { deadline: deadline?.toISOString() ?? null },
+  });
+}
+
 export function badRequest(message: string, data?: unknown) {
   return new ORPCError("BAD_REQUEST", { message, data });
 }

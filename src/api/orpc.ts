@@ -11,10 +11,12 @@ import {
   clientTooOld,
   emailNotVerified,
   forbidden,
+  mfaRequired,
   notImplemented,
   rateLimited,
   unauthorized,
 } from "../lib/errors";
+import { MFA_EXEMPT_PROCEDURES, mfaBlocks } from "../lib/mfa";
 import { checkRateLimit, type RateBucket } from "../lib/ratelimit";
 import { sanitizeDeep } from "../lib/text-safety";
 import { type Context, type TenantContext, tenantOf } from "./context";
@@ -126,6 +128,16 @@ const guard = os.middleware(async ({ context, next, procedure, path }) => {
 
   if (meta.permission !== "none" && !context.permissions.has(meta.permission)) {
     throw forbidden(meta.permission, `Missing permission ${meta.permission} for ${path.join(".")}`);
+  }
+  // Required two-step sign-in (T-28-2, ADR 0025): web sessions only, never public or station
+  // procedures; floor PIN sessions carry no `mfa`.
+  if (
+    context.sessionKind === "user" &&
+    (mode === "user" || mode === "floor") &&
+    !MFA_EXEMPT_PROCEDURES.has(path.join(".")) &&
+    mfaBlocks(context.mfa)
+  ) {
+    throw mfaRequired(context.mfa?.deadline ?? null);
   }
   if (EMAIL_VERIFIED_PROCEDURES.has(path.join(".")) && !context.emailVerified) {
     throw emailNotVerified();

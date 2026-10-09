@@ -1,3 +1,4 @@
+import type { AuthErrorCode } from "@invai/contracts";
 import { type BetterAuthOptions, type BetterAuthPlugin, betterAuth } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import {
@@ -25,6 +26,13 @@ import {
 } from "./db/schema";
 import { env } from "./env";
 import {
+  clearAfterSuccess,
+  clearLock,
+  lockedFor,
+  notifyLocked,
+  recordFailure,
+} from "./lib/account-lockout";
+import {
   localeOf,
   resetPasswordEmail,
   resetPasswordLink,
@@ -35,6 +43,8 @@ import {
   verifyEmailLink,
 } from "./lib/auth-mail";
 import { logger } from "./lib/log";
+import { isUserMfaRequired, loadMfaState, restartGraceIfNewlyRequired } from "./lib/mfa";
+import { isReusedPassword, recordCurrentPassword } from "./lib/password-history";
 import { betterAuthConsume } from "./lib/ratelimit";
 import { invitePreview } from "./modules/tenancy/invites";
 import { onOrganizationCreated } from "./modules/today/org-hooks";
@@ -120,7 +130,30 @@ const log = logger("auth");
  *   step is pending. A completed reset also verifies the email (the link reached the inbox).
  * - Changing the password needs the current one and always signs the other sessions out.
  * Floor PIN sessions (fs1. tokens, modules/tenancy/floor-auth.ts) are separate and untouched.
+ *
+ * Amazon DPP controls (T-28-2, ADR 0025); the error codes are the contract's AUTH_ERROR_CODES:
+ * - Lockout: 10 wrong passwords in a row for one email (known or not) lock its sign-in for 30
+ *   minutes: ACCOUNT_LOCKED (423, retryAfterSec), checked before the endpoint so no session is
+ *   made. One email per lock; a password reset unlocks (src/lib/account-lockout.ts).
+ * - Password history: a new password equal to the current one or any of the previous 9 gets
+ *   PASSWORD_REUSED (400) on change and reset (src/lib/password-history.ts).
+ * - Required two-step sign-in for owners/admins: enforced in the oRPC guard (src/lib/mfa.ts);
+ *   here, a required user can't turn it off (MFA_DISABLE_NOT_ALLOWED, 403).
  */
+
+/** A Better Auth error with one of the contract's auth codes (the web maps them by code). */
+function authError(
+  status: "LOCKED" | "BAD_REQUEST" | "FORBIDDEN",
+  code: AuthErrorCode,
+  message: string,
+  extra: Record<string, unknown> = {},
+  headers: Record<string, string> = {},
+) {
+  return new APIError(status, { code, message, ...extra }, headers);
+}
+
+const passwordReused = () =>
+  authError("BAD_REQUEST", "PASSWORD_REUSED", "Choose a password you haven't used before");
 
 /** Verification links work for 24 hours: a slow or spam-filtered email must not strand a new shop. */
 export const EMAIL_VERIFICATION_TTL_SEC = 24 * 60 * 60;
@@ -185,6 +218,9 @@ export const authOptions = {
     },
     onPasswordReset: async ({ user }) => {
       log.info("password reset", { userId: user.id });
+      // Better Auth updates the password with an updateMany, whose hook gets no row.
+      await recordCurrentPassword(user.id);
+      await clearLock(user.email);
       // The reset link reached this inbox, so the email is proven.
       if (!user.emailVerified) {
         await db.update(users).set({ emailVerified: true }).where(eq(users.id, user.id));
@@ -266,9 +302,66 @@ export const authOptions = {
   },
   hooks: {
     before: createAuthMiddleware(async (ctx) => {
-      // Changing the password always signs the other sessions out, whatever the client sends.
+      // A locked email answers 423 before the endpoint runs: no password check, no session.
+      if (ctx.path === "/sign-in/email" && typeof ctx.body?.email === "string") {
+        const retryAfterSec = await lockedFor(ctx.body.email);
+        if (retryAfterSec !== null) {
+          throw authError(
+            "LOCKED",
+            "ACCOUNT_LOCKED",
+            "Too many wrong passwords. Try again later, or reset your password.",
+            { retryAfterSec },
+            { "Retry-After": String(retryAfterSec) },
+          );
+        }
+      }
       if (ctx.path === "/change-password") {
+        // Only with the right current password: otherwise a stolen session could test guesses
+        // against the old passwords. A wrong one falls through to the endpoint's INVALID_PASSWORD.
+        const session = await getSessionFromCtx(ctx);
+        const { currentPassword, newPassword } = (ctx.body ?? {}) as Record<string, unknown>;
+        if (session && typeof currentPassword === "string" && typeof newPassword === "string") {
+          const verify = ctx.context.password.verify;
+          const current = await ctx.context.internalAdapter.findCredentialAccount(session.user.id);
+          if (
+            current?.password &&
+            (await verify({ hash: current.password, password: currentPassword })) &&
+            (await isReusedPassword(session.user.id, newPassword, verify))
+          ) {
+            throw passwordReused();
+          }
+        }
+        // Changing the password always signs the other sessions out, whatever the client sends.
         return { context: { body: { ...(ctx.body ?? {}), revokeOtherSessions: true } } };
+      }
+      if (ctx.path === "/reset-password") {
+        // Find the user from the reset token without consuming it; a bad or expired token falls
+        // through to the endpoint's INVALID_TOKEN.
+        const token = ctx.body?.token ?? ctx.query?.token;
+        const newPassword = ctx.body?.newPassword;
+        if (typeof token === "string" && typeof newPassword === "string") {
+          const verification = await ctx.context.internalAdapter.findVerificationValue(
+            `reset-password:${token}`,
+          );
+          if (
+            verification &&
+            verification.expiresAt > new Date() &&
+            (await isReusedPassword(verification.value, newPassword, ctx.context.password.verify))
+          ) {
+            throw passwordReused();
+          }
+        }
+      }
+      // Owners and admins of a real shop must keep two-step sign-in on (ADR 0025).
+      if (ctx.path === "/two-factor/disable") {
+        const session = await getSessionFromCtx(ctx);
+        if (session && (await loadMfaState(session.user.id))?.required) {
+          throw authError(
+            "FORBIDDEN",
+            "MFA_DISABLE_NOT_ALLOWED",
+            "Owners and admins must keep two-step sign-in on",
+          );
+        }
       }
       // Two-step sign-in needs a verified email first. Otherwise someone who signed up with a
       // stranger's address could turn it on and lock the real owner out even after a reset.
@@ -283,6 +376,23 @@ export const authOptions = {
       }
     }),
     after: createAuthMiddleware(async (ctx) => {
+      if (ctx.path === "/sign-in/email" && typeof ctx.body?.email === "string") {
+        const email: string = ctx.body.email;
+        const returned = ctx.context.returned;
+        if (isAPIError(returned)) {
+          if (
+            (returned.body as { code?: string } | undefined)?.code !== "INVALID_EMAIL_OR_PASSWORD"
+          )
+            return;
+          const { crossed } = await recordFailure(email);
+          // Not awaited: the locking attempt answers like any wrong password, without SMTP.
+          if (crossed) void notifyLocked(email);
+        } else if (returned) {
+          // The password was right (a pending second step included): the streak ends.
+          await clearAfterSuccess(email);
+        }
+        return;
+      }
       if (ctx.path !== "/change-password") return;
       const returned = ctx.context.returned as { user?: MailUser } | undefined;
       if (!returned || isAPIError(returned) || !returned.user) return;
@@ -291,6 +401,22 @@ export const authOptions = {
     }),
   },
   databaseHooks: {
+    // Password history: every password set (sign-up, invite, seed, change; reset is in
+    // onPasswordReset) enters it.
+    account: {
+      create: {
+        after: async (account) => {
+          if (account.providerId === "credential") await recordCurrentPassword(account.userId);
+        },
+      },
+      update: {
+        after: async (account) => {
+          if (account?.providerId === "credential" && account.userId) {
+            await recordCurrentPassword(account.userId);
+          }
+        },
+      },
+    },
     user: {
       update: {
         // Two-step sign-in flips on in /two-factor/verify-totp (first code) and off in /disable.
@@ -333,6 +459,11 @@ export const authOptions = {
       requireEmailVerificationOnInvitation: false,
       organizationHooks: {
         afterAcceptInvitation: async ({ invitation, user }) => {
+          // Joining as owner/admin starts a fresh two-step grace period (ADR 0025).
+          await restartGraceIfNewlyRequired(
+            user.id,
+            await isUserMfaRequired(user.id, { excludeOrgId: invitation.organizationId }),
+          );
           if (user.emailVerified) return;
           await db
             .update(users)
@@ -345,8 +476,13 @@ export const authOptions = {
             );
         },
         // Default "Main" location, trial subscription, company.created (src/modules/today).
-        afterCreateOrganization: async ({ organization: org }) => {
+        afterCreateOrganization: async ({ organization: org, user }) => {
           await onOrganizationCreated({ id: org.id, type: org.type as string | undefined });
+          // The creator is its owner: a fresh two-step grace period if that's new (ADR 0025).
+          await restartGraceIfNewlyRequired(
+            user.id,
+            await isUserMfaRequired(user.id, { excludeOrgId: org.id }),
+          );
         },
       },
       schema: {

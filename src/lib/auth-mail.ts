@@ -131,6 +131,28 @@ export function securityNoticeEmail(locale: AuthMailLocale, kind: SecurityNotice
   return { subject: notice.subject, text, html };
 }
 
+const LOCKED: Record<AuthMailLocale, (minutes: number) => { subject: string; body: string }> = {
+  en: (m) => ({
+    subject: `Your InvAI sign-in is locked for ${m} minutes`,
+    body: `Someone typed the wrong password for your InvAI account too many times, so we locked sign-in for ${m} minutes. To get in now, reset your password: that unlocks your account at once.`,
+  }),
+  es: (m) => ({
+    subject: `Bloqueamos el inicio de sesión de InvAI por ${m} minutos`,
+    body: `Alguien escribió mal la contraseña de tu cuenta de InvAI demasiadas veces, así que bloqueamos el inicio de sesión por ${m} minutos. Para entrar ahora, cambia tu contraseña: eso desbloquea tu cuenta de inmediato.`,
+  }),
+};
+
+/** The one email per account lock (T-28-2): how long it lasts, and that a reset unlocks it now. */
+export function accountLockedEmail(locale: AuthMailLocale, minutes: number): AuthMail {
+  const { subject, body } = LOCKED[locale](minutes);
+  const resetLink = `${env.WEB_ORIGIN}/forgot-password`;
+  const text = `${body}\n\n${resetLink}\n\n${NOT_YOU[locale]}`;
+  const html = `<p>${escapeHtml(body)}</p>
+<p><a href="${escapeHtml(resetLink)}">${escapeHtml(resetLink)}</a></p>
+<p style="color:#666">${escapeHtml(NOT_YOU[locale])}</p>`;
+  return { subject, text, html };
+}
+
 /** How long an account email may wait on the mail server before it is logged as not sent. */
 export const AUTH_MAIL_TIMEOUT_MS = 15_000;
 
@@ -140,7 +162,7 @@ export const AUTH_MAIL_TIMEOUT_MS = 15_000;
  */
 export function sendAuthMail(
   to: string,
-  kind: "verify_email" | "reset_password" | SecurityNotice,
+  kind: "verify_email" | "reset_password" | "account_locked" | SecurityNotice,
   mail: AuthMail,
   timeoutMs = AUTH_MAIL_TIMEOUT_MS,
 ): Promise<boolean> {

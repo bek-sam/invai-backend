@@ -7,6 +7,7 @@ import type { CompanyType, Role, StationKind } from "../db/schema";
 import { companies, members, stations, users } from "../db/schema";
 import type { Actor } from "../lib/audit";
 import { logger } from "../lib/log";
+import { type MfaState, mfaState } from "../lib/mfa";
 import {
   isFloorSessionRevoked,
   isStationTokenLive,
@@ -19,7 +20,14 @@ const log = logger("context");
 export type SessionKind = "user" | "floor" | "station";
 
 export type StationInfo = { id: string; name: string; kind: StationKind | null; tokenId: string };
-export type Membership = { orgId: string; name: string; type: CompanyType; role: Role };
+/** `demo`: a sample workspace (tenancy.demo); it never makes two-step sign-in required. */
+export type Membership = {
+  orgId: string;
+  name: string;
+  type: CompanyType;
+  role: Role;
+  demo: boolean;
+};
 
 /** Built once per request from the cookie session, a floor session or a station token. */
 export type Context = {
@@ -39,6 +47,11 @@ export type Context = {
   memberships: Membership[];
   /** The Better Auth session id for user sessions (used by me.switchOrg). */
   authSessionId: string | null;
+  /**
+   * Required two-step sign-in state (user sessions only, src/lib/mfa.ts). `guard` refuses with
+   * MFA_REQUIRED once it blocks; absent for floor and station sessions.
+   */
+  mfa?: MfaState;
   /** Set by `ResponseHeadersPlugin` (api/app.ts): headers a middleware wants on the HTTP response
    * even when it throws (e.g. `Retry-After` on RATE_LIMITED). Absent outside a real request (tests
    * calling a procedure directly with `call()`). */
@@ -217,12 +230,18 @@ async function userContext(ctx: Context, headers: Headers): Promise<Context | nu
       name: companies.name,
       type: companies.type,
       role: members.role,
-      status: members.status,
+      demo: companies.demo,
     })
     .from(members)
     .innerJoin(companies, eq(companies.id, members.organizationId))
     .where(and(eq(members.userId, session.user.id), eq(members.status, "active")))
     .orderBy(members.createdAt);
+  const [account] = await db
+    .select({ enabled: users.twoFactorEnabled, graceStartsAt: users.mfaGraceStartsAt })
+    .from(users)
+    .where(eq(users.id, session.user.id))
+    .limit(1);
+  if (!account) return null;
   const activeId = session.session.activeOrganizationId ?? null;
   const active = memberships.find((m) => m.orgId === activeId) ?? memberships[0] ?? null;
   return {
@@ -235,8 +254,13 @@ async function userContext(ctx: Context, headers: Headers): Promise<Context | nu
     role: active?.role ?? null,
     permissions:
       active && roleFits(active.type, active.role) ? permissionsFor(active.role) : NO_PERMISSIONS,
-    memberships: memberships.map(({ orgId, name, type, role }) => ({ orgId, name, type, role })),
+    memberships,
     authSessionId: session.session.id,
+    mfa: mfaState({
+      memberships,
+      twoFactorEnabled: account.enabled,
+      graceStartsAt: account.graceStartsAt,
+    }),
   };
 }
 

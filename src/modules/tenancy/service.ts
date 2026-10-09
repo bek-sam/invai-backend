@@ -18,6 +18,7 @@ import {
 import { isPlaceholderEmail, PIN_ONLY_EMAIL_DOMAIN } from "../../integrations/vendors/mailer";
 import { audit } from "../../lib/audit";
 import { badRequest, conflict, forbidden, notFound, ORPCError } from "../../lib/errors";
+import { isUserMfaRequired, restartGraceIfNewlyRequired } from "../../lib/mfa";
 import { keyset, type PageInput } from "../../lib/pagination";
 import { assertWithinPlan } from "../billing/service";
 import { issueStationToken, revokeStationTokens, setPin } from "./floor-auth";
@@ -116,6 +117,16 @@ export async function me(tx: Tx, ctx: Context & { tenant: TenantContext }): Prom
       ? { id: tenant.station.id, name: tenant.station.name, kind: tenant.station.kind }
       : null,
     onboarding: company.type === "vendor" ? null : await onboardingChecklist(tx, tenant.companyId),
+    // Web sessions only: a floor PIN session has no two-step state (T-28-2).
+    ...(ctx.sessionKind === "user" && ctx.mfa
+      ? {
+          mfa: {
+            required: ctx.mfa.required,
+            enabled: ctx.mfa.enabled,
+            deadline: ctx.mfa.deadline?.toISOString() ?? null,
+          },
+        }
+      : {}),
   };
 }
 
@@ -558,12 +569,15 @@ export async function changeRole(
   }
   if (current === "owner" && input.role !== "owner" && (await activeOwnerCount(ctx.companyId)) <= 1)
     throw conflict("A company needs at least one owner");
+  const wasMfaRequired = await isUserMfaRequired(input.userId);
   const [row] = await db
     .update(members)
     .set({ role: input.role })
     .where(and(eq(members.organizationId, ctx.companyId), eq(members.userId, input.userId)))
     .returning({ id: members.id });
   if (!row) throw notFound("user", input.userId);
+  // Promoted to owner/admin: a fresh two-step grace period, not an instant block (T-28-2).
+  await restartGraceIfNewlyRequired(input.userId, wasMfaRequired);
   await audit(tx, {
     companyId: ctx.companyId,
     actor: ctx.actor,
@@ -613,12 +627,15 @@ export async function setMemberStatus(
     (await activeOwnerCount(ctx.companyId)) <= 1
   )
     throw conflict("A company needs at least one owner");
+  const wasMfaRequired = await isUserMfaRequired(userId);
   const [row] = await db
     .update(members)
     .set({ status })
     .where(and(eq(members.organizationId, ctx.companyId), eq(members.userId, userId)))
     .returning({ id: members.id });
   if (!row) throw notFound("user", userId);
+  // A reactivated owner/admin gets a fresh two-step grace period (T-28-2).
+  if (status === "active") await restartGraceIfNewlyRequired(userId, wasMfaRequired);
   if (status === "deactivated") {
     await tx.update(staffPins).set({ active: false }).where(eq(staffPins.userId, userId));
   }
