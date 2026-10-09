@@ -18,6 +18,10 @@ const GLOBAL_TABLES = new Set([
   // twoFactor plugin (T-2-3): one row per user, keyed by user_id, no company. Read by Better Auth
   // over the app connection like `accounts`; the TOTP secret and backup codes are encrypted.
   "two_factors",
+  // T-28-2 (ADR 0025): pre-auth lockout counters keyed by an email HMAC (no user, no company yet)
+  // and per-user password hashes like `accounts`; neither holds tenant data.
+  "sign_in_failures",
+  "password_history",
   "companies",
   "members",
   "invitations",

@@ -179,3 +179,58 @@ describe("floor session hardening", () => {
     expect(await resolveStationToken(token)).toBeNull();
   });
 });
+
+/*
+ * T-28-2 security review (ADR 0025). Both tests are `it.fails` acceptance markers: they pass
+ * (as expected failures) while the gap is open, and turn red once fixed; then drop `.fails`.
+ */
+describe("T-28-2 account controls (security review)", () => {
+  // S-57: the lock is checked before the endpoint and counted after the scrypt verify, so a burst
+  // of parallel attempts all pass the check before any of them is counted. The number of
+  // passwords one burst can test is bounded by concurrency (per-IP limit x IPs), not by 10.
+  it.fails("S-57: one burst of parallel sign-ins can test at most ACCOUNT_LOCK_THRESHOLD passwords", async () => {
+    const { app } = await import("../../api/app");
+    const { env } = await import("../../env");
+    const email = `s57-${Date.now()}@nobody.test`;
+    const attempt = async () => {
+      const res = await app.request("/api/auth/sign-in/email", {
+        method: "POST",
+        headers: { "content-type": "application/json", origin: env.WEB_ORIGIN },
+        body: JSON.stringify({ email, password: "wrong password 9" }),
+      });
+      return res.status;
+    };
+    const statuses = await Promise.all(Array.from({ length: 40 }, attempt));
+    // 401 = the password was actually checked; everything past the threshold must be 423.
+    expect(statuses.filter((s) => s === 401).length).toBeLessThanOrEqual(
+      env.ACCOUNT_LOCK_THRESHOLD,
+    );
+  });
+
+  // S-58: the grace restart fires whenever a not-required user becomes required, including a
+  // demote-then-promote (or deactivate-then-reactivate) of the same person, so two admins can
+  // keep each other's two-step deadline in the future forever.
+  it.fails("S-58: demoting and re-promoting a past-deadline admin does not restart the grace", async () => {
+    const { users } = await import("../../db/schema");
+    const { loadMfaState, mfaBlocks } = await import("../../lib/mfa");
+    const companyId = (await createCompany()).id;
+    const ownerId = (await createUser(companyId, "owner")).id;
+    const adminId = (await createUser(companyId, "admin")).id;
+    await db
+      .update(users)
+      .set({ mfaGraceStartsAt: new Date(Date.now() - 60 * 24 * 60 * 60 * 1000) })
+      .where(eq(users.id, adminId));
+    expect(mfaBlocks((await loadMfaState(adminId)) ?? undefined), "blocked before").toBe(true);
+    const owner = tenantContext(companyId, ownerId, "owner");
+    await withTenant(companyId, (tx) =>
+      svc.changeRole(tx, owner, { userId: adminId, role: "office" }),
+    );
+    await withTenant(companyId, (tx) =>
+      svc.changeRole(tx, owner, { userId: adminId, role: "admin" }),
+    );
+    expect(
+      mfaBlocks((await loadMfaState(adminId)) ?? undefined),
+      "still blocked after re-promotion",
+    ).toBe(true);
+  });
+});
