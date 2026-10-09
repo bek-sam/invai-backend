@@ -28,9 +28,9 @@ import { env } from "./env";
 import {
   clearAfterSuccess,
   clearLock,
-  lockedFor,
+  giveBack,
   notifyLocked,
-  recordFailure,
+  reserveAttempt,
 } from "./lib/account-lockout";
 import {
   localeOf,
@@ -302,10 +302,12 @@ export const authOptions = {
   },
   hooks: {
     before: createAuthMiddleware(async (ctx) => {
-      // A locked email answers 423 before the endpoint runs: no password check, no session.
+      // Every attempt is counted before the password check (S-57). Past the threshold, or while
+      // locked, it answers 423 before the endpoint runs: no password check, no session.
       if (ctx.path === "/sign-in/email" && typeof ctx.body?.email === "string") {
-        const retryAfterSec = await lockedFor(ctx.body.email);
-        if (retryAfterSec !== null) {
+        const { allowed, retryAfterSec: retry } = await reserveAttempt(ctx.body.email);
+        if (!allowed) {
+          const retryAfterSec = retry ?? 1;
           throw authError(
             "LOCKED",
             "ACCOUNT_LOCKED",
@@ -382,11 +384,14 @@ export const authOptions = {
         if (isAPIError(returned)) {
           if (
             (returned.body as { code?: string } | undefined)?.code !== "INVALID_EMAIL_OR_PASSWORD"
-          )
+          ) {
+            // No password was tested (bad input, unverified email): the attempt doesn't count.
+            await giveBack(email);
             return;
-          const { crossed } = await recordFailure(email);
-          // Not awaited: the locking attempt answers like any wrong password, without SMTP.
-          if (crossed) void notifyLocked(email);
+          }
+          // Counted in the before-hook. Not awaited: a wrong password answers like any other,
+          // without SMTP; the first failure once the email is locked sends the one lock email.
+          void notifyLocked(email);
         } else if (returned) {
           // The password was right (a pending second step included): the streak ends.
           await clearAfterSuccess(email);

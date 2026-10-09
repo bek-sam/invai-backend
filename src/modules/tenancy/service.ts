@@ -634,8 +634,9 @@ export async function setMemberStatus(
     .where(and(eq(members.organizationId, ctx.companyId), eq(members.userId, userId)))
     .returning({ id: members.id });
   if (!row) throw notFound("user", userId);
-  // A reactivated owner/admin gets a fresh two-step grace period (T-28-2).
-  if (status === "active") await restartGraceIfNewlyRequired(userId, wasMfaRequired);
+  // A reactivated owner/admin gets a fresh two-step grace period, once per user (T-28-2, S-58);
+  // deactivating a required one records that, so a later reactivation doesn't restart it.
+  await restartGraceIfNewlyRequired(userId, wasMfaRequired);
   if (status === "deactivated") {
     await tx.update(staffPins).set({ active: false }).where(eq(staffPins.userId, userId));
   }

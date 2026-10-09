@@ -1,0 +1,1 @@
+ALTER TABLE "users" ADD COLUMN "mfa_required_since" timestamp with time zone;

@@ -302,6 +302,13 @@
       "when": 1791557243469,
       "tag": "0042_auth_lockout_password_history_mfa",
       "breakpoints": true
+    },
+    {
+      "idx": 43,
+      "version": "7",
+      "when": 1791559624219,
+      "tag": "0043_auth_mfa_required_since",
+      "breakpoints": true
     }
   ]
 }

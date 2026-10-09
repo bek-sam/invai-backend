@@ -53,6 +53,11 @@ export const users = pgTable("users", {
    * No backfill: rows that existed before the migration got the migration time.
    */
   mfaGraceStartsAt: timestamp({ withTimezone: true }).notNull().defaultNow(),
+  /**
+   * First time the user was seen required for two-step sign-in (S-58). Set once, never cleared:
+   * the grace restarts only while this is null, so demote/re-promote can't postpone the deadline.
+   */
+  mfaRequiredSince: timestamp({ withTimezone: true }),
   ...timestamps,
 });
 

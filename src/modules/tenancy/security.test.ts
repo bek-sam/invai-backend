@@ -188,7 +188,7 @@ describe("T-28-2 account controls (security review)", () => {
   // S-57: the lock is checked before the endpoint and counted after the scrypt verify, so a burst
   // of parallel attempts all pass the check before any of them is counted. The number of
   // passwords one burst can test is bounded by concurrency (per-IP limit x IPs), not by 10.
-  it.fails("S-57: one burst of parallel sign-ins can test at most ACCOUNT_LOCK_THRESHOLD passwords", async () => {
+  it("S-57: one burst of parallel sign-ins can test at most ACCOUNT_LOCK_THRESHOLD passwords", async () => {
     const { app } = await import("../../api/app");
     const { env } = await import("../../env");
     const email = `s57-${Date.now()}@nobody.test`;
@@ -210,7 +210,7 @@ describe("T-28-2 account controls (security review)", () => {
   // S-58: the grace restart fires whenever a not-required user becomes required, including a
   // demote-then-promote (or deactivate-then-reactivate) of the same person, so two admins can
   // keep each other's two-step deadline in the future forever.
-  it.fails("S-58: demoting and re-promoting a past-deadline admin does not restart the grace", async () => {
+  it("S-58: demoting and re-promoting a past-deadline admin does not restart the grace", async () => {
     const { users } = await import("../../db/schema");
     const { loadMfaState, mfaBlocks } = await import("../../lib/mfa");
     const companyId = (await createCompany()).id;

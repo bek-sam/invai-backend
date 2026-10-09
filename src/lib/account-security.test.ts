@@ -25,7 +25,7 @@ const { router } = await import("../api/router");
 const { db, withSystem, withTenant } = await import("../db/client");
 const { companies, members, passwordHistory, signInFailures, users } = await import("../db/schema");
 const { env } = await import("../env");
-const { emailKey, recordFailure } = await import("./account-lockout");
+const { emailKey, giveBack, reserveAttempt } = await import("./account-lockout");
 const { isMfaRequired, mfaBlocks, mfaState } = await import("./mfa");
 const { PASSWORD_HISTORY_SIZE, recordCurrentPassword } = await import("./password-history");
 const { changeRole } = await import("../modules/tenancy/service");
@@ -205,11 +205,48 @@ describe("sign-in lockout (B-185)", () => {
     expect((await signIn(email)).res.status).toBe(423);
   });
 
-  it("counting is atomic: exactly one of N concurrent failures crosses the threshold", async () => {
+  it("counting is atomic: exactly one of N concurrent attempts crosses, only threshold are allowed", async () => {
     const email = uniqEmail("atomic");
-    const results = await Promise.all(Array.from({ length: 20 }, () => recordFailure(email)));
+    const results = await Promise.all(Array.from({ length: 20 }, () => reserveAttempt(email)));
     expect(results.filter((r) => r.crossed)).toHaveLength(1);
+    expect(results.filter((r) => r.allowed)).toHaveLength(env.ACCOUNT_LOCK_THRESHOLD);
     expect(Math.max(...results.map((r) => r.failures))).toBe(20);
+  });
+
+  it("S-57: a burst of 40 tests at most 10 passwords; the right one inside a locked burst gets no session", async () => {
+    const email = uniqEmail("burst40");
+    await signUp(email);
+    const wrongs = Array.from({ length: 39 }, () =>
+      signIn(email, "wrong password 9").then((r) => r.res.status),
+    );
+    // The right password, sent once the 10 allowed attempts are already counted.
+    await vi.waitFor(async () => {
+      const [row] = await db
+        .select({ failures: signInFailures.failures })
+        .from(signInFailures)
+        .where(eq(signInFailures.emailHmac, emailKey(email)));
+      expect(row?.failures ?? 0).toBeGreaterThanOrEqual(env.ACCOUNT_LOCK_THRESHOLD);
+    });
+    const right = await signIn(email);
+    const statuses = await Promise.all(wrongs);
+    expect(statuses.filter((s) => s === 401)).toHaveLength(env.ACCOUNT_LOCK_THRESHOLD);
+    expect(statuses.filter((s) => s === 423)).toHaveLength(39 - env.ACCOUNT_LOCK_THRESHOLD);
+    expect(right.res.status).toBe(423);
+    expect(right.cookie).toBe("");
+    await vi.waitFor(() => expect(lockMails(email)).toHaveLength(1), { timeout: 5_000 });
+  });
+
+  it("an attempt that tested no password is given back", async () => {
+    const email = uniqEmail("giveback");
+    for (let i = 0; i < 10; i++) await reserveAttempt(email);
+    await giveBack(email);
+    const [row] = await db
+      .select()
+      .from(signInFailures)
+      .where(eq(signInFailures.emailHmac, emailKey(email)));
+    expect(row?.failures).toBe(9);
+    expect(row?.lockedUntil).toBeNull();
+    expect((await reserveAttempt(email)).allowed).toBe(true);
   });
 });
 

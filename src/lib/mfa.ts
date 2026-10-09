@@ -1,4 +1,4 @@
-import { and, eq, ne } from "drizzle-orm";
+import { and, eq, isNull, ne } from "drizzle-orm";
 import { db } from "../db/client";
 import { type CompanyType, companies, members, type Role, users } from "../db/schema";
 import { env } from "../env";
@@ -13,7 +13,10 @@ import { logger } from "./log";
  *   never required. It is per user, not per active org, so `me.switchOrg` can't dodge it.
  * - Deadline = `users.mfa_grace_starts_at` + MFA_GRACE_DAYS. The start is restarted (now()) when
  *   a user who was not required becomes required (`restartGraceIfNewlyRequired`): role change,
- *   reactivation, invitation accepted, creating a real org.
+ *   reactivation, invitation accepted, creating a real org. At most once per user (S-58):
+ *   `users.mfa_required_since` is set the first time the user is seen required (that restart, or
+ *   a demotion/deactivation of an already-required user) and never cleared; while it is set, no
+ *   restart happens, so demote/re-promote can't keep the deadline in the future.
  * - Enforcement: `guard` in src/api/orpc.ts answers MFA_REQUIRED (403, data.deadline) for user
  *   sessions past the deadline without two-step sign-in, except MFA_EXEMPT_PROCEDURES. Better
  *   Auth routes, floor and station sessions, webhooks, SSE /events and /l links are outside it.
@@ -106,8 +109,21 @@ export async function restartGraceIfNewlyRequired(
   userId: string,
   wasRequired: boolean,
 ): Promise<boolean> {
-  if (wasRequired || !(await isUserMfaRequired(userId))) return false;
-  await db.update(users).set({ mfaGraceStartsAt: new Date() }).where(eq(users.id, userId));
+  const firstTime = and(eq(users.id, userId), isNull(users.mfaRequiredSince));
+  if (wasRequired) {
+    // Seen required (before a demotion or deactivation, say): any later promotion keeps the
+    // deadline this user already has.
+    await db.update(users).set({ mfaRequiredSince: new Date() }).where(firstTime);
+    return false;
+  }
+  if (!(await isUserMfaRequired(userId))) return false;
+  const now = new Date();
+  const [row] = await db
+    .update(users)
+    .set({ mfaGraceStartsAt: now, mfaRequiredSince: now })
+    .where(firstTime)
+    .returning({ id: users.id });
+  if (!row) return false;
   log.info("two-step grace started", { userId });
   return true;
 }

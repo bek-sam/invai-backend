@@ -9,24 +9,28 @@ import { logger } from "./log";
 /*
  * Per-email sign-in lockout (T-28-2, B-185, ADR 0025, Amazon DPP "lockout after ten unsuccessful
  * login attempts"). Wired into Better Auth's /sign-in/email hooks in src/auth.ts:
- *   before: `lockedFor(email)` -> 423 ACCOUNT_LOCKED, so the endpoint (and any session) never runs;
- *   after:  INVALID_EMAIL_OR_PASSWORD -> `recordFailure(email)`; success -> `clearAfterSuccess`.
- * A completed password reset clears the row (`clearLock`).
+ *   before: `reserveAttempt(email)` counts the attempt BEFORE the password check (S-57). Only
+ *           attempts 1..threshold reach the check; the one that reaches the threshold sets the
+ *           lock, and every later one answers 423 ACCOUNT_LOCKED without running the endpoint (no
+ *           password check, no session). So one parallel burst tests at most `threshold`
+ *           passwords.
+ *   after:  INVALID_EMAIL_OR_PASSWORD -> `notifyLocked` (one email per lock); a right password ->
+ *           `clearAfterSuccess`; any other error -> `giveBack` (no password was tested).
+ * A completed password reset clears the row (`clearLock`). If the endpoint dies without an answer
+ * (a 500), the attempt stays counted: failing closed.
  *
- * The key is an HMAC of the normalized email, so the table never holds an address, and an email
- * with no account locks exactly like a real one (no account-exists signal). The per-IP limit
- * (decision 0008) is separate and unchanged. Counting is one atomic upsert, so N parallel wrong
- * passwords count N, and exactly one of them sees the count reach the threshold: that one sends
- * the single "account locked" email.
+ * The key is an HMAC of the normalized email under BETTER_AUTH_SECRET, so the table never holds
+ * an address, and an email with no account locks exactly like a real one (no account-exists
+ * signal). Rotating the secret resets every counter. The per-IP limit (decision 0008) is separate.
  *
  * A row is stale (the count starts again at 1) once its lock has ended, or when it was not locked
- * and the last failure is older than FAILURE_WINDOW_HOURS. New rows also sweep up to 500 stale
- * ones, so the table holds about a day of failures at most.
+ * and the last attempt is older than FAILURE_WINDOW_HOURS. New rows also sweep up to 500 stale
+ * ones, so the table holds about a day of attempts at most.
  */
 
 const log = logger("auth.lockout");
 
-/** Failures older than this (with no lock) no longer count toward the next lock. */
+/** Attempts older than this (with no lock) no longer count toward the next lock. */
 export const FAILURE_WINDOW_HOURS = 24;
 
 export const normalizeEmail = (email: string) => email.trim().toLowerCase();
@@ -35,28 +39,26 @@ export const normalizeEmail = (email: string) => email.trim().toLowerCase();
 export const emailKey = (email: string) =>
   hmacHex(env.BETTER_AUTH_SECRET, `sign-in-lock:${normalizeEmail(email)}`);
 
-/** Seconds until the email's lock ends, or null when it isn't locked. */
-export async function lockedFor(email: string): Promise<number | null> {
-  const res = await db.execute<{ retry: number }>(sql`
-    select greatest(1, ceil(extract(epoch from (locked_until - now()))))::int as retry
-    from sign_in_failures
-    where email_hmac = ${emailKey(email)} and locked_until > now()`);
-  return res.rows[0]?.retry ?? null;
-}
-
-export type FailureResult = {
+export type Reservation = {
+  /** False: the email is locked; answer 423 without checking the password. */
+  allowed: boolean;
+  /** Attempts counted in this streak, this one included (refused ones count too). */
   failures: number;
-  /** True for exactly one failure per lock: the one that reached the threshold. */
+  /** True for exactly one attempt per lock: the one that reached the threshold and set it. */
   crossed: boolean;
   retryAfterSec: number | null;
 };
 
-/** Count one wrong password for this email; locks it when the count reaches the threshold. */
-export async function recordFailure(
+/**
+ * Count one sign-in attempt for this email before its password is checked. One atomic upsert, so
+ * N parallel attempts count N, exactly one of them reaches the threshold (and sets the lock), and
+ * the ones past it are refused.
+ */
+export async function reserveAttempt(
   email: string,
   threshold = env.ACCOUNT_LOCK_THRESHOLD,
   minutes = env.ACCOUNT_LOCK_MINUTES,
-): Promise<FailureResult> {
+): Promise<Reservation> {
   const key = emailKey(email);
   const stale = sql`((f.locked_until is not null and f.locked_until <= now())
     or (f.locked_until is null
@@ -81,17 +83,40 @@ export async function recordFailure(
   if (!row) throw new Error("sign_in_failures upsert returned nothing");
   if (row.inserted) await sweepStale();
   return {
+    allowed: row.failures <= threshold,
     failures: row.failures,
     crossed: row.failures === threshold,
     retryAfterSec: row.retry,
   };
 }
 
-/** A right password ends the streak. A lock set meanwhile by parallel wrong attempts stays. */
-export async function clearAfterSuccess(email: string): Promise<void> {
+/**
+ * The attempt ended without testing a password (bad input, unverified email): uncount it. A lock
+ * that only this attempt's count had set is lifted again.
+ */
+export async function giveBack(
+  email: string,
+  threshold = env.ACCOUNT_LOCK_THRESHOLD,
+): Promise<void> {
+  await db.execute(sql`
+    update sign_in_failures set
+      failures = failures - 1,
+      locked_until = case when failures - 1 < ${threshold} then null else locked_until end
+    where email_hmac = ${emailKey(email)} and failures > 0`);
+}
+
+/**
+ * A right password ends the streak, including a lock its own attempt set (wrong 9 times, right
+ * the 10th). A lock that already refused attempts (count past the threshold) stays.
+ */
+export async function clearAfterSuccess(
+  email: string,
+  threshold = env.ACCOUNT_LOCK_THRESHOLD,
+): Promise<void> {
   await db.execute(sql`
     delete from sign_in_failures
-    where email_hmac = ${emailKey(email)} and (locked_until is null or locked_until <= now())`);
+    where email_hmac = ${emailKey(email)}
+      and (failures <= ${threshold} or locked_until is null or locked_until <= now())`);
 }
 
 /** A completed password reset proves the inbox: it ends any lock at once. */
@@ -109,30 +134,27 @@ async function sweepStale() {
 }
 
 /**
- * After the failure that locked the email: one email to the account (if one exists), and a warn
- * log with the user id only. `notified_at` is the once-per-lock guard on top of `crossed`.
- * Returns the delivery promise (tests await it); the auth hook doesn't.
+ * After a wrong password: if the email is locked and nobody was told yet, claim `notified_at`
+ * (once per lock, whichever failure gets there first), then send one email to the account (if
+ * one exists) and a warn log with the user id only. Returns the delivery promise (tests await
+ * it); the auth hook doesn't.
  */
 export async function notifyLocked(
   email: string,
   minutes = env.ACCOUNT_LOCK_MINUTES,
 ): Promise<boolean> {
-  const [user] = await db
-    .select({ id: users.id, email: users.email, locale: users.locale, pinOnly: users.pinOnly })
-    .from(users)
-    .where(sql`lower(${users.email}) = ${normalizeEmail(email)}`)
-    .limit(1);
-  if (!user) {
-    log.warn("sign-in locked", { userId: null });
-    return false;
-  }
-  log.warn("sign-in locked", { userId: user.id });
-  if (user.pinOnly) return false;
   const claimed = await db.execute(sql`
     update sign_in_failures set notified_at = now()
     where email_hmac = ${emailKey(email)} and notified_at is null and locked_until > now()
     returning email_hmac`);
   if (claimed.rows.length === 0) return false;
+  const [user] = await db
+    .select({ id: users.id, email: users.email, locale: users.locale, pinOnly: users.pinOnly })
+    .from(users)
+    .where(sql`lower(${users.email}) = ${normalizeEmail(email)}`)
+    .limit(1);
+  log.warn("sign-in locked", { userId: user?.id ?? null });
+  if (!user || user.pinOnly) return false;
   return sendAuthMail(
     user.email,
     "account_locked",
