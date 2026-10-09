@@ -234,3 +234,56 @@ describe("T-28-2 account controls (security review)", () => {
     ).toBe(true);
   });
 });
+
+describe("T-29-2 two-step sample rule (security review)", () => {
+  // ADR 0028: only `isSampleRow` (demoOwnerUserId set or settings.demoRetiredAt) exempts an org.
+  // A real shop's owner must not be able to write either marker through the org settings
+  // procedures and so drop their own two-step requirement.
+  it("a real shop owner cannot make the shop look like a sample through me.updateOrg or today.dismissChecklist", async () => {
+    const { call } = await import("@orpc/server");
+    const { router } = await import("../../api/router");
+    const { anonymousContext, permissionsFor } = await import("../../api/context");
+    const { companies } = await import("../../db/schema");
+    const { isUserMfaRequired } = await import("../../lib/mfa");
+    const companyId = (await createCompany()).id;
+    const ownerId = (await createUser(companyId, "owner")).id;
+    expect(await isUserMfaRequired(ownerId), "required before").toBe(true);
+    const owner = {
+      ...anonymousContext(new Headers(), null),
+      sessionKind: "user" as const,
+      user: { id: ownerId, name: "o", email: "o@test.local" },
+      emailVerified: true,
+      companyId,
+      orgType: "shop" as const,
+      role: "owner" as const,
+      permissions: permissionsFor("owner"),
+    };
+    const smuggled = {
+      name: "Still real",
+      demoOwnerUserId: ownerId,
+      demoRetiredAt: new Date().toISOString(),
+      settings: { demoRetiredAt: new Date().toISOString() },
+    } as never;
+    await call(router.me.updateOrg, smuggled, { context: owner });
+    await call(router.today.dismissChecklist, { dismissed: true } as never, { context: owner });
+    const [row] = await db
+      .select({ name: companies.name, o: companies.demoOwnerUserId, s: companies.settings })
+      .from(companies)
+      .where(eq(companies.id, companyId));
+    expect(row?.name).toBe("Still real");
+    expect(row?.o).toBeNull();
+    expect(row?.s?.demoRetiredAt).toBeUndefined();
+    expect(await isUserMfaRequired(ownerId), "still required").toBe(true);
+  });
+
+  it("a sample membership never removes the requirement a real owner/admin membership carries", async () => {
+    const { isMfaRequired } = await import("../../lib/mfa");
+    expect(
+      isMfaRequired([
+        { type: "shop", role: "owner", sample: true },
+        { type: "shop", role: "admin", sample: false },
+      ]),
+    ).toBe(true);
+    expect(isMfaRequired([{ type: "shop", role: "owner", sample: true }])).toBe(false);
+  });
+});
