@@ -63,6 +63,19 @@ const raw = createEnv({
     FLOOR_TOKEN_SECRET: z.string().min(32).optional(),
     FLOOR_SESSION_TTL_HOURS: z.coerce.number().default(12),
     /**
+     * Account security (T-28-2, ADR 0025, Amazon DPP): this many wrong passwords in a row for one
+     * email lock its sign-in for ACCOUNT_LOCK_MINUTES (at most 10: the DPP's ceiling). Owners and
+     * admins must turn on two-step sign-in within MFA_GRACE_DAYS (0–14).
+     */
+    ACCOUNT_LOCK_THRESHOLD: z.coerce.number().int().min(1).max(10).default(10),
+    ACCOUNT_LOCK_MINUTES: z.coerce
+      .number()
+      .int()
+      .min(1)
+      .max(24 * 60)
+      .default(30),
+    MFA_GRACE_DAYS: z.coerce.number().int().min(0).max(14).default(7),
+    /**
      * Oldest `X-Contract-Version` a floor tablet may call with (T-13-1, ADR 0012). Defaults to
      * contracts' hand-maintained `FLOOR_COMPAT_BASELINE`, not `CONTRACT_VERSION`, so a version bump
      * alone never refuses current tablets. The env var is the emergency/rollback override.

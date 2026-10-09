@@ -26,7 +26,8 @@ import {
 
 /*
  * Better Auth tables (users, sessions, accounts, verifications, two_factors, companies, members,
- * invitations) are NOT tenant tables: authentication runs before the tenant is known, so they carry no RLS.
+ * invitations) and the account-security tables (sign_in_failures, password_history) are NOT tenant
+ * tables: authentication runs before the tenant is known, so they carry no RLS.
  * Only src/auth.ts and modules/tenancy touch them. Every other table in this file is a tenant
  * table with `company_id` and a policy.
  */
@@ -46,6 +47,12 @@ export const users = pgTable("users", {
    * synthetic placeholder (`PIN_ONLY_EMAIL_DOMAIN`) that nothing may ever mail or display.
    */
   pinOnly: boolean().notNull().default(false),
+  /**
+   * Start of the grace period for required two-step sign-in (T-28-2, ADR 0025): deadline = this +
+   * MFA_GRACE_DAYS. Restarted when a user who was not required becomes required (src/lib/mfa.ts).
+   * No backfill: rows that existed before the migration got the migration time.
+   */
+  mfaGraceStartsAt: timestamp({ withTimezone: true }).notNull().defaultNow(),
   ...timestamps,
 });
 
@@ -175,6 +182,43 @@ export const twoFactors = pgTable(
     createdAt: createdAt(),
   },
   (t) => [uniqueIndex().on(t.userId)],
+);
+
+/**
+ * Per-email sign-in lockout (T-28-2, B-185, ADR 0025). Global by design: sign-in runs before any
+ * tenant is known, and unknown emails lock exactly like real ones. Keyed by an HMAC of the
+ * normalized email, never the address. Rows go away on success, on a password reset, or once
+ * stale (src/lib/account-lockout.ts).
+ */
+export const signInFailures = pgTable(
+  "sign_in_failures",
+  {
+    emailHmac: text().primaryKey(),
+    failures: integer().notNull().default(0),
+    lockedUntil: timestamp({ withTimezone: true }),
+    /** When the "account locked" email went out for the current lock (null: none, or no user). */
+    notifiedAt: timestamp({ withTimezone: true }),
+    updatedAt: timestamp({ withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index().on(t.updatedAt)],
+);
+
+/**
+ * The last password hashes per user (T-28-2, B-186, ADR 0025), in Better Auth's own scrypt
+ * format, at most 10 per user (the current one included), deleted with the user. Global like
+ * `accounts`.
+ */
+export const passwordHistory = pgTable(
+  "password_history",
+  {
+    id: id(),
+    userId: uuid()
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    hash: text().notNull(),
+    createdAt: timestamp({ withTimezone: true }).notNull().default(sql`clock_timestamp()`),
+  },
+  (t) => [index().on(t.userId, t.createdAt)],
 );
 
 export const ROLES = [

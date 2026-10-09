@@ -295,6 +295,13 @@
       "when": 1791037465611,
       "tag": "0041_photos_lifestyle",
       "breakpoints": true
+    },
+    {
+      "idx": 42,
+      "version": "7",
+      "when": 1791557243469,
+      "tag": "0042_auth_lockout_password_history_mfa",
+      "breakpoints": true
     }
   ]
 }
