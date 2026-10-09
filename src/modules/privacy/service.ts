@@ -9,12 +9,14 @@ import {
   and,
   eq,
   getTableColumns,
+  gt,
   inArray,
   is,
   isNotNull,
   isNull,
   lt,
   ne,
+  notInArray,
   notLike,
   or,
   type SQL,
@@ -34,6 +36,7 @@ import {
   floorRequests,
   importRuns,
   invitations,
+  itemArtwork,
   jobs,
   listings,
   marketPriceSnapshots,
@@ -42,7 +45,10 @@ import {
   orders,
   PRIVACY_REQUEST_DUE_MS,
   type PrivacyCounts,
+  personalizationTemplates,
   privacyRequests,
+  refundEvents,
+  reprints,
   sessions,
   shipments,
 } from "../../db/schema";
@@ -50,7 +56,17 @@ import type { PrivacyWebhookRequest } from "../../integrations/channels/types";
 import { audit, systemActor } from "../../lib/audit";
 import { notFound } from "../../lib/errors";
 import { errorData, logger } from "../../lib/log";
-import { bucket, deleteObject, deletePrefix, getObject, listObjects, s3 } from "../../lib/s3";
+import {
+  bucket,
+  deleteObject,
+  deletePrefix,
+  getObject,
+  isCompanyKey,
+  listObjects,
+  s3,
+} from "../../lib/s3";
+import { forgetFiles } from "../files/service";
+import { ARTWORK_ITEM_FLAGS, withFlags } from "../orders/flags";
 import { createJobRow, toJob, updateJobRow } from "../production/service";
 import { createZip, ZipLimitError } from "./zip";
 
@@ -107,32 +123,295 @@ async function targetOrders(tx: Tx, connectionIds: string[], orderIds: string[] 
     );
 }
 
-/** Remove buyer PII from these orders (inside the tenant transaction). */
-async function redactOrders(tx: Tx, ids: string[]): Promise<Omit<PrivacyCounts, "rawPayloads">> {
-  if (ids.length === 0) return { orders: 0, buyerPii: 0, personalizedItems: 0 };
+/* ---- Buyer text: personalization, rendered art, free-text notes (decision 0027) ----------- */
+
+/** Item states whose text and art the 30-day clock clears; other units are still being made. */
+export const BUYER_TEXT_ITEM_STATES = ["shipped", "delivered", "cancelled"] as const;
+
+/**
+ * `shipped-items`: the 30-day clock (only units in BUYER_TEXT_ITEM_STATES). `all`: redact
+ * requests and the 18-month sweep (every unit).
+ */
+export type BuyerTextScope = "shipped-items" | "all";
+
+export type BuyerTextRedacted = {
+  /** Items whose personalization answers were cleared. */
+  personalizedItems: number;
+  /** Items whose artwork (values, flags, render, photo objects) was purged. */
+  artwork: number;
+  /** Rows whose free-text note was cleared (orders, refund events, reprints). */
+  notes: number;
+  /** Object keys deleted from storage. */
+  files: string[];
+  /** Keys whose delete failed: their items were left as they were for the next run. */
+  failedFiles: string[];
+};
+
+/**
+ * Orders (in an `orders` query) that still hold buyer text the given scope clears: a free-text
+ * note, or an item with personalization answers, artwork not yet purged, or a reprint note.
+ */
+export function holdsBuyerText(scope: BuyerTextScope): SQL {
+  const itemState =
+    scope === "all" ? sql`` : sql` and i.state in ('shipped', 'delivered', 'cancelled')`;
+  return sql`(${orders.buyerNote} is not null or ${orders.holdNote} is not null
+    or ${orders.cancelNote} is not null
+    or exists (select 1 from refund_events r where r.company_id = ${orders.companyId}
+      and r.order_id = ${orders.id} and r.note is not null)
+    or exists (select 1 from order_items i where i.company_id = ${orders.companyId}
+      and i.order_id = ${orders.id}${itemState} and (
+        jsonb_path_exists(i.personalization, '$[*] ? (@.answer != null || @.fileUrl != null)')
+        or i.artwork_status not in ('none', 'purged')
+        or exists (select 1 from item_artwork a where a.company_id = i.company_id
+          and a.order_item_id = i.id and a.status <> 'purged')
+        or exists (select 1 from reprints p where p.company_id = i.company_id
+          and p.order_item_id = i.id and p.note is not null))))`;
+}
+
+/**
+ * Clear the buyer's free text from these orders, inside the caller's tenant transaction:
+ * - notes a person typed that may name the buyer (`orders.buyer_note`, `hold_note`,
+ *   `cancel_note`, `refund_events.note`) on every order, and `reprints.note` per cleared item;
+ * - per item in scope: personalization answers and file URLs; `item_artwork` values, flags and
+ *   error, its render and preview objects and any buyer-photo objects, status `purged`; on the
+ *   item the artwork keys, `artwork_status = purged` and the artwork flags. A purged item can't
+ *   go on a sheet (production/sheets.ts needs a rendered or approved key).
+ * Storage first: objects are deleted before the rows change, and an item whose delete failed is
+ * left out of this run (keys and status kept) so the next run finds it again. Order facts (ids,
+ * SKUs, amounts, dates, states, template id, enum reasons) stay. Idempotent.
+ */
+export async function redactBuyerText(
+  tx: Tx,
+  orderIds: string[],
+  opts: { scope: BuyerTextScope },
+): Promise<BuyerTextRedacted> {
+  const res: BuyerTextRedacted = {
+    personalizedItems: 0,
+    artwork: 0,
+    notes: 0,
+    files: [],
+    failedFiles: [],
+  };
+  if (orderIds.length === 0) return res;
+  const items = await tx
+    .select({
+      id: orderItems.id,
+      companyId: orderItems.companyId,
+      personalization: orderItems.personalization,
+      artworkStatus: orderItems.artworkStatus,
+      artworkKey: orderItems.artworkKey,
+      artworkPreviewKey: orderItems.artworkPreviewKey,
+      flags: orderItems.flags,
+    })
+    .from(orderItems)
+    .where(
+      and(
+        inArray(orderItems.orderId, orderIds),
+        opts.scope === "all" ? undefined : inArray(orderItems.state, [...BUYER_TEXT_ITEM_STATES]),
+      ),
+    );
+  const itemIds = items.map((i) => i.id);
+  const arts = itemIds.length
+    ? await tx
+        .select({ a: itemArtwork, slots: personalizationTemplates.slots })
+        .from(itemArtwork)
+        .leftJoin(personalizationTemplates, eq(personalizationTemplates.id, itemArtwork.templateId))
+        .where(inArray(itemArtwork.orderItemId, itemIds))
+    : [];
+  const artByItem = new Map(arts.map((r) => [r.a.orderItemId, r]));
+  const reprintNotes = itemIds.length
+    ? await tx
+        .select({ id: reprints.id, orderItemId: reprints.orderItemId })
+        .from(reprints)
+        .where(and(inArray(reprints.orderItemId, itemIds), isNotNull(reprints.note)))
+    : [];
+  const reprintsByItem = new Map<string, string[]>();
+  for (const r of reprintNotes)
+    reprintsByItem.set(r.orderItemId, [...(reprintsByItem.get(r.orderItemId) ?? []), r.id]);
+
+  // An item's own artwork keys that are not its artwork row's render (a manual upload) are
+  // deleted only when they are artwork keys and no other item points at them.
+  const itemKeys = new Set<string>();
+  for (const i of items)
+    for (const k of [i.artworkKey, i.artworkPreviewKey])
+      if (k?.startsWith(`${i.companyId}/artwork/`)) itemKeys.add(k);
+  const shared = new Set<string>();
+  if (itemKeys.size) {
+    const keys = [...itemKeys];
+    const others = await tx
+      .select({ k1: orderItems.artworkKey, k2: orderItems.artworkPreviewKey })
+      .from(orderItems)
+      .where(
+        and(
+          or(inArray(orderItems.artworkKey, keys), inArray(orderItems.artworkPreviewKey, keys)),
+          notInArray(orderItems.id, itemIds),
+        ),
+      );
+    for (const o of others) for (const k of [o.k1, o.k2]) if (k) shared.add(k);
+  }
+
+  type Plan = {
+    item: (typeof items)[number];
+    answers: boolean;
+    art: boolean;
+    reprintIds: string[];
+    keys: string[];
+  };
+  const plans: Plan[] = [];
+  for (const i of items) {
+    const answers = (i.personalization ?? []).some((p) => p.answer !== null || p.fileUrl !== null);
+    const row = artByItem.get(i.id);
+    const art =
+      (row !== undefined && row.a.status !== "purged") ||
+      !["none", "purged"].includes(i.artworkStatus);
+    const reprintIds = reprintsByItem.get(i.id) ?? [];
+    if (!answers && !art && reprintIds.length === 0) continue;
+    const keys = new Set<string>();
+    if (art) {
+      const own = (k: string | null | undefined): k is string =>
+        !!k && isCompanyKey(i.companyId, k);
+      if (row) {
+        if (own(row.a.fileKey)) keys.add(row.a.fileKey);
+        if (own(row.a.previewKey)) keys.add(row.a.previewKey);
+        // A photo slot's value is the storage key of the buyer's photo.
+        for (const slot of row.slots ?? []) {
+          const v = row.a.values[slot.name];
+          if (slot.kind === "photo" && own(v) && v.startsWith(`${i.companyId}/photo/`)) keys.add(v);
+        }
+      }
+      for (const k of [i.artworkKey, i.artworkPreviewKey])
+        if (k && itemKeys.has(k) && !shared.has(k)) keys.add(k);
+    }
+    plans.push({ item: i, answers, art, reprintIds, keys: [...keys] });
+  }
+
+  // Storage first.
+  const failed = new Set<string>();
+  const deleted = new Set<string>();
+  for (const key of new Set(plans.flatMap((p) => p.keys))) {
+    try {
+      await deleteObject(key);
+      deleted.add(key);
+    } catch (err) {
+      failed.add(key);
+      log.warn("buyer text object delete failed; the item waits for the next run", {
+        ...errorData(err),
+      });
+    }
+  }
+  res.files = [...deleted];
+  res.failedFiles = [...failed];
+
+  for (const p of plans) {
+    if (p.keys.some((k) => failed.has(k))) continue;
+    if (p.answers || p.art)
+      await tx
+        .update(orderItems)
+        .set({
+          ...(p.answers
+            ? {
+                personalization: (p.item.personalization ?? []).map((a) => ({
+                  ...a,
+                  answer: null,
+                  fileUrl: null,
+                })),
+              }
+            : {}),
+          ...(p.art
+            ? {
+                artworkStatus: "purged" as const,
+                artworkKey: null,
+                artworkPreviewKey: null,
+                flags: withFlags(p.item.flags, [], ARTWORK_ITEM_FLAGS),
+              }
+            : {}),
+        })
+        .where(eq(orderItems.id, p.item.id));
+    if (p.answers) res.personalizedItems++;
+    if (p.art) {
+      await tx
+        .update(itemArtwork)
+        .set({
+          values: {},
+          flags: [],
+          error: null,
+          fileKey: null,
+          previewKey: null,
+          status: "purged",
+        })
+        .where(eq(itemArtwork.orderItemId, p.item.id));
+      res.artwork++;
+    }
+    if (p.reprintIds.length) {
+      await tx.update(reprints).set({ note: null }).where(inArray(reprints.id, p.reprintIds));
+      res.notes += p.reprintIds.length;
+    }
+  }
+
+  res.notes += (
+    await tx
+      .update(orders)
+      .set({ buyerNote: null, holdNote: null, cancelNote: null })
+      .where(
+        and(
+          inArray(orders.id, orderIds),
+          or(isNotNull(orders.buyerNote), isNotNull(orders.holdNote), isNotNull(orders.cancelNote)),
+        ),
+      )
+      .returning({ id: orders.id })
+  ).length;
+  res.notes += (
+    await tx
+      .update(refundEvents)
+      .set({ note: null })
+      .where(and(inArray(refundEvents.orderId, orderIds), isNotNull(refundEvents.note)))
+      .returning({ id: refundEvents.id })
+  ).length;
+  await forgetFiles(tx, res.files);
+  return res;
+}
+
+export type OrdersRedacted = Omit<PrivacyCounts, "rawPayloads"> & {
+  artwork: number;
+  notes: number;
+  files: number;
+  failedFiles: number;
+};
+
+/**
+ * Remove buyer PII from these orders (inside the tenant transaction): the `buyer_pii` rows, the
+ * buyer reference, the raw payload key, and every item's text and art (`redactBuyerText`, scope
+ * `all`). The caller deletes the raw payload objects first.
+ */
+async function redactOrders(tx: Tx, ids: string[]): Promise<OrdersRedacted> {
+  const text = await redactBuyerText(tx, ids, { scope: "all" });
+  if (ids.length === 0)
+    return {
+      orders: 0,
+      buyerPii: 0,
+      personalizedItems: 0,
+      artwork: 0,
+      notes: 0,
+      files: 0,
+      failedFiles: 0,
+    };
   const pii = await tx
     .delete(buyerPii)
     .where(inArray(buyerPii.orderId, ids))
     .returning({ id: buyerPii.id });
   await tx
     .update(orders)
-    .set({ buyerNote: null, buyerRef: null, rawPayloadKey: null })
+    .set({ buyerRef: null, rawPayloadKey: null })
     .where(inArray(orders.id, ids));
-  const items = await tx
-    .select({ id: orderItems.id, personalization: orderItems.personalization })
-    .from(orderItems)
-    .where(inArray(orderItems.orderId, ids));
-  let personalizedItems = 0;
-  for (const item of items) {
-    const answers = item.personalization ?? [];
-    if (!answers.some((p) => p.answer !== null || p.fileUrl !== null)) continue;
-    await tx
-      .update(orderItems)
-      .set({ personalization: answers.map((p) => ({ ...p, answer: null, fileUrl: null })) })
-      .where(eq(orderItems.id, item.id));
-    personalizedItems++;
-  }
-  return { orders: ids.length, buyerPii: pii.length, personalizedItems };
+  return {
+    orders: ids.length,
+    buyerPii: pii.length,
+    personalizedItems: text.personalizedItems,
+    artwork: text.artwork,
+    notes: text.notes,
+    files: text.files.length,
+    failedFiles: text.failedFiles.length,
+  };
 }
 
 /**
@@ -188,6 +467,8 @@ export async function handlePrivacyRequest(input: {
           tx,
           found.map((o) => o.id),
         );
+        // Rolls the redaction back so the delivery is retried while the keys are still known.
+        if (res.failedFiles > 0) throw new Error("privacy redaction: an object delete failed");
         const c = { ...res, rawPayloads: keys.length };
         await audit(tx, {
           companyId,
@@ -750,14 +1031,12 @@ export function buyerPiiCutoff(now = new Date()): Date {
   return d;
 }
 
-/** Orders that still hold buyer PII of any kind. */
+/** Orders that still hold buyer PII of any kind (text and art: `holdsBuyerText`). */
 const holdsPii = or(
-  isNotNull(orders.buyerNote),
   isNotNull(orders.buyerRef),
   isNotNull(orders.rawPayloadKey),
   sql`exists (select 1 from buyer_pii b where b.order_id = ${orders.id})`,
-  sql`exists (select 1 from order_items i where i.order_id = ${orders.id}
-    and jsonb_path_exists(i.personalization, '$[*] ? (@.answer != null || @.fileUrl != null)'))`,
+  holdsBuyerText("all"),
 );
 
 const REDACT_BATCH = 500;
@@ -765,9 +1044,11 @@ const REDACT_BATCH = 500;
 /**
  * Daily: buyer PII on orders placed more than 18 months ago is removed, independent of any export
  * or deletion (processor retention limit). Same redaction as a Shopify customers/redact: the
- * `buyer_pii` row, buyer note and reference, personalization answers and the raw payload go;
- * order facts (ids, SKUs, amounts, dates, item counts) stay. Company ids are read as system, the
- * work runs per company inside `withTenant`. Idempotent: a redacted order no longer matches.
+ * `buyer_pii` row, buyer reference, the raw payload and every item's text, art and notes
+ * (`redactBuyerText`, scope `all`) go; order facts (ids, SKUs, amounts, dates, item counts) stay.
+ * Company ids are read as system, the work runs per company inside `withTenant`, in order-id
+ * order so an order whose object delete failed is passed over until the next day. Idempotent: a
+ * redacted order no longer matches.
  */
 export async function redactStaleBuyerPii(now = new Date()) {
   const cutoff = buyerPiiCutoff(now);
@@ -778,15 +1059,23 @@ export async function redactStaleBuyerPii(now = new Date()) {
   );
   let total = 0;
   for (const { companyId } of companyIds) {
+    let after: string | null = null;
     for (;;) {
-      const batch = await withTenant(companyId, (tx) =>
-        tx
-          .select({ id: orders.id, rawPayloadKey: orders.rawPayloadKey })
-          .from(orders)
-          .where(and(eq(orders.companyId, companyId), stale))
-          .limit(REDACT_BATCH),
+      const from: string | null = after;
+      const batch: { id: string; rawPayloadKey: string | null }[] = await withTenant(
+        companyId,
+        (tx) =>
+          tx
+            .select({ id: orders.id, rawPayloadKey: orders.rawPayloadKey })
+            .from(orders)
+            .where(
+              and(eq(orders.companyId, companyId), stale, from ? gt(orders.id, from) : undefined),
+            )
+            .orderBy(orders.id)
+            .limit(REDACT_BATCH),
       );
       if (batch.length === 0) break;
+      after = batch[batch.length - 1]?.id ?? null;
       const keys = batch.map((o) => o.rawPayloadKey).filter((k): k is string => !!k);
       for (const key of keys) await deleteObject(key);
       await withTenant(companyId, async (tx) => {

@@ -12,7 +12,7 @@ describe("privacy retention: personalization copies", () => {
   // answers (`valuesFromAnswers`, personalization/service.ts). The 30-day purge, the 18-month PII
   // sweep and the Amazon sweep (decision 0026 lists item_artwork as "keep, no Amazon content")
   // all leave it, so a buyer's custom text outlives every retention window. Remove `.fails` when fixed.
-  it.fails("an 18-month-old delivered Amazon order keeps no buyer personalization text", async () => {
+  it("an 18-month-old delivered Amazon order keeps no buyer personalization text", async () => {
     const companyId = (await createCompany()).id;
     const conn = await createConnection(companyId, "amazon");
     const { order, items } = await createOrder(companyId, conn.id, {

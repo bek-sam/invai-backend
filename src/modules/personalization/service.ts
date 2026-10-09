@@ -21,11 +21,11 @@ import {
 import { ImagingError, imaging } from "../../integrations/imaging/client";
 import { audit } from "../../lib/audit";
 import { badRequest, conflict, notFound, ORPCError, upstream } from "../../lib/errors";
-import { logger } from "../../lib/log";
+import { errorData, logger } from "../../lib/log";
 import { emit } from "../../lib/outbox";
 import { keyset, type PageInput } from "../../lib/pagination";
 import { publish } from "../../lib/realtime";
-import { isCompanyKey, objectKey, presignGet } from "../../lib/s3";
+import { deleteObject, isCompanyKey, objectKey, presignGet } from "../../lib/s3";
 import { ARTWORK_ITEM_FLAGS, ARTWORK_TO_ITEM_FLAG, withFlags } from "../orders/flags";
 import { transitionItem } from "../orders/state-machine";
 
@@ -527,6 +527,26 @@ async function saveItemRender(
         .returning();
   if (!artwork) throw new Error("artwork upsert failed");
   await applyOutcomeToItem(tx, ctx, item, out);
+  // A superseded render still holds the buyer's text, and no purge can find it once its key is
+  // gone from the row: delete it after the new outcome is committed (decision 0027).
+  // Only render keys (`{companyId}/artwork/...`, a new random key per render) are deleted.
+  const superseded = [...new Set([existing?.fileKey, existing?.previewKey])].filter(
+    (k): k is string =>
+      !!k &&
+      k !== out.fileKey &&
+      isCompanyKey(ctx.companyId, k) &&
+      k.startsWith(`${ctx.companyId}/artwork/`),
+  );
+  if (superseded.length)
+    afterCommit(tx, async () => {
+      for (const key of superseded) {
+        try {
+          await deleteObject(key);
+        } catch (err) {
+          log.warn("superseded render delete failed", { orderItemId: itemId, ...errorData(err) });
+        }
+      }
+    });
 
   await audit(tx, {
     companyId: ctx.companyId,
@@ -787,7 +807,7 @@ export async function listArtwork(
     .innerJoin(orderItems, eq(orderItems.id, itemArtwork.orderItemId))
     .where(sql`${orderItems.state} <> 'cancelled'`)
     .groupBy(itemArtwork.status);
-  const counts = { pending: 0, rendered: 0, flagged: 0, approved: 0, failed: 0 };
+  const counts = { pending: 0, rendered: 0, flagged: 0, approved: 0, failed: 0, purged: 0 };
   for (const c of countRows) counts[c.status] = c.n;
   return {
     items: rows.slice(0, input.limit).map(toItemArtwork),
@@ -816,7 +836,10 @@ export async function approveArtwork(tx: Tx, ctx: TenantContext, orderItemId: st
     .where(eq(itemArtwork.orderItemId, orderItemId))
     .limit(1);
   if (!a) throw notFound("item_artwork", orderItemId);
-  if (!a.fileKey) throw conflict("There is no rendered artwork to approve; re-render first");
+  // Purged on a retention clock: the text is gone, so there is nothing to approve. `update`
+  // with new values (a re-render) is the way back in.
+  if (a.status === "purged" || !a.fileKey)
+    throw conflict("There is no rendered artwork to approve; re-render first");
   const now = new Date();
   await tx
     .update(itemArtwork)

@@ -65,7 +65,15 @@ export const personalizationTemplates = pgTable(
   ],
 ).enableRLS();
 
-export const ARTWORK_STATUSES = ["pending", "rendered", "flagged", "approved", "failed"] as const;
+/** `purged`: the buyer text and rendered art were removed on a retention clock (decision 0027). */
+export const ARTWORK_STATUSES = [
+  "pending",
+  "rendered",
+  "flagged",
+  "approved",
+  "failed",
+  "purged",
+] as const;
 
 export type ArtworkFlag = {
   slot: string | null;

@@ -167,6 +167,7 @@ export const ITEM_ARTWORK_STATUSES = [
   "flagged",
   "approved",
   "failed",
+  "purged",
 ] as const;
 
 /**
