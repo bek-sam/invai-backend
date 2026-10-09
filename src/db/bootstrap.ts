@@ -1,5 +1,5 @@
 import { createHash, createHmac, pbkdf2Sync, randomBytes } from "node:crypto";
-import { Client, type ClientConfig } from "pg";
+import { Client } from "pg";
 import { MIGRATION_LOCK_KEY, MIGRATION_SESSION } from "./migrate";
 
 /*
@@ -136,6 +136,8 @@ export type BootstrapResult = {
   /** Attributes that were wrong and were fixed, as SQL keywords (`NOBYPASSRLS`, ...). */
   fixedAttributes: string[];
   passwordUpdated: boolean;
+  /** False when the server trusts the connection, so the password could not be checked. */
+  passwordVerified: boolean;
 };
 
 async function readRole(client: Client, role: string): Promise<RoleRow | null> {
@@ -146,23 +148,36 @@ async function readRole(client: Client, role: string): Promise<RoleRow | null> {
   return res.rows[0] ?? null;
 }
 
-/** Can the app role log in with `password`? Only a wrong password or a missing role is "no". */
-async function canLogIn(ownerConfig: ClientConfig, cfg: BootstrapConfig): Promise<boolean> {
-  const client = new Client({
-    ...ownerConfig,
-    user: cfg.appRole,
-    password: cfg.appPassword,
-    connectionTimeoutMillis: 10_000,
-  });
+/**
+ * Logs in as the app role with the configured password:
+ * - `ok`: the server checked the password and accepted it;
+ * - `wrong`: wrong password, or no such role;
+ * - `unverified`: the server let the connection in without checking any password (`trust` in
+ *   pg_hba, as local Docker images do for 127.0.0.1). `system_user` (Postgres 16+) is null then.
+ *   RDS always checks passwords.
+ */
+export async function checkLogin(cfg: BootstrapConfig): Promise<"ok" | "wrong" | "unverified"> {
+  // Same host, port, database and options as the owner URL, other credentials. They go into the
+  // URL itself: node-postgres lets `connectionString` override a separate `user`/`password`.
+  const url = new URL(cfg.ownerUrl);
+  url.username = encodeURIComponent(cfg.appRole);
+  url.password = encodeURIComponent(cfg.appPassword);
+  const client = new Client({ connectionString: url.toString(), connectionTimeoutMillis: 10_000 });
   try {
     await client.connect();
-    await client.query("select 1");
-    return true;
+    const res = await client.query<{ who: string; auth: string | null }>(
+      "select current_user as who, system_user as auth",
+    );
+    const row = res.rows[0];
+    if (row?.who !== cfg.appRole) {
+      throw new ReleaseStepError(`login check ran as ${row?.who}, not ${cfg.appRole}`);
+    }
+    return row.auth ? "ok" : "unverified";
   } catch (err) {
     // 28P01 invalid_password, 28000 invalid_authorization_specification (no such role / no
     // pg_hba match). Anything else (network, CONNECT missing) is a real failure.
     const code = (err as { code?: string }).code;
-    if (code === "28P01" || code === "28000") return false;
+    if (code === "28P01" || code === "28000") return "wrong";
     throw err;
   } finally {
     await client.end().catch(() => {});
@@ -174,15 +189,12 @@ async function canLogIn(ownerConfig: ClientConfig, cfg: BootstrapConfig): Promis
  * grant it `CONNECT` on the current database and `USAGE` on schema `public`. Nothing else.
  *
  * Idempotent: an existing role gets only the attributes that are wrong, and a new password only
- * when it can't already log in with the configured one. On a correct database a second run
- * changes nothing (the GRANTs are no-ops). Serialized with migrations by the same advisory lock.
+ * when the server rejects the configured one. On a correct database a second run changes nothing
+ * (the GRANTs are no-ops). Serialized with migrations by the same advisory lock. Where the server
+ * trusts the connection without a password, the password is left alone and reported unverified.
  */
 export async function bootstrapAppRole(cfg: BootstrapConfig): Promise<BootstrapResult> {
-  const ownerConfig: ClientConfig = {
-    connectionString: cfg.ownerUrl,
-    connectionTimeoutMillis: 10_000,
-  };
-  const client = new Client(ownerConfig);
+  const client = new Client({ connectionString: cfg.ownerUrl, connectionTimeoutMillis: 10_000 });
   await client.connect();
   try {
     const who = await client.query<{ current_user: string; db: string }>(
@@ -233,7 +245,7 @@ export async function bootstrapAppRole(cfg: BootstrapConfig): Promise<BootstrapR
     }
 
     let passwordUpdated = false;
-    if (!created && !(await canLogIn(ownerConfig, cfg))) {
+    if (!created && (await checkLogin(cfg)) === "wrong") {
       await client.query(
         `ALTER ROLE ${role} PASSWORD ${client.escapeLiteral(scramVerifier(cfg.appPassword))}`,
       );
@@ -257,22 +269,34 @@ export async function bootstrapAppRole(cfg: BootstrapConfig): Promise<BootstrapR
         `${cfg.appRole} is a member of ${currentUser}, so it would bypass RLS; revoke that membership`,
       );
     }
-    if (!(await canLogIn(ownerConfig, cfg))) {
+    const login = await checkLogin(cfg);
+    if (login === "wrong") {
       throw new ReleaseStepError(`${cfg.appRole} cannot log in with the configured password`);
     }
-    return { appRole: cfg.appRole, database, created, fixedAttributes, passwordUpdated };
+    return {
+      appRole: cfg.appRole,
+      database,
+      created,
+      fixedAttributes,
+      passwordUpdated,
+      passwordVerified: login === "ok",
+    };
   } finally {
     await client.end().catch(() => {});
   }
 }
 
-/** Every URL-looking token and every given secret replaced, one line. */
+/**
+ * One line of at most 300 characters, with every given secret (8 characters or more, so a short
+ * local password like `invai` doesn't mangle role names) and every URL-looking token replaced.
+ */
 export function redactLine(text: string, secrets: (string | undefined)[]): string {
   let out = text.split("\n")[0] ?? "";
   for (const s of secrets) {
-    if (s && s.length >= 3) out = out.split(s).join("[redacted]");
+    if (s && s.length >= 8) out = out.split(s).join("[redacted]");
   }
-  return out.replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s'"]+/gi, "[url]");
+  out = out.replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s'"]+/gi, "[url]");
+  return out.length > 300 ? `${out.slice(0, 300)}...` : out;
 }
 
 /**
@@ -303,8 +327,14 @@ export async function runReleaseStep(name: string, step: () => Promise<string>):
     console.log(`[${name}] ${summary}`);
     process.exitCode = 0;
   } catch (err) {
-    const e = err as { message?: string; code?: string; cause?: { message?: string } };
-    const parts = [e.message ?? String(err)];
+    const e = err as {
+      message?: string;
+      code?: string;
+      cause?: { message?: string };
+      errors?: { message?: string }[];
+    };
+    // A refused connection is an AggregateError with an empty message.
+    const parts = [e.message || e.errors?.[0]?.message || String(err)];
     // Drizzle wraps the pg error: "Failed query: ..." first, the reason in `cause`.
     if (e.cause?.message) parts.push(e.cause.message);
     const detail = err instanceof ReleaseStepError ? parts[0] : parts.reverse().join(" <- ");

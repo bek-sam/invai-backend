@@ -182,6 +182,17 @@ const raw = createEnv({
   },
   runtimeEnv: process.env,
   emptyStringAsUndefined: true,
+  // One line naming each bad variable and why, never its value (a URL holds a password). The
+  // default handler prints a multi-line object; release CLIs and the API log one line (T-30-2).
+  onValidationError: (issues) => {
+    const list = issues
+      .map(
+        (i) =>
+          `${(i.path ?? []).map((p) => String(typeof p === "object" ? p.key : p)).join(".") || "?"} (${i.message})`,
+      )
+      .join(", ");
+    throw new Error(`Invalid environment variables: ${list}`);
+  },
 });
 
 function withDatabase(url: string, database: string): string {

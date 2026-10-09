@@ -99,6 +99,20 @@ describe("production key guard", () => {
     expect(res.out).toContain("missing SMTP_URL.");
   });
 
+  it("refuses production without MAIL_FROM too (B-58: no silent mail mock)", async () => {
+    const { MAIL_FROM: _omit, ...rest } = ALL_KEYS;
+    const res = await boot({ NODE_ENV: "production", ...rest, SMTP_URL: "smtp://mail:25" });
+    expect(res.ok).toBe(false);
+    expect(res.out).toContain("missing MAIL_FROM.");
+  });
+
+  it("names a malformed variable in one line without printing its value (T-30-2)", async () => {
+    const res = await boot({ DATABASE_URL: "postgres://invai_app:Hunter2Secret@bad host/invai" });
+    expect(res.ok).toBe(false);
+    expect(res.out).toContain("Invalid environment variables: DATABASE_URL (Invalid URL)");
+    expect(res.out).not.toContain("Hunter2Secret");
+  });
+
   it("boots in production with ALLOW_MOCKS=true and warns loudly", async () => {
     const res = await boot({ NODE_ENV: "production", ALLOW_MOCKS: "true" });
     expect(res.ok).toBe(true);

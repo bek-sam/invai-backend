@@ -12,5 +12,8 @@ await runReleaseStep("bootstrap", async () => {
     r.fixedAttributes.length ? `fixed ${r.fixedAttributes.join(" ")}` : null,
     r.passwordUpdated ? "password updated" : null,
   ].filter(Boolean);
-  return `${r.appRole} on ${r.database}: ${changes.length ? changes.join(", ") : "unchanged"}`;
+  const note = r.passwordVerified
+    ? ""
+    : " (password not checked: the server trusts this connection)";
+  return `${r.appRole} on ${r.database}: ${changes.length ? changes.join(", ") : "unchanged"}${note}`;
 });
