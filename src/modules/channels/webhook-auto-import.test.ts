@@ -1,10 +1,14 @@
 import { and, eq } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
+import { systemContext } from "../../api/context";
 import { withSystem, withTenant } from "../../db/client";
 import { channelConnections, DEFAULT_CONNECTION_SETTINGS, jobs, orders } from "../../db/schema";
+import { mockEtsyReceipt, signEtsyWebhook } from "../../integrations/channels/etsy";
+import { MOCK_ETSY_WEBHOOK_SECRET } from "../../integrations/channels/etsy/webhooks";
 import { signShopifyBody } from "../../integrations/channels/shopify";
 import { mockShopifyOrder } from "../../integrations/channels/shopify/mock";
 import { createCompany, createLocation } from "../../test/fixtures";
+import { importNormalizedOrders } from "../orders/import";
 import { processWebhook, recordWebhookDelivery, syncConnection } from "./sync";
 
 /* T-29-4 (decision 0030, B-292): with auto-import off, a webhook for an unknown order is
@@ -26,7 +30,12 @@ function delivery(shop: string, topic: string, payload: unknown, id = `t294-${un
   };
 }
 
-const restOrder = (id: string, financial_status: string) => ({
+const restOrder = (
+  id: string,
+  financial_status: string,
+  extra: { note?: string; updated_at?: string } = {},
+) => ({
+  ...extra,
   id: Number(id),
   name: `#T294-${id.slice(-4)}`,
   created_at: new Date().toISOString(),
@@ -139,14 +148,84 @@ describe("webhooks with auto-import off", () => {
     expect((await find(companyId, id))[0]?.status).toBe("cancelled");
   });
 
-  it("an update for a known order applies (no second row)", async () => {
+  it("an update for a known order applies (note and watermark change, no second row)", async () => {
     const { companyId, shop, conn } = await setup(true);
     const id = String(7_300_000_000 + Math.floor(Math.random() * 1_000_000));
-    await send(delivery(shop, "orders/create", restOrder(id, "paid")));
+    await send(
+      delivery(
+        shop,
+        "orders/create",
+        restOrder(id, "paid", { updated_at: "2026-10-01T10:00:00Z" }),
+      ),
+    );
+    const before = (await find(companyId, id))[0];
+    expect(before?.buyerNote).toBeNull();
     await setAutoImport(conn.id, false);
-    const res = await send(delivery(shop, "orders/updated", restOrder(id, "paid")));
+    const res = await send(
+      delivery(
+        shop,
+        "orders/updated",
+        restOrder(id, "paid", { note: "please gift wrap", updated_at: "2026-10-02T10:00:00Z" }),
+      ),
+    );
     expect(res).toMatchObject({ handled: true, kind: "order_upsert" });
-    expect(await find(companyId, id)).toHaveLength(1);
+    const rows = await find(companyId, id);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.buyerNote).toBe("please gift wrap");
+    expect(rows[0]?.channelUpdatedAt?.toISOString()).toBe("2026-10-02T10:00:00.000Z");
+  });
+
+  it("an Etsy cancel (order_ref) for a known order still applies with auto-import off", async () => {
+    const companyId = (await createCompany()).id;
+    await createLocation(companyId);
+    const etsyShop = String(20_000_000 + Math.floor(Math.random() * 70_000_000));
+    // Receipt ids ending in 0 are cancelled in the mock Etsy store.
+    const receipt = String(8_000_000_000 + Math.floor(Math.random() * 100_000) * 10);
+    const [econn] = await withSystem((tx) =>
+      tx
+        .insert(channelConnections)
+        .values({
+          companyId,
+          channel: "etsy",
+          name: "Etsy t294",
+          status: "connected",
+          mode: "api",
+          provider: "mock",
+          externalShopId: etsyShop,
+          settings: { ...DEFAULT_CONNECTION_SETTINGS, autoImport: false },
+        })
+        .returning(),
+    );
+    if (!econn) throw new Error("insert failed");
+    await withTenant(companyId, (tx) =>
+      importNormalizedOrders(
+        tx,
+        systemContext(companyId),
+        econn,
+        [mockEtsyReceipt(receipt).order],
+        {
+          source: "csv",
+        },
+      ),
+    );
+    expect((await find(companyId, receipt))[0]?.status).not.toBe("cancelled");
+
+    const id = `msg_${uniq()}`;
+    const ts = Math.floor(Date.now() / 1000);
+    const body = JSON.stringify({
+      event_type: "ORDER_CANCELED",
+      resource_url: `https://openapi.etsy.com/v3/application/shops/${etsyShop}/receipts/${receipt}`,
+      shop_id: Number(etsyShop),
+    });
+    const headers = {
+      "webhook-id": id,
+      "webhook-timestamp": String(ts),
+      "webhook-signature": signEtsyWebhook(id, ts, body, MOCK_ETSY_WEBHOOK_SECRET),
+    };
+    expect(await recordWebhookDelivery("etsy", id)).toBe(true);
+    const res = await processWebhook("etsy", headers, body, new Date().toISOString());
+    expect(res).toMatchObject({ handled: true });
+    expect((await find(companyId, receipt))[0]?.status).toBe("cancelled");
   });
 
   it("auto-import on or unset imports from a webhook as before", async () => {
