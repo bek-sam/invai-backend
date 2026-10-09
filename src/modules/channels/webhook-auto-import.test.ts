@@ -197,16 +197,13 @@ describe("webhooks with auto-import off", () => {
         .returning(),
     );
     if (!econn) throw new Error("insert failed");
+    const fetched = mockEtsyReceipt(receipt).order;
+    expect(fetched).not.toBeNull();
+    if (!fetched) throw new Error("mock receipt has no order");
     await withTenant(companyId, (tx) =>
-      importNormalizedOrders(
-        tx,
-        systemContext(companyId),
-        econn,
-        [mockEtsyReceipt(receipt).order],
-        {
-          source: "csv",
-        },
-      ),
+      importNormalizedOrders(tx, systemContext(companyId), econn, [fetched], {
+        source: "csv",
+      }),
     );
     expect((await find(companyId, receipt))[0]?.status).not.toBe("cancelled");
 
