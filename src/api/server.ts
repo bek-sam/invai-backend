@@ -1,7 +1,7 @@
 import type { Server } from "node:http";
 import { serve } from "@hono/node-server";
 import { env } from "../env";
-import { logger } from "../lib/log";
+import { errorData, logger } from "../lib/log";
 import { ensureBucket } from "../lib/s3";
 import { withShutdownCap } from "../lib/shutdown-timeout";
 import { app } from "./app";
@@ -51,3 +51,6 @@ async function shutdown(signal: string) {
 
 process.on("SIGTERM", () => void shutdown("SIGTERM"));
 process.on("SIGINT", () => void shutdown("SIGINT"));
+// ADR 0028: a stray rejected promise (a fire-and-forget side effect) is logged and the API keeps
+// serving; uncaughtException keeps Node's default (crash, the task restarts).
+process.on("unhandledRejection", (reason) => log.error("unhandled rejection", errorData(reason)));

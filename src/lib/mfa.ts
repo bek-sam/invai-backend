@@ -2,6 +2,7 @@ import { and, eq, isNull, ne } from "drizzle-orm";
 import { db } from "../db/client";
 import { type CompanyType, companies, members, type Role, users } from "../db/schema";
 import { env } from "../env";
+import { isSampleRow } from "../modules/tenancy/demo-flag";
 import { logger } from "./log";
 
 /*
@@ -9,8 +10,10 @@ import { logger } from "./log";
  * buyer data). One rule everywhere:
  *
  * - Required = the user holds an active `owner` or `admin` membership in any org that is not a
- *   sample workspace (`companies.demo`). Vendor orgs only carry the `vendor` role, so vendors are
- *   never required. It is per user, not per active org, so `me.switchOrg` can't dodge it.
+ *   sample workspace by `isSampleRow` (`demoOwnerUserId` set or `settings.demoRetiredAt`; ADR 0028,
+ *   0029). `companies.demo` alone never exempts: the seeded Desert Bloom follows the real rule.
+ *   Vendor orgs only carry the `vendor` role, so vendors are never required. It is per user, not
+ *   per active org, so `me.switchOrg` can't dodge it.
  * - Deadline = `users.mfa_grace_starts_at` + MFA_GRACE_DAYS. The start is restarted (now()) when
  *   a user who was not required becomes required (`restartGraceIfNewlyRequired`): role change,
  *   reactivation, invitation accepted, creating a real org. At most once per user (S-58):
@@ -30,12 +33,13 @@ export const MFA_REQUIRED_ROLES: readonly Role[] = ["owner", "admin"];
 /** What a past-deadline user can still call: enough to load the app shell and switch orgs. */
 export const MFA_EXEMPT_PROCEDURES: ReadonlySet<string> = new Set(["me.get", "me.switchOrg"]);
 
-export type MfaMembership = { type: CompanyType; role: Role; demo: boolean };
+/** `sample`: the org is a sample workspace (`isSampleRow`); it never makes anyone required. */
+export type MfaMembership = { type: CompanyType; role: Role; sample: boolean };
 export type MfaState = { required: boolean; enabled: boolean; deadline: Date | null };
 
 export function isMfaRequired(memberships: readonly MfaMembership[]): boolean {
   return memberships.some(
-    (m) => m.type !== "vendor" && !m.demo && MFA_REQUIRED_ROLES.includes(m.role),
+    (m) => m.type !== "vendor" && !m.sample && MFA_REQUIRED_ROLES.includes(m.role),
   );
 }
 
@@ -62,10 +66,29 @@ export function mfaBlocks(state: MfaState | undefined, now = new Date()): boolea
   return !!state?.required && !state.enabled && state.deadline !== null && now >= state.deadline;
 }
 
+/**
+ * What a membership query selects from `companies` so `withSampleFlag` can apply the sample rule
+ * (join `members` to `companies` and spread these into the select; src/api/context.ts does too).
+ */
+export const sampleColumns = {
+  demoOwnerUserId: companies.demoOwnerUserId,
+  settings: companies.settings,
+};
+
+type SampleInput = Parameters<typeof isSampleRow>[0];
+
+/** Replaces the two `sampleColumns` with `sample: isSampleRow(row)`. */
+export function withSampleFlag<T extends SampleInput>(
+  row: T,
+): Omit<T, keyof SampleInput> & { sample: boolean } {
+  const { demoOwnerUserId, settings, ...rest } = row;
+  return { ...rest, sample: isSampleRow({ demoOwnerUserId, settings }) };
+}
+
 /** Active memberships with the sample flag (`excludeOrgId`: as if that membership didn't exist). */
-async function activeMemberships(userId: string, excludeOrgId?: string) {
-  return db
-    .select({ type: companies.type, role: members.role, demo: companies.demo })
+async function activeMemberships(userId: string, excludeOrgId?: string): Promise<MfaMembership[]> {
+  const rows = await db
+    .select({ type: companies.type, role: members.role, ...sampleColumns })
     .from(members)
     .innerJoin(companies, eq(companies.id, members.organizationId))
     .where(
@@ -75,6 +98,7 @@ async function activeMemberships(userId: string, excludeOrgId?: string) {
         excludeOrgId ? ne(members.organizationId, excludeOrgId) : undefined,
       ),
     );
+  return rows.map(withSampleFlag);
 }
 
 /** Is the user required right now (optionally ignoring one org, for "before joining it")? */

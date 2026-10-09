@@ -28,6 +28,7 @@ import { env } from "./env";
 import {
   clearAfterSuccess,
   clearLock,
+  errorKind,
   giveBack,
   notifyLocked,
   reserveAttempt,
@@ -391,7 +392,11 @@ export const authOptions = {
           }
           // Counted in the before-hook. Not awaited: a wrong password answers like any other,
           // without SMTP; the first failure once the email is locked sends the one lock email.
-          void notifyLocked(email);
+          // B-297: a failure there (a DB error) is logged, never an unhandled rejection. Only
+          // its kind: a drizzle error's text quotes the query params, the email among them.
+          notifyLocked(email).catch((err: unknown) =>
+            log.error("lock email failed", errorKind(err)),
+          );
         } else if (returned) {
           // The password was right (a pending second step included): the streak ends.
           await clearAfterSuccess(email);

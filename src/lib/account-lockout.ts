@@ -35,6 +35,19 @@ export const FAILURE_WINDOW_HOURS = 24;
 
 export const normalizeEmail = (email: string) => email.trim().toLowerCase();
 
+/**
+ * What to log about a `notifyLocked` failure: the error's class and Postgres code, never its text
+ * (a drizzle error quotes the query params, the email among them; B-297).
+ */
+export function errorKind(err: unknown): { error: string; code: string | null } {
+  const e = err as { name?: unknown; code?: unknown; cause?: { code?: unknown } } | null;
+  const code = e?.code ?? e?.cause?.code;
+  return {
+    error: err instanceof Error ? err.name : typeof err,
+    code: typeof code === "string" ? code : null,
+  };
+}
+
 /** The table key for an email: HMAC-SHA256 under the auth secret, never the address. */
 export const emailKey = (email: string) =>
   hmacHex(env.BETTER_AUTH_SECRET, `sign-in-lock:${normalizeEmail(email)}`);

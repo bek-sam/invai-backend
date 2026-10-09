@@ -94,3 +94,6 @@ async function shutdown(signal: string) {
 
 process.on("SIGTERM", () => void shutdown("SIGTERM"));
 process.on("SIGINT", () => void shutdown("SIGINT"));
+// ADR 0028: a stray rejected promise is logged and the worker keeps running its queues;
+// uncaughtException keeps Node's default (crash, the task restarts).
+process.on("unhandledRejection", (reason) => log.error("unhandled rejection", errorData(reason)));

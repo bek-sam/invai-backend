@@ -341,13 +341,13 @@ describe("password history (B-186)", () => {
 });
 
 describe("required two-step sign-in (B-188)", () => {
-  const shop = { type: "shop" as const, demo: false };
+  const shop = { type: "shop" as const, sample: false };
   it("required = owner/admin in a real org; vendors, sample workspaces and staff don't count", () => {
     expect(isMfaRequired([{ ...shop, role: "owner" }])).toBe(true);
     expect(isMfaRequired([{ ...shop, role: "admin" }])).toBe(true);
     expect(isMfaRequired([{ ...shop, role: "office" }])).toBe(false);
-    expect(isMfaRequired([{ type: "shop", demo: true, role: "owner" }])).toBe(false);
-    expect(isMfaRequired([{ type: "vendor", demo: false, role: "vendor" }])).toBe(false);
+    expect(isMfaRequired([{ type: "shop", sample: true, role: "owner" }])).toBe(false);
+    expect(isMfaRequired([{ type: "vendor", sample: false, role: "vendor" }])).toBe(false);
     expect(
       isMfaRequired([
         { ...shop, role: "office" },
@@ -455,26 +455,69 @@ describe("required two-step sign-in (B-188)", () => {
     expect((await loadMfaState(office.id))?.deadline?.getTime()).toBe(before);
   });
 
-  it("an owner of a sample workspace only is never required", async () => {
-    const [demo] = await withSystem((tx) =>
-      tx
-        .insert(companies)
-        .values({ name: "Sample", slug: `sample-${Date.now()}-${n++}`, type: "shop", demo: true })
-        .returning(),
-    );
+  // ADR 0028 (B-297 note 2): reactivation through setMemberStatus is the one allowed restart.
+  it("reactivating a deactivated admin restarts the grace once; deactivate/reactivate again doesn't", async () => {
+    const { setMemberStatus } = await import("../modules/tenancy/service");
+    const company = await createCompany();
+    const owner = await createUser(company.id, "owner");
+    const admin = await createUser(company.id, "admin");
+    const asOwner = tenantContext(company.id, owner.id, "owner");
+    await db.update(members).set({ status: "deactivated" }).where(eq(members.userId, admin.id));
+    const longAgo = new Date(Date.now() - 60 * DAY);
+    await db.update(users).set({ mfaGraceStartsAt: longAgo }).where(eq(users.id, admin.id));
+    const { loadMfaState } = await import("./mfa");
+
+    await withTenant(company.id, (tx) => setMemberStatus(tx, asOwner, admin.id, "active"));
+    const fresh = await loadMfaState(admin.id);
+    expect(fresh?.deadline?.getTime()).toBeGreaterThan(Date.now() + 6 * DAY);
+    expect(mfaBlocks(fresh ?? undefined)).toBe(false);
+
+    // Time passes: the deadline is gone. Deactivate and reactivate again: no second restart.
+    await db.update(users).set({ mfaGraceStartsAt: longAgo }).where(eq(users.id, admin.id));
+    await withTenant(company.id, (tx) => setMemberStatus(tx, asOwner, admin.id, "deactivated"));
+    await withTenant(company.id, (tx) => setMemberStatus(tx, asOwner, admin.id, "active"));
+    const after = await loadMfaState(admin.id);
+    expect(after?.deadline?.getTime()).toBe(longAgo.getTime() + env.MFA_GRACE_DAYS * DAY);
+    expect(mfaBlocks(after ?? undefined)).toBe(true);
+  });
+
+  // ADR 0028/0029: the exemption is `isSampleRow` (a user's own sample workspace, live or
+  // retired), never `companies.demo` alone, which the seeded Desert Bloom has.
+  it.each([
+    ["a live sample workspace (demoOwnerUserId)", "live", false],
+    ["a retired sample workspace (settings.demoRetiredAt)", "retired", false],
+    ["a demo = true shop that is not a sample workspace (the seeded shop)", "seeded", true],
+  ] as const)("an owner of %s only: required = %s", async (_label, kind, required) => {
     const real = await createCompany();
     const designer = await createUser(real.id, "designer");
+    const [org] = await withSystem((tx) =>
+      tx
+        .insert(companies)
+        .values({
+          name: "Sample",
+          slug: `sample-${Date.now()}-${n++}`,
+          type: "shop",
+          demo: true,
+          demoOwnerUserId: kind === "live" ? designer.id : null,
+          settings: kind === "retired" ? { demoRetiredAt: new Date().toISOString() } : {},
+        })
+        .returning(),
+    );
     await withSystem((tx) =>
       tx
         .insert(members)
-        .values({ organizationId: demo?.id as string, userId: designer.id, role: "owner" }),
+        .values({ organizationId: org?.id as string, userId: designer.id, role: "owner" }),
     );
-    await db
-      .update(users)
-      .set({ mfaGraceStartsAt: new Date(Date.now() - 90 * DAY) })
-      .where(eq(users.id, designer.id));
-    const { loadMfaState } = await import("./mfa");
-    expect((await loadMfaState(designer.id))?.required).toBe(false);
+    const start = new Date(Date.now() - 90 * DAY);
+    await db.update(users).set({ mfaGraceStartsAt: start }).where(eq(users.id, designer.id));
+    const { loadMfaState, isUserMfaRequired } = await import("./mfa");
+    const state = await loadMfaState(designer.id);
+    expect(state?.required).toBe(required);
+    expect(await isUserMfaRequired(designer.id)).toBe(required);
+    expect(state?.deadline?.getTime() ?? null).toBe(
+      required ? start.getTime() + env.MFA_GRACE_DAYS * DAY : null,
+    );
+    expect(mfaBlocks(state ?? undefined)).toBe(required);
   });
 
   it("floor PIN sessions are never asked for two-step sign-in", async () => {

@@ -7,7 +7,7 @@ import type { CompanyType, Role, StationKind } from "../db/schema";
 import { companies, members, stations, users } from "../db/schema";
 import type { Actor } from "../lib/audit";
 import { logger } from "../lib/log";
-import { type MfaState, mfaState } from "../lib/mfa";
+import { type MfaState, mfaState, sampleColumns, withSampleFlag } from "../lib/mfa";
 import {
   isFloorSessionRevoked,
   isStationTokenLive,
@@ -20,13 +20,13 @@ const log = logger("context");
 export type SessionKind = "user" | "floor" | "station";
 
 export type StationInfo = { id: string; name: string; kind: StationKind | null; tokenId: string };
-/** `demo`: a sample workspace (tenancy.demo); it never makes two-step sign-in required. */
+/** `sample`: a sample workspace (`isSampleRow`); it never makes two-step sign-in required. */
 export type Membership = {
   orgId: string;
   name: string;
   type: CompanyType;
   role: Role;
-  demo: boolean;
+  sample: boolean;
 };
 
 /** Built once per request from the cookie session, a floor session or a station token. */
@@ -224,18 +224,20 @@ async function stationContext(ctx: Context, token: string): Promise<Context | nu
 async function userContext(ctx: Context, headers: Headers): Promise<Context | null> {
   const session = await auth.api.getSession({ headers });
   if (!session) return null;
-  const memberships = await db
-    .select({
-      orgId: members.organizationId,
-      name: companies.name,
-      type: companies.type,
-      role: members.role,
-      demo: companies.demo,
-    })
-    .from(members)
-    .innerJoin(companies, eq(companies.id, members.organizationId))
-    .where(and(eq(members.userId, session.user.id), eq(members.status, "active")))
-    .orderBy(members.createdAt);
+  const memberships: Membership[] = (
+    await db
+      .select({
+        orgId: members.organizationId,
+        name: companies.name,
+        type: companies.type,
+        role: members.role,
+        ...sampleColumns,
+      })
+      .from(members)
+      .innerJoin(companies, eq(companies.id, members.organizationId))
+      .where(and(eq(members.userId, session.user.id), eq(members.status, "active")))
+      .orderBy(members.createdAt)
+  ).map(withSampleFlag);
   const [account] = await db
     .select({ enabled: users.twoFactorEnabled, graceStartsAt: users.mfaGraceStartsAt })
     .from(users)

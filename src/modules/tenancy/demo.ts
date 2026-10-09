@@ -9,6 +9,7 @@ import { buildShopData, DESERT_BLOOM_PROFILE } from "../../db/seed/builder";
 import { rng } from "../../db/seed/data";
 import { badRequest, forbidden } from "../../lib/errors";
 import { errorData, logger } from "../../lib/log";
+import { sampleColumns, withSampleFlag } from "../../lib/mfa";
 import { deleteObject, listKeysOlderThan } from "../../lib/s3";
 import * as svc from "./service";
 
@@ -186,13 +187,13 @@ async function switchTo(context: RequestContext, companyId: string): Promise<Me>
       name: companies.name,
       type: companies.type,
       role: members.role,
-      demo: companies.demo,
+      ...sampleColumns,
     })
     .from(members)
     .innerJoin(companies, eq(companies.id, members.organizationId))
     .where(and(eq(members.userId, userId), eq(members.status, "active")))
     .orderBy(asc(members.createdAt));
-  const memberships: Membership[] = rows;
+  const memberships: Membership[] = rows.map(withSampleFlag);
   const target = memberships.find((m) => m.orgId === companyId);
   if (!target) throw forbidden("org.read", "Not a member of that company");
   await auth.api.setActiveOrganization({
