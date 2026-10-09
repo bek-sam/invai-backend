@@ -1,10 +1,28 @@
+import { existsSync } from "node:fs";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
 import { Pool } from "pg";
 import { ensureReferenceData } from "./reference";
 
-const MIGRATIONS_FOLDER = fileURLToPath(new URL("../../drizzle", import.meta.url));
+/**
+ * The `drizzle/` folder two levels above `entryUrl`: `src/db/<file>.ts` -> `<repo>/drizzle` when run
+ * from source, `dist/db/<cli>.js` -> `<app>/drizzle` when run compiled (the image keeps `drizzle/`
+ * next to `dist/`). Throws if the folder has no `meta/_journal.json`, so a wrong location fails
+ * loudly instead of drizzle reporting "nothing to apply".
+ *
+ * Resolve it from the *entry* file (`src/db/migrate-cli.ts`), never from a shared module: tsup
+ * moves shared code into `dist/chunk-*.js`, one level higher, where `../../drizzle` would point
+ * outside the app (T-30-2).
+ */
+export function migrationsFolderFrom(entryUrl: string): string {
+  const folder = fileURLToPath(new URL("../../drizzle", entryUrl));
+  if (!existsSync(join(folder, "meta", "_journal.json"))) {
+    throw new Error(`migrations folder not found: ${folder} has no meta/_journal.json`);
+  }
+  return folder;
+}
 
 /**
  * Fixed, known `pg_advisory_lock` key for `runMigrations` (T-12-2, B-16 follow-up; T-1-5 review:
@@ -70,10 +88,17 @@ export async function releaseMigrationLock(pool: Pool) {
 /**
  * Apply every migration in ./drizzle as the owner role, then upsert the global reference data
  * (plan catalog, trademark index — see `./reference`). Safe to run repeatedly. Used by `pnpm
- * db:migrate` and by the test global setup (against the test database). A fresh, empty database
- * has a working trademark check the moment this returns; no seed step is needed.
+ * db:migrate` and the release task (both through `src/db/migrate-cli.ts`) and by the test global
+ * setup (against the test database). A fresh, empty database has a working trademark check the
+ * moment this returns; no seed step is needed.
  */
-export async function runMigrations(migrationDatabaseUrl: string, opts: { quiet?: boolean } = {}) {
+export async function runMigrations(
+  migrationDatabaseUrl: string,
+  opts: { quiet?: boolean; migrationsFolder?: string } = {},
+) {
+  // From source (tests, tsx) this file sits at src/db/, so its own URL resolves the folder; the
+  // compiled CLI always passes `migrationsFolder` (see `migrationsFolderFrom`).
+  const migrationsFolder = opts.migrationsFolder ?? migrationsFolderFrom(import.meta.url);
   const log = opts.quiet ? () => {} : (msg: string) => console.log(`[migrate] ${msg}`);
   // max: 1 so every query below -- the lock, the extensions, the migration and the reference
   // data -- runs on the one physical connection that holds the session-level advisory lock.
@@ -93,7 +118,7 @@ export async function runMigrations(migrationDatabaseUrl: string, opts: { quiet?
         }
       }
       const db = drizzle(pool, { casing: "snake_case" });
-      await migrate(db, { migrationsFolder: MIGRATIONS_FOLDER });
+      await migrate(db, { migrationsFolder });
       await ensureReferenceData(db);
       log(`up to date (${new URL(migrationDatabaseUrl).pathname.slice(1)})`);
     } finally {
@@ -102,9 +127,4 @@ export async function runMigrations(migrationDatabaseUrl: string, opts: { quiet?
   } finally {
     await pool.end();
   }
-}
-
-if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
-  const { env } = await import("../env");
-  await runMigrations(env.MIGRATION_DATABASE_URL);
 }
