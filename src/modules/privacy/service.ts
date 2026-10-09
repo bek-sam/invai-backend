@@ -25,14 +25,18 @@ import { systemContext, type TenantContext } from "../../api/context";
 import { type Tx, withSystem, withTenant } from "../../db/client";
 import * as schema from "../../db/schema";
 import {
+  addressVerifications,
   auditLog,
   buyerPii,
   channelConnections,
   companies,
   files,
   floorRequests,
+  importRuns,
   invitations,
   jobs,
+  listings,
+  marketPriceSnapshots,
   members,
   orderItems,
   orders,
@@ -40,11 +44,12 @@ import {
   type PrivacyCounts,
   privacyRequests,
   sessions,
+  shipments,
 } from "../../db/schema";
 import type { PrivacyWebhookRequest } from "../../integrations/channels/types";
 import { audit, systemActor } from "../../lib/audit";
 import { notFound } from "../../lib/errors";
-import { logger } from "../../lib/log";
+import { errorData, logger } from "../../lib/log";
 import { bucket, deleteObject, deletePrefix, getObject, listObjects, s3 } from "../../lib/s3";
 import { createJobRow, toJob, updateJobRow } from "../production/service";
 import { createZip, ZipLimitError } from "./zip";
@@ -827,4 +832,353 @@ export async function purgeOldFloorRequests(now = new Date()) {
     deleted += rows.length;
   }
   return { companies: companyIds.length, deleted };
+}
+
+/* ---- Amazon non-PII retention (decision 0026, B-187) ------------------------------------- */
+
+/** Order statuses the Amazon sweep may touch; open orders of any age are never swept. */
+export const AMAZON_SWEEP_STATUSES = ["shipped", "delivered", "cancelled"] as const;
+const AMAZON_MARKET_SOURCES = ["amazon_pricing", "amazon_brand_analytics"] as const;
+const AMAZON_BATCH = 500;
+
+/** Rows changed per table (a column set to null or its placeholder, or the row deleted). */
+export type AmazonRowsCleared = {
+  orders: number;
+  order_items: number;
+  shipments: number;
+  address_verifications: number;
+  import_runs: number;
+  listings: number;
+  market_price_snapshots: number;
+};
+
+export type AmazonRetentionResult = {
+  companies: number;
+  failedCompanies: number;
+  orders: number;
+  rowsCleared: AmazonRowsCleared;
+};
+
+const noRows = (): AmazonRowsCleared => ({
+  orders: 0,
+  order_items: 0,
+  shipments: 0,
+  address_verifications: 0,
+  import_runs: 0,
+  listings: 0,
+  market_price_snapshots: 0,
+});
+
+function addRows(into: AmazonRowsCleared, from: AmazonRowsCleared) {
+  for (const k of Object.keys(into) as (keyof AmazonRowsCleared)[]) into[k] += from[k];
+}
+
+/** Sales channel `amazon`, or last imported from an Amazon-format CSV on a generic connection. */
+const isAmazonOrder = or(
+  eq(orders.channel, "amazon"),
+  sql`exists (select 1 from import_runs r where r.id = ${orders.importRunId} and r.format = 'amazon')`,
+);
+
+/** Orders that still hold a "drop" value (decision 0026): a swept order no longer matches. */
+const holdsAmazonDropData = or(
+  isNotNull(orders.shippingMethod),
+  sql`exists (select 1 from order_items i where i.company_id = ${orders.companyId}
+    and i.order_id = ${orders.id} and i.channel_listing_id is not null)`,
+  sql`exists (select 1 from shipments s where s.company_id = ${orders.companyId}
+    and s.order_id = ${orders.id} and s.tracking_push_error is not null)`,
+  sql`exists (select 1 from address_verifications v where v.company_id = ${orders.companyId}
+    and v.order_id = ${orders.id})`,
+);
+
+/** What the sweep selects, per table; each predicate excludes rows already swept. */
+function amazonStale(cutoff: Date) {
+  return {
+    orders: and(
+      isAmazonOrder,
+      lt(orders.placedAt, cutoff),
+      inArray(orders.status, [...AMAZON_SWEEP_STATUSES]),
+      holdsAmazonDropData,
+    ),
+    importRuns: and(
+      lt(importRuns.startedAt, cutoff),
+      inArray(importRuns.status, ["completed", "failed"]),
+      or(
+        eq(importRuns.format, "amazon"),
+        sql`exists (select 1 from channel_connections c where c.id = ${importRuns.connectionId}
+          and c.channel = 'amazon')`,
+      ),
+      or(ne(importRuns.fileKey, ""), sql`${importRuns.errors} <> '[]'::jsonb`),
+    ),
+    listings: and(
+      eq(listings.channel, "amazon"),
+      lt(sql`coalesce(${listings.lastSyncedAt}, ${listings.updatedAt})`, cutoff),
+      sql`${listings.raw} <> '{}'::jsonb`,
+    ),
+    snapshots: and(
+      inArray(marketPriceSnapshots.source, [...AMAZON_MARKET_SOURCES]),
+      lt(marketPriceSnapshots.asOf, cutoff),
+    ),
+  };
+}
+type AmazonStale = ReturnType<typeof amazonStale>;
+
+const countAll = sql<number>`count(*)::int`;
+
+/** Dry run: what one company's sweep would change. Reads only. */
+async function countAmazonDrop(tx: Tx, companyId: string, w: AmazonStale) {
+  const swept = and(eq(orders.companyId, companyId), w.orders);
+  const sweptIds = tx.select({ id: orders.id }).from(orders).where(swept);
+  const count = async (q: Promise<{ n: number }[]>) => Number((await q)[0]?.n ?? 0);
+  const rows: AmazonRowsCleared = {
+    orders: await count(
+      tx
+        .select({ n: countAll })
+        .from(orders)
+        .where(and(swept, isNotNull(orders.shippingMethod))),
+    ),
+    order_items: await count(
+      tx
+        .select({ n: countAll })
+        .from(orderItems)
+        .where(
+          and(
+            eq(orderItems.companyId, companyId),
+            inArray(orderItems.orderId, sweptIds),
+            isNotNull(orderItems.channelListingId),
+          ),
+        ),
+    ),
+    shipments: await count(
+      tx
+        .select({ n: countAll })
+        .from(shipments)
+        .where(
+          and(
+            eq(shipments.companyId, companyId),
+            inArray(shipments.orderId, sweptIds),
+            isNotNull(shipments.trackingPushError),
+          ),
+        ),
+    ),
+    address_verifications: await count(
+      tx
+        .select({ n: countAll })
+        .from(addressVerifications)
+        .where(
+          and(
+            eq(addressVerifications.companyId, companyId),
+            inArray(addressVerifications.orderId, sweptIds),
+          ),
+        ),
+    ),
+    import_runs: await count(
+      tx
+        .select({ n: countAll })
+        .from(importRuns)
+        .where(and(eq(importRuns.companyId, companyId), w.importRuns)),
+    ),
+    listings: await count(
+      tx
+        .select({ n: countAll })
+        .from(listings)
+        .where(and(eq(listings.companyId, companyId), w.listings)),
+    ),
+    market_price_snapshots: await count(
+      tx
+        .select({ n: countAll })
+        .from(marketPriceSnapshots)
+        .where(and(eq(marketPriceSnapshots.companyId, companyId), w.snapshots)),
+    ),
+  };
+  const orderCount = await count(tx.select({ n: countAll }).from(orders).where(swept));
+  return { orders: orderCount, rows };
+}
+
+/**
+ * One transaction of the sweep for one company: at most AMAZON_BATCH orders (row-locked), and as
+ * many import runs, listings and price snapshots. Keep columns and `updated_at` are never written.
+ */
+async function sweepAmazonBatch(tx: Tx, companyId: string, w: AmazonStale) {
+  const rows = noRows();
+  const ids = (
+    await tx
+      .select({ id: orders.id })
+      .from(orders)
+      .where(and(eq(orders.companyId, companyId), w.orders))
+      .orderBy(orders.id)
+      .limit(AMAZON_BATCH)
+      .for("update")
+  ).map((r) => r.id);
+  if (ids.length) {
+    rows.orders = (
+      await tx
+        .update(orders)
+        .set({ shippingMethod: null, updatedAt: sql`${orders.updatedAt}` })
+        .where(and(inArray(orders.id, ids), isNotNull(orders.shippingMethod)))
+        .returning({ id: orders.id })
+    ).length;
+    rows.order_items = (
+      await tx
+        .update(orderItems)
+        .set({ channelListingId: null, updatedAt: sql`${orderItems.updatedAt}` })
+        .where(
+          and(
+            eq(orderItems.companyId, companyId),
+            inArray(orderItems.orderId, ids),
+            isNotNull(orderItems.channelListingId),
+          ),
+        )
+        .returning({ id: orderItems.id })
+    ).length;
+    rows.shipments = (
+      await tx
+        .update(shipments)
+        .set({ trackingPushError: null, updatedAt: sql`${shipments.updatedAt}` })
+        .where(
+          and(
+            eq(shipments.companyId, companyId),
+            inArray(shipments.orderId, ids),
+            isNotNull(shipments.trackingPushError),
+          ),
+        )
+        .returning({ id: shipments.id })
+    ).length;
+    rows.address_verifications = (
+      await tx
+        .delete(addressVerifications)
+        .where(
+          and(
+            eq(addressVerifications.companyId, companyId),
+            inArray(addressVerifications.orderId, ids),
+          ),
+        )
+        .returning({ id: addressVerifications.id })
+    ).length;
+  }
+  const runIds = (
+    await tx
+      .select({ id: importRuns.id })
+      .from(importRuns)
+      .where(and(eq(importRuns.companyId, companyId), w.importRuns))
+      .limit(AMAZON_BATCH)
+      .for("update")
+  ).map((r) => r.id);
+  if (runIds.length)
+    rows.import_runs = (
+      await tx
+        .update(importRuns)
+        .set({ errors: [], fileKey: "", updatedAt: sql`${importRuns.updatedAt}` })
+        .where(inArray(importRuns.id, runIds))
+        .returning({ id: importRuns.id })
+    ).length;
+  const listingIds = (
+    await tx
+      .select({ id: listings.id })
+      .from(listings)
+      .where(and(eq(listings.companyId, companyId), w.listings))
+      .limit(AMAZON_BATCH)
+      .for("update")
+  ).map((r) => r.id);
+  if (listingIds.length)
+    rows.listings = (
+      await tx
+        .update(listings)
+        .set({ raw: {}, updatedAt: sql`${listings.updatedAt}` })
+        .where(inArray(listings.id, listingIds))
+        .returning({ id: listings.id })
+    ).length;
+  rows.market_price_snapshots = (
+    await tx
+      .delete(marketPriceSnapshots)
+      .where(
+        inArray(
+          marketPriceSnapshots.id,
+          tx
+            .select({ id: marketPriceSnapshots.id })
+            .from(marketPriceSnapshots)
+            .where(and(eq(marketPriceSnapshots.companyId, companyId), w.snapshots))
+            .limit(AMAZON_BATCH),
+        ),
+      )
+      .returning({ id: marketPriceSnapshots.id })
+  ).length;
+  const more =
+    ids.length === AMAZON_BATCH ||
+    runIds.length === AMAZON_BATCH ||
+    listingIds.length === AMAZON_BATCH ||
+    rows.market_price_snapshots === AMAZON_BATCH;
+  const changed = Object.values(rows).reduce((a, b) => a + b, 0);
+  if (changed > 0)
+    await audit(tx, {
+      companyId,
+      actor: systemActor,
+      action: "privacy.amazon_retention",
+      entityType: "company",
+      entityId: companyId,
+      summary: `Retention: Amazon data older than ${BUYER_PII_RETENTION_MONTHS} months cleared from ${ids.length} order(s)`,
+      data: { orders: ids.length, rows },
+    });
+  return { orders: ids.length, rows, more, changed };
+}
+
+/**
+ * Daily, after `redactStaleBuyerPii`: Amazon non-PII data older than 18 months (Amazon DPP,
+ * decision 0026). Only orders placed before the cutoff and shipped, delivered or cancelled; open
+ * orders and other channels are never touched, and no order, item or shipment row is deleted.
+ * Money, dates, order numbers and line codes stay for the shop's books. Company ids are read as
+ * system; the work runs per company inside `withTenant`; a failing company is logged and skipped.
+ * `dryRun` returns the same counts and writes nothing.
+ */
+export async function sweepStaleAmazonData(
+  now = new Date(),
+  opts: { dryRun?: boolean } = {},
+): Promise<AmazonRetentionResult> {
+  const dryRun = opts.dryRun === true;
+  const cutoff = buyerPiiCutoff(now);
+  const w = amazonStale(cutoff);
+  // withSystem: cross-tenant sweep, reads company ids only; every change runs in withTenant.
+  const companyIds = await withSystem(async (tx) => {
+    const lists = [
+      await tx.selectDistinct({ id: orders.companyId }).from(orders).where(w.orders),
+      await tx.selectDistinct({ id: importRuns.companyId }).from(importRuns).where(w.importRuns),
+      await tx.selectDistinct({ id: listings.companyId }).from(listings).where(w.listings),
+      await tx
+        .selectDistinct({ id: marketPriceSnapshots.companyId })
+        .from(marketPriceSnapshots)
+        .where(w.snapshots),
+    ];
+    return [...new Set(lists.flat().map((r) => r.id))];
+  });
+  const rowsCleared = noRows();
+  let orderTotal = 0;
+  let failed = 0;
+  for (const companyId of companyIds) {
+    try {
+      if (dryRun) {
+        const c = await withTenant(companyId, (tx) => countAmazonDrop(tx, companyId, w));
+        orderTotal += c.orders;
+        addRows(rowsCleared, c.rows);
+        continue;
+      }
+      for (;;) {
+        const b = await withTenant(companyId, (tx) => sweepAmazonBatch(tx, companyId, w));
+        orderTotal += b.orders;
+        addRows(rowsCleared, b.rows);
+        if (!b.more) break;
+        // A full batch that changed nothing would select the same rows forever.
+        if (b.changed === 0) throw new Error("Amazon retention batch changed nothing");
+      }
+    } catch (err) {
+      failed++;
+      log.error("amazon retention sweep failed for a company", { companyId, ...errorData(err) });
+    }
+  }
+  const result = {
+    companies: companyIds.length,
+    failedCompanies: failed,
+    orders: orderTotal,
+    rowsCleared,
+  };
+  log.info("amazon retention sweep", { dryRun, cutoff: cutoff.toISOString(), ...result });
+  return result;
 }

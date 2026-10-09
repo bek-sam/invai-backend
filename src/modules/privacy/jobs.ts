@@ -9,6 +9,7 @@ import {
   purgeOldFloorRequests,
   redactStaleBuyerPii,
   runTenantExport,
+  sweepStaleAmazonData,
 } from "./service";
 
 const log = logger("privacy.jobs");
@@ -60,7 +61,8 @@ export async function scheduleHardPurge(companyId: string, delayMs = HARD_PURGE_
 }
 
 /**
- * Daily: buyer PII past 18 months, `floor_requests` past 30 days, and any due purge whose delayed
+ * Daily: buyer PII past 18 months, then non-PII Amazon data past 18 months (decision 0026),
+ * `floor_requests` past 30 days, and any due purge whose delayed
  * job was lost (enqueued again under the same id, so never twice).
  */
 export const privacyRetentionSweepJob = defineJob({
@@ -70,10 +72,12 @@ export const privacyRetentionSweepJob = defineJob({
   options: { attempts: 3 },
   handler: async () => {
     const buyerPii = await redactStaleBuyerPii();
+    // After the PII redaction (decision 0026): same 18-month cutoff, non-PII Amazon data.
+    const amazon = await sweepStaleAmazonData();
     const floorRequests = await purgeOldFloorRequests();
     const due = await overduePurges();
     for (const companyId of due) await tenantHardPurgeJob.enqueue({ companyId });
-    return { buyerPii, floorRequests, overduePurges: due.length };
+    return { buyerPii, amazon, floorRequests, overduePurges: due.length };
   },
 });
 
