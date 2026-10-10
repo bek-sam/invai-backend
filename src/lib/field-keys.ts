@@ -30,6 +30,16 @@ export interface FieldKeyProvider {
 /** Same shape for every ring and wrapped key: short, printable, no `:` or `,`. */
 const KEY_ID = /^[A-Za-z0-9_.-]{1,64}$/;
 
+/**
+ * True when `id` can be named in a message: the key-id shape, and not a 32-byte key in base64 or
+ * base64url (an unpadded `+`/`/`-free key passes the shape; S-66, architect edit 5). Every message
+ * that echoes an id runs after this check.
+ */
+function isSafeKeyId(id: string): boolean {
+  if (!KEY_ID.test(id)) return false;
+  return !(id.length >= 42 && id.length <= 44 && Buffer.from(id, "base64").length === 32);
+}
+
 export const KMS_NOT_BUILT_MESSAGE =
   "FIELD_ENCRYPTION_PROVIDER=kms: the AWS KMS adapter is not built yet (backlog B-327). " +
   "Set FIELD_ENCRYPTION_PROVIDER=static to use the FIELD_ENCRYPTION_KEY ring until it lands.";
@@ -73,7 +83,7 @@ function parseEntries(raw: string, varName: string): { id: string; value: string
     const idx = part.indexOf(":");
     if (idx <= 0) throw new Error(`${varName} entries must look like keyId:base64`);
     const id = part.slice(0, idx).trim();
-    if (!KEY_ID.test(id)) {
+    if (!isSafeKeyId(id)) {
       throw new Error(`${varName} entry ${i + 1} has an invalid key id (letters, digits, _ . -)`);
     }
     if (seen.has(id)) throw new Error(`${varName} lists key id ${id} twice`);
@@ -84,16 +94,28 @@ function parseEntries(raw: string, varName: string): { id: string; value: string
   return out;
 }
 
-/** The static `FIELD_ENCRYPTION_KEY` ring: the first key encrypts, every key decrypts. */
+/**
+ * The static `FIELD_ENCRYPTION_KEY` ring: the first key encrypts, every key decrypts. Each entry's
+ * id is checked for shape before any message could use it (S-66: a swapped `<base64key>:k1` makes
+ * the "id" the key itself), so failures name the entry number only; a repeated id is refused
+ * (S-67: the first entry would encrypt and the last would decrypt).
+ */
 export function parseStaticRing(raw: string | undefined): KeyRing {
   if (!raw) throw new Error("FIELD_ENCRYPTION_KEY is not set");
   const all = new Map<string, Buffer>();
   let primary: DataKey | null = null;
-  for (const part of raw.split(",")) {
+  for (const [i, part] of raw.split(",").entries()) {
+    const entry = `FIELD_ENCRYPTION_KEY entry ${i + 1}`;
     const idx = part.indexOf(":");
     if (idx <= 0) throw new Error("FIELD_ENCRYPTION_KEY entries must look like keyId:base64");
     const id = part.slice(0, idx).trim();
-    const key = decode32(part.slice(idx + 1), `FIELD_ENCRYPTION_KEY ${id}`);
+    if (!isSafeKeyId(id)) {
+      throw new Error(
+        `${entry} has an invalid key id (letters, digits, _ . -; is it keyId:base64?)`,
+      );
+    }
+    const key = decode32(part.slice(idx + 1), entry);
+    if (all.has(id)) throw new Error(`FIELD_ENCRYPTION_KEY lists key id ${id} twice`);
     all.set(id, key);
     primary ??= { id, key };
   }

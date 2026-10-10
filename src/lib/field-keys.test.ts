@@ -40,6 +40,13 @@ const DATA_KEY_2 = randomBytes(32);
 const WRAPPED = wrapDataKey(MASTER, "d1", DATA_KEY);
 const WRAPPED_2 = wrapDataKey(MASTER, "d0", DATA_KEY_2);
 const STATIC_RING = saved.FIELD_ENCRYPTION_KEY as string;
+/** A key whose base64 has no `+` or `/`: without its `=` it passes the key-id shape (S-66). */
+const ALNUM_KEY = (() => {
+  for (;;) {
+    const b64 = randomBytes(32).toString("base64").replace(/=+$/, "");
+    if (/^[A-Za-z0-9]+$/.test(b64)) return b64;
+  }
+})();
 
 /** Every secret a message must never contain, in the encodings a leak would use. */
 function secretsIn(text: string): string[] {
@@ -48,13 +55,14 @@ function secretsIn(text: string): string[] {
     b.toString("hex"),
     b.toString("base64url"),
   ]);
-  values.push(WRAPPED, WRAPPED_2, STATIC_RING.slice(STATIC_RING.indexOf(":") + 1));
+  values.push(WRAPPED, WRAPPED_2, ALNUM_KEY, STATIC_RING.slice(STATIC_RING.indexOf(":") + 1));
   return values.filter((v) => text.includes(v));
 }
 
 function useLocal(extra: Record<string, string | undefined> = {}) {
   Object.assign(process.env, {
     FIELD_ENCRYPTION_PROVIDER: "local",
+    FIELD_ENCRYPTION_KEY: STATIC_RING,
     FIELD_ENCRYPTION_LOCAL_MASTER_KEY: MASTER_B64,
     FIELD_ENCRYPTION_DATA_KEYS: `d1:${WRAPPED},d0:${WRAPPED_2}`,
   });
@@ -112,6 +120,48 @@ describe("static provider (default, unchanged)", () => {
     await initFieldEncryption();
     expect(decryptField(stored)).toBe("Jane Buyer");
     expect(needsReencrypt(stored)).toBe(false);
+  });
+
+  it("a swapped or repeated entry is refused at parse, naming the entry or id only (S-66, S-67)", async () => {
+    const cases: [string, string, RegExp][] = [
+      [
+        "swapped",
+        `${DATA_KEY.toString("base64")}:k1`,
+        /^FIELD_ENCRYPTION_KEY entry 1 has an invalid key id/,
+      ],
+      [
+        "swapped, unpadded",
+        `${ALNUM_KEY}:k1`,
+        /^FIELD_ENCRYPTION_KEY entry 1 has an invalid key id/,
+      ],
+      [
+        "key in the id position, key as value",
+        `${ALNUM_KEY}:${DATA_KEY.toString("base64")}`,
+        /^FIELD_ENCRYPTION_KEY entry 1 has an invalid key id/,
+      ],
+      [
+        "swapped second entry",
+        `k2:${DATA_KEY_2.toString("base64")},${MASTER_B64}:k1`,
+        /^FIELD_ENCRYPTION_KEY entry 2 has an invalid key id/,
+      ],
+      [
+        "repeated id",
+        `k9:${DATA_KEY.toString("base64")},k9:${DATA_KEY_2.toString("base64")}`,
+        /^FIELD_ENCRYPTION_KEY lists key id k9 twice\n/,
+      ],
+    ];
+    for (const [label, ring, expected] of cases) {
+      delete process.env.FIELD_ENCRYPTION_PROVIDER;
+      process.env.FIELD_ENCRYPTION_KEY = ring;
+      resetKeyRing();
+      for (const text of [
+        await errorText(() => encryptField("x")),
+        await errorText(() => decryptField("k9:AAAA")),
+      ]) {
+        expect(text, label).toMatch(expected);
+        expect(secretsIn(text), label).toEqual([]);
+      }
+    }
   });
 
   it("init is memoized: the same promise every time until resetKeyRing()", () => {
@@ -197,6 +247,43 @@ describe("local provider", () => {
         /needs FIELD_ENCRYPTION_DATA_KEYS/,
       ],
       ["missing id", { FIELD_ENCRYPTION_DATA_KEYS: WRAPPED }, /keyId:base64/],
+      // S-66: a swapped entry (`<key>:k1`) on either ring names the entry number only.
+      [
+        "swapped static entry",
+        { FIELD_ENCRYPTION_KEY: `${DATA_KEY.toString("base64")}:k1` },
+        /^FIELD_ENCRYPTION_KEY entry 1 has an invalid key id/,
+      ],
+      [
+        "swapped static entry, unpadded key",
+        { FIELD_ENCRYPTION_KEY: `k0:${DATA_KEY_2.toString("base64")},${ALNUM_KEY}:k1` },
+        /^FIELD_ENCRYPTION_KEY entry 2 has an invalid key id/,
+      ],
+      [
+        "swapped data key entry",
+        { FIELD_ENCRYPTION_DATA_KEYS: `d0:${WRAPPED_2},${WRAPPED}:d1` },
+        /^FIELD_ENCRYPTION_DATA_KEYS entry 2 has an invalid key id/,
+      ],
+      [
+        "swapped data key entry, unpadded key",
+        { FIELD_ENCRYPTION_DATA_KEYS: `${ALNUM_KEY}:d1` },
+        /^FIELD_ENCRYPTION_DATA_KEYS entry 1 has an invalid key id/,
+      ],
+      [
+        "key-shaped id on both rings",
+        {
+          FIELD_ENCRYPTION_KEY: `${ALNUM_KEY}:${DATA_KEY.toString("base64")}`,
+          FIELD_ENCRYPTION_DATA_KEYS: `${ALNUM_KEY}:${WRAPPED}`,
+        },
+        /^FIELD_ENCRYPTION_KEY entry 1 has an invalid key id/,
+      ],
+      // S-67: a repeated static id is refused by id.
+      [
+        "repeated static id",
+        {
+          FIELD_ENCRYPTION_KEY: `k9:${DATA_KEY.toString("base64")},k9:${DATA_KEY_2.toString("base64")}`,
+        },
+        /^FIELD_ENCRYPTION_KEY lists key id k9 twice\n/,
+      ],
     ];
     for (const [label, extra, expected] of cases) {
       useLocal(extra);
