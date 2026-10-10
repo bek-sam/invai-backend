@@ -1,6 +1,7 @@
 import { eq } from "drizzle-orm";
 import { withSystem } from "../../src/db/client";
-import { companies } from "../../src/db/schema";
+import { aiCreditLedger, companies } from "../../src/db/schema";
+import { periodOf } from "../../src/modules/billing/service";
 import { createCompany, createLocation, createUser } from "../../src/test/fixtures";
 
 /*
@@ -19,6 +20,16 @@ export async function createEvalTenant(): Promise<EvalTenant> {
   const company = await createCompany({ name: `Eval harness ${new Date().toISOString()}` });
   const user = await createUser(company.id, "owner");
   await createLocation(company.id);
+  // A new company is on the trial plan (100 credits a month), fewer than one full run uses, so
+  // the later routes failed with CREDITS_EXHAUSTED. A pack keeps every case about the route.
+  await withSystem((tx) =>
+    tx.insert(aiCreditLedger).values({
+      companyId: company.id,
+      kind: "pack",
+      credits: 100_000,
+      period: periodOf().key,
+    }),
+  );
   return { companyId: company.id, userId: user.id };
 }
 
