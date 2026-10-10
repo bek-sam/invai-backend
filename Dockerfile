@@ -1,5 +1,5 @@
 # One image, five commands (T-30-3): api (default CMD), worker and the three release CLIs.
-#   node dist/api/server.js | node dist/worker/index.js
+#   node --import ./dist/lib/telemetry.js dist/api/server.js | ... dist/worker/index.js (same import)
 #   node dist/db/bootstrap-cli.js | dist/db/migrate-cli.js | dist/db/reference-seed-cli.js
 # Migrations are at /app/drizzle (migrate-cli resolves them from <app>/drizzle).
 #
@@ -73,4 +73,5 @@ EXPOSE 3000
 # check off, and ECS ignores Dockerfile HEALTHCHECKs (health is set on the service).
 HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=5 \
   CMD ["node", "-e", "fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/livez').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
-CMD ["node", "dist/api/server.js"]
+# Tracing is off unless OTEL_EXPORTER_OTLP_ENDPOINT is set (lib/telemetry.ts); the import costs nothing otherwise.
+CMD ["node", "--import", "./dist/lib/telemetry.js", "dist/api/server.js"]
