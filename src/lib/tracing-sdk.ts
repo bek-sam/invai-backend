@@ -1,5 +1,10 @@
 import type { Attributes } from "@opentelemetry/api";
-import { resourceFromAttributes } from "@opentelemetry/resources";
+import {
+  detectResources,
+  envDetector,
+  type Resource,
+  resourceFromAttributes,
+} from "@opentelemetry/resources";
 import {
   BatchSpanProcessor,
   NodeTracerProvider,
@@ -7,7 +12,7 @@ import {
   type SpanExporter,
   type SpanProcessor,
 } from "@opentelemetry/sdk-trace-node";
-import { markTracingOn } from "./tracing";
+import { markTracingOn, registerTracingFlush } from "./tracing";
 
 /*
  * The OpenTelemetry SDK, loaded only when tracing is on (lib/telemetry.ts imports this module
@@ -114,6 +119,21 @@ export type TracingOptions = {
 };
 
 /**
+ * The provider's resource: OTEL_RESOURCE_ATTRIBUTES via `envDetector` only (host and process
+ * detectors would export the hostname and command line), with our `service.name` winning over any
+ * value the environment carries. The AllowlistExporter filters span attributes, not the resource:
+ * what an operator sets in the environment is exported verbatim.
+ */
+export function buildResource(serviceName: string): Resource {
+  const own = resourceFromAttributes({ "service.name": serviceName });
+  try {
+    return detectResources({ detectors: [envDetector] }).merge(own);
+  } catch {
+    return own;
+  }
+}
+
+/**
  * Registers the tracer provider (AsyncLocalStorage context, W3C trace-context propagator) and the
  * undici instrumentation for global `fetch`. Only calls to `propagateTo()`'s origin (imaging) are
  * traced, so no `traceparent` header goes to a third party (AI providers, marketplaces).
@@ -126,11 +146,12 @@ export async function startTracing(opts: TracingOptions): Promise<NodeTracerProv
     processor = new BatchSpanProcessor(new AllowlistExporter(new OTLPTraceExporter({ url })));
   }
   const provider = new NodeTracerProvider({
-    resource: resourceFromAttributes({ "service.name": opts.serviceName }),
+    resource: buildResource(opts.serviceName),
     spanProcessors: [processor],
   });
   provider.register();
   markTracingOn(true);
+  registerTracingFlush(() => provider.forceFlush());
 
   const { UndiciInstrumentation } = await import("@opentelemetry/instrumentation-undici");
   new UndiciInstrumentation({

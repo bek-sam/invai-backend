@@ -17,6 +17,7 @@ import {
   WORKER_STALL_SETTINGS,
 } from "../lib/queues";
 import { withShutdownCap } from "../lib/shutdown-timeout";
+import { flushTracing } from "../lib/tracing";
 import { onJobFailed } from "./job-failures";
 import { startOutboxRelay } from "./outbox-relay";
 import "./sweeps";
@@ -111,11 +112,13 @@ async function shutdown(signal: string) {
       signal,
       capMs: SHUTDOWN_CAP_MS,
     });
+    await flushTracing();
     process.exit(1);
   }
 
   await closeQueues();
   await closeDb();
+  await flushTracing();
   process.exit(0);
 }
 

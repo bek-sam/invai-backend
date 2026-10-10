@@ -12,6 +12,7 @@ import {
   trace,
 } from "@opentelemetry/api";
 import type { QueueBaseOptions } from "bullmq";
+import { withShutdownCap } from "./shutdown-timeout";
 
 /*
  * Trace helpers the app code uses (T-32-5, B-18). They only touch `@opentelemetry/api`, which is
@@ -32,6 +33,25 @@ export function tracingOn(): boolean {
 
 export function markTracingOn(on: boolean) {
   Reflect.set(globalThis, ON, on);
+}
+
+let flusher: (() => Promise<void>) | null = null;
+
+/** `startTracing` registers how to flush its provider; tests clear it with null. */
+export function registerTracingFlush(fn: (() => Promise<void>) | null) {
+  flusher = fn;
+}
+
+/**
+ * Exports the spans still buffered, waiting at most `capMs`, so a SIGTERM does not lose the last
+ * seconds of a trace. A no-op when tracing is off; never throws and never waits past the cap.
+ */
+export async function flushTracing(capMs = 3_000): Promise<void> {
+  if (!flusher) return;
+  await withShutdownCap(
+    flusher().catch(() => {}),
+    capMs,
+  );
 }
 
 const tracer = () => trace.getTracer("invai");

@@ -5,6 +5,7 @@ import { initFieldEncryption } from "../lib/crypto";
 import { errorData, logger } from "../lib/log";
 import { ensureBucket } from "../lib/s3";
 import { withShutdownCap } from "../lib/shutdown-timeout";
+import { flushTracing } from "../lib/tracing";
 import { app } from "./app";
 import { beginShutdown } from "./shutdown";
 
@@ -53,6 +54,7 @@ async function shutdown(signal: string) {
     server.closeAllConnections();
   }
   log.info("exiting", { signal, forced: timedOut });
+  await flushTracing();
   process.exit(timedOut ? 1 : 0);
 }
 
