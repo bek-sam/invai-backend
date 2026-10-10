@@ -309,6 +309,13 @@
       "when": 1791559624219,
       "tag": "0043_auth_mfa_required_since",
       "breakpoints": true
+    },
+    {
+      "idx": 44,
+      "version": "7",
+      "when": 1791655080485,
+      "tag": "0044_tenancy_outbox_trace",
+      "breakpoints": true
     }
   ]
 }

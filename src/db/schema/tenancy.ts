@@ -431,6 +431,9 @@ export const outboxEvents = pgTable(
     lastError: text(),
     dispatchedAt: timestamp({ withTimezone: true }),
     createdAt: createdAt(),
+    /** W3C `traceparent` of the span that emitted the event (T-32-5); null when tracing is off.
+     * The relay enqueues the event's jobs inside this context. Never part of the payload. */
+    traceParent: text(),
   },
   (t) => [
     index("outbox_events_pending_idx").on(t.createdAt).where(sql`dispatched_at is null`),
