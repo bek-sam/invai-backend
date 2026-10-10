@@ -41,7 +41,9 @@ export async function onJobFailed(
   const { companyId } = ref.data;
   const rowId = ref.data.jobId ?? ref.data.importRunId ?? null;
   // S-68: `jobs.error` reaches the shop's staff through `Job.error`; store it scrubbed.
-  const error = String(errorData(err).error) || String(err);
+  // An empty scrubbed head (a message that was only parameters) falls back to a fixed word, never the raw text.
+  const scrubbed = errorData(err).error;
+  const error = typeof scrubbed === "string" && scrubbed.trim() ? scrubbed : "failed";
   try {
     if (rowId) {
       const [row] = await withTenant(companyId, (tx) =>

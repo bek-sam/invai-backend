@@ -68,6 +68,19 @@ describe("worker: jobs BullMQ gave up on", () => {
     expect(row?.error).not.toContain(buyer);
   });
 
+  it("an error whose scrubbed head is empty stores a fixed word, never the raw text (T-35-5)", async () => {
+    const id = await jobRow("running");
+    const buyer = "maria.gonzalez@example.com";
+    await onJobFailed(
+      getJob("shipping.batchBuy"),
+      { name: "shipping.batchBuy", data: { companyId, jobId: id }, finishedOn: Date.now() },
+      new Error(`\nparams: ${buyer}`),
+    );
+    const row = await statusOf(id);
+    expect(row).toMatchObject({ status: "failed", error: "failed" });
+    expect(row?.error).not.toContain(buyer);
+  });
+
   it("leaves a finished row alone and ignores data without ids", async () => {
     const id = await jobRow("done");
     await onJobFailed(
