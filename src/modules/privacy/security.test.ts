@@ -6,7 +6,8 @@ import { objectKey, putObject } from "../../lib/s3";
 import { createCompany, createConnection, createOrder } from "../../test/fixtures";
 import { purgeBuyerPii } from "../orders/jobs";
 import { createNameTemplate, exists, readBack, seedItemArt } from "./buyer-text.fixtures";
-import { buyerPiiCutoff, redactStaleBuyerPii, sweepStaleAmazonData } from "./service";
+import { expireTenantExports } from "./export-retention";
+import { buyerPiiCutoff, exportKey, redactStaleBuyerPii, sweepStaleAmazonData } from "./service";
 
 const DAY = 86400_000;
 
@@ -140,6 +141,29 @@ describe("buyer-text purge: storage deletes stay inside the unit's own objects (
     const live2 = await readBack(c, live.order.id, liveItem.id);
     expect(live2.art?.values.photo).toBe(art.photoKey);
     expect(await exists(art.photoKey)).toBe(true);
+  });
+});
+
+describe("export expiry deletes only the company's tenant-export zips (T-31-5)", () => {
+  // The sweep lists by prefix and deletes by age, so the prefix is the whole fence: a widened
+  // prefix (`{c}/`, `{c}/tenant-export` without the slash, the bucket root) would delete every
+  // old design, label and raw payload of the shop, or a sibling folder that shares the name start.
+  it("an old design, raw payload and look-alike folder survive; only the old zip goes", async () => {
+    const a = (await createCompany()).id;
+    const b = (await createCompany()).id;
+    const zip = await putObject(exportKey(a, crypto.randomUUID()), "PK", "application/zip");
+    const keep = [
+      await putObject(objectKey(a, "design", "png"), "d", "image/png"),
+      await putObject(objectKey(a, "raw", "json"), "{}", "application/json"),
+      await putObject(`${a}/tenant-exports/${crypto.randomUUID()}.zip`, "PK", "application/zip"),
+      await putObject(`${a}/tenant-export-old/${crypto.randomUUID()}.zip`, "PK", "application/zip"),
+      await putObject(exportKey(b, crypto.randomUUID()), "PK", "application/zip"),
+    ];
+    // Every object above is "older than 7 days" from this clock.
+    const res = await expireTenantExports(a, new Date(Date.now() + 8 * DAY));
+    expect(res.exportsDeleted).toBe(1);
+    expect(await exists(zip)).toBe(false);
+    for (const k of keep) expect(await exists(k), k).toBe(true);
   });
 });
 
