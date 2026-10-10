@@ -1,5 +1,5 @@
 import { REALTIME_SSE_PATH } from "@invai/contracts";
-import { SpanKind } from "@opentelemetry/api";
+import { ROOT_CONTEXT, SpanKind } from "@opentelemetry/api";
 import { OpenAPIHandler } from "@orpc/openapi/fetch";
 import { RPCHandler } from "@orpc/server/fetch";
 import { ResponseHeadersPlugin } from "@orpc/server/plugins";
@@ -19,7 +19,7 @@ import { errorData, logger } from "../lib/log";
 import { setLogContext, withLogContext } from "../lib/log-context";
 import { redis } from "../lib/queues";
 import { s3Healthy } from "../lib/s3";
-import { contextFromHeaders, setSpanAttributes, tracingOn, withSpan } from "../lib/tracing";
+import { linksFromHeaders, setSpanAttributes, tracingOn, withSpan } from "../lib/tracing";
 import { buildContext } from "./context";
 import { events } from "./events";
 import { internal } from "./internal";
@@ -67,7 +67,7 @@ export function routeGroup(path: string): string {
 /**
  * Request scope (T-32-5): every log line of the request carries its `requestId` (the oRPC
  * context reuses it) and, once the session is known, `companyId`. With tracing on, the request
- * gets a SERVER span (continuing an incoming `traceparent`) with allowlisted attributes only:
+ * gets a SERVER span (a new root; an incoming `traceparent` is only a link) with allowlisted attributes only:
  * method, route group, status, procedure path (set in api/orpc.ts), company and request id.
  */
 app.use("*", async (c, next) => {
@@ -79,7 +79,10 @@ app.use("*", async (c, next) => {
       `${c.req.method} ${route}`,
       {
         kind: SpanKind.SERVER,
-        parent: contextFromHeaders(c.req.raw.headers),
+        // S-69: always a new root, on every route group; this runs before auth and no upstream
+        // of ours sends `traceparent`, so an incoming one is only kept as a link.
+        parent: ROOT_CONTEXT,
+        links: linksFromHeaders(c.req.raw.headers),
         attributes: {
           "http.request.method": c.req.method,
           "http.route": route,

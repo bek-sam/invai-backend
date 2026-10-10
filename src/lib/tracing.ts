@@ -3,6 +3,7 @@ import {
   type Context,
   context,
   INVALID_SPAN_CONTEXT,
+  type Link,
   propagation,
   ROOT_CONTEXT,
   type Span,
@@ -66,12 +67,16 @@ export function setSpanAttributes(attrs: Attributes) {
  */
 export async function withSpan<T>(
   name: string,
-  opts: { kind?: SpanKind; attributes?: Attributes; parent?: Context },
+  opts: { kind?: SpanKind; attributes?: Attributes; parent?: Context; links?: Link[] },
   fn: (span: Span) => Promise<T>,
 ): Promise<T> {
   if (!tracingOn()) return fn(trace.wrapSpanContext(INVALID_SPAN_CONTEXT));
   const parent = opts.parent ?? context.active();
-  const span = tracer().startSpan(name, { kind: opts.kind, attributes: opts.attributes }, parent);
+  const span = tracer().startSpan(
+    name,
+    { kind: opts.kind, attributes: opts.attributes, links: opts.links },
+    parent,
+  );
   try {
     return await context.with(trace.setSpan(parent, span), () => fn(span));
   } catch (err) {
@@ -82,13 +87,19 @@ export async function withSpan<T>(
   }
 }
 
-/** Reads `traceparent` from incoming request headers (a fresh root when absent or malformed). */
-export function contextFromHeaders(headers: Headers): Context {
-  if (!tracingOn()) return ROOT_CONTEXT;
-  return propagation.extract(ROOT_CONTEXT, headers, {
+/**
+ * An incoming request's `traceparent` as a span link, never as the parent (S-69): a caller must
+ * not pick our trace id or turn sampling off with flags `00`. Empty when tracing is off, or the
+ * header is absent or malformed. The request span itself is always a new root.
+ */
+export function linksFromHeaders(headers: Headers): Link[] {
+  if (!tracingOn()) return [];
+  const incoming = propagation.extract(ROOT_CONTEXT, headers, {
     keys: () => [...headers.keys()],
     get: (h, key) => h.get(key) ?? undefined,
   });
+  const sc = trace.getSpanContext(incoming);
+  return sc && trace.isSpanContextValid(sc) ? [{ context: sc }] : [];
 }
 
 type BullTelemetry = NonNullable<QueueBaseOptions["telemetry"]>;

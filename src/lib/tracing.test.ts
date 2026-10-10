@@ -10,13 +10,22 @@ import { type Job, Queue, Worker } from "bullmq";
 import { eq, isNull } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
+import { app } from "../api/app";
 import { withSystem, withTenant } from "../db/client";
 import { outboxEvents } from "../db/schema";
 import { createCompany } from "../test/fixtures";
 import { relayOnce } from "../worker/outbox-relay";
 import { emit } from "./outbox";
 import { defineJob, onEvent, queues, redis } from "./queues";
-import { bullmqTelemetry, currentTraceparent, markTracingOn, tracingOn, withSpan } from "./tracing";
+import {
+  activeTraceId,
+  bullmqTelemetry,
+  currentTraceparent,
+  linksFromHeaders,
+  markTracingOn,
+  tracingOn,
+  withSpan,
+} from "./tracing";
 import { AllowlistExporter, SPAN_ATTRIBUTE_ALLOWLIST, startTracing } from "./tracing-sdk";
 
 /*
@@ -270,5 +279,59 @@ describe("BullMQ telemetry option", () => {
     const traceparent = JSON.parse(job?.opts.telemetry?.metadata ?? "{}").traceparent as string;
     expect(traceIdOf(traceparent)).toBe(ids[0]);
     expect(ids[0]).not.toBe(ids[1]);
+  });
+});
+
+/*
+ * T-33-3 (S-69, architect ruling 2): an outside caller's `traceparent` never sets the parent or
+ * the sampling decision of a request span, on any route group; it is kept only as a link.
+ */
+describe("incoming traceparent is a link, never the parent (S-69)", () => {
+  const CALLER_TRACE = "deadbeefdeadbeefdeadbeefdeadbeef";
+  const CALLER_SPAN = "00f067aa0ba902b7";
+  const unsampled = `00-${CALLER_TRACE}-${CALLER_SPAN}-00`;
+
+  it("P4: flags 00 still records the span, and the active trace id is ours", async () => {
+    let inside: string | undefined;
+    await withSpan(
+      "req",
+      { parent: ROOT_CONTEXT, links: linksFromHeaders(new Headers({ traceparent: unsampled })) },
+      async () => {
+        inside = activeTraceId();
+      },
+    );
+    const [span] = memory.getFinishedSpans();
+    expect(span?.name).toBe("req");
+    expect(inside).toBe(span?.spanContext().traceId);
+    expect(inside).not.toBe(CALLER_TRACE);
+    expect(span?.links.map((l) => l.context.traceId)).toEqual([CALLER_TRACE]);
+  });
+
+  it.each([
+    "/rpc/orders/list",
+    "/api/v1/orders",
+    "/api/auth/get-session",
+    "/webhooks/shopify/x",
+    "/internal/outbox",
+    "/l/not-a-token",
+    "/nowhere",
+  ])("every route group starts a new root: %s", async (path) => {
+    await app.request(path, { headers: { traceparent: unsampled } });
+    const server = memory.getFinishedSpans().filter((s) => s.kind === SpanKind.SERVER);
+    expect(server).toHaveLength(1);
+    const [span] = server;
+    expect(span?.spanContext().traceId).not.toBe(CALLER_TRACE);
+    expect(span?.parentSpanContext).toBeUndefined();
+    expect(span?.links.map((l) => `${l.context.traceId}-${l.context.spanId}`)).toEqual([
+      `${CALLER_TRACE}-${CALLER_SPAN}`,
+    ]);
+  });
+
+  it("an absent or malformed traceparent gives no link", async () => {
+    expect(linksFromHeaders(new Headers())).toEqual([]);
+    expect(linksFromHeaders(new Headers({ traceparent: "00-zz-yy-01" }))).toEqual([]);
+    await app.request("/nowhere");
+    const [span] = memory.getFinishedSpans().filter((s) => s.kind === SpanKind.SERVER);
+    expect(span?.links).toEqual([]);
   });
 });
