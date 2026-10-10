@@ -1,5 +1,6 @@
 import { Worker } from "bullmq";
 import { and, eq, inArray, isNull, sql } from "drizzle-orm";
+import { DrizzleQueryError } from "drizzle-orm/errors";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 import { withSystem, withTenant } from "../db/client";
@@ -43,6 +44,11 @@ const toInput = (e: { companyId: string; payload: Record<string, unknown> }) => 
 onEvent("test.t121.cancelled", scrapLikeJob, toInput);
 onEvent("test.t121.rescrapped", scrapLikeJob, toInput);
 onEvent("test.t121.plain", plainJob, (e) => ({ companyId: e.companyId }));
+// T-33-3 (S-68): a subscriber whose mapping fails with a query error carrying a buyer value.
+const S68_BUYER = "maria.gonzalez@example.com";
+onEvent("test.t333.fails", plainJob, () => {
+  throw new DrizzleQueryError('select * from "orders" where "email" = $1', [S68_BUYER]);
+});
 
 async function event(name: string, payload: Record<string, unknown>) {
   const [row] = await withSystem((tx) =>
@@ -213,5 +219,18 @@ describe("outbox purge and parked events", () => {
     await withSystem((tx) =>
       tx.execute(sql`update outbox_events set dispatched_at = now() where id = ${id}`),
     );
+  });
+});
+
+describe("stored dispatch errors (T-33-3, S-68)", () => {
+  it("last_error is stored scrubbed: the query stays, the parameter does not", async () => {
+    const row = await event("test.t333.fails", {});
+    await relayOnce();
+    const [after] = await withSystem((tx) =>
+      tx.select().from(outboxEvents).where(eq(outboxEvents.id, row.id)),
+    );
+    expect(after?.attempts).toBe(1);
+    expect(after?.lastError).toBe('Failed query: select * from "orders" where "email" = $1');
+    expect(after?.lastError).not.toContain(S68_BUYER);
   });
 });

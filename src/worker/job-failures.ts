@@ -40,7 +40,8 @@ export async function onJobFailed(
   if (!ref.success) return;
   const { companyId } = ref.data;
   const rowId = ref.data.jobId ?? ref.data.importRunId ?? null;
-  const error = err.message || String(err);
+  // S-68: `jobs.error` reaches the shop's staff through `Job.error`; store it scrubbed.
+  const error = String(errorData(err).error) || String(err);
   try {
     if (rowId) {
       const [row] = await withTenant(companyId, (tx) =>

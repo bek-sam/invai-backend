@@ -83,6 +83,12 @@ export default async function setup(project: TestProject) {
   await ensureBucket();
 
   return async () => {
+    // This process imported the db pools and (through fixtures) the queues and Redis; left open
+    // they kept every run waiting out Vitest's 10 s close timeout (B-338).
+    const { closeDb } = await import("../db/client");
+    const { closeQueues } = await import("../lib/queues");
+    await closeQueues().catch(() => {});
+    await closeDb().catch(() => {});
     await dbClaim.cleanup();
     await redisClaim.cleanup();
   };

@@ -1,4 +1,5 @@
 import { eq } from "drizzle-orm";
+import { DrizzleQueryError } from "drizzle-orm/errors";
 import { beforeAll, describe, expect, it } from "vitest";
 import { withSystem, withTenant } from "../db/client";
 import { channelConnections, importRuns, jobs } from "../db/schema";
@@ -48,6 +49,23 @@ describe("worker: jobs BullMQ gave up on", () => {
       status: "failed",
       error: "job stalled more than allowable limit",
     });
+  });
+
+  it("stores the error scrubbed: jobs.error never holds a query parameter (T-33-3, S-68)", async () => {
+    const id = await jobRow("running");
+    const buyer = "maria.gonzalez@example.com";
+    const err = new DrizzleQueryError('update "orders" set "email" = $1', [buyer]);
+    await onJobFailed(
+      getJob("shipping.batchBuy"),
+      { name: "shipping.batchBuy", data: { companyId, jobId: id }, finishedOn: Date.now() },
+      err,
+    );
+    const row = await statusOf(id);
+    expect(row).toMatchObject({
+      status: "failed",
+      error: 'Failed query: update "orders" set "email" = $1',
+    });
+    expect(row?.error).not.toContain(buyer);
   });
 
   it("leaves a finished row alone and ignores data without ids", async () => {

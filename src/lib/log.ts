@@ -52,6 +52,7 @@ const PII_KEYS = new Set([
   "line2",
   "apikey",
   "values",
+  "params",
 ]);
 
 /** Ids, counts and flags about a field are not the field: `stationTokenId`, `emailVerified`. */
@@ -76,18 +77,30 @@ export function isSensitiveKey(key: string): boolean {
 
 const MAX_DEPTH = 8;
 
-/** A copy of `value` with every sensitive key's value replaced by `[redacted]`, at any depth. */
+/**
+ * A copy of `value` safe to log, at any depth: every sensitive key's value is `[redacted]`, every
+ * string loses drizzle's `params:` tail (S-68: `{ error: String(err) }` call sites), an `Error`
+ * becomes `errorData(err)`, and any other class instance becomes its own fields, redacted the same
+ * way (or `[ClassName]` when it has none). Dates are kept.
+ */
 export function redact(value: unknown, depth = 0, seen = new WeakSet<object>()): unknown {
+  if (typeof value === "string") return scrubParams(value);
   if (value === null || typeof value !== "object") return value;
+  if (value instanceof Error) return errorData(value);
+  if (value instanceof Date) return value;
   if (seen.has(value)) return "[circular]";
   if (depth >= MAX_DEPTH) return "[depth]";
   seen.add(value);
   if (Array.isArray(value)) return value.map((v) => redact(v, depth + 1, seen));
   const proto = Object.getPrototypeOf(value);
-  if (proto !== Object.prototype && proto !== null) return value;
+  const plain = proto === Object.prototype || proto === null;
+  const className = (proto?.constructor as { name?: string } | undefined)?.name || "Object";
+  if (!plain && (ArrayBuffer.isView(value) || value instanceof ArrayBuffer))
+    return `[${className}]`;
+  const entries = Object.entries(value);
+  if (!plain && entries.length === 0) return `[${className}]`;
   const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(value))
-    out[k] = isSensitiveKey(k) ? REDACTED : redact(v, depth + 1, seen);
+  for (const [k, v] of entries) out[k] = isSensitiveKey(k) ? REDACTED : redact(v, depth + 1, seen);
   return out;
 }
 
@@ -136,13 +149,29 @@ export type Logger = ReturnType<typeof logger>;
 /* ---- Errors --------------------------------------------------------------------------------- */
 
 /** drizzle's DrizzleQueryError appends `\nparams: <values>` to its message and stack. */
-const PARAMS_LINE = /\nparams: [\s\S]*?(?=\n\s+at |$)/g;
+const PARAMS_FROM = "\nparams: ";
+/** Fallback for a stack whose header isn't the message: cut up to the first V8 frame line. */
+const PARAMS_LINE = /\nparams: [\s\S]*?(?=\n {4}at |$)/g;
 
-function scrubText(text: string, err?: Error): string {
-  let out = text;
-  const q = err as (Error & { query?: unknown; params?: unknown }) | undefined;
-  if (q && typeof q.query === "string" && "params" in q)
-    out = out.split(q.message).join(`Failed query: ${q.query}`);
+/**
+ * Cuts a non-stack text from drizzle's `\nparams: ` to its end, so a multi-line value (even one
+ * with a line that looks like a stack frame) leaves nothing behind (S-68 c).
+ */
+export function scrubParams(text: string): string {
+  const i = text.indexOf(PARAMS_FROM);
+  return i < 0 ? text : text.slice(0, i);
+}
+
+function scrubMessage(err: Error): string {
+  const q = err as Error & { query?: unknown; params?: unknown };
+  if (typeof q.query === "string" && "params" in q) return `Failed query: ${q.query}`;
+  return scrubParams(err.message);
+}
+
+/** The stack with its message header replaced by the scrubbed message; frames are kept. */
+function scrubStack(stack: string, err: Error, message: string): string {
+  const i = err.message ? stack.indexOf(err.message) : -1;
+  const out = i < 0 ? stack : stack.slice(0, i) + message + stack.slice(i + err.message.length);
   return out.replace(PARAMS_LINE, "");
 }
 
@@ -154,10 +183,11 @@ type PgFields = { code?: unknown; constraint?: unknown };
  * cause's `detail` and message are never copied: a unique violation echoes the duplicate value.
  */
 export function errorData(err: unknown): Record<string, unknown> {
-  if (!(err instanceof Error)) return { error: scrubText(String(err)) };
+  if (!(err instanceof Error)) return { error: scrubParams(String(err)) };
+  const error = scrubMessage(err);
   const out: Record<string, unknown> = {
-    error: scrubText(err.message, err),
-    stack: env.isProd || !err.stack ? undefined : scrubText(err.stack, err),
+    error,
+    stack: env.isProd || !err.stack ? undefined : scrubStack(err.stack, err, error),
   };
   for (const src of [err as PgFields, err.cause as PgFields | undefined]) {
     if (!src || typeof src !== "object") continue;

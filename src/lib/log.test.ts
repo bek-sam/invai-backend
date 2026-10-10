@@ -141,3 +141,82 @@ describe("errorData", () => {
     expect(errorData("text")).toEqual({ error: "text" });
   });
 });
+
+/*
+ * T-33-3 (S-68): query values must not reach a log line by any other road: an error or class
+ * instance passed as data (P1, P1b), `{ error: String(err) }` (P2, the 45 module call sites), a
+ * re-wrapped message whose multi-line value has a frame-like line (P3).
+ */
+describe("S-68: params never reach a line by another road", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  /** A buyer note whose second line looks like a stack frame: the old regex stopped there. */
+  const NOTE = "Leave at the back\n    at the gate, Camelback";
+  const drizzleErr = () =>
+    new DrizzleQueryError('update "orders" set "note" = $1 where "email" = $2', [NOTE, BUYER]);
+  function lines(): string[] {
+    const out: string[] = [];
+    const push = (l: string) => void out.push(l);
+    vi.spyOn(console, "log").mockImplementation(push);
+    vi.spyOn(console, "error").mockImplementation(push);
+    return out;
+  }
+  const clean = (text: string) => {
+    expect(text).not.toContain(BUYER);
+    expect(text).not.toContain("Camelback");
+    expect(text).not.toContain("the back");
+  };
+
+  it("P1: an Error passed as data is logged as errorData, without params", () => {
+    const out = lines();
+    logger("t333").error("x", { err: drizzleErr() });
+    expect(out).toHaveLength(1);
+    clean(out[0] as string);
+    expect(out[0]).toContain('Failed query: update \\"orders\\"');
+  });
+
+  it("P1b: a class instance is reduced to its redacted own fields", () => {
+    class Buyer {
+      id = "b-1";
+      email = BUYER;
+      params = [BUYER];
+      note = `ok\nparams: ${BUYER}`;
+    }
+    class Empty {}
+    const out = lines();
+    logger("t333").info("x", { buyer: new Buyer(), empty: new Empty(), at: new Date(0) });
+    clean(out[0] as string);
+    expect(redact({ buyer: new Buyer(), empty: new Empty() })).toEqual({
+      buyer: { id: "b-1", email: REDACTED, params: REDACTED, note: "ok" },
+      empty: "[Empty]",
+    });
+    expect(out[0]).toContain("1970-01-01T00:00:00.000Z");
+  });
+
+  it("P2: `{ error: String(drizzleError) }` through logger() keeps no param value", async () => {
+    const out = lines();
+    logger("t333").warn("x", { error: String(drizzleErr()) });
+    const real = await db.execute(sql`select ${BUYER}::int`).catch((e: unknown) => e);
+    logger("t333").warn("x", { error: String(real), message: (real as Error).message });
+    expect(out).toHaveLength(2);
+    for (const l of out) clean(l);
+    expect(out[0]).toContain("Failed query");
+  });
+
+  it("P3: a re-wrapped message with a multi-line, frame-like value keeps no tail", () => {
+    const wrapped = new Error(`sync failed: ${drizzleErr().message}`);
+    const data = errorData(wrapped);
+    clean(JSON.stringify(data));
+    expect(data.error).toBe(
+      'sync failed: Failed query: update "orders" set "note" = $1 where "email" = $2',
+    );
+    expect(String(data.stack)).toContain("    at ");
+  });
+
+  it("B-338: the params scrub alone handles a wrapped message (no drizzle error to split on)", () => {
+    const wrapped = new Error(`x: Failed query: select $1\nparams: ${BUYER}`);
+    expect(errorData(wrapped).error).toBe("x: Failed query: select $1");
+    expect(String(errorData(wrapped).stack)).not.toContain(BUYER);
+    expect(redact(`x\nparams: ${BUYER}\nmore`)).toBe("x");
+  });
+});

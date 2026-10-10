@@ -112,7 +112,8 @@ export async function relayOnce(): Promise<number> {
           .update(outboxEvents)
           .set({
             attempts,
-            lastError: String(err),
+            // S-68: stored scrubbed, like the log line (no query parameters).
+            lastError: String(errorData(err).error),
             dispatchedAt: attempts >= MAX_ATTEMPTS ? new Date() : null,
           })
           .where(eq(outboxEvents.id, row.id));
