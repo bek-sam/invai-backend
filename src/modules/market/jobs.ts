@@ -168,7 +168,7 @@ export async function refreshDemand(now = new Date()) {
       });
       out.push({
         source: provider.source,
-        failed: err instanceof Error ? err.message : String(err),
+        failed: "A market data source did not answer (source_failed)",
       });
     }
   }
@@ -326,7 +326,7 @@ export async function refreshPricing(companyId: string, now = new Date()) {
       });
       results.push({
         channel: conn.channel,
-        failed: err instanceof Error ? err.message : String(err),
+        failed: "The channel price data did not answer (pricing_failed)",
       });
       continue;
     }

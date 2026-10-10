@@ -6,6 +6,7 @@ import type { Tx } from "../../db/client";
 import { blankVariants, designFiles, designs, orderItems, orders, products } from "../../db/schema";
 import { audit } from "../../lib/audit";
 import { conflict, notFound } from "../../lib/errors";
+import { errorData } from "../../lib/log";
 import { emit } from "../../lib/outbox";
 import { createRule, loadMatcher, type Matcher, recordRuleUse } from "../channels/sku";
 import { releaseForItems, reserveForItems } from "../inventory/service";
@@ -312,7 +313,7 @@ export async function bulkApply(
     } catch (err) {
       failed.push({
         channelSku: m.channelSku,
-        message: err instanceof Error ? err.message : String(err),
+        message: String(errorData(err).error).trim() || "failed",
       });
     }
   }
