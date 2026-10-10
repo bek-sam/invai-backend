@@ -1,7 +1,9 @@
+import { SpanKind } from "@opentelemetry/api";
 import { and, asc, eq, gte, isNotNull, isNull, lt, sql } from "drizzle-orm";
 import { withSystem, withTenant } from "../db/client";
 import { alerts, outboxEvents } from "../db/schema";
 import { errorData, logger } from "../lib/log";
+import { withLogContext } from "../lib/log-context";
 import {
   type DefinedJob,
   type OutboxEventRecord,
@@ -9,6 +11,7 @@ import {
   safeJobId,
   subscribersOf,
 } from "../lib/queues";
+import { contextFromTraceparent, withSpan } from "../lib/tracing";
 import { raiseAlert } from "../modules/today/service";
 
 const log = logger("outbox");
@@ -78,11 +81,25 @@ export async function relayOnce(): Promise<number> {
         payload: row.payload,
       };
       try {
-        for (const sub of subscribersOf(row.name)) {
-          const input = sub.map(event);
-          if (input === null) continue;
-          await sub.job.enqueue(input, { jobId: await relayJobId(sub.job, input, row.id) });
-        }
+        // Inside the emitting request's trace (T-32-5): `trace_parent` from the row, a new root
+        // when it is null. BullMQ's `add` carries it on in `opts.telemetry.metadata`.
+        await withLogContext({ companyId: row.companyId }, () =>
+          withSpan(
+            `outbox dispatch ${row.name}`,
+            {
+              kind: SpanKind.PRODUCER,
+              parent: contextFromTraceparent(row.traceParent),
+              attributes: { "invai.event": row.name, "invai.company_id": row.companyId },
+            },
+            async () => {
+              for (const sub of subscribersOf(row.name)) {
+                const input = sub.map(event);
+                if (input === null) continue;
+                await sub.job.enqueue(input, { jobId: await relayJobId(sub.job, input, row.id) });
+              }
+            },
+          ),
+        );
         await tx
           .update(outboxEvents)
           .set({ dispatchedAt: new Date(), attempts: row.attempts + 1, lastError: null })

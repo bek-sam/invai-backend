@@ -4,6 +4,7 @@ import { closeDb } from "../db/client";
 import { initFieldEncryption } from "../lib/crypto";
 import { companyIdFromData, withFairness } from "../lib/fairness";
 import { errorData, logger } from "../lib/log";
+import { withLogContext } from "../lib/log-context";
 import {
   closeQueues,
   getJob,
@@ -12,6 +13,7 @@ import {
   QUEUE_CONCURRENCY,
   QUEUE_NAMES,
   redis,
+  telemetryOption,
   WORKER_STALL_SETTINGS,
 } from "../lib/queues";
 import { withShutdownCap } from "../lib/shutdown-timeout";
@@ -37,13 +39,31 @@ await initFieldEncryption().catch((err) => {
  */
 const fairProcessJob = withFairness(companyIdFromData, processJob);
 
+/** Every log line of a job carries its queue, name, id and company (T-32-5). */
+const scopedProcessJob: typeof fairProcessJob = (job, token) =>
+  withLogContext(
+    {
+      queue: job.queueName,
+      job: job.name,
+      jobId: job.id,
+      companyId: companyIdFromData(job),
+    },
+    () => fairProcessJob(job, token),
+  );
+
 const workers = QUEUE_NAMES.map((queue) => {
   const worker = new Worker(
     queue,
     // Dispatch by name; input that fails the job's schema fails it for good (no retries).
-    fairProcessJob,
-    // Explicit stall settings per queue (T-22-2, B-166): see WORKER_STALL_SETTINGS.
-    { connection: redis, concurrency: QUEUE_CONCURRENCY[queue], ...WORKER_STALL_SETTINGS[queue] },
+    scopedProcessJob,
+    // Explicit stall settings per queue (T-22-2, B-166): see WORKER_STALL_SETTINGS. `telemetry`
+    // only when tracing is on: the job's `process` span continues the producer's trace.
+    {
+      ...telemetryOption(),
+      connection: redis,
+      concurrency: QUEUE_CONCURRENCY[queue],
+      ...WORKER_STALL_SETTINGS[queue],
+    },
   );
   worker.on("failed", (job, err) => {
     log.error("job failed", {

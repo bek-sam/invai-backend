@@ -10,6 +10,7 @@ import { Redis } from "ioredis";
 import { z } from "zod";
 import { env } from "../env";
 import { logger } from "./log";
+import { bullmqTelemetry } from "./tracing";
 
 const log = logger("queues");
 
@@ -98,10 +99,21 @@ export const DEFAULT_JOB_OPTIONS: JobsOptions = {
  */
 const REPORTS_BULK_PRIORITY = 10;
 
+/**
+ * BullMQ's `telemetry` option, present only when tracing is on (lib/telemetry.ts runs first via
+ * `--import`): `add` then stores the caller's trace context in `opts.telemetry.metadata`, and the
+ * worker continues it. Job data is never touched.
+ */
+export const telemetryOption = () => {
+  const telemetry = bullmqTelemetry();
+  return telemetry ? { telemetry } : {};
+};
+
 export const queues = Object.fromEntries(
   QUEUE_NAMES.map((name) => [
     name,
     new Queue(name, {
+      ...telemetryOption(),
       connection: redis,
       defaultJobOptions:
         name === "reports"

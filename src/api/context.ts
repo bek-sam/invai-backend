@@ -7,6 +7,7 @@ import type { CompanyType, Role, StationKind } from "../db/schema";
 import { companies, members, stations, users } from "../db/schema";
 import type { Actor } from "../lib/audit";
 import { logger } from "../lib/log";
+import { logContext } from "../lib/log-context";
 import { type MfaState, mfaState, sampleColumns, withSampleFlag } from "../lib/mfa";
 import {
   isFloorSessionRevoked,
@@ -75,7 +76,8 @@ const NO_PERMISSIONS: ReadonlySet<Permission> = new Set();
 
 export function anonymousContext(headers: Headers, ip: string | null): Context {
   return {
-    requestId: crypto.randomUUID(),
+    // The request scope's id (api/app.ts), so log lines and the oRPC context agree.
+    requestId: logContext()?.requestId ?? crypto.randomUUID(),
     ip,
     headers,
     sessionKind: null,

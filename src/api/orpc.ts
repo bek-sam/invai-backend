@@ -4,6 +4,7 @@ import {
   isContractVersionAtLeast,
   type ProcedureMeta,
 } from "@invai/contracts";
+import { trace } from "@opentelemetry/api";
 import { type AnyContractRouter, isContractProcedure } from "@orpc/contract";
 import { implement, type Router } from "@orpc/server";
 import { env } from "../env";
@@ -19,6 +20,7 @@ import {
 import { MFA_EXEMPT_PROCEDURES, mfaBlocks } from "../lib/mfa";
 import { checkRateLimit, type RateBucket } from "../lib/ratelimit";
 import { sanitizeDeep } from "../lib/text-safety";
+import { tracingOn } from "../lib/tracing";
 import { type Context, type TenantContext, tenantOf } from "./context";
 
 /*
@@ -229,8 +231,18 @@ const rateLimit = os.middleware(async ({ context, next, procedure, path }) => {
   return next();
 });
 
+/** Names the request span after the procedure (`orpc orders.list`, `rpc.method`); no-op when off. */
+const traceProcedure = os.middleware(async ({ next, path }) => {
+  const span = tracingOn() ? trace.getActiveSpan() : undefined;
+  if (span) {
+    span.updateName(`orpc ${path.join(".")}`);
+    span.setAttribute("rpc.method", path.join("."));
+  }
+  return next();
+});
+
 /** Guarded builder without a tenant requirement. Sanitizes input before the permission guard. */
-export const pub = os.use(sanitizeInput).use(guard).use(rateLimit);
+export const pub = os.use(traceProcedure).use(sanitizeInput).use(guard).use(rateLimit);
 
 /** Guarded builder that adds `context.tenant: TenantContext`. */
 export const authed = pub.use(async ({ context, next }) => {

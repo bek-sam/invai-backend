@@ -1,4 +1,5 @@
 import { REALTIME_SSE_PATH } from "@invai/contracts";
+import { SpanKind } from "@opentelemetry/api";
 import { OpenAPIHandler } from "@orpc/openapi/fetch";
 import { RPCHandler } from "@orpc/server/fetch";
 import { ResponseHeadersPlugin } from "@orpc/server/plugins";
@@ -15,8 +16,10 @@ import { env } from "../env";
 import { imaging } from "../integrations/imaging/client";
 import { isORPCError } from "../lib/errors";
 import { errorData, logger } from "../lib/log";
+import { setLogContext, withLogContext } from "../lib/log-context";
 import { redis } from "../lib/queues";
 import { s3Healthy } from "../lib/s3";
+import { contextFromHeaders, setSpanAttributes, tracingOn, withSpan } from "../lib/tracing";
 import { buildContext } from "./context";
 import { events } from "./events";
 import { internal } from "./internal";
@@ -52,6 +55,51 @@ const rest = new OpenAPIHandler(router, {
 });
 
 export const app = new Hono();
+
+/** Route groups for span names and `http.route`: a fixed label, never the raw path (tokens, ids). */
+const ROUTE_GROUPS = ["/rpc", "/api/v1", "/api/auth", "/webhooks", "/internal", "/l"] as const;
+const UNTRACED = new Set(["/health", "/livez", "/readyz", REALTIME_SSE_PATH]);
+
+export function routeGroup(path: string): string {
+  return ROUTE_GROUPS.find((g) => path === g || path.startsWith(`${g}/`)) ?? "other";
+}
+
+/**
+ * Request scope (T-32-5): every log line of the request carries its `requestId` (the oRPC
+ * context reuses it) and, once the session is known, `companyId`. With tracing on, the request
+ * gets a SERVER span (continuing an incoming `traceparent`) with allowlisted attributes only:
+ * method, route group, status, procedure path (set in api/orpc.ts), company and request id.
+ */
+app.use("*", async (c, next) => {
+  const requestId = crypto.randomUUID();
+  return withLogContext({ requestId }, async () => {
+    if (!tracingOn() || UNTRACED.has(c.req.path)) return next();
+    const route = routeGroup(c.req.path);
+    return withSpan(
+      `${c.req.method} ${route}`,
+      {
+        kind: SpanKind.SERVER,
+        parent: contextFromHeaders(c.req.raw.headers),
+        attributes: {
+          "http.request.method": c.req.method,
+          "http.route": route,
+          "invai.request_id": requestId,
+        },
+      },
+      async (span) => {
+        await next();
+        span.setAttribute("http.response.status_code", c.res.status);
+      },
+    );
+  });
+});
+
+/** The oRPC handlers call this once the session is resolved. */
+function scopeToSession(companyId: string | null) {
+  if (!companyId) return;
+  setLogContext({ companyId });
+  setSpanAttributes({ "invai.company_id": companyId });
+}
 
 // API responses are JSON/SSE only, so the strictest CSP applies; HSTS only matters behind TLS.
 // Permissions-Policy denies every browser feature outright: nothing here is rendered as HTML,
@@ -149,6 +197,7 @@ app.on(["GET", "POST"], "/api/auth/*", (c) => auth.handler(c.req.raw));
 
 app.use("/rpc/*", async (c, next) => {
   const context = await buildContext(c.req.raw);
+  scopeToSession(context.companyId);
   const { matched, response } = await rpc.handle(c.req.raw, { prefix: "/rpc", context });
   if (matched) return c.newResponse(response.body, response);
   await next();
@@ -156,6 +205,7 @@ app.use("/rpc/*", async (c, next) => {
 
 app.use("/api/v1/*", async (c, next) => {
   const context = await buildContext(c.req.raw);
+  scopeToSession(context.companyId);
   const { matched, response } = await rest.handle(c.req.raw, { prefix: "/api/v1", context });
   if (matched) return c.newResponse(response.body, response);
   await next();
