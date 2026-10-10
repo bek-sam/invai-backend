@@ -157,4 +157,17 @@ describe("release CLIs as processes", () => {
       expect(lines(res.out, label)[0]).toMatch(new RegExp(`^\\[${label}\\] failed`));
     }
   }, 120_000);
+
+  it("reference-seed-cli names the connection reason, not only 'Failed query' (B-311)", async () => {
+    const res = await runCli("reference-seed-cli", {
+      MIGRATION_DATABASE_URL: `postgres://invai:${SECRET}@localhost:1/x`,
+    });
+    expect(res.code, res.out).toBe(1);
+    expect(lines(res.out, "reference-seed")).toEqual([
+      expect.stringMatching(
+        /^\[reference-seed\] failed \(ECONNREFUSED\): connect ECONNREFUSED [^ ]+:1 <- Failed query: /,
+      ),
+    ]);
+    expect(res.out).not.toContain(SECRET);
+  }, 60_000);
 });

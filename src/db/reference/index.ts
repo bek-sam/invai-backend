@@ -23,8 +23,8 @@ const excluded = (column: string) => sql.raw(`excluded.${column}`);
 async function ensurePlanCatalog(db: NodePgDatabase): Promise<void> {
   // Deferred to call time, not module load: merely *importing* `ensureReferenceData` (as
   // src/db/migrate.ts does, at the top of the file) then stays free of `modules/billing/service`
-  // and the full env schema. This does not make `runMigrations`/`db:migrate` itself env-free —
-  // the CLI already loads the full env before calling `runMigrations` (migrate.ts's `argv` guard),
+  // and the full env schema. This does not make `runMigrations`/`db:migrate` itself env-free:
+  // both CLIs that reach it (`migrate-cli.ts`, `reference-seed-cli.ts`) load the full env first,
   // so production's key guard (T-1-1, or ALLOW_MOCKS=true) still applies once this actually runs.
   const { PLAN_CATALOG } = await import("../../modules/billing/service");
   await db

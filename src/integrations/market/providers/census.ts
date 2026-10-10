@@ -1,7 +1,8 @@
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { env } from "../../../env";
 import { logger } from "../../../lib/log";
+// Bundled into the build (tsup inlines JSON imports), so the compiled worker needs no file next to
+// its chunk: a path relative to `import.meta.url` pointed outside `dist/` once compiled (B-311).
+import fixture from "../fixtures/census-marts-448-monthly.json" with { type: "json" };
 import { fetchJsonWithPolicy } from "../http";
 import { seriesAsOf } from "../period";
 import type { DemandSeries, SeriesPoint } from "../types";
@@ -53,9 +54,7 @@ type CensusResponse = [header: string[], ...rows: CensusRow[]];
  * from the documented response shape above, not copied from a real answer -- flagged here and in
  * the card report rather than presented as real Census numbers.
  */
-const FIXTURE_PATH = fileURLToPath(
-  new URL("../fixtures/census-marts-448-monthly.json", import.meta.url),
-);
+const FIXTURE = fixture as unknown as CensusResponse;
 
 function rowsToPoints(rows: CensusRow[]): SeriesPoint[] {
   return rows
@@ -64,7 +63,7 @@ function rowsToPoints(rows: CensusRow[]): SeriesPoint[] {
 }
 
 function readFixture(): CensusResponse {
-  return JSON.parse(readFileSync(FIXTURE_PATH, "utf8")) as CensusResponse;
+  return FIXTURE;
 }
 
 /** Real call, only reached when `CENSUS_API_KEY` is set (never in this card's tests). */
