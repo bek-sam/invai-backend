@@ -13,28 +13,52 @@ import {
   orders,
   transfers,
 } from "../../db/schema";
+import { runJobInline } from "../../lib/queues";
 import { objectKey, putObject } from "../../lib/s3";
 import { createCompany, createConnection, createOrder } from "../../test/fixtures";
 import { purgeBuyerPii, purgePiiObjects } from "../orders/jobs";
 import { createNameTemplate, exists, readBack, seedItemArt } from "./buyer-text.fixtures";
+import { privacyRetentionSweepJob } from "./jobs";
 import {
   ORPHAN_MIN_AGE_MS,
   purgeSheetFiles,
   REF_CHUNK,
   referencedKeys,
+  reportSheetsWaitingOverCap,
   SHEET_FILES_PURGE_STATES,
+  SHEET_WAITING_CAP_DAYS,
   storageKeyColumns,
 } from "./print-files";
 
-/* Real MinIO, with a switch to make chosen keys fail to delete. */
-const s3 = vi.hoisted(() => ({ failing: new Set<string>() }));
+/* Real MinIO, recording every delete, with a switch to make chosen keys fail to delete. */
+const s3 = vi.hoisted(() => ({ failing: new Set<string>(), deleted: [] as string[] }));
 vi.mock("../../lib/s3", async (orig) => {
   const actual = await orig<typeof import("../../lib/s3")>();
   return {
     ...actual,
     deleteObject: async (key: string) => {
+      s3.deleted.push(key);
       if (s3.failing.has(key)) throw new Error("storage unavailable");
       return actual.deleteObject(key);
+    },
+  };
+});
+
+/* Warnings, captured with their data (the real logger still writes). */
+const logs = vi.hoisted(() => ({ warn: [] as { msg: string; data?: Record<string, unknown> }[] }));
+vi.mock("../../lib/log", async (orig) => {
+  const actual = await orig<typeof import("../../lib/log")>();
+  return {
+    ...actual,
+    logger: (scope: string) => {
+      const real = actual.logger(scope);
+      return {
+        ...real,
+        warn: (msg: string, data?: Record<string, unknown>) => {
+          logs.warn.push({ msg, data });
+          real.warn(msg, data);
+        },
+      };
     },
   };
 });
@@ -280,6 +304,125 @@ describe("gang sheet print files follow the unit clocks (decision 0031)", () => 
     expect(await noneExist(aSheet.keys)).toBe(true);
     expect(await allExist(bSheet.keys)).toBe(true);
     expect((await sheetRow(b.c, bSheet.id))?.pngKey).toBe(bSheet.keys[0]);
+  });
+});
+
+describe("sheet key backstop and failed-delete warning (B-310)", () => {
+  it("a sheet key outside the company prefix is skipped: no delete call, the other company's object stays", async () => {
+    const a = await shop();
+    const b = await shop();
+    const sheet = await makeSheet(a.c, "received", [{ itemId: await purgedUnit(a.c, a.conn) }]);
+    const foreign = await png(b.c, "sheet");
+    await withSystem(async (tx) => {
+      await tx.update(gangSheets).set({ pngKey: foreign }).where(eq(gangSheets.id, sheet.id));
+      await tx
+        .insert(files)
+        .values({ companyId: b.c, key: foreign, kind: "sheet", status: "ready" });
+    });
+    s3.deleted.length = 0;
+
+    const res = await purgeSheetFiles(a.c);
+
+    expect(res.sheetFilesPurged).toBe(1);
+    expect(s3.deleted).not.toContain(foreign);
+    expect(s3.deleted.sort()).toEqual([sheet.keys[1], sheet.keys[2]].sort());
+    expect(await exists(foreign)).toBe(true);
+    const bRow = await withTenant(b.c, (tx) =>
+      tx.select().from(files).where(eq(files.key, foreign)),
+    );
+    expect(bRow).toHaveLength(1);
+  });
+
+  it("a failed sheet file delete logs a warning with the sheet id", async () => {
+    const { c, conn } = await shop();
+    const sheet = await makeSheet(c, "received", [{ itemId: await purgedUnit(c, conn) }]);
+    s3.failing.add(sheet.keys[0] as string);
+    logs.warn.length = 0;
+    try {
+      const res = await purgeSheetFiles(c);
+      expect(res.failedSheets).toBe(1);
+    } finally {
+      s3.failing.clear();
+    }
+    const warned = logs.warn.filter((l) => l.data?.companyId === c);
+    expect(warned).toHaveLength(1);
+    expect(warned[0]?.data).toMatchObject({ companyId: c, sheetId: sheet.id });
+  });
+});
+
+describe("sheets waiting past 14 days with a purged unit are reported, never changed (decision 0033)", () => {
+  const CAP = SHEET_WAITING_CAP_DAYS * DAY;
+  const backdate = (id: string, createdAt: Date) =>
+    withSystem((tx) => tx.update(gangSheets).set({ createdAt }).where(eq(gangSheets.id, id)));
+
+  it("counts ready, sent and acknowledged sheets past the cap with a warning each; files and states stay", async () => {
+    const { c, conn } = await shop();
+    const now = new Date();
+    const over = new Date(now.getTime() - CAP - 1000);
+    const due: { id: string; keys: string[]; status: SheetStatus }[] = [];
+    for (const status of ["ready", "sent", "acknowledged"] as const) {
+      const s = await makeSheet(c, status, [{ itemId: await purgedUnit(c, conn) }]);
+      await backdate(s.id, over);
+      due.push({ ...s, status });
+    }
+    // Not counted: exactly 14 days old, a waiting state outside the cap, no purged unit.
+    const atCap = await makeSheet(c, "ready", [{ itemId: await purgedUnit(c, conn) }]);
+    await backdate(atCap.id, new Date(now.getTime() - CAP));
+    const printing = await makeSheet(c, "printing", [{ itemId: await purgedUnit(c, conn) }]);
+    await backdate(printing.id, over);
+    const live = await makeSheet(c, "ready", [{ itemId: await liveUnit(c, conn) }]);
+    await backdate(live.id, over);
+    const before = await withTenant(c, (tx) =>
+      tx.select().from(gangSheets).where(eq(gangSheets.companyId, c)),
+    );
+    logs.warn.length = 0;
+    s3.deleted.length = 0;
+
+    for (let run = 0; run < 2; run++) {
+      const res = await reportSheetsWaitingOverCap(now, [c]);
+      expect(res).toEqual({ sheetsWaitingOverCap: 3, failedCompanies: 0 });
+    }
+
+    const warned = logs.warn.filter((l) => l.data?.companyId === c).map((l) => l.data?.sheetId);
+    expect(warned.sort()).toEqual([...due, ...due].map((d) => d.id).sort());
+    expect(s3.deleted).toEqual([]);
+    for (const d of due) expect(await allExist(d.keys)).toBe(true);
+    const after = await withTenant(c, (tx) =>
+      tx.select().from(gangSheets).where(eq(gangSheets.companyId, c)),
+    );
+    const byId = (rows: typeof after) => [...rows].sort((x, y) => x.id.localeCompare(y.id));
+    expect(byId(after)).toEqual(byId(before));
+  });
+
+  it("company A's report never counts or logs company B's sheets", async () => {
+    const a = await shop();
+    const b = await shop();
+    const over = new Date(Date.now() - CAP - DAY);
+    const aSheet = await makeSheet(a.c, "ready", [{ itemId: await purgedUnit(a.c, a.conn) }]);
+    const bSheet = await makeSheet(b.c, "sent", [{ itemId: await purgedUnit(b.c, b.conn) }]);
+    await backdate(aSheet.id, over);
+    await backdate(bSheet.id, over);
+    logs.warn.length = 0;
+
+    const res = await reportSheetsWaitingOverCap(new Date(), [a.c]);
+
+    expect(res.sheetsWaitingOverCap).toBe(1);
+    expect(logs.warn.map((l) => l.data?.sheetId)).toEqual([aSheet.id]);
+    expect((await sheetRow(b.c, bSheet.id))?.status).toBe("sent");
+  });
+
+  it("runs in the daily privacy.retentionSweep job, the same count each night, nothing changed", async () => {
+    const { c, conn } = await shop();
+    const s = await makeSheet(c, "ready", [{ itemId: await purgedUnit(c, conn) }]);
+    await backdate(s.id, new Date(Date.now() - CAP - DAY));
+    for (let run = 0; run < 2; run++) {
+      const res = (await runJobInline(privacyRetentionSweepJob, {})) as {
+        sheetsWaitingOverCap: number;
+      };
+      expect(res.sheetsWaitingOverCap).toBeGreaterThanOrEqual(1);
+      expect(await allExist(s.keys)).toBe(true);
+      expect((await sheetRow(c, s.id))?.status).toBe("ready");
+    }
   });
 });
 

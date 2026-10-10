@@ -2,6 +2,8 @@ import { z } from "zod";
 import { env } from "../../env";
 import { errorData, logger } from "../../lib/log";
 import { defineJob, queues, safeJobId } from "../../lib/queues";
+import { expireAllTenantExports } from "./export-retention";
+import { reportSheetsWaitingOverCap } from "./print-files";
 import {
   HARD_PURGE_DELAY_MS,
   hardPurgeCompany,
@@ -62,7 +64,8 @@ export async function scheduleHardPurge(companyId: string, delayMs = HARD_PURGE_
 
 /**
  * Daily: buyer PII past 18 months, then non-PII Amazon data past 18 months (decision 0026),
- * `floor_requests` past 30 days, and any due purge whose delayed
+ * `floor_requests` past 30 days, export zips past 7 days and a report of sheets waiting past
+ * 14 days with a purged unit (decision 0033), and any due purge whose delayed
  * job was lost (enqueued again under the same id, so never twice).
  */
 export const privacyRetentionSweepJob = defineJob({
@@ -75,9 +78,20 @@ export const privacyRetentionSweepJob = defineJob({
     // After the PII redaction (decision 0026): same 18-month cutoff, non-PII Amazon data.
     const amazon = await sweepStaleAmazonData();
     const floorRequests = await purgeOldFloorRequests();
+    const exports = await expireAllTenantExports();
+    const waiting = await reportSheetsWaitingOverCap();
     const due = await overduePurges();
     for (const companyId of due) await tenantHardPurgeJob.enqueue({ companyId });
-    return { buyerPii, amazon, floorRequests, overduePurges: due.length };
+    return {
+      buyerPii,
+      amazon,
+      floorRequests,
+      overduePurges: due.length,
+      exportsDeleted: exports.exportsDeleted,
+      exportsFailed: exports.exportsFailed,
+      sheetsWaitingOverCap: waiting.sheetsWaitingOverCap,
+      failedCompanies: exports.failedCompanies + waiting.failedCompanies,
+    };
   },
 });
 

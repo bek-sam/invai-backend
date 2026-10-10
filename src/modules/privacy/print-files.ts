@@ -6,6 +6,7 @@ import {
   gt,
   inArray,
   isNotNull,
+  lt,
   notInArray,
   or,
   type SQL,
@@ -185,6 +186,70 @@ export async function purgeSheetFiles(
     });
     if (!more) return res;
   }
+}
+
+/* ---- Waiting sheets past the cap (decision 0033) ----------------------------------------- */
+
+/** A waiting sheet created more than this many days ago is reported (never changed). */
+export const SHEET_WAITING_CAP_DAYS = 14;
+/** The waiting states the cap watches. */
+export const SHEET_WAITING_CAP_STATES = ["ready", "sent", "acknowledged"] as const;
+
+/**
+ * Report only: each sheet in SHEET_WAITING_CAP_STATES that still has files, holds a purged unit and
+ * was created more than 14 days before `now` gets a warning with its id and is counted. Items have
+ * no purge timestamp, so the sheet's `createdAt` is the clock (as for `oldestSheetWaitingDays`).
+ * No file, state or cancel change, for any status.
+ */
+export async function reportSheetsWaitingOverCap(
+  now = new Date(),
+  only?: string[],
+): Promise<{ sheetsWaitingOverCap: number; failedCompanies: number }> {
+  const cutoff = new Date(now.getTime() - SHEET_WAITING_CAP_DAYS * DAY);
+  const res = { sheetsWaitingOverCap: 0, failedCompanies: 0 };
+  for (const companyId of only ?? (await companiesWithPurgedSheets())) {
+    try {
+      let last: string | undefined;
+      for (;;) {
+        const rows = await withTenant(companyId, (tx) =>
+          tx
+            .select({
+              id: gangSheets.id,
+              status: gangSheets.status,
+              createdAt: gangSheets.createdAt,
+            })
+            .from(gangSheets)
+            .where(
+              and(
+                eq(gangSheets.companyId, companyId),
+                inArray(gangSheets.status, [...SHEET_WAITING_CAP_STATES]),
+                lt(gangSheets.createdAt, cutoff),
+                hasFiles,
+                holdsPurgedUnit,
+                last ? gt(gangSheets.id, last) : undefined,
+              ),
+            )
+            .orderBy(gangSheets.id)
+            .limit(SHEET_BATCH),
+        );
+        for (const r of rows) {
+          res.sheetsWaitingOverCap++;
+          log.warn("sheet with a purged unit is still waiting past the cap; files kept", {
+            companyId,
+            sheetId: r.id,
+            status: r.status,
+            days: Math.floor((now.getTime() - r.createdAt.getTime()) / DAY),
+          });
+        }
+        last = rows[rows.length - 1]?.id;
+        if (rows.length < SHEET_BATCH) break;
+      }
+    } catch (err) {
+      res.failedCompanies++;
+      log.error("waiting-sheet report failed for a company", { companyId, ...errorData(err) });
+    }
+  }
+  return res;
 }
 
 /* ---- Orphan renders ---------------------------------------------------------------------- */
