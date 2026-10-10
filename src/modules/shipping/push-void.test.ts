@@ -1,7 +1,7 @@
 import { eq } from "drizzle-orm";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { withSystem, withTenant } from "../../db/client";
-import { buyerPii, labels, orderItems, shipments } from "../../db/schema";
+import { auditLog, buyerPii, labels, orderItems, shipments } from "../../db/schema";
 import type { CarrierAdapter, PurchasedLabel } from "../../integrations/carriers";
 import * as carriersModule from "../../integrations/carriers";
 import type { ChannelAdapter, TrackingPush } from "../../integrations/channels";
@@ -247,16 +247,42 @@ describe("tracking push, cancel and void after a label", () => {
       expect(shopify.notified).toHaveLength(1);
     });
 
-    it("a driver error from the channel stores its head, not its parameter values (B-343)", async () => {
+    it("a channel's own error text is never stored: a fixed sentence with a code is (B-353, B-354)", async () => {
       const { shipment } = await labeled();
-      const value = "Maria Perez 4410 Mesquite Lane";
       shopify.onPush = async () => {
-        throw new Error(`Failed query: select 1\nparams: ${value}`);
+        throw new Error(
+          "Shopify 422: cannot ship to Maria Perez, maria.perez@example.com, 4410 Mesquite Lane\nparams: 4410 Mesquite Lane",
+        );
       };
       expect(await push(shipment.id)).toBe("retry");
       const r = await row(shipment.id);
-      expect(r.trackingPushError).toMatch(/^Failed query/);
-      expect(r.trackingPushError).not.toContain(value);
+      expect(r.trackingPushError).toBe(
+        "The channel did not accept the tracking upload (push_failed)",
+      );
+    });
+
+    it("a failed void of a cancelled order audits the query head, not its parameter values (B-353)", async () => {
+      const { order, shipment } = await labeled();
+      await withTenant(companyId, (tx) =>
+        cancelOrder(tx, ctx, { id: order.id, reason: "buyer_request", note: null }),
+      );
+      const value = "Maria Perez 4410 Mesquite Lane";
+      const real = await vi.importActual<typeof import("../../lib/outbox")>("../../lib/outbox");
+      vi.mocked(outbox.emit).mockImplementation(async (tx, co, name, payload) => {
+        if (name === "shipment.voided") throw new Error(`Failed query: select 1\nparams: ${value}`);
+        return real.emit(tx, co, name, payload);
+      });
+      try {
+        expect(await svc.voidCancelledLabels(ctx, order.id)).toMatchObject({ failed: 1 });
+      } finally {
+        vi.mocked(outbox.emit).mockImplementation(real.emit);
+      }
+      const rows = await withSystem((tx) =>
+        tx.select().from(auditLog).where(eq(auditLog.entityId, shipment.id)),
+      );
+      const failed = rows.find((r) => r.action === "label.void_failed");
+      expect(failed?.summary).toContain("Failed query");
+      expect(failed?.summary).not.toContain(value);
     });
 
     it("waits while another push is in flight", async () => {

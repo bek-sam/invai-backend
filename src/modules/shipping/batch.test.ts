@@ -4,6 +4,7 @@ import { withSystem, withTenant } from "../../db/client";
 import { buyerPii, jobs, labels, outboxEvents, shipments, subscriptions } from "../../db/schema";
 import type { CarrierAdapter, PurchasedLabel } from "../../integrations/carriers";
 import * as carriersModule from "../../integrations/carriers";
+import { CarrierError } from "../../integrations/carriers/types";
 import { runJobInline } from "../../lib/queues";
 import {
   createCompany,
@@ -315,5 +316,25 @@ describe("batch label buy job", () => {
     expect(results[orderId as string]?.status).toBe("failed");
     expect(results[orderId as string]?.error).toMatch(/^Failed query/);
     expect(JSON.stringify(job.input)).not.toContain(value);
+  });
+
+  it("a carrier's own error text is never stored in the job results (B-353, B-354)", async () => {
+    const [orderId] = await packedOrders(1);
+    const res = await startBatchBuy(ctx, { orderIds: [orderId as string] });
+    vi.mocked(carriersModule.carrierAdapter).mockImplementation(async () => {
+      throw new CarrierError(
+        "easypost",
+        "upstream",
+        "422: cannot deliver to Maria Perez, maria.perez@example.com, 4410 Mesquite Lane",
+      );
+    });
+    await runJobInline(batchBuyJob, { companyId, jobId: res.jobId });
+    const job = await jobRow(res.jobId);
+    const results = (job.input as { results: Record<string, { status: string; error?: string }> })
+      .results;
+    expect(results[orderId as string]?.error).toBe(
+      "An outside service did not answer (UPSTREAM_FAILED)",
+    );
+    expect(JSON.stringify(job.input)).not.toContain("Mesquite");
   });
 });

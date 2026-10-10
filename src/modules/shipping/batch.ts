@@ -18,6 +18,7 @@ import {
   pickRate,
   rateOrder,
 } from "./service";
+import { storedError } from "./stored-error";
 
 /*
  * Batch label buy as a job (B-61). `shipping.batchBuy` records a `batch_labels` job row and an
@@ -204,8 +205,8 @@ export async function runBatchBuy(companyId: string, jobId: string) {
     try {
       return await buyOne(ctx, jobId, orderId, batch);
     } catch (err) {
-      const message = String(errorData(err).error);
-      log.warn("batch label failed", { companyId, jobId, orderId, error: message });
+      const message = storedError(err);
+      log.warn("batch label failed", { companyId, jobId, orderId, ...errorData(err) });
       const prev = batch.results[orderId];
       return done(prev?.shipmentId ?? null, "failed", message);
     }
@@ -301,7 +302,7 @@ export const batchBuyJob = defineJob({
         await updateJobRow(companyId, jobId, {
           status: "failed",
           progress: 1,
-          error: String(errorData(err).error),
+          error: storedError(err),
         });
       throw err;
     }

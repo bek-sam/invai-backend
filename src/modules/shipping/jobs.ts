@@ -34,6 +34,7 @@ import {
   voidCancelledLabels,
   voidShipment,
 } from "./service";
+import { scrubbed, storedError } from "./stored-error";
 
 const log = logger("shipping.jobs");
 
@@ -426,7 +427,7 @@ export async function processCarrierEvent(input: {
       status: "failed",
       companyId: target.companyId,
       subjectId,
-      detail: err instanceof Error ? err.message.slice(0, 500) : "failed",
+      detail: scrubbed(err).slice(0, 500),
     }).catch(() => {});
     if (finished) log.warn("carrier event recorded but its transaction failed", { eventId });
     throw err;
@@ -665,7 +666,7 @@ export async function retryStuckIntent(
       }
     }
   } catch (err) {
-    error = String(errorData(err).error);
+    error = storedError(err);
     final = isORPCError(err) && err.code === "VOID_REJECTED";
   }
   if (!error) {

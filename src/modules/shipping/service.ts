@@ -78,6 +78,7 @@ import { pushTrackingForShipment } from "../channels/service";
 import { todayRange } from "../orders/shipby";
 import { transitionItem } from "../orders/state-machine";
 import { createJobRow, updateJobRow } from "../production/service";
+import { storedError, storedProviderError } from "./stored-error";
 import { zoneForZips } from "./zone";
 
 const log = logger("shipping");
@@ -1140,8 +1141,7 @@ export async function batchBuy(
         results.push({ orderId, shipmentId: shipment.shipment.id, status: "labeled", error: null });
       }
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      results.push({ orderId, shipmentId: null, status: "failed", error: message });
+      results.push({ orderId, shipmentId: null, status: "failed", error: storedError(err) });
     }
     if (i % 5 === 4 || i === input.orderIds.length - 1)
       await updateJobRow(ctx.companyId, job.id, { progress: (i + 1) / input.orderIds.length });
@@ -1512,8 +1512,8 @@ export async function voidCancelledLabels(
         continue;
       }
       out.failed += 1;
-      const detail = err instanceof Error ? err.message : String(err);
-      log.warn("label of a cancelled order not voided", { shipmentId: s.id, detail });
+      const detail = storedError(err);
+      log.warn("label of a cancelled order not voided", { shipmentId: s.id, ...errorData(err) });
       await withTenant(ctx.companyId, (tx) =>
         audit(tx, {
           companyId: ctx.companyId,
@@ -1687,7 +1687,11 @@ async function recordPushFailure(
   shipmentId: string,
   err: unknown,
 ): Promise<PushOutcome> {
-  const error = String(errorData(err).error);
+  const error = storedProviderError(
+    err,
+    "The channel did not accept the tracking upload",
+    "push_failed",
+  );
   return withTenant(companyId, async (tx) => {
     const [s] = await tx.select().from(shipments).where(eq(shipments.id, shipmentId)).for("update");
     if (!s) return "failed" as const;
