@@ -25,7 +25,7 @@ import { errorData, logger } from "../../lib/log";
 import { emit } from "../../lib/outbox";
 import { keyset, type PageInput } from "../../lib/pagination";
 import { publish } from "../../lib/realtime";
-import { deleteObject, isCompanyKey, objectKey, presignGet } from "../../lib/s3";
+import { deleteObject, isCompanyKey, isSafeKey, objectKey, presignGet } from "../../lib/s3";
 import { ARTWORK_ITEM_FLAGS, ARTWORK_TO_ITEM_FLAG, withFlags } from "../orders/flags";
 import { transitionItem } from "../orders/state-machine";
 
@@ -304,6 +304,8 @@ export function localFlags(slots: TemplateSlot[], values: Record<string, string>
 
 export type RenderOutcome = {
   status: "rendered" | "flagged" | "failed";
+  /** Photo slots whose value was not a key of the render's company: not sent, flagged (S-60). */
+  droppedPhotoSlots: string[];
   fileKey: string | null;
   widthPx: number | null;
   heightPx: number | null;
@@ -342,17 +344,100 @@ function renderTemplatePayload(
   };
 }
 
-/** Render values through imaging and merge imaging's flags with the local checks. */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** The company a render belongs to: the first segment of its `objectKey(companyId, ...)` out key. */
+function outKeyCompany(outKey: string): string | null {
+  if (!isSafeKey(outKey)) return null;
+  const [first, ...rest] = outKey.split("/");
+  return first && rest.length && UUID_RE.test(first) ? first : null;
+}
+
+/**
+ * Imaging downloads every non-empty photo value as a storage key (S-60). Only keys under the
+ * render's own company prefix are sent; anything else (another shop's key, a URL, buyer free
+ * text) is dropped. With no company (a malformed out key) every photo value is dropped.
+ */
+function screenPhotoValues(
+  slots: TemplateSlot[],
+  values: Record<string, string>,
+  companyId: string | null,
+) {
+  const sent = { ...values };
+  const dropped: TemplateSlot[] = [];
+  for (const s of slots) {
+    if (s.kind !== "photo") continue;
+    const v = sent[s.name];
+    if (v === undefined) continue;
+    if (!v.trim()) {
+      delete sent[s.name];
+      continue;
+    }
+    if (companyId && isCompanyKey(companyId, v)) continue;
+    delete sent[s.name];
+    dropped.push(s);
+  }
+  return { sent, dropped };
+}
+
+/** Staff-entered photo values must be this shop's own uploads, like `assertOwnBackground`. */
+function assertOwnPhotoValues(
+  ctx: TenantContext,
+  slots: TemplateSlot[],
+  values: Record<string, string>,
+) {
+  for (const s of slots) {
+    const v = s.kind === "photo" ? values[s.name] : undefined;
+    if (v?.trim() && !isCompanyKey(ctx.companyId, v)) throw notFound("file");
+  }
+}
+
+/**
+ * Render values through imaging and merge imaging's flags with the local checks. The one place
+ * slot values reach imaging: photo values and the background are checked against the company
+ * of `outKey` here, so every caller (staff edits, buyer answers, stored values, the seed) is
+ * covered.
+ */
 export async function renderValues(
   template: Pick<TemplateRow, "widthIn" | "heightIn" | "backgroundKey" | "slots" | "dpi">,
   values: Record<string, string>,
   outKey: string,
 ): Promise<RenderOutcome> {
-  const local = localFlags(template.slots, values);
+  const companyId = outKeyCompany(outKey);
+  const { sent, dropped } = screenPhotoValues(template.slots, values, companyId);
+  const droppedNames = new Set(dropped.map((s) => s.name));
+  const local = [
+    // A dropped photo gets exactly one `missing_answer`, the one below.
+    ...localFlags(template.slots, sent).filter(
+      (f) => !(f.code === "missing_answer" && f.slot && droppedNames.has(f.slot)),
+    ),
+    ...dropped.map((s) => ({
+      slot: s.name,
+      code: "missing_answer",
+      message: `Add the buyer's photo for "${s.sourceQuestion ?? s.name}". The answer was not a photo uploaded to this shop.`,
+      suggestion: null,
+    })),
+  ];
+  const droppedPhotoSlots = [...droppedNames];
+  if (dropped.length)
+    log.warn("photo values outside the shop dropped", { companyId, slots: droppedPhotoSlots });
+  if (template.backgroundKey && !(companyId && isCompanyKey(companyId, template.backgroundKey))) {
+    log.warn("personalization render refused: background outside the shop", { companyId });
+    return {
+      status: "failed",
+      droppedPhotoSlots,
+      fileKey: null,
+      widthPx: null,
+      heightPx: null,
+      flags: local,
+      error: "The template background is not a file of this shop. Upload the background again.",
+      transient: false,
+    };
+  }
   try {
     const res = await imaging.renderPersonalization({
       template: renderTemplatePayload(template),
-      values,
+      values: sent,
       out_key: outKey,
       dpi: template.dpi,
     });
@@ -363,6 +448,7 @@ export async function renderValues(
     const flags = [...local, ...remote];
     return {
       status: flags.length ? "flagged" : "rendered",
+      droppedPhotoSlots,
       fileKey: res.key,
       widthPx: res.width_px,
       heightPx: res.height_px,
@@ -374,6 +460,7 @@ export async function renderValues(
     log.warn("personalization render failed", { error: detail });
     return {
       status: "failed",
+      droppedPhotoSlots,
       fileKey: null,
       widthPx: null,
       heightPx: null,
@@ -390,6 +477,8 @@ export async function previewTemplate(
   input: { id: string; values: Record<string, string> },
 ) {
   const t = await templateRow(tx, input.id);
+  assertOwnBackground(ctx, t.backgroundKey);
+  assertOwnPhotoValues(ctx, t.slots, input.values);
   const key = objectKey(ctx.companyId, "preview", "png");
   const out = await renderValues(t, input.values, key);
   if (out.status === "failed" || !out.fileKey) throw upstream("imaging", out.error);
@@ -589,14 +678,15 @@ export async function renderItemArtwork(
   ctx: TenantContext,
   itemId: string,
   opts: { templateId?: string; values?: Record<string, string> } = {},
-): Promise<{ clean: boolean; artwork: ArtworkRow }> {
+): Promise<{ clean: boolean; artwork: ArtworkRow; photoDropped: boolean }> {
   const plan = await planItemRender(tx, itemId, opts);
   const out = await renderValues(
     plan.template,
     plan.values,
     objectKey(ctx.companyId, "artwork", "png"),
   );
-  return saveItemRender(tx, ctx, plan, out);
+  const saved = await saveItemRender(tx, ctx, plan, out);
+  return { ...saved, photoDropped: out.droppedPhotoSlots.length > 0 };
 }
 
 /* ----------------------------- render in the background ----------------------------- */
@@ -884,12 +974,15 @@ export async function updateArtworkValues(
     .where(eq(itemArtwork.orderItemId, input.orderItemId))
     .limit(1);
   if (!a) throw notFound("item_artwork", input.orderItemId);
+  assertOwnPhotoValues(ctx, (await templateRow(tx, a.templateId)).slots, input.values);
   const values = { ...a.values, ...input.values };
-  const { clean } = await renderItemArtwork(tx, ctx, input.orderItemId, {
+  const { clean, photoDropped } = await renderItemArtwork(tx, ctx, input.orderItemId, {
     templateId: a.templateId,
     values,
   });
-  if (input.approve) return approveArtwork(tx, ctx, input.orderItemId);
+  // A stored photo value that is not this shop's key was dropped from the render: approving
+  // would send the unit to print without the buyer's photo.
+  if (input.approve && !photoDropped) return approveArtwork(tx, ctx, input.orderItemId);
   await settleItemState(tx, ctx, input.orderItemId, clean, "artwork_edited");
   return getArtwork(tx, ctx, input.orderItemId);
 }
