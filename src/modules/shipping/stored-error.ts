@@ -31,7 +31,7 @@ function knownCode(err: unknown): string | null {
 export function storedError(err: unknown): string {
   if (err instanceof CarrierError) return `${CARRIER_SENTENCE[err.code]} (${err.code})`;
   if (isORPCError(err) && err.code === "UPSTREAM_FAILED")
-    return "An outside service did not answer (UPSTREAM_FAILED)";
+    return "An outside service could not complete the request (UPSTREAM_FAILED)";
   return scrubbed(err);
 }
 

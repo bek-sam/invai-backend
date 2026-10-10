@@ -563,7 +563,9 @@ describe("global demand cache (ADR 0015)", () => {
     const out = (await runJobInline(job("market.refreshDemand"), {})) as {
       sources: { source: string; failed?: string; rows?: number }[];
     };
-    expect(out.sources.find((s) => s.source === "google_trends")?.failed).toMatch(/down/);
+    expect(out.sources.find((s) => s.source === "google_trends")?.failed).toBe(
+      "A market data source did not answer (source_failed)",
+    );
     expect(out.sources.find((s) => s.source === "pinterest_trends")?.rows).toBeGreaterThan(0);
     const g = await withSystem((tx) =>
       tx

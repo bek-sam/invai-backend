@@ -333,7 +333,7 @@ describe("batch label buy job", () => {
     const results = (job.input as { results: Record<string, { status: string; error?: string }> })
       .results;
     expect(results[orderId as string]?.error).toBe(
-      "An outside service did not answer (UPSTREAM_FAILED)",
+      "An outside service could not complete the request (UPSTREAM_FAILED)",
     );
     expect(JSON.stringify(job.input)).not.toContain("Mesquite");
   });
