@@ -245,3 +245,24 @@ describe("image generation switches (T-27-1)", () => {
     expect((await boot({ NODE_ENV: "test", IMAGE_GEN_MOCK_DRIFT: "1" })).ok).toBe(true);
   });
 });
+
+describe("field-encryption provider (T-32-2)", () => {
+  it("defaults to static; a typo fails the boot instead of silently using static", async () => {
+    const typo = await boot({ FIELD_ENCRYPTION_PROVIDER: "lcoal" });
+    expect(typo.ok).toBe(false);
+    expect(typo.out).toContain("FIELD_ENCRYPTION_PROVIDER");
+    const blank = await boot({ FIELD_ENCRYPTION_PROVIDER: "" });
+    expect(blank.ok).toBe(true);
+  });
+
+  it("local is refused in production unless ALLOW_MOCKS=true; kms parses (init refuses it later)", async () => {
+    const prod = { NODE_ENV: "production", ...ALL_KEYS, SMTP_URL: "smtp://mail:25" };
+    const local = { ...prod, FIELD_ENCRYPTION_PROVIDER: "local" };
+    const refused = await boot(local);
+    expect(refused.ok).toBe(false);
+    expect(refused.out).toContain("FIELD_ENCRYPTION_PROVIDER=local");
+    expect((await boot({ ...local, ALLOW_MOCKS: "true" })).ok).toBe(true);
+    const kms = await boot({ ...prod, FIELD_ENCRYPTION_PROVIDER: "kms" });
+    expect(kms.ok).toBe(true);
+  });
+});

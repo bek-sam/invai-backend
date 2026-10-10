@@ -2,6 +2,7 @@ import { sql } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 import { Pool } from "pg";
 import { env } from "../env";
+import { initFieldEncryption } from "../lib/crypto";
 import * as schema from "./schema";
 
 /** App role (invai_app): RLS enforced. Every request-scoped query goes through withTenant(). */
@@ -49,6 +50,9 @@ async function scoped<T>(
   settings: Record<string, string>,
   fn: (tx: Tx) => Promise<T>,
 ): Promise<T> {
+  // Every encrypted column is read or written inside a scoped transaction, so awaiting the
+  // memoized key-ring init here covers every entry point (api, worker, seed, evals, scripts).
+  await initFieldEncryption();
   let txRef: Tx | null = null;
   const result = await database.transaction(async (tx) => {
     txRef = tx;

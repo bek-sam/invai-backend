@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import { eq, sql } from "drizzle-orm";
 import { auth } from "../../auth";
 import { env } from "../../env";
+import { initFieldEncryption } from "../../lib/crypto";
 import { logger } from "../../lib/log";
 import { PLAN_CATALOG } from "../../modules/billing/service";
 import { closeDb, systemDb, withSystem } from "../client";
@@ -93,6 +94,7 @@ async function seedGlobals() {
 async function main() {
   const started = Date.now();
   assertSafeToSeed(env.DATABASE_URL, env.MIGRATION_DATABASE_URL, process.env.SEED_OUTPUT_FILE);
+  await initFieldEncryption();
   const [existing] = await systemDb
     .select({ id: companies.id })
     .from(companies)

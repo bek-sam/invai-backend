@@ -155,7 +155,7 @@ export function carrierAdapter(): CarrierAdapter {
 | Realtime | `publish(companyId, name, payload)` (contracts `RealtimeEvents`; wire = `RealtimeEnvelope`) |
 | Jobs | `defineJob`, `onEvent`, `getJob`, `runJobInline` (`src/lib/queues.ts`) |
 | S3 | `objectKey`, `presignPut/Get`, `putObject`, `getObject`, `headObject` |
-| Encryption | `encryptedText()` column type, `encryptJson/decryptJson`, `randomToken`, `sha256Hex` |
+| Encryption | `encryptedText()` column type, `encryptJson/decryptJson`, `randomToken`, `sha256Hex`. The key ring comes from a provider (`lib/field-keys.ts`, `FIELD_ENCRYPTION_PROVIDER`); `scoped()` awaits `initFieldEncryption()`, so modules never call it |
 | Pagination | `keyset(createdAtCol, idCol, input)` |
 | CSV | `parseCsvObjects`, `col(row, ...names)`, `toCsv` |
 | Errors | `src/lib/errors.ts` |

@@ -7,40 +7,60 @@ import {
   timingSafeEqual,
 } from "node:crypto";
 import { customType } from "drizzle-orm/pg-core";
+import { type KeyRing, parseStaticRing, providerFromEnv, providerName } from "./field-keys";
 
 /**
  * Field encryption for buyer PII and channel credentials: AES-256-GCM with a key ring.
- * Ciphertext format: `<keyId>:<base64(iv(12) | tag(16) | data)>`. The first key in
- * FIELD_ENCRYPTION_KEY encrypts; every key decrypts, so rotation is "prepend a key, re-encrypt
- * lazily". KMS envelope keys can replace the ring later without changing the column format.
+ * Ciphertext format: `<keyId>:<base64(iv(12) | tag(16) | data)>`. The ring's primary key
+ * encrypts; every key decrypts, so rotation is "add a key in front, re-encrypt lazily".
+ *
+ * Where the ring comes from is the provider's job (`field-keys.ts`, ADR 0034):
+ * - `static` (default): the `FIELD_ENCRYPTION_KEY` ring, loaded lazily on first use, so the sync
+ *   path works even if `initFieldEncryption()` was never called.
+ * - any other provider: `initFieldEncryption()` must finish first (`scoped()` in db/client.ts
+ *   awaits it before every transaction; the api, worker and seed await it at start). Until then
+ *   encrypt and decrypt throw: they never fall back to the static key.
  */
 
-type KeyRing = { primary: { id: string; key: Buffer }; all: Map<string, Buffer> };
 let ring: KeyRing | null = null;
+let initPromise: Promise<void> | null = null;
+/** Bumped by resetKeyRing() so an init still in flight can't install a stale ring. */
+let generation = 0;
 
 function loadRing(): KeyRing {
   if (ring) return ring;
-  const raw = process.env.FIELD_ENCRYPTION_KEY;
-  if (!raw) throw new Error("FIELD_ENCRYPTION_KEY is not set");
-  const all = new Map<string, Buffer>();
-  let primary: KeyRing["primary"] | null = null;
-  for (const part of raw.split(",")) {
-    const idx = part.indexOf(":");
-    if (idx <= 0) throw new Error("FIELD_ENCRYPTION_KEY entries must look like keyId:base64");
-    const id = part.slice(0, idx).trim();
-    const key = Buffer.from(part.slice(idx + 1).trim(), "base64");
-    if (key.length !== 32) throw new Error(`FIELD_ENCRYPTION_KEY ${id} must decode to 32 bytes`);
-    all.set(id, key);
-    primary ??= { id, key };
+  const name = providerName(process.env.FIELD_ENCRYPTION_PROVIDER);
+  if (name !== "static") {
+    throw new Error(
+      `Field encryption is not initialised: FIELD_ENCRYPTION_PROVIDER=${name} needs ` +
+        "initFieldEncryption() to finish before any encrypt or decrypt",
+    );
   }
-  if (!primary) throw new Error("FIELD_ENCRYPTION_KEY is empty");
-  ring = { primary, all };
+  ring = parseStaticRing(process.env.FIELD_ENCRYPTION_KEY);
   return ring;
 }
 
-/** Test hook: forget the cached key ring (used after changing the env var). */
+/**
+ * Builds the key ring from the configured provider, once (memoized; a failure stays failed so
+ * every caller fails closed). With `static` it resolves without touching the ring, as before.
+ */
+export function initFieldEncryption(): Promise<void> {
+  if (initPromise) return initPromise;
+  const gen = generation;
+  initPromise = (async () => {
+    const provider = providerFromEnv();
+    if (provider.name === "static") return;
+    const loaded = await provider.loadDataKeys();
+    if (gen === generation) ring = loaded;
+  })();
+  return initPromise;
+}
+
+/** Test hook: forget the cached key ring and provider state (used after changing env vars). */
 export function resetKeyRing() {
   ring = null;
+  initPromise = null;
+  generation++;
 }
 
 export function encryptField(plain: string): string {

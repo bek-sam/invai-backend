@@ -1,6 +1,7 @@
 import type { Server } from "node:http";
 import { serve } from "@hono/node-server";
 import { env } from "../env";
+import { initFieldEncryption } from "../lib/crypto";
 import { errorData, logger } from "../lib/log";
 import { ensureBucket } from "../lib/s3";
 import { withShutdownCap } from "../lib/shutdown-timeout";
@@ -8,6 +9,12 @@ import { app } from "./app";
 import { beginShutdown } from "./shutdown";
 
 const log = logger("api");
+
+// Fail fast: a missing or wrong field-encryption key stops the start, not the first request.
+await initFieldEncryption().catch((err) => {
+  log.error("field encryption failed to start", errorData(err));
+  process.exit(1);
+});
 
 if (!env.isProd) {
   await ensureBucket().catch((err) => log.warn("bucket check failed", { error: String(err) }));

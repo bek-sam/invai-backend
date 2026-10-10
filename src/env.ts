@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { FLOOR_COMPAT_BASELINE } from "@invai/contracts";
 import { createEnv } from "@t3-oss/env-core";
 import { z } from "zod";
+import { assertProviderAllowed, FIELD_ENCRYPTION_PROVIDERS } from "./lib/field-keys";
 
 // Local development reads .env (Node 24 built-in). Production injects real env vars.
 if (process.env.NODE_ENV !== "production" && !process.env.INVAI_SKIP_DOTENV) {
@@ -87,6 +88,16 @@ const raw = createEnv({
 
     /** `<keyId>:<base64 32 bytes>[,<keyId>:<base64>]`; the first key encrypts, all keys decrypt. */
     FIELD_ENCRYPTION_KEY: z.string().min(40),
+    /**
+     * Where the field-encryption ring comes from (ADR 0034): `static` = FIELD_ENCRYPTION_KEY
+     * only; `local` = wrapped data keys unwrapped with a local master key (development; the
+     * static ring stays decrypt-only); `kms` = refused at start until the AWS adapter (B-327).
+     */
+    FIELD_ENCRYPTION_PROVIDER: z.enum(FIELD_ENCRYPTION_PROVIDERS).default("static"),
+    /** `local` only: base64 of 32 bytes. Never logged. */
+    FIELD_ENCRYPTION_LOCAL_MASTER_KEY: secret(z.string()),
+    /** `local` only: `keyId:base64(wrapped)[,...]` from `field-keys-cli.ts`; the first encrypts. */
+    FIELD_ENCRYPTION_DATA_KEYS: secret(z.string()),
 
     ANTHROPIC_API_KEY: secret(z.string()),
     /** Second AI provider (decision 0021): used only when ANTHROPIC_API_KEY is unset. */
@@ -291,6 +302,7 @@ if (isProd && raw.IMAGE_GEN_PROVIDER === "openai" && !raw.OPENAI_API_KEY) {
       "key, or set IMAGE_GEN_PROVIDER=mock to keep sample scenes.",
   );
 }
+assertProviderAllowed(raw.FIELD_ENCRYPTION_PROVIDER, { isProd, allowMocks: raw.ALLOW_MOCKS });
 if (raw.IMAGE_GEN_MOCK_DRIFT !== undefined && !isTest) {
   throw new Error("IMAGE_GEN_MOCK_DRIFT is a test-only switch; unset it outside NODE_ENV=test.");
 }

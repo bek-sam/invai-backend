@@ -1,6 +1,7 @@
 import { Worker } from "bullmq";
 import "../modules/jobs";
 import { closeDb } from "../db/client";
+import { initFieldEncryption } from "../lib/crypto";
 import { companyIdFromData, withFairness } from "../lib/fairness";
 import { errorData, logger } from "../lib/log";
 import {
@@ -19,6 +20,12 @@ import { startOutboxRelay } from "./outbox-relay";
 import "./sweeps";
 
 const log = logger("worker");
+
+// Fail fast, before any queue starts taking jobs (T-32-2).
+await initFieldEncryption().catch((err) => {
+  log.error("field encryption failed to start", errorData(err));
+  process.exit(1);
+});
 
 /*
  * One BullMQ Worker per queue. Jobs are dispatched by name to the definition registered with
