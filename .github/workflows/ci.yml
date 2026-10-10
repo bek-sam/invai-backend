@@ -38,6 +38,16 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+      # SMTP sink at :1025, the non-production default SMTP_URL (src/env.ts). The notify, digest
+      # and mailer tests send real mail through it.
+      mailpit:
+        image: axllent/mailpit@sha256:b68349e3a014b90c5610bfb26b2ae36f3892d7b8cf25ee140c6c71c98d2fcf48 # v1.31.4
+        ports: ["1025:1025"]
+        options: >-
+          --health-cmd "/mailpit readyz"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     env:
       # Owner role: migrations, seed, outbox relay, cross-tenant jobs. RLS-enforced app role
       # below (invai_app has no BYPASSRLS, matching local dev and prod).
@@ -73,6 +83,16 @@ jobs:
           path: invai-contracts
           ssh-key: ${{ secrets.CONTRACTS_DEPLOY_KEY }}
           persist-credentials: false
+      # The imaging contract drift test (src/integrations/imaging/contract.test.ts) reads the
+      # Pydantic schemas from ../invai-imaging with `uv run`. Public repo, no key needed.
+      - name: Check out invai-imaging (sibling, main)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: bek-sam/invai-imaging
+          ref: main
+          path: invai-imaging
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           package_json_file: invai-backend/package.json
@@ -81,6 +101,8 @@ jobs:
           node-version-file: invai-backend/.nvmrc
           cache: pnpm
           cache-dependency-path: invai-backend/pnpm-lock.yaml
+      - run: uv sync
+        working-directory: invai-imaging
       - run: pnpm install --frozen-lockfile
         working-directory: invai-contracts
       - run: pnpm install --frozen-lockfile
