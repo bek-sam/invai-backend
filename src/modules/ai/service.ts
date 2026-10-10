@@ -20,6 +20,7 @@ import type { z } from "zod";
 import { assertCredits, creditBalance } from "../../ai/credits";
 import { runAssistant, runStructured, sanitizeDeep, sanitizeText } from "../../ai/gateway";
 import { ASSISTANT_PROMPT, type ListingCopy, listingCopyPrompt } from "../../ai/prompts";
+import { storedErrorText } from "../../ai/stored-error";
 import {
   describeIssues,
   IMAGE_AI_DISCLOSURE,
@@ -44,7 +45,7 @@ import {
 import { audit } from "../../lib/audit";
 import { toCsv } from "../../lib/csv";
 import { badRequest, conflict, invalidTransition, notFound } from "../../lib/errors";
-import { logger } from "../../lib/log";
+import { errorData, logger } from "../../lib/log";
 import { emit } from "../../lib/outbox";
 import { keyset, type PageInput } from "../../lib/pagination";
 import { publish } from "../../lib/realtime";
@@ -528,7 +529,7 @@ export async function generateDraft(companyId: string, draftId: string, userId: 
     });
     return { ok: validation.ok, credits };
   } catch (err) {
-    const message = err instanceof ORPCError ? err.message : (err as Error).message;
+    const message = storedErrorText(err);
     await withTenant(companyId, async (tx) => {
       await tx
         .update(listingDrafts)
@@ -540,7 +541,7 @@ export async function generateDraft(companyId: string, draftId: string, userId: 
       type: "listing_draft.updated",
       data: { draftId, status: "failed" },
     });
-    log.warn("draft generation failed", { draftId, error: message });
+    log.warn("draft generation failed", { draftId, ...errorData(err) });
     return { ok: false, error: message };
   }
 }
@@ -1426,7 +1427,7 @@ export async function* ask(
           : (err as Error).message.includes("declined")
             ? "refusal"
             : "internal";
-    log.warn("assistant failed", { error: (err as Error).message });
+    log.warn("assistant failed", errorData(err));
     yield { type: "error", message: (err as Error).message, code };
   } finally {
     if (!settled) {
@@ -1470,7 +1471,7 @@ export async function* ask(
       ).catch((err) =>
         log.warn("could not record shown recommendations", {
           companyId: ctx.companyId,
-          error: (err as Error).message,
+          ...errorData(err),
         }),
       );
     }

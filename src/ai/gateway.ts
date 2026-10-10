@@ -4,7 +4,7 @@ import { withTenant } from "../db/client";
 import { aiJobs } from "../db/schema";
 import { env } from "../env";
 import { upstream } from "../lib/errors";
-import { logger } from "../lib/log";
+import { errorData, logger } from "../lib/log";
 import { sanitizeDeep, sanitizeText } from "../lib/text-safety";
 import { isSampleWorkspace } from "../modules/tenancy/demo-flag";
 import { assertSpendAvailable, recordSpend } from "./breaker";
@@ -26,6 +26,7 @@ import {
   type ImageInput,
   type ProviderAssistantEvent,
 } from "./providers/types";
+import { storedErrorText } from "./stored-error";
 import {
   describeIssues,
   fallbackAnswer,
@@ -108,11 +109,11 @@ async function failJob(companyId: string, aiJobId: string, err: unknown) {
       .update(aiJobs)
       .set({
         status: "failed",
-        error: sanitizeText(String((err as Error).message)),
+        error: storedErrorText(err),
         finishedAt: new Date(),
       })
       .where(eq(aiJobs.id, aiJobId)),
-  ).catch((e) => log.error("could not mark ai job failed", { error: (e as Error).message }));
+  ).catch((e) => log.error("could not mark ai job failed", errorData(e)));
 }
 
 /*
@@ -237,7 +238,7 @@ export async function runStructured<V, O>(
     return { output, credits, model: res.model, aiJobId };
   } catch (err) {
     await failJob(meta.companyId, aiJobId, err);
-    log.warn("structured call failed", { prompt: prompt.id, error: (err as Error).message });
+    log.warn("structured call failed", { prompt: prompt.id, ...errorData(err) });
     throw toApiError(err, provider);
   }
 }

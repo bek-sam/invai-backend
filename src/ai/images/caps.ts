@@ -4,10 +4,10 @@ import { and, eq, gt, gte, lt, or, sql } from "drizzle-orm";
 import { type Tx, withTenant } from "../../db/client";
 import { aiJobs } from "../../db/schema";
 import { env } from "../../env";
-import { sanitizeText } from "../../lib/text-safety";
 import { assertSpendAvailable, recordSpend, spendCaps, spendDay } from "../breaker";
 import { assertCredits } from "../credits";
 import { PHOTO_SCENE_CREDITS } from "../models";
+import { storedErrorText } from "../stored-error";
 import {
   type GeneratedScene,
   ImageGenError,
@@ -164,12 +164,7 @@ export async function recordImageGen(input: {
         costCents,
         credits: 0,
         stopReason: r ? "end_turn" : null,
-        error: r
-          ? null
-          : sanitizeText(String((input.error as Error)?.message ?? input.error ?? "failed")).slice(
-              0,
-              500,
-            ),
+        error: r ? null : storedErrorText(input.error),
         entityType: input.entity?.type ?? null,
         entityId: input.entity?.id ?? null,
         createdBy: input.userId,

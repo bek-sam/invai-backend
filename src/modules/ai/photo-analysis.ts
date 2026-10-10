@@ -12,7 +12,7 @@ import {
   repairPhotoAnalysis,
   validatePhotoAnalysis,
 } from "../../ai/validators/photo-analysis";
-import { logger } from "../../lib/log";
+import { errorData, logger } from "../../lib/log";
 import { getObject, isCompanyKey } from "../../lib/s3";
 
 const log = logger("ai.photos");
@@ -75,7 +75,7 @@ export async function previewImage(companyId: string, key: string | null): Promi
   } catch (err) {
     log.warn("preview could not be read; analyzing without the image", {
       companyId,
-      error: (err as Error).message,
+      ...errorData(err),
     });
     return [];
   }

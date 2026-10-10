@@ -6,7 +6,7 @@ import { trademarkJudgePrompt } from "../../ai/prompts";
 import type { TenantContext } from "../../api/context";
 import type { Tx } from "../../db/client";
 import { env } from "../../env";
-import { logger } from "../../lib/log";
+import { errorData, logger } from "../../lib/log";
 
 const log = logger("ai.trademark");
 
@@ -166,9 +166,7 @@ export async function checkTrademarks(
       }
       judged = true;
     } catch (err) {
-      log.warn("trademark judge failed; using the deterministic score", {
-        error: (err as Error).message,
-      });
+      log.warn("trademark judge failed; using the deterministic score", errorData(err));
     }
   }
   matches = matches.sort((a, b) => b.risk - a.risk);
