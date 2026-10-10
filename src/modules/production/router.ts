@@ -1,6 +1,7 @@
 import { authed } from "../../api/orpc";
 import { withTenant } from "../../db/client";
 import { logger } from "../../lib/log";
+import { withExportExpiry } from "../privacy/service";
 import { sendSheetToVendor } from "../vendors/service";
 import * as svc from "./service";
 
@@ -17,7 +18,9 @@ export const productionRouter = authed.production.router({
   },
   jobs: {
     get: authed.production.jobs.get.handler(({ input, context: { tenant } }) =>
-      withTenant(tenant.companyId, (tx) => svc.getJobRow(tx, input.id)),
+      withTenant(tenant.companyId, async (tx) =>
+        withExportExpiry(tx, await svc.getJobRow(tx, input.id)),
+      ),
     ),
   },
   sheets: {

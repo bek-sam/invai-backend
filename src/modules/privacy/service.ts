@@ -719,19 +719,21 @@ export async function exportStatus(tx: Tx, jobId: string): Promise<Job> {
     .where(and(eq(jobs.id, jobId), eq(jobs.kind, "tenant_export")))
     .limit(1);
   if (!row) throw notFound("job", jobId);
-  const job = toJob(row);
-  // B-325 (decision 0033): once the zip expired its `files` row is gone; say so instead of handing
-  // out a file id that answers NOT_FOUND. Computed on read; the jobs row is not written.
-  const fileId = job.status === "done" ? job.resultIds[0] : undefined;
-  if (fileId) {
-    const [file] = await tx
-      .select({ id: files.id })
-      .from(files)
-      .where(eq(files.id, fileId))
-      .limit(1);
-    if (!file) return { ...job, resultIds: [], message: "expired" };
-  }
-  return job;
+  return withExportExpiry(tx, toJob(row));
+}
+
+/**
+ * B-325 (decision 0033), B-340: once an export zip expired its `files` row is gone; say so instead of
+ * handing out a file id that answers NOT_FOUND. Computed on read, the jobs row is not written. Any
+ * other job kind, or an export whose file still exists, comes back unchanged. The read runs in the
+ * caller's tenant transaction, so RLS keeps it company-scoped.
+ */
+export async function withExportExpiry(tx: Tx, job: Job): Promise<Job> {
+  const fileId =
+    job.kind === "tenant_export" && job.status === "done" ? job.resultIds[0] : undefined;
+  if (!fileId) return job;
+  const [file] = await tx.select({ id: files.id }).from(files).where(eq(files.id, fileId)).limit(1);
+  return file ? job : { ...job, resultIds: [], message: "expired" };
 }
 
 /** Mark an export failed (enqueue failed, or a permanent failure in the job). */
