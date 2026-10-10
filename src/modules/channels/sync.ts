@@ -58,6 +58,7 @@ import {
   toChannelConn,
   toImportReport,
 } from "./service";
+import { scrubbedError, storedChannelError } from "./stored-error";
 
 const log = logger("channels.sync");
 
@@ -378,7 +379,7 @@ async function runCsvImport(
 
 /** Mark a run (and its job row) failed; chunks already committed stay imported and counted. */
 async function failCsvImport(companyId: string, runId: string, err: unknown) {
-  const message = String(errorData(err).error);
+  const message = scrubbedError(err);
   log.error("csv import failed", { companyId, importId: runId, error: message });
   const jobRow = await withTenant(companyId, async (tx) => {
     const [run] = await tx.select().from(importRuns).where(eq(importRuns.id, runId)).for("update");
@@ -590,7 +591,11 @@ export async function syncConnection(
     await publish(companyId, "connection.health", { connectionId, ok: true });
     return res;
   } catch (err) {
-    const message = String(errorData(err).error);
+    const message = storedChannelError(
+      err,
+      "The channel did not answer the order sync",
+      "sync_failed",
+    );
     log.warn("sync failed", { companyId, connectionId, ...errorData(err) });
     await withTenant(companyId, async (tx) => {
       await markConnection(tx, conn.id, { kind: "error", error: message });
@@ -789,7 +794,7 @@ export async function processWebhook(
   } catch (err) {
     await finishWebhookDelivery(channel, headers, {
       status: "failed",
-      detail: err instanceof Error ? err.message : String(err),
+      detail: scrubbedError(err),
     }).catch(() => {});
     throw err;
   }

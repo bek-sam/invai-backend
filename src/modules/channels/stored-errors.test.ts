@@ -16,7 +16,9 @@ vi.mock("../../integrations/channels", async (importOriginal) => {
 });
 
 const VALUE = "Maria Perez 4410 Mesquite Lane";
-const driverError = () => new Error(`Failed query: select 1\nparams: ${VALUE}`);
+/** A marketplace's own message: it can quote the buyer, so it must never be stored. */
+const driverError = () =>
+  new Error(`Etsy 422: cannot ship to ${VALUE}, maria.perez@example.com, Phoenix AZ 85004`);
 
 async function shopify(companyId: string, extra: Partial<typeof channelConnections.$inferInsert>) {
   const [row] = await withSystem((tx) =>
@@ -47,8 +49,8 @@ const reload = (companyId: string, id: string) =>
 
 afterEach(() => vi.unstubAllGlobals());
 
-describe("channel errors are stored scrubbed (B-343)", () => {
-  it("a failed sync stores the head in connection.lastError and the job error", async () => {
+describe("channel errors are stored as a fixed sentence (B-343, B-353, B-354)", () => {
+  it("a failed sync stores a fixed sentence with a code in connection.lastError and the job error", async () => {
     const co = (await createCompany()).id;
     const conn = await shopify(co, {});
     const [job] = await withSystem((tx) =>
@@ -66,15 +68,14 @@ describe("channel errors are stored scrubbed (B-343)", () => {
     });
     await expect(syncConnection(co, conn.id, job?.id)).rejects.toThrow();
     const after = await reload(co, conn.id);
-    expect(after?.lastError).toMatch(/^Failed query/);
-    expect(after?.lastError).not.toContain(VALUE);
+    expect(after?.lastError).toBe("The channel did not answer the order sync (sync_failed)");
     const [row] = await withTenant(co, (tx) =>
       tx
         .select()
         .from(jobs)
         .where(eq(jobs.id, job?.id as string)),
     );
-    expect(row?.error ?? "").not.toContain(VALUE);
+    expect(row?.error).toBe("The channel did not answer the order sync (sync_failed)");
   });
 
   it("a failed token refresh stores the head in the connection's refreshError and lastError", async () => {
@@ -96,9 +97,12 @@ describe("channel errors are stored scrubbed (B-343)", () => {
     await refreshExpiringTokens();
     const after = await reload(co, conn.id);
     expect(after?.lastError).toContain("could not be renewed");
-    expect(after?.lastError).not.toContain(VALUE);
+    expect(after?.lastError).not.toContain("Mesquite");
+    expect(after?.lastError).not.toContain("maria.perez");
     const { decryptJson } = await import("../../lib/crypto");
     const creds = decryptJson<{ refreshError?: { message: string } }>(after?.credentials as string);
-    expect(creds.refreshError?.message).not.toContain(VALUE);
+    expect(creds.refreshError?.message).toBe(
+      "Shopify access could not be renewed (refresh_failed)",
+    );
   });
 });

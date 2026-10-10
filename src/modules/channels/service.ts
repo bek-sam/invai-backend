@@ -32,11 +32,11 @@ import type {
 import { audit } from "../../lib/audit";
 import { decryptJson, encryptJson, randomToken } from "../../lib/crypto";
 import { badRequest, notFound, ORPCError } from "../../lib/errors";
-import { errorData } from "../../lib/log";
 import { emit } from "../../lib/outbox";
 import { keyset, type PageInput } from "../../lib/pagination";
 import { assertWithinPlan } from "../billing/service";
 import { isSampleWorkspace } from "../tenancy/demo-flag";
+import { storedChannelError } from "./stored-error";
 
 /*
  * Channel connections: list/connect/update/disconnect, health, tracking push for shipping.
@@ -101,7 +101,11 @@ export async function refreshConnectionToken(
       return { ...conn, credentials: next };
     } catch (err) {
       const permanent = err instanceof ShopifyRefreshError && err.permanent;
-      const message = String(errorData(err).error);
+      const message = storedChannelError(
+        err,
+        "Shopify access could not be renewed",
+        permanent ? "refresh_refused" : "refresh_failed",
+      );
       const flagged: ChannelCredentials = {
         ...creds,
         refreshError: { at: new Date().toISOString(), message, permanent },
@@ -112,7 +116,7 @@ export async function refreshConnectionToken(
           credentials: encryptJson(flagged),
           lastError: permanent
             ? "Shopify no longer accepts this connection's access. Reconnect the store."
-            : `Shopify access could not be renewed (${message}); retrying.`,
+            : `${message}; retrying.`,
           lastErrorAt: new Date(),
         })
         .where(eq(channelConnections.id, row.id));
