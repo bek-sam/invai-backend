@@ -134,7 +134,7 @@ failure (no stack trace).
 
 | Step | What it does |
 |---|---|
-| `bootstrap-cli` | Creates or updates `invai_app` from `DATABASE_URL` (or `APP_DB_PASSWORD`): `LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE`, `CONNECT` on the database and `USAGE` on schema `public`, nothing else. Table grants and REVOKEs stay in the migrations. The password is sent as a SCRAM verifier, and only changed when the server rejects the configured one. Refuses any app role but `invai_app` and any owner but `invai`. Reads only those three variables (no `.env`). |
+| `bootstrap-cli` | Creates or updates `invai_app` from `DATABASE_URL` (or `APP_DB_PASSWORD`): `LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION`, `CONNECT` on the database and `USAGE` on schema `public`, nothing else. Table grants and REVOKEs stay in the migrations. The password is sent as a SCRAM verifier, and only changed when the server rejects the configured one. Refuses any app role but `invai_app` and any owner but `invai`. Also fails, changing nothing more, when `invai_app` is a member of any role (the line names the `REVOKE ... FROM invai_app` to run as `invai`; it removes only grants `invai` made, so add `GRANTED BY <grantor>` for others) or owns any object (the line names `REASSIGN OWNED BY invai_app TO invai`, and for `pg_default_acl` entries `ALTER DEFAULT PRIVILEGES FOR ROLE invai_app REVOKE ...`, which `REASSIGN OWNED` does not clear). Reads only those three variables (no `.env`). |
 | `migrate-cli` | Every pending migration from `<app>/drizzle` under the migration advisory lock, then the reference data. Also `pnpm db:migrate` (from source). |
 | `reference-seed-cli` | Plans and trademark marks only (no tenant rows). |
 

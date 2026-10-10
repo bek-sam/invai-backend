@@ -719,7 +719,19 @@ export async function exportStatus(tx: Tx, jobId: string): Promise<Job> {
     .where(and(eq(jobs.id, jobId), eq(jobs.kind, "tenant_export")))
     .limit(1);
   if (!row) throw notFound("job", jobId);
-  return toJob(row);
+  const job = toJob(row);
+  // B-325 (decision 0033): once the zip expired its `files` row is gone; say so instead of handing
+  // out a file id that answers NOT_FOUND. Computed on read; the jobs row is not written.
+  const fileId = job.status === "done" ? job.resultIds[0] : undefined;
+  if (fileId) {
+    const [file] = await tx
+      .select({ id: files.id })
+      .from(files)
+      .where(eq(files.id, fileId))
+      .limit(1);
+    if (!file) return { ...job, resultIds: [], message: "expired" };
+  }
+  return job;
 }
 
 /** Mark an export failed (enqueue failed, or a permanent failure in the job). */

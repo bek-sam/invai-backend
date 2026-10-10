@@ -432,7 +432,8 @@ describe("bootstrapAppRole refuses every RLS-bypass channel (S-61)", () => {
       );
       expect(err).toBeInstanceOf(ReleaseStepError);
       expect((err as Error).message).toBe(
-        `${appRole} is a member of ${helperRole}, pg_read_all_data and would gain their rights past RLS; run: REVOKE ${helperRole}, pg_read_all_data FROM ${appRole}`,
+        `${appRole} is a member of ${helperRole}, pg_read_all_data and would gain their rights past RLS; run: REVOKE ${helperRole}, pg_read_all_data FROM ${appRole} ` +
+          "(as invai, this removes only grants invai made; for another grantor add GRANTED BY <grantor>)",
       );
       const still = await sql(
         `select count(*)::int as n from pg_auth_members where member = '${appRole}'::regrole`,
@@ -448,7 +449,7 @@ describe("bootstrapAppRole refuses every RLS-bypass channel (S-61)", () => {
     await sql(`ALTER ROLE ${appRole} REPLICATION`);
     try {
       await expect(bootstrapAppRole(cfg)).rejects.toThrow(
-        `would gain its rights past RLS; run: REVOKE ${helperRole} FROM ${appRole} (fixed meanwhile: NOREPLICATION)`,
+        `would gain its rights past RLS; run: REVOKE ${helperRole} FROM ${appRole} (as invai, this removes only grants invai made; for another grantor add GRANTED BY <grantor>) (fixed meanwhile: NOREPLICATION)`,
       );
     } finally {
       await sql(`REVOKE ${helperRole} FROM ${appRole}`);
@@ -470,6 +471,25 @@ describe("bootstrapAppRole refuses every RLS-bypass channel (S-61)", () => {
       await sql(`DROP SCHEMA s61_${tag}`);
       await sql("DROP TABLE s61_owned");
       await sql("DROP FUNCTION s61_fn()");
+    }
+  });
+
+  it("owns default privileges: names pg_default_acl and the ALTER DEFAULT PRIVILEGES fix, not only REASSIGN (B-321)", async () => {
+    const grant = `FOR ROLE ${appRole} IN SCHEMA public GRANT SELECT ON TABLES TO ${helperRole}`;
+    await sql(`ALTER DEFAULT PRIVILEGES ${grant}`);
+    try {
+      await expect(bootstrapAppRole(cfg)).rejects.toThrow(
+        `${appRole} owns 1 object (1 pg_default_acl entry) and bypasses RLS on what it owns; run: ALTER DEFAULT PRIVILEGES FOR ROLE ${appRole} REVOKE ... for each pg_default_acl entry (REASSIGN OWNED does not clear them)`,
+      );
+      await sql(`CREATE SCHEMA s61d_${tag} AUTHORIZATION ${appRole}`);
+      await expect(bootstrapAppRole(cfg)).rejects.toThrow(
+        `run: REASSIGN OWNED BY ${appRole} TO invai; then ALTER DEFAULT PRIVILEGES FOR ROLE ${appRole} REVOKE`,
+      );
+    } finally {
+      await sql(`DROP SCHEMA IF EXISTS s61d_${tag}`);
+      await sql(
+        `ALTER DEFAULT PRIVILEGES ${grant.replace("GRANT SELECT ON TABLES TO", "REVOKE SELECT ON TABLES FROM")}`,
+      );
     }
   });
 });

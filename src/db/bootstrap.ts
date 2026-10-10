@@ -166,6 +166,7 @@ const OWNED_KINDS: Record<string, string> = {
   pg_foreign_data_wrapper: "foreign-data wrapper",
   pg_event_trigger: "event trigger",
   pg_language: "language",
+  pg_default_acl: "pg_default_acl entry",
   pg_collation: "collation",
   pg_conversion: "conversion",
   pg_operator: "operator",
@@ -209,7 +210,8 @@ async function rlsBypassProblems(client: Client, appRole: string, owner: string)
   const roles = member.rows.map((r) => r.name);
   if (roles.length) {
     problems.push(
-      `${appRole} is a member of ${listNames(roles)} and would gain ${roles.length === 1 ? "its" : "their"} rights past RLS; run: REVOKE ${roles.map(sqlName).join(", ")} FROM ${sqlName(appRole)}`,
+      `${appRole} is a member of ${listNames(roles)} and would gain ${roles.length === 1 ? "its" : "their"} rights past RLS; run: REVOKE ${roles.map(sqlName).join(", ")} FROM ${sqlName(appRole)} ` +
+        `(as ${owner}, this removes only grants ${owner} made; for another grantor add GRANTED BY <grantor>)`,
     );
   }
   const owned = await client.query<{ catalog: string; n: number }>(
@@ -225,8 +227,19 @@ async function rlsBypassProblems(client: Client, appRole: string, owner: string)
   if (owned.rows.length) {
     const total = owned.rows.reduce((sum, r) => sum + r.n, 0);
     const kinds = owned.rows.map((r) => `${r.n} ${OWNED_KINDS[r.catalog] ?? r.catalog}`);
+    // REASSIGN OWNED does not move default privileges (B-321): those need ALTER DEFAULT PRIVILEGES.
+    const defaultAcls = owned.rows.some((r) => r.catalog === "pg_default_acl");
+    const others = owned.rows.some((r) => r.catalog !== "pg_default_acl");
+    const fixes = [
+      ...(others ? [`REASSIGN OWNED BY ${sqlName(appRole)} TO ${sqlName(owner)}`] : []),
+      ...(defaultAcls
+        ? [
+            `ALTER DEFAULT PRIVILEGES FOR ROLE ${sqlName(appRole)} REVOKE ... for each pg_default_acl entry (REASSIGN OWNED does not clear them)`,
+          ]
+        : []),
+    ];
     problems.push(
-      `${appRole} owns ${total} object${total === 1 ? "" : "s"} (${kinds.join(", ")}) and bypasses RLS on what it owns; run: REASSIGN OWNED BY ${sqlName(appRole)} TO ${sqlName(owner)}`,
+      `${appRole} owns ${total} object${total === 1 ? "" : "s"} (${kinds.join(", ")}) and bypasses RLS on what it owns; run: ${fixes.join("; then ")}`,
     );
   }
   return problems;

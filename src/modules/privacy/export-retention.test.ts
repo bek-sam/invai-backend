@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import { anonymousContext, type Context, permissionsFor } from "../../api/context";
 import { router } from "../../api/router";
 import { withSystem, withTenant } from "../../db/client";
-import { files } from "../../db/schema";
+import { files, jobs } from "../../db/schema";
 import { runJobInline } from "../../lib/queues";
 import { putObject } from "../../lib/s3";
 import { createCompany, createUser } from "../../test/fixtures";
@@ -257,5 +257,63 @@ describe("tenant-export zips expire after 7 days (decision 0033)", () => {
       exportsDeleted: number;
     };
     expect(second.exportsDeleted).toBe(0);
+  });
+});
+
+/*
+ * T-33-3 (B-325, architect ruling 1): after the zip expired, exportStatus says "expired" with no
+ * file id, computed on read; a young export is unchanged; another company's job is NOT_FOUND.
+ */
+describe("exportStatus after the zip expired (B-325)", () => {
+  /** A finished export job whose result is the zip `fileId`. */
+  async function doneJob(c: string, fileId: string) {
+    const [row] = await withSystem((tx) =>
+      tx
+        .insert(jobs)
+        .values({
+          id: fileId,
+          companyId: c,
+          kind: "tenant_export",
+          status: "done",
+          progress: 1,
+          resultIds: [fileId],
+          message: "Exported 3 tables and 1 files",
+          input: {},
+          finishedAt: new Date(Date.now() - KEEP_MS - DAY),
+        })
+        .returning(),
+    );
+    return row as typeof jobs.$inferSelect;
+  }
+  const status = (c: string, userId: string, jobId: string) =>
+    call(router.privacy.exportStatus, { jobId }, { context: owner(c, userId) });
+
+  it("an expired zip: done, no result ids, message expired; nothing else changes and the row is not written", async () => {
+    const c = (await createCompany()).id;
+    const ownerId = (await createUser(c, "owner")).id;
+    const old = await makeExport(c, new Date(Date.now() - KEEP_MS - DAY));
+    const young = await makeExport(c, new Date(Date.now() - DAY));
+    const oldJob = await doneJob(c, old.id);
+    await doneJob(c, young.id);
+
+    const before = await status(c, ownerId, old.id);
+    expect(before).toMatchObject({ status: "done", resultIds: [old.id] });
+    await expireTenantExports(c);
+
+    const after = await status(c, ownerId, old.id);
+    expect(after).toEqual({ ...before, resultIds: [], message: "expired" });
+    expect(after).toMatchObject({ status: "done", progress: 1, error: null });
+    const [stored] = await withTenant(c, (tx) => tx.select().from(jobs).where(eq(jobs.id, old.id)));
+    expect(stored).toEqual(oldJob);
+
+    expect(await status(c, ownerId, young.id)).toMatchObject({
+      status: "done",
+      resultIds: [young.id],
+      message: "Exported 3 tables and 1 files",
+    });
+
+    const other = (await createCompany()).id;
+    const otherOwner = (await createUser(other, "owner")).id;
+    await expect(status(other, otherOwner, old.id)).rejects.toMatchObject({ code: "NOT_FOUND" });
   });
 });
