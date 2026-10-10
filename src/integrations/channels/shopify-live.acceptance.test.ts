@@ -515,7 +515,9 @@ describe("T-20-3 Shopify live adapter over fetch", () => {
     expect(s).toMatchObject({
       trackingPushStatus: "pending",
       trackingPushAttempts: 1,
-      trackingPushError: expect.stringMatching(/Tracking company is invalid/),
+      trackingPushError: expect.stringContaining("(UPSTREAM_FAILED)"),
     });
+    // T-35-3: the stored text is a fixed sentence; provider wording must not be stored.
+    expect(s?.trackingPushError).not.toContain("Tracking company is invalid");
   });
 });
