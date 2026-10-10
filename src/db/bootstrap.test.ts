@@ -8,9 +8,11 @@ import {
   type BootstrapConfig,
   bootstrapAppRole,
   checkLogin,
+  MIN_REDACTED_SECRET,
   parseBootstrapConfig,
   ReleaseStepError,
   redactLine,
+  releaseFailureLine,
   scramVerifier,
 } from "./bootstrap";
 import { runMigrations } from "./migrate";
@@ -91,9 +93,66 @@ describe("redactLine", () => {
   it("keeps one line, drops URLs and secrets of 8+ characters", () => {
     const line = redactLine("auth failed for Hunter2Secret at postgres://u:p@h/db\nstack line", [
       "Hunter2Secret",
-      "invai",
     ]);
     expect(line).toBe("auth failed for [redacted] at [url]");
+  });
+
+  it("redacts a short secret passed explicitly, down to the 3-character floor (B-311)", () => {
+    expect(MIN_REDACTED_SECRET).toBe(3);
+    expect(redactLine("user x7Pw logged in with x7Pw", ["x7Pw"])).toBe(
+      "user [redacted] logged in with [redacted]",
+    );
+    expect(redactLine("abc and ab", ["abc"])).toBe("[redacted] and ab");
+    // 1-2 characters would match inside nearly every word: left alone.
+    expect(redactLine("a role named ab", ["a", "ab"])).toBe("a role named ab");
+  });
+});
+
+describe("releaseFailureLine (B-311)", () => {
+  /** What drizzle throws: the SQL first, params on the next line, the pg error as `cause`. */
+  const drizzleError = (cause: unknown) =>
+    Object.assign(
+      new Error('Failed query: insert into "plans" ("key", "name") values ($1, $2)\nparams: a,b'),
+      { cause },
+    );
+
+  it("puts the connection reason and its code first, not only 'Failed query'", () => {
+    const refused = Object.assign(new AggregateError([], ""), {
+      code: "ECONNREFUSED",
+      errors: [
+        Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:1"), { code: "ECONNREFUSED" }),
+      ],
+    });
+    expect(releaseFailureLine("reference-seed", drizzleError(refused), [])).toBe(
+      '[reference-seed] failed (ECONNREFUSED): connect ECONNREFUSED 127.0.0.1:1 <- Failed query: insert into "plans" ("key", "name") values ($1...',
+    );
+  });
+
+  it("redacts the reason too, and never prints the query params", () => {
+    const auth = Object.assign(new Error('password authentication failed for user "x7Pw"'), {
+      code: "28P01",
+    });
+    const line = releaseFailureLine("reference-seed", drizzleError(auth), ["x7Pw"]);
+    expect(line).toMatch(/^\[reference-seed\] failed \(28P01\): password authentication failed/);
+    expect(line).not.toContain("x7Pw");
+    expect(line).not.toContain("params");
+  });
+
+  it("ends a refused ALTER ROLE (no REPLICATION right on RDS or PG16+) as one coded line", () => {
+    // What pg throws: the reason in `message`, Postgres's DETAIL line in `detail`.
+    const refused = Object.assign(new Error("permission denied to alter role"), {
+      code: "42501",
+      detail: "Only roles with the REPLICATION attribute may change the REPLICATION attribute.",
+    });
+    expect(releaseFailureLine("bootstrap", refused, [])).toBe(
+      "[bootstrap] failed (42501): permission denied to alter role: Only roles with the REPLICATION attribute may change the REPLICATION attribute.",
+    );
+  });
+
+  it("prints a ReleaseStepError as is", () => {
+    expect(
+      releaseFailureLine("bootstrap", new ReleaseStepError("DATABASE_URL is not set"), []),
+    ).toBe("[bootstrap] failed: DATABASE_URL is not set");
   });
 });
 
@@ -167,7 +226,7 @@ describe("bootstrapAppRole on a scratch database", () => {
 
   async function roleRow() {
     const res = await owner.query(
-      `select a.rolsuper, a.rolbypassrls, a.rolcreatedb, a.rolcreaterole, a.rolcanlogin, a.rolpassword,
+      `select a.rolreplication, a.rolsuper, a.rolbypassrls, a.rolcreatedb, a.rolcreaterole, a.rolcanlogin, a.rolpassword,
               (select s.setconfig from pg_db_role_setting s where s.setrole = a.oid and s.setdatabase = 0) as config
          from pg_authid a where a.rolname = $1`,
       [APP_ROLE],
@@ -197,6 +256,7 @@ describe("bootstrapAppRole on a scratch database", () => {
     // Precondition guard: refuse to run bootstrap where it would change the shared role.
     const before = await roleRow();
     expect(before).toMatchObject({
+      rolreplication: false,
       rolsuper: false,
       rolbypassrls: false,
       rolcreatedb: false,
@@ -287,5 +347,129 @@ describe("bootstrapAppRole on a scratch database", () => {
     await expect(bootstrapAppRole(cfg)).rejects.toThrow(
       "bootstrap must run as the owner role invai, connected as invai_app",
     );
+  });
+});
+
+/*
+ * S-61 (B-313): the channels past RLS that role attributes don't cover. These run against a
+ * scratch role of their own, never `invai_app`: roles are cluster-wide and this cluster is
+ * shared. `bootstrapAppRole` takes the role from its config (only `parseBootstrapConfig` pins it
+ * to invai_app), so the checks are the same ones the release runs. The scratch role, its helper
+ * role and the scratch database are dropped afterwards.
+ */
+describe("bootstrapAppRole refuses every RLS-bypass channel (S-61)", () => {
+  const tag = Date.now().toString(36);
+  const name = `invai_test_bsdrift_${tag}`;
+  const appRole = `invai_test_app_${tag}`;
+  const helperRole = `invai_test_tblowner_${tag}`;
+  const appPassword = `S61-test-pw-${tag}`;
+  const at = (url: string, db: string) => {
+    const u = new URL(url);
+    u.pathname = `/${db}`;
+    return u.toString();
+  };
+  const ownerUrl = at(env.MIGRATION_DATABASE_URL, name);
+  const serverUrl = at(env.MIGRATION_DATABASE_URL, "postgres");
+  const cfg: BootstrapConfig = { ownerUrl, ownerRole: "invai", appRole, appPassword };
+  const unchanged = { created: false, fixedAttributes: [], passwordUpdated: false };
+  let owner: Client;
+  const sql = (text: string) => owner.query(text);
+
+  beforeAll(async () => {
+    const server = new Client({ connectionString: serverUrl });
+    await server.connect();
+    await server.query(`CREATE DATABASE "${name}"`);
+    await server.query(
+      `CREATE ROLE ${appRole} LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION PASSWORD '${appPassword}'`,
+    );
+    await server.query(`CREATE ROLE ${helperRole} NOLOGIN`);
+    await server.end();
+    owner = new Client({ connectionString: ownerUrl });
+    await owner.connect();
+  });
+
+  afterAll(async () => {
+    await owner?.end();
+    const server = new Client({ connectionString: serverUrl });
+    await server.connect();
+    await server.query(`DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`);
+    await server.query(`DROP ROLE IF EXISTS ${appRole}`);
+    await server.query(`DROP ROLE IF EXISTS ${helperRole}`);
+    await server.end();
+  });
+
+  it("clean role: unchanged, rc 0 path", async () => {
+    expect(await bootstrapAppRole(cfg)).toMatchObject({ ...unchanged, database: name });
+  });
+
+  it("a role that is a member OF the app role (PG16+/RDS creator's ADMIN grant) still passes", async () => {
+    await sql(`GRANT ${appRole} TO invai WITH ADMIN OPTION`);
+    try {
+      expect(await bootstrapAppRole(cfg)).toMatchObject(unchanged);
+    } finally {
+      await sql(`REVOKE ${appRole} FROM invai`);
+    }
+  });
+
+  it("REPLICATION: sets NOREPLICATION, reports it, and the next run is unchanged", async () => {
+    await sql(`ALTER ROLE ${appRole} REPLICATION`);
+    try {
+      expect(await bootstrapAppRole(cfg)).toMatchObject({ fixedAttributes: ["NOREPLICATION"] });
+      const row = await sql(`select rolreplication from pg_roles where rolname = '${appRole}'`);
+      expect(row.rows[0]).toEqual({ rolreplication: false });
+      expect(await bootstrapAppRole(cfg)).toMatchObject(unchanged);
+    } finally {
+      await sql(`ALTER ROLE ${appRole} NOREPLICATION`);
+    }
+  });
+
+  it("member of any role: fails naming the roles and the REVOKE, and revokes nothing itself", async () => {
+    await sql(`GRANT ${helperRole}, pg_read_all_data TO ${appRole}`);
+    try {
+      const err = await bootstrapAppRole(cfg).then(
+        () => null,
+        (e: unknown) => e,
+      );
+      expect(err).toBeInstanceOf(ReleaseStepError);
+      expect((err as Error).message).toBe(
+        `${appRole} is a member of ${helperRole}, pg_read_all_data and would gain their rights past RLS; run: REVOKE ${helperRole}, pg_read_all_data FROM ${appRole}`,
+      );
+      const still = await sql(
+        `select count(*)::int as n from pg_auth_members where member = '${appRole}'::regrole`,
+      );
+      expect(still.rows[0]).toEqual({ n: 2 });
+    } finally {
+      await sql(`REVOKE ${helperRole}, pg_read_all_data FROM ${appRole}`);
+    }
+  });
+
+  it("member of a role and REPLICATION: still fails, and says the attribute was fixed", async () => {
+    await sql(`GRANT ${helperRole} TO ${appRole}`);
+    await sql(`ALTER ROLE ${appRole} REPLICATION`);
+    try {
+      await expect(bootstrapAppRole(cfg)).rejects.toThrow(
+        `would gain its rights past RLS; run: REVOKE ${helperRole} FROM ${appRole} (fixed meanwhile: NOREPLICATION)`,
+      );
+    } finally {
+      await sql(`REVOKE ${helperRole} FROM ${appRole}`);
+      await sql(`ALTER ROLE ${appRole} NOREPLICATION`);
+    }
+  });
+
+  it("owns anything (any kind): fails naming count and kinds", async () => {
+    await sql(`CREATE SCHEMA s61_${tag} AUTHORIZATION ${appRole}`);
+    await sql("CREATE TABLE s61_owned (x int)");
+    await sql(`ALTER TABLE s61_owned OWNER TO ${appRole}`);
+    await sql("CREATE FUNCTION s61_fn() RETURNS int LANGUAGE sql AS 'select 1'");
+    await sql(`ALTER FUNCTION s61_fn() OWNER TO ${appRole}`);
+    try {
+      await expect(bootstrapAppRole(cfg)).rejects.toThrow(
+        `${appRole} owns 3 objects (1 relation, 1 schema, 1 function) and bypasses RLS on what it owns; run: REASSIGN OWNED BY ${appRole} TO invai`,
+      );
+    } finally {
+      await sql(`DROP SCHEMA s61_${tag}`);
+      await sql("DROP TABLE s61_owned");
+      await sql("DROP FUNCTION s61_fn()");
+    }
   });
 });

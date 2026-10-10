@@ -125,6 +125,8 @@ const REQUIRED_ATTRIBUTES = {
   rolbypassrls: { want: false, sql: "NOBYPASSRLS" },
   rolcreatedb: { want: false, sql: "NOCREATEDB" },
   rolcreaterole: { want: false, sql: "NOCREATEROLE" },
+  // A replication login reads every tenant's rows from a logical slot, past RLS (S-61).
+  rolreplication: { want: false, sql: "NOREPLICATION" },
 } as const;
 type Attribute = keyof typeof REQUIRED_ATTRIBUTES;
 type RoleRow = Record<Attribute, boolean>;
@@ -142,10 +144,92 @@ export type BootstrapResult = {
 
 async function readRole(client: Client, role: string): Promise<RoleRow | null> {
   const res = await client.query<RoleRow>(
-    "select rolcanlogin, rolsuper, rolbypassrls, rolcreatedb, rolcreaterole from pg_roles where rolname = $1",
+    "select rolcanlogin, rolsuper, rolbypassrls, rolcreatedb, rolcreaterole, rolreplication from pg_roles where rolname = $1",
     [role],
   );
   return res.rows[0] ?? null;
+}
+
+/** Plain words for the `pg_shdepend.classid` catalogs an owned object can live in. */
+const OWNED_KINDS: Record<string, string> = {
+  pg_class: "relation",
+  pg_proc: "function",
+  pg_namespace: "schema",
+  pg_type: "type",
+  pg_database: "database",
+  pg_tablespace: "tablespace",
+  pg_extension: "extension",
+  pg_publication: "publication",
+  pg_subscription: "subscription",
+  pg_largeobject_metadata: "large object",
+  pg_foreign_server: "foreign server",
+  pg_foreign_data_wrapper: "foreign-data wrapper",
+  pg_event_trigger: "event trigger",
+  pg_language: "language",
+  pg_collation: "collation",
+  pg_conversion: "conversion",
+  pg_operator: "operator",
+  pg_opclass: "operator class",
+  pg_opfamily: "operator family",
+  pg_statistic_ext: "statistics object",
+  pg_ts_config: "text search configuration",
+  pg_ts_dict: "text search dictionary",
+};
+
+/** A role name as SQL: bare when Postgres would keep it as is, quoted otherwise. */
+const sqlName = (name: string) =>
+  /^[a-z_][a-z0-9_$]*$/.test(name) ? name : `"${name.replace(/"/g, '""')}"`;
+
+const listNames = (names: string[]) =>
+  names.length > 5
+    ? `${names.slice(0, 5).join(", ")} and ${names.length - 5} more`
+    : names.join(", ");
+
+/**
+ * The channels past RLS that attributes don't cover (S-61). Bootstrap reports them and never
+ * fixes them itself: a membership or an owned object was granted by someone on purpose or by
+ * mistake, and an operator decides.
+ * - Membership in any role (`pg_auth_members.member` = the app role): the app role gains that
+ *   role's rights, whether it owns tables (owners bypass RLS), runs programs
+ *   (`pg_execute_server_program`), reads everything (`pg_read_all_data`) or replicates
+ *   (`rds_replication`). Roles that are members *of* the app role are fine: on PG16+ and RDS the
+ *   role that creates it gets ADMIN membership in it automatically.
+ * - Owning anything in this database or cluster-wide (`pg_shdepend`, `deptype = 'o'`): RLS does
+ *   not apply to a table's owner, and an owned function, schema or type is a way to get one.
+ */
+async function rlsBypassProblems(client: Client, appRole: string, owner: string) {
+  const problems: string[] = [];
+  const member = await client.query<{ name: string }>(
+    `select r.rolname as name
+       from pg_auth_members m join pg_roles r on r.oid = m.roleid
+      where m.member = (select oid from pg_roles where rolname = $1)
+      order by 1`,
+    [appRole],
+  );
+  const roles = member.rows.map((r) => r.name);
+  if (roles.length) {
+    problems.push(
+      `${appRole} is a member of ${listNames(roles)} and would gain ${roles.length === 1 ? "its" : "their"} rights past RLS; run: REVOKE ${roles.map(sqlName).join(", ")} FROM ${sqlName(appRole)}`,
+    );
+  }
+  const owned = await client.query<{ catalog: string; n: number }>(
+    `select d.classid::regclass::text as catalog, count(*)::int as n
+       from pg_shdepend d
+      where d.refclassid = 'pg_authid'::regclass
+        and d.refobjid = (select oid from pg_roles where rolname = $1)
+        and d.deptype = 'o'
+        and d.dbid in (0, (select oid from pg_database where datname = current_database()))
+      group by 1 order by 1`,
+    [appRole],
+  );
+  if (owned.rows.length) {
+    const total = owned.rows.reduce((sum, r) => sum + r.n, 0);
+    const kinds = owned.rows.map((r) => `${r.n} ${OWNED_KINDS[r.catalog] ?? r.catalog}`);
+    problems.push(
+      `${appRole} owns ${total} object${total === 1 ? "" : "s"} (${kinds.join(", ")}) and bypasses RLS on what it owns; run: REASSIGN OWNED BY ${sqlName(appRole)} TO ${sqlName(owner)}`,
+    );
+  }
+  return problems;
 }
 
 /**
@@ -185,8 +269,10 @@ export async function checkLogin(cfg: BootstrapConfig): Promise<"ok" | "wrong" |
 }
 
 /**
- * Create or update the app role as `LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE`, and
- * grant it `CONNECT` on the current database and `USAGE` on schema `public`. Nothing else.
+ * Create or update the app role as `LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE
+ * NOREPLICATION`, and grant it `CONNECT` on the current database and `USAGE` on schema `public`.
+ * Nothing else. Fails (and changes nothing more) when the role is a member of any role or owns
+ * anything (`rlsBypassProblems`).
  *
  * Idempotent: an existing role gets only the attributes that are wrong, and a new password only
  * when the server rejects the configured one. On a correct database a second run changes nothing
@@ -226,7 +312,8 @@ export async function bootstrapAppRole(cfg: BootstrapConfig): Promise<BootstrapR
         );
         created = true;
       } else {
-        // Only what differs: naming SUPERUSER/BYPASSRLS at all needs those attributes on RDS.
+        // Only what differs: naming SUPERUSER/BYPASSRLS/REPLICATION at all needs those
+        // attributes on RDS (and on PG16+ for REPLICATION). A refused ALTER fails the step.
         for (const [col, a] of Object.entries(REQUIRED_ATTRIBUTES)) {
           if (existing[col as Attribute] !== a.want) fixedAttributes.push(a.sql);
         }
@@ -260,14 +347,13 @@ export async function bootstrapAppRole(cfg: BootstrapConfig): Promise<BootstrapR
     if (wrong.length) {
       throw new ReleaseStepError(`${cfg.appRole} still lacks ${wrong.join(" ")}`);
     }
-    const member = await client.query<{ ok: boolean }>(
-      "select pg_has_role($1, $2, 'MEMBER') as ok",
-      [cfg.appRole, currentUser],
-    );
-    if (member.rows[0]?.ok) {
-      throw new ReleaseStepError(
-        `${cfg.appRole} is a member of ${currentUser}, so it would bypass RLS; revoke that membership`,
-      );
+    const problems = await rlsBypassProblems(client, cfg.appRole, currentUser);
+    if (problems.length) {
+      // Attribute fixes above are committed and stay; say so, since the run still fails.
+      const fixed = fixedAttributes.length
+        ? ` (fixed meanwhile: ${fixedAttributes.join(" ")})`
+        : "";
+      throw new ReleaseStepError(`${problems.join("; ")}${fixed}`);
     }
     const login = await checkLogin(cfg);
     if (login === "wrong") {
@@ -287,16 +373,68 @@ export async function bootstrapAppRole(cfg: BootstrapConfig): Promise<BootstrapR
 }
 
 /**
- * One line of at most 300 characters, with every given secret (8 characters or more, so a short
- * local password like `invai` doesn't mangle role names) and every URL-looking token replaced.
+ * Secrets shorter than this are not redacted: a 1-2 character value matches inside almost any
+ * word, so replacing it turns the line into noise, and a value that short protects nothing.
+ * Everything from 3 characters up that is passed in is replaced, even where that also hides a
+ * role name (the local password `invai` is the owner's name too; real passwords are long).
+ */
+export const MIN_REDACTED_SECRET = 3;
+
+/**
+ * One line of at most 400 characters, with every given secret (`MIN_REDACTED_SECRET` characters
+ * or more, longest first so a URL goes before the password inside it) and every URL-looking
+ * token replaced.
  */
 export function redactLine(text: string, secrets: (string | undefined)[]): string {
   let out = text.split("\n")[0] ?? "";
-  for (const s of secrets) {
-    if (s && s.length >= 8) out = out.split(s).join("[redacted]");
+  const given = secrets.filter((s): s is string => !!s && s.length >= MIN_REDACTED_SECRET);
+  for (const s of given.sort((a, b) => b.length - a.length)) {
+    out = out.split(s).join("[redacted]");
   }
   out = out.replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s'"]+/gi, "[url]");
-  return out.length > 300 ? `${out.slice(0, 300)}...` : out;
+  return out.length > 400 ? `${out.slice(0, 400)}...` : out;
+}
+
+type ErrorLike = {
+  message?: string;
+  code?: string;
+  /** pg's DETAIL line: what a refused ALTER ROLE needs, for instance. */
+  detail?: string;
+  cause?: unknown;
+  errors?: ErrorLike[];
+};
+
+/** Message and code of an error, looking inside an AggregateError (a refused connection's
+ * message is empty; each address it tried is in `errors`). */
+function reasonOf(err: unknown): { text: string; code?: string } {
+  const e = (err ?? {}) as ErrorLike;
+  const inner = e.errors?.find((x) => x?.message);
+  const text = e.message || inner?.message || String(err);
+  return { text: e.detail ? `${text}: ${e.detail}` : text, code: e.code || inner?.code };
+}
+
+/**
+ * The line a failed release step prints: `[<name>] failed (<code>): <reason>`, redacted. Drizzle
+ * wraps the pg error as "Failed query: <sql>" with the reason (and the pg or socket code) in
+ * `cause`, so the reason comes first and the query is cut to its start; its params never
+ * appear (they are on the next line, and only the first line is kept).
+ */
+export function releaseFailureLine(
+  name: string,
+  err: unknown,
+  secrets: (string | undefined)[],
+): string {
+  const top = reasonOf(err);
+  const cause =
+    !(err instanceof ReleaseStepError) && (err as ErrorLike | undefined)?.cause
+      ? reasonOf((err as ErrorLike).cause)
+      : null;
+  const outer = top.text.startsWith("Failed query")
+    ? `${(top.text.split("\n")[0] ?? "").slice(0, 60)}...`
+    : top.text;
+  const detail = cause ? `${cause.text} <- ${outer}` : top.text;
+  const code = top.code ?? cause?.code;
+  return `[${name}] failed${code ? ` (${code})` : ""}: ${redactLine(detail, secrets)}`;
 }
 
 /**
@@ -327,20 +465,7 @@ export async function runReleaseStep(name: string, step: () => Promise<string>):
     console.log(`[${name}] ${summary}`);
     process.exitCode = 0;
   } catch (err) {
-    const e = err as {
-      message?: string;
-      code?: string;
-      cause?: { message?: string };
-      errors?: { message?: string }[];
-    };
-    // A refused connection is an AggregateError with an empty message.
-    const parts = [e.message || e.errors?.[0]?.message || String(err)];
-    // Drizzle wraps the pg error: "Failed query: ..." first, the reason in `cause`.
-    if (e.cause?.message) parts.push(e.cause.message);
-    const detail = err instanceof ReleaseStepError ? parts[0] : parts.reverse().join(" <- ");
-    console.error(
-      `[${name}] failed${e.code ? ` (${e.code})` : ""}: ${redactLine(detail ?? "", secrets)}`,
-    );
+    console.error(releaseFailureLine(name, err, secrets));
     process.exitCode = 1;
   }
   setTimeout(() => {
