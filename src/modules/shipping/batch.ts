@@ -204,7 +204,7 @@ export async function runBatchBuy(companyId: string, jobId: string) {
     try {
       return await buyOne(ctx, jobId, orderId, batch);
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = String(errorData(err).error);
       log.warn("batch label failed", { companyId, jobId, orderId, error: message });
       const prev = batch.results[orderId];
       return done(prev?.shipmentId ?? null, "failed", message);

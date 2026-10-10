@@ -9,6 +9,7 @@ import {
   gangSheets,
   jobs,
   orderItems,
+  outboxEvents,
   vendorConnections,
 } from "../../db/schema";
 import { DEFAULT_SHEET_SPEC } from "../../db/schema/vendors";
@@ -152,10 +153,32 @@ describe("production sheet errors are stored scrubbed (B-343)", () => {
     expect(batch?.error).not.toContain(VALUE);
   });
 
+  it("a failed compose stores the head in the sheet error and the build_failed event", async () => {
+    const batchRef = await withTenant(companyId, (tx) => svc.buildBatch(tx, ctx, opts));
+    imagingMock.compose.mockRejectedValueOnce(drizzleErr());
+    await svc.runBuildSheets(companyId, batchRef.batchId, batchRef.jobId);
+    const sheets = await withSystem((tx) =>
+      tx.select().from(gangSheets).where(eq(gangSheets.batchId, batchRef.batchId)),
+    );
+    const failed = sheets.filter((s) => s.status === "failed");
+    expect(failed.length).toBeGreaterThan(0);
+    for (const s of failed) {
+      expect(s.error).toMatch(/^Failed query/);
+      expect(s.error).not.toContain(VALUE);
+    }
+    const events = await withSystem((tx) =>
+      tx.select().from(outboxEvents).where(eq(outboxEvents.companyId, companyId)),
+    );
+    const built = events.filter((e) => e.name === "sheet.build_failed");
+    expect(built.length).toBeGreaterThan(0);
+    expect(JSON.stringify(built.map((e) => e.payload))).not.toContain(VALUE);
+  });
+
   it("a failed re-nest stores the head in the sheet error and jobs.error", async () => {
-    const ref = await withTenant(companyId, (tx) => svc.buildBatch(tx, ctx, opts));
-    await svc.runBuildSheets(companyId, ref.batchId, ref.jobId);
-    const sheetId = (await jobRow(ref.jobId))?.resultIds[0] as string;
+    const [existing] = await withSystem((tx) =>
+      tx.select().from(gangSheets).where(eq(gangSheets.companyId, companyId)),
+    );
+    const sheetId = existing?.id as string;
     expect(sheetId).toBeTruthy();
     const regen = await withTenant(companyId, (tx) => svc.regenerateSheet(tx, ctx, sheetId));
     imagingMock.nest.mockRejectedValueOnce(drizzleErr());

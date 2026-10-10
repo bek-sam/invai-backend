@@ -300,4 +300,20 @@ describe("batch label buy job", () => {
     expect(job.error).toMatch(/^Failed query/);
     expect(job.error).not.toContain(value);
   });
+
+  it("a per-order failure stores the error head in the job results (B-343)", async () => {
+    const [orderId] = await packedOrders(1);
+    const res = await startBatchBuy(ctx, { orderIds: [orderId as string] });
+    const value = "Maria Perez 4410 Mesquite Lane";
+    vi.mocked(carriersModule.carrierAdapter).mockImplementation(async () => {
+      throw new Error(`Failed query: select 1\nparams: ${value}`);
+    });
+    await runJobInline(batchBuyJob, { companyId, jobId: res.jobId });
+    const job = await jobRow(res.jobId);
+    const results = (job.input as { results: Record<string, { status: string; error?: string }> })
+      .results;
+    expect(results[orderId as string]?.status).toBe("failed");
+    expect(results[orderId as string]?.error).toMatch(/^Failed query/);
+    expect(JSON.stringify(job.input)).not.toContain(value);
+  });
 });

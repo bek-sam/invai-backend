@@ -599,10 +599,7 @@ export async function composeSheet(
       header_height_in: HEADER_HEIGHT_IN,
     });
   } catch (err) {
-    error =
-      err instanceof ImagingError
-        ? `imaging: ${err.detail}`
-        : String(err instanceof Error ? err.message : err);
+    error = err instanceof ImagingError ? `imaging: ${err.detail}` : String(errorData(err).error);
     log.warn("compose failed", { sheetId, error });
   }
 
