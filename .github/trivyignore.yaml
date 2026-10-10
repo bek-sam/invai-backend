@@ -1,5 +1,2 @@
 # Generated from invai-infra/scan/ignores.json by scan/ignores.py. Do not edit.
-vulnerabilities:
-  - id: CVE-2026-93749
-    statement: "source-map-js 1.2.1 (HIGH, fixed 1.2.2) comes in through postcss/vite in each lockfile; the bump touches another owner's pnpm-lock.yaml, so it is a card for each owner (ops/scans/2026-10-10.md) (owner: architect (contracts), product-designer (ui), backend-foundation (backend), web-engineer (web), floor-engineer (floor))"
-    expired_at: 2026-11-09
+vulnerabilities: []
