@@ -110,7 +110,7 @@ jobs:
           docker run -d --name minio -p 9000:9000 \
             -e MINIO_ROOT_USER=invai -e MINIO_ROOT_PASSWORD=invai-secret \
             cgr.dev/chainguard/minio@sha256:71674988a1c7ddd5724928633199152b11e4ddefd6c6ce2d60772ff4a8f22ca9 server /data
-          for i in $(seq 1 30); do
+          for _ in $(seq 1 30); do
             curl -sf http://localhost:9000/minio/health/live && exit 0
             sleep 1
           done
@@ -120,3 +120,44 @@ jobs:
       # No ANTHROPIC_API_KEY here, so env.mocks.ai is true and this runs against the mock provider
       # (plumbing check only — see evals/run.ts and invai-docs/decisions/0007-ai-model-policy.md).
       - run: pnpm run --if-present evals
+
+  # Supply-chain scan (T-31-4): same tools, digests and threshold as `pnpm scan` in invai-infra
+  # (scan/tools.env). Results stay in the job log: nothing is uploaded. Ignores come from
+  # .github/trivyignore.yaml, generated from invai-infra/scan/ignores.json; each has an expiry.
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: invai-backend
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check out invai-contracts (sibling, main)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: bek-sam/invai-contracts
+          ref: main
+          path: invai-contracts
+          ssh-key: ${{ secrets.CONTRACTS_DEPLOY_KEY }}
+          persist-credentials: false
+      - name: Secrets (gitleaks, full history)
+        run: docker run --rm -v "$PWD/invai-backend:/repo:ro" ghcr.io/gitleaks/gitleaks@sha256:c00b6bd0aeb3071cbcb79009cb16a60dd9e0a7c60e2be9ab65d25e6bc8abbb7f git /repo --redact --no-banner --exit-code 1
+      - name: Dependencies (trivy, HIGH and CRITICAL with a fix)
+        run: |
+          docker run --rm -v "$PWD/invai-backend:/src:ro" aquasec/trivy@sha256:af6acf9a6b85dfe389a1941505c0ce9efef52a4719635e1a962f022a3d855daa fs /src \
+            --scanners vuln --severity HIGH,CRITICAL --ignore-unfixed --include-dev-deps \
+            --ignorefile /src/.github/trivyignore.yaml --exit-code 1
+      - name: Workflows (actionlint, SHA pins, permissions)
+        run: |
+          docker run --rm -v "$PWD/invai-backend:/repo:ro" -w /repo rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 -color
+          unpinned="$(grep -rnE '^\s*(-\s+)?uses:' invai-backend/.github/workflows | grep -vE 'uses:\s+\./' | grep -vE '@[0-9a-f]{40}' || true)"
+          [ -z "$unpinned" ] || { echo "actions not pinned by SHA:"; echo "$unpinned"; exit 1; }
+          missing="$(grep -L '^permissions:' invai-backend/.github/workflows/*.yml || true)"
+          [ -z "$missing" ] || { echo "no top-level permissions: $missing"; exit 1; }
+      - name: Image (build, then trivy for vulnerabilities and secrets)
+        run: |
+          docker build -f invai-backend/Dockerfile -t scan-backend:ci .
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD/invai-backend/.github/trivyignore.yaml:/ignore.yaml:ro" aquasec/trivy@sha256:af6acf9a6b85dfe389a1941505c0ce9efef52a4719635e1a962f022a3d855daa image scan-backend:ci \
+            --scanners vuln,secret --severity HIGH,CRITICAL --ignore-unfixed --ignorefile /ignore.yaml --exit-code 1
