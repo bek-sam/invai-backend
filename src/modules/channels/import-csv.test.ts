@@ -239,4 +239,25 @@ describe("CSV import: inline for small files, a chunked job for large ones", () 
     expect(job).toMatchObject({ status: "failed", error: "still broken" });
     mocked.mockImplementation(actual.importNormalizedOrders);
   });
+
+  it("stores the error head, not the parameter values, on the run and its job (B-343)", async () => {
+    const key = await upload(genericCsv("S", 2 * CSV_CHUNK_ORDERS));
+    const report = await importCsv(ctx, { id: connId, fileKey: key, format: "generic" });
+    const value = "Maria Perez 4410 Mesquite Lane";
+    const mocked = vi.mocked(importModule.importNormalizedOrders);
+    const actual = await vi.importActual<typeof import("../orders/import")>("../orders/import");
+    mocked.mockImplementation(async () => {
+      throw new Error(`Failed query: select 1\nparams: ${value}`);
+    });
+    await expect(
+      runJobInline(importCsvJob, { companyId, importRunId: report.importId }),
+    ).rejects.toThrow();
+    const [job] = await withTenant(companyId, (tx) =>
+      tx.select().from(jobs).where(eq(jobs.id, report.importId)),
+    );
+    expect(job?.status).toBe("failed");
+    expect(job?.error).toMatch(/^Failed query/);
+    expect(job?.error).not.toContain(value);
+    mocked.mockImplementation(actual.importNormalizedOrders);
+  });
 });

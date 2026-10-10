@@ -4,7 +4,7 @@ import { z } from "zod";
 import { withTenant } from "../../db/client";
 import { gangSheetBatches, gangSheets, jobs } from "../../db/schema";
 import { imaging } from "../../integrations/imaging/client";
-import { logger } from "../../lib/log";
+import { errorData, logger } from "../../lib/log";
 import { defineJob, isFinalAttempt, onEvent, RETRY_BACKOFF } from "../../lib/queues";
 import { updateJobRow } from "./job-rows";
 import {
@@ -44,7 +44,7 @@ async function onRunError(
   what: string,
   context: Record<string, unknown>,
 ) {
-  const error = err instanceof Error ? err.message : String(err);
+  const error = String(errorData(err).error);
   if (final) {
     log.error(`${what} failed`, { companyId, ...context, error });
     await updateJobRow(companyId, jobId, { status: "failed", progress: 1, error });
@@ -89,7 +89,7 @@ export const buildSheetsJob = defineJob({
         await withTenant(companyId, (tx) =>
           tx
             .update(gangSheetBatches)
-            .set({ status: "failed", error: err instanceof Error ? err.message : String(err) })
+            .set({ status: "failed", error: String(errorData(err).error) })
             .where(eq(gangSheetBatches.id, batchId)),
         );
       throw err;

@@ -109,3 +109,31 @@ describe("production jobs", () => {
     expect(transferSetHash(a)).toMatch(/^[0-9a-f]{16}$/);
   });
 });
+
+describe("production jobs store scrubbed errors (B-343)", () => {
+  const VALUE = "Maria Perez 4410 Mesquite Lane";
+  const drizzleErr = () => new Error(`Failed query: update "x" set "a" = $1\nparams: ${VALUE}`);
+
+  it("build: a driver error leaves its parameter values out of jobs.message, jobs.error and the batch", async () => {
+    imagingMock.isUp.mockResolvedValue(true);
+    run.build.mockRejectedValue(drizzleErr());
+    const { batchId, jobId } = await batchWithJob();
+    await expect(
+      runJobInline(buildSheetsJob, { companyId, batchId, jobId }, { attempt: 1, attempts: 4 }),
+    ).rejects.toThrow();
+    const retrying = await jobRow(jobId);
+    expect(retrying?.message).toMatch(/^Retrying after an error: Failed query/);
+    expect(retrying?.message).not.toContain(VALUE);
+
+    await expect(
+      runJobInline(buildSheetsJob, { companyId, batchId, jobId }, { attempt: 4, attempts: 4 }),
+    ).rejects.toThrow();
+    const failed = await jobRow(jobId);
+    expect(failed?.error).toMatch(/^Failed query/);
+    expect(failed?.error).not.toContain(VALUE);
+    const batch = await batchRow(batchId);
+    expect(batch?.error).toMatch(/^Failed query/);
+    expect(batch?.error).not.toContain(VALUE);
+    run.build.mockResolvedValue({ sheetIds: [] });
+  });
+});

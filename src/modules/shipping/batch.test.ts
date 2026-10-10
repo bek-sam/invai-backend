@@ -12,6 +12,7 @@ import {
   createUser,
   tenantContext,
 } from "../../test/fixtures";
+import * as jobRows from "../production/job-rows";
 import { batchBuyJob, startBatchBuy } from "./batch";
 import * as svc from "./service";
 
@@ -23,6 +24,11 @@ import * as svc from "./service";
 vi.mock("../../integrations/carriers", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../integrations/carriers")>();
   return { ...actual, carrierAdapter: vi.fn(actual.carrierAdapter) };
+});
+
+vi.mock("../production/job-rows", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../production/job-rows")>();
+  return { ...actual, updateJobRow: vi.fn(actual.updateJobRow) };
 });
 
 type Fake = CarrierAdapter & {
@@ -277,5 +283,21 @@ describe("batch label buy job", () => {
     });
     const rows = await withTenant(other, (tx) => tx.select().from(jobs));
     expect(rows).toHaveLength(0);
+  });
+
+  it("a failed run stores the error head, not the parameter values (B-343)", async () => {
+    const [orderId] = await packedOrders(1);
+    const res = await startBatchBuy(ctx, { orderIds: [orderId as string] });
+    const value = "Maria Perez 4410 Mesquite Lane";
+    vi.mocked(jobRows.updateJobRow).mockImplementationOnce(async () => {
+      throw new Error(`Failed query: select 1\nparams: ${value}`);
+    });
+    await expect(
+      runJobInline(batchBuyJob, { companyId, jobId: res.jobId }, { attempt: 3, attempts: 3 }),
+    ).rejects.toThrow();
+    const job = await jobRow(res.jobId);
+    expect(job.status).toBe("failed");
+    expect(job.error).toMatch(/^Failed query/);
+    expect(job.error).not.toContain(value);
   });
 });

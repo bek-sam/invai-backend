@@ -247,6 +247,18 @@ describe("tracking push, cancel and void after a label", () => {
       expect(shopify.notified).toHaveLength(1);
     });
 
+    it("a driver error from the channel stores its head, not its parameter values (B-343)", async () => {
+      const { shipment } = await labeled();
+      const value = "Maria Perez 4410 Mesquite Lane";
+      shopify.onPush = async () => {
+        throw new Error(`Failed query: select 1\nparams: ${value}`);
+      };
+      expect(await push(shipment.id)).toBe("retry");
+      const r = await row(shipment.id);
+      expect(r.trackingPushError).toMatch(/^Failed query/);
+      expect(r.trackingPushError).not.toContain(value);
+    });
+
     it("waits while another push is in flight", async () => {
       const { shipment } = await labeled();
       await withSystem((tx) =>

@@ -665,7 +665,7 @@ export async function retryStuckIntent(
       }
     }
   } catch (err) {
-    error = err instanceof Error ? err.message : String(err);
+    error = String(errorData(err).error);
     final = isORPCError(err) && err.code === "VOID_REJECTED";
   }
   if (!error) {

@@ -301,7 +301,7 @@ export const batchBuyJob = defineJob({
         await updateJobRow(companyId, jobId, {
           status: "failed",
           progress: 1,
-          error: err instanceof Error ? err.message : String(err),
+          error: String(errorData(err).error),
         });
       throw err;
     }

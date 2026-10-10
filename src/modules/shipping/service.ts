@@ -68,7 +68,7 @@ import {
 import { type Actor, audit } from "../../lib/audit";
 import { hmacHex } from "../../lib/crypto";
 import { badRequest, conflict, notFound, ORPCError, upstream } from "../../lib/errors";
-import { logger } from "../../lib/log";
+import { errorData, logger } from "../../lib/log";
 import { emit } from "../../lib/outbox";
 import { keyset, type PageInput } from "../../lib/pagination";
 import { publish } from "../../lib/realtime";
@@ -1687,7 +1687,7 @@ async function recordPushFailure(
   shipmentId: string,
   err: unknown,
 ): Promise<PushOutcome> {
-  const error = err instanceof Error ? err.message : String(err);
+  const error = String(errorData(err).error);
   return withTenant(companyId, async (tx) => {
     const [s] = await tx.select().from(shipments).where(eq(shipments.id, shipmentId)).for("update");
     if (!s) return "failed" as const;

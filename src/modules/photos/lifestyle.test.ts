@@ -19,6 +19,8 @@ import {
   photoSets,
 } from "../../db/schema";
 import { env } from "../../env";
+import * as channelsModule from "../../integrations/channels";
+import { ProductImagePushError } from "../../integrations/channels/types";
 import { imaging } from "../../integrations/imaging/client";
 import { runJobInline } from "../../lib/queues";
 import { createCompany, createConnection, createUser, tenantContext } from "../../test/fixtures";
@@ -41,6 +43,11 @@ const h = vi.hoisted(() => ({
   drafts: new Map<string, unknown>(),
   attachCalls: [] as unknown[],
 }));
+
+vi.mock("../../integrations/channels", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../integrations/channels")>();
+  return { ...actual, getChannelAdapter: vi.fn(actual.getChannelAdapter) };
+});
 
 vi.mock("../../ai/images", async (importOriginal) => {
   const real = await importOriginal<typeof import("../../ai/images")>();
@@ -1000,5 +1007,38 @@ describe("retention (ADR 0023 §9)", () => {
     );
     expect(after2?.scenePurgedAt?.toISOString()).toBe(after?.scenePurgedAt?.toISOString());
     expect(again.objects).toBeGreaterThanOrEqual(0);
+  });
+});
+
+describe("Shopify push errors (B-343)", () => {
+  it("a refused push stores the message head, not any parameter values", async () => {
+    const { company, ctx, design, set } = await approvedLifestyleSet(["shopify"]);
+    const conn = await createConnection(company.id, "shopify");
+    const listing = await shopifyListing(company.id, conn.id, design.id);
+    const queued = await withTenant(company.id, (tx) =>
+      push.pushToShopify(tx, ctx, {
+        setId: set.id,
+        connectionId: conn.id,
+        productRef: { listingId: listing.id },
+        imageIds: set.images.map((i) => i.id),
+        idempotencyKey: `push-${crypto.randomUUID()}`,
+      }),
+    );
+    const value = "Maria Perez 4410 Mesquite Lane";
+    const real = await vi.mocked(channelsModule.getChannelAdapter)("shopify", "mock", {
+      companyId: company.id,
+    });
+    vi.mocked(channelsModule.getChannelAdapter).mockResolvedValueOnce({
+      ...real,
+      pushProductImages: async () => {
+        throw new ProductImagePushError("rejected", `Rejected\nparams: ${value}`);
+      },
+    });
+    await runJobInline(pushImagesJob, { companyId: company.id, pushId: queued.id });
+    const [row] = await withTenant(company.id, (tx) =>
+      tx.select().from(photoPushes).where(eq(photoPushes.id, queued.id)),
+    );
+    expect(row?.status).toBe("failed");
+    expect(row?.error).toBe("Rejected");
   });
 });

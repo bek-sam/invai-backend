@@ -16,7 +16,7 @@ import { ProductImagePushError } from "../../integrations/channels/types";
 import { audit } from "../../lib/audit";
 import { sha256Hex } from "../../lib/crypto";
 import { badRequest, conflict, notFound } from "../../lib/errors";
-import { logger } from "../../lib/log";
+import { errorData, logger } from "../../lib/log";
 import { isCompanyKey, presignGet } from "../../lib/s3";
 import { getDesign } from "../catalog/service";
 import { freshChannelConn, getConnectionRow } from "../channels/service";
@@ -382,7 +382,7 @@ export async function runPush(
     if (err instanceof ProductImagePushError) {
       log.warn("photo push refused", { ...job, code: err.code, outcome: err.outcome });
       const status = err.outcome === "partial" ? "partial" : "failed";
-      await finishPush(job, { status, skipped, error: err.message });
+      await finishPush(job, { status, skipped, error: String(errorData(err).error) });
       return { status };
     }
     log.warn("photo push failed", { ...job, finalAttempt, error: (err as Error).message });

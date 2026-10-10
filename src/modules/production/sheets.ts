@@ -39,7 +39,7 @@ import {
 import { ImagingError, imaging, type NestResult } from "../../integrations/imaging/client";
 import { type Actor, audit } from "../../lib/audit";
 import { badRequest, invalidTransition, notFound, ORPCError } from "../../lib/errors";
-import { logger } from "../../lib/log";
+import { errorData, logger } from "../../lib/log";
 import { emit } from "../../lib/outbox";
 import { keyset, type PageInput } from "../../lib/pagination";
 import { publish } from "../../lib/realtime";
@@ -731,7 +731,8 @@ export async function runBuildSheets(companyId: string, batchId: string, jobId: 
     });
     nest = await imaging.nest(nestRequest(eligible, plan.vendor.spec));
   } catch (err) {
-    const error = err instanceof ImagingError ? `imaging: ${err.detail}` : String(err);
+    const error =
+      err instanceof ImagingError ? `imaging: ${err.detail}` : String(errorData(err).error);
     await finish("failed", [], "Nesting failed", error);
     return { sheetIds: [] };
   }
@@ -880,7 +881,8 @@ export async function runRegenerateSheet(companyId: string, sheetId: string, job
         .where(eq(gangSheets.id, sheetId));
     });
   } catch (err) {
-    const error = err instanceof ImagingError ? `imaging: ${err.detail}` : String(err);
+    const error =
+      err instanceof ImagingError ? `imaging: ${err.detail}` : String(errorData(err).error);
     await withTenant(companyId, async (tx) => {
       const cur = await lockSheet(tx, sheetId);
       if (cur.status === "building")

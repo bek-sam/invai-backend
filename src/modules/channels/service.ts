@@ -32,6 +32,7 @@ import type {
 import { audit } from "../../lib/audit";
 import { decryptJson, encryptJson, randomToken } from "../../lib/crypto";
 import { badRequest, notFound, ORPCError } from "../../lib/errors";
+import { errorData } from "../../lib/log";
 import { emit } from "../../lib/outbox";
 import { keyset, type PageInput } from "../../lib/pagination";
 import { assertWithinPlan } from "../billing/service";
@@ -100,7 +101,7 @@ export async function refreshConnectionToken(
       return { ...conn, credentials: next };
     } catch (err) {
       const permanent = err instanceof ShopifyRefreshError && err.permanent;
-      const message = err instanceof Error ? err.message : String(err);
+      const message = String(errorData(err).error);
       const flagged: ChannelCredentials = {
         ...creds,
         refreshError: { at: new Date().toISOString(), message, permanent },

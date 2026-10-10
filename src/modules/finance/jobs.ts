@@ -73,7 +73,7 @@ export const recomputeJob = defineJob({
         await withTenant(companyId, (tx) =>
           setJobState(tx, companyId, jobRowId, {
             status: "failed",
-            error: (err as Error).message,
+            error: String(errorData(err).error),
             message: "Failed",
           }),
         ).catch(() => {});

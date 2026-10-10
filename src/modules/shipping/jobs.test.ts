@@ -13,6 +13,7 @@ import { CarrierError } from "../../integrations/carriers";
 import { parseEasypostEvent, signEasypostBody } from "../../integrations/carriers/easypost/webhook";
 import type { ChannelAdapter } from "../../integrations/channels";
 import * as channelsModule from "../../integrations/channels";
+import * as outbox from "../../lib/outbox";
 import { redis, runJobInline } from "../../lib/queues";
 import {
   createCompany,
@@ -44,6 +45,10 @@ import * as svc from "./service";
  * The carrier and Shopify are fakes that count calls.
  */
 
+vi.mock("../../lib/outbox", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../lib/outbox")>();
+  return { ...actual, emit: vi.fn(actual.emit) };
+});
 vi.mock("../../integrations/carriers", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../integrations/carriers")>();
   return {
@@ -631,6 +636,31 @@ describe("stuck intent sweep", () => {
       entityId: shipment.id,
       title: "A label void needs a look",
     });
+    await redis.del(`stuck-intent:void:${shipment.id}`);
+  });
+
+  it("a stuck-intent alert keeps the error head, not the parameter values (B-343)", async () => {
+    const { shipment } = await labeled("etsy");
+    await withSystem((tx) =>
+      tx
+        .update(shipments)
+        .set({ status: "voiding", voidAttemptedAt: null })
+        .where(eq(shipments.id, shipment.id)),
+    );
+    const value = "Maria Perez 4410 Mesquite Lane";
+    const real = await vi.importActual<typeof import("../../lib/outbox")>("../../lib/outbox");
+    vi.mocked(outbox.emit).mockImplementation(async (tx, co, name, payload) => {
+      if (name === "shipment.voided") throw new Error(`Failed query: select 1\nparams: ${value}`);
+      return real.emit(tx, co, name, payload);
+    });
+    await redis.set(`stuck-intent:void:${shipment.id}`, String(STUCK_ALERT_AFTER - 1));
+    await age(shipment.id);
+    expect(await retryStuckIntent(companyId, shipment.id, "void")).toBe("alerted");
+    vi.mocked(outbox.emit).mockImplementation(real.emit);
+    const alert = await stuckAlert("void", shipment.id);
+    const detail = (alert?.data as { detail?: string } | undefined)?.detail;
+    expect(detail).toMatch(/^Failed query/);
+    expect(detail).not.toContain(value);
     await redis.del(`stuck-intent:void:${shipment.id}`);
   });
 
