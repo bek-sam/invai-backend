@@ -1,3 +1,4 @@
+import { explicitInputs } from "./inputs"; // must stay first: reads env before .env loads
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { and, eq, inArray } from "drizzle-orm";
@@ -91,12 +92,12 @@ async function main() {
   const requestedOpenAi = process.env.IMAGE_GEN_PROVIDER === "openai";
   const inputsRefusal = paidInputsRefusal({
     paidPath: requestedOpenAi,
-    budgetRaw: process.env.SCENE_TRIAL_BUDGET_CENTS,
-    sinceRaw: process.env.SCENE_TRIAL_SINCE,
+    budgetRaw: explicitInputs.budgetRaw,
+    sinceRaw: explicitInputs.sinceRaw,
   });
   if (inputsRefusal) fail(inputsRefusal);
-  const since = new Date(process.env.SCENE_TRIAL_SINCE || "2026-10-12T00:00:00Z");
-  const budget = Number(process.env.SCENE_TRIAL_BUDGET_CENTS || 600);
+  const since = new Date(explicitInputs.sinceRaw || "2026-10-12T00:00:00Z");
+  const budget = Number(explicitInputs.budgetRaw || 600);
   if (Number.isNaN(since.getTime()) || !Number.isFinite(budget))
     fail("SCENE_TRIAL_SINCE or SCENE_TRIAL_BUDGET_CENTS is not valid");
 

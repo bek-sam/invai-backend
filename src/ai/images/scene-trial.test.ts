@@ -1,3 +1,7 @@
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { eq } from "drizzle-orm";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -342,6 +346,54 @@ describe("paidInputsRefusal (T-41-5 A12)", () => {
     expect(
       paidInputsRefusal({ paidPath: false, budgetRaw: undefined, sinceRaw: undefined }),
     ).toBeNull();
+  });
+});
+
+describe("paid-path inputs ignore .env (T-41-5 round 2)", () => {
+  const root = resolve(__dirname, "../../..");
+  it("a .env-only budget and since date reach paidInputsRefusal as undefined", () => {
+    const dir = mkdtempSync(join(tmpdir(), "scene-env-"));
+    try {
+      writeFileSync(
+        join(dir, ".env"),
+        "SCENE_TRIAL_BUDGET_CENTS=200\nSCENE_TRIAL_SINCE=2026-10-13T00:00:00Z\n",
+      );
+      const script = join(dir, "probe.mts");
+      writeFileSync(
+        script,
+        `import { explicitInputs } from ${JSON.stringify(join(root, "evals/scene_trial/inputs.ts"))};
+import ${JSON.stringify(join(root, "src/env.ts"))};
+console.log(JSON.stringify({ explicit: explicitInputs, afterEnv: process.env.SCENE_TRIAL_BUDGET_CENTS }));
+`,
+      );
+      const childEnv: Record<string, string | undefined> = { ...process.env };
+      delete childEnv.SCENE_TRIAL_BUDGET_CENTS;
+      delete childEnv.SCENE_TRIAL_SINCE;
+      delete childEnv.INVAI_SKIP_DOTENV;
+      const out = execFileSync(join(root, "node_modules/.bin/tsx"), [script], {
+        cwd: dir,
+        env: childEnv,
+        encoding: "utf8",
+      });
+      const got = JSON.parse(out.trim().split("\n").pop() ?? "{}");
+      expect(got.afterEnv).toBe("200"); // the probe really did load the .env line
+      expect(got.explicit.budgetRaw).toBeUndefined();
+      expect(got.explicit.sinceRaw).toBeUndefined();
+      expect(
+        paidInputsRefusal({
+          paidPath: true,
+          budgetRaw: got.explicit.budgetRaw,
+          sinceRaw: got.explicit.sinceRaw,
+        }),
+      ).toMatch(/SCENE_TRIAL_BUDGET_CENTS and SCENE_TRIAL_SINCE set explicitly/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  it("run.ts imports inputs first and never reads the two variables from process.env", () => {
+    const src = readFileSync(join(root, "evals/scene_trial/run.ts"), "utf8");
+    expect(src.split("\n").find((l) => l.startsWith("import "))).toMatch(/\.\/inputs"/);
+    expect(src).not.toMatch(/process\.env\.SCENE_TRIAL_(BUDGET_CENTS|SINCE)\s*(\|\||[,)])/);
   });
 });
 
