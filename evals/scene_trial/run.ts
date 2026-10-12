@@ -1,3 +1,5 @@
+import { writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { and, eq, inArray } from "drizzle-orm";
 import { getImageProvider, IMAGE_JOB_KIND, SCENE_PROMPT_REF } from "../../src/ai/images";
 import { imageCostCents, OPENAI_IMAGE_MODEL } from "../../src/ai/models";
@@ -16,7 +18,9 @@ import * as svc from "../../src/modules/photos/service";
 import { runJobInline } from "../../src/lib/queues";
 import { tenantContext } from "../../src/test/fixtures";
 import { CONTROL_PROMPT_REF, controlGate, runControl } from "./control";
+import { copyKeys, maskStats } from "./frames";
 import { budgetVerdict, ledgerCents } from "./guard";
+import { getObject } from "../../src/lib/s3";
 
 /*
  * Scene trial runner (T-37-2 AC3, AC4). Creates one photo set with lifestyle scenes for a named
@@ -124,6 +128,14 @@ async function main() {
       `control: ${r.scores.passes ? "PASS" : "FAIL"} | codes ${r.scores.failures.join(",") || "-"} | reasons ${r.scores.regionReasons.join(",") || "-"} | structural ${r.scores.structural} | reg ${f(r.scores.registration)} | c1 ${f(r.scores.c1)} | lock ${f(r.scores.lock)}`,
     );
     console.log(`control keys: base ${r.keys.base} mask ${r.keys.mask} scene ${r.keys.scene}`);
+    const cm = maskStats(await getObject(r.keys.mask));
+    console.log(`control mask: alpha255 share ${cm.alpha255Share.toFixed(4)} hash ${cm.hash}`);
+    const out = arg("out");
+    if (out) {
+      await copyKeys(out, [r.keys.base, r.keys.mask, r.keys.scene]);
+      await writeFile(join(out, `design-${design.id.slice(0, 8)}.png`), await getObject(front.fileKey));
+      console.log(`copied control files to ${out}`);
+    }
     console.log(`control gate: ${g.reason}`);
     console.log(
       `cost: ${r.cents}c for 1 image_scene ai_job ${r.aiJobId}; ledger since ${since.toISOString()} now ${await ledgerCents(since)}c of ${budget}c`,
@@ -249,6 +261,23 @@ async function main() {
   console.log(
     `registration over ${sorted.length} frames: min ${sorted[0]?.toFixed(3) ?? "-"} median ${mid?.toFixed(3) ?? "-"} max ${sorted.at(-1)?.toFixed(3) ?? "-"}`,
   );
+  const out = arg("out");
+  for (const c of comps) {
+    if (!c.sceneMaskKey) continue;
+    const m = maskStats(await getObject(c.sceneMaskKey));
+    console.log(`mask ${c.sceneKind} ${c.id.slice(0, 8)}: alpha255 share ${m.alpha255Share.toFixed(4)} hash ${m.hash}`);
+    if (out) {
+      const keys = [c.sceneBaseKey, c.sceneMaskKey];
+      for (let a = 1; a <= Math.max(1, c.sceneAttempt); a++)
+        keys.push(`${owner.companyId}/photos/${set.id}/scenes/${c.id}-a${a}.png`);
+      await copyKeys(out, keys.filter((k): k is string => !!k));
+    }
+  }
+  if (out) {
+    const { front } = await withTenant(owner.companyId, (tx) => svc.printFile(tx, ctx, design.id));
+    if (front) await writeFile(join(out, `design-${design.id.slice(0, 8)}.png`), await getObject(front.fileKey));
+    console.log(`copied frame files to ${out}; set id ${set.id}`);
+  }
   const cents = jobs.reduce((n, j) => n + j.cents, 0);
   console.log(
     `totals: scenes ${scenesPassed}/${comps.length}, frames ${framesPassed}/${framesTotal}, provider calls ${calls}, structural skips ${skips}`,

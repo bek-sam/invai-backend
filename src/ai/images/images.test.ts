@@ -682,6 +682,18 @@ describe("assertImageGenAllowed / recordImageGen (AC4)", () => {
       const err = await codeOf(check(shop.id, 6, priced));
       expect(err.data).toMatchObject({ cap: 6, used: 1 });
     });
+
+    it("an openai row at 0 cents still counts toward the real cap (security review)", async () => {
+      menv.IMAGE_GEN_DAILY_CAP_PER_SHOP = 30;
+      const shop = await createCompany();
+      await rows(shop.id, "openai", 0, 25);
+      expect(
+        await withTenant(shop.id, (tx) => imagesUsedToday(tx, shop.id, new Date(), "openai")),
+      ).toBe(25);
+      const err = await codeOf(check(shop.id, 6, priced));
+      expect(err.code).toBe("IMAGE_DAILY_CAP_REACHED");
+      expect(err.data).toMatchObject({ cap: 30, used: 25 });
+    });
   });
 
   it("S-53: a failed call that may be billed records the estimate and counts toward the cap; rejected ones don't", async () => {
