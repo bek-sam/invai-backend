@@ -144,6 +144,13 @@ export const shipments = pgTable(
     trackingPushAttempts: integer().notNull().default(0),
     trackingPushError: text(),
     labeledAt: timestamp({ withTimezone: true }),
+    /**
+     * T-41-2 (B-143): last successful tracker check (a poll, a routed carrier event or the mock
+     * timer) and last failed one. "Latest check" is the later of the two; the dispatch guard
+     * only counts a check made after the order's ship-by.
+     */
+    trackerCheckedAt: timestamp({ withTimezone: true }),
+    trackerCheckFailedAt: timestamp({ withTimezone: true }),
     deliveredAt: timestamp({ withTimezone: true }),
     voidedAt: timestamp({ withTimezone: true }),
     /**
