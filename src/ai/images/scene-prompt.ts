@@ -9,7 +9,7 @@ import type { ScenePrompt } from "./types";
  * fixed word lists to pick a fixed phrase. The rules block is constant and always last.
  */
 
-export const SCENE_PROMPT_VERSION = 1;
+export const SCENE_PROMPT_VERSION = 2;
 export const SCENE_PROMPT_REF = `scene_prompt@${SCENE_PROMPT_VERSION}`;
 
 /** The one sentence every prompt must carry (imaging restores and composites the print area). */
@@ -20,7 +20,7 @@ export const PRINT_AREA_RULE =
 export const SCENE_RULES = [
   "Rules:",
   `- ${PRINT_AREA_RULE}`,
-  "- Keep the garment's shape, position, size, folds and color as given.",
+  "- Keep the garment exactly as given in the image: same outline, position, size, angle, folds and color. Do not re-pose, resize, move, rotate, re-draw or restyle it.",
   "- No text, letters, numbers, signs, logos, brand names, trademarks or watermarks anywhere in the image.",
   "- No real or recognizable people, no celebrities or public figures, and no children or teenagers. Any person shown is a fictional adult.",
   "- No other clothing with prints or logos.",
@@ -174,13 +174,13 @@ export function buildScenePrompt(
   const containsPerson = sceneContainsPerson(analysis, sceneKind);
   const garmentPhrase = `a ${blankColorWords(blankName)} ${GARMENT_WORDS[garment]}`;
   const subject = containsPerson
-    ? `The ${GARMENT_WORDS[garment]} is worn by a fictional adult model with a relaxed pose, face turned away or cropped out of frame.`
-    : `The ${GARMENT_WORDS[garment]} lies flat and neatly arranged; no people or body parts.`;
+    ? `A fictional adult model stands partly visible beside or behind the ${GARMENT_WORDS[garment]}, face turned away or cropped out of frame; the model does not wear, hold or cover the ${GARMENT_WORDS[garment]}.`
+    : `No people or body parts appear.`;
   const text = [
-    `Product photo of ${garmentPhrase} in ${scene.setting}.`,
+    `Edit the given image of ${garmentPhrase}: the ${GARMENT_WORDS[garment]} is a fixed object and stays exactly where it is, with the same outline, size, angle and color.`,
+    `Replace only the background around it with ${scene.setting}.`,
     subject,
     `Lighting and mood: ${moodFor(analysis)}.`,
-    "Draw only the background, light and props around the garment as given in the image.",
     "",
     SCENE_RULES,
   ].join("\n");

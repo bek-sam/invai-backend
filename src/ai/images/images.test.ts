@@ -284,7 +284,7 @@ describe("buildScenePrompt (AC5)", () => {
     expect(p.text).toContain("heather dark navy hoodie");
     expect(p.text).toContain(PRINT_AREA_RULE);
     expect(p.text.endsWith(SCENE_RULES)).toBe(true);
-    expect(p.ref).toBe("scene_prompt@1");
+    expect(p.ref).toBe("scene_prompt@2");
   });
 
   it("person flag is conservative: kind default, or the analysis suggested one", () => {
@@ -598,7 +598,7 @@ describe("assertImageGenAllowed / recordImageGen (AC4)", () => {
       ].sort(),
     );
     expect(rows.find((r) => r.provider === "openai")?.input).toMatchObject({
-      prompt: "scene_prompt@1",
+      prompt: "scene_prompt@2",
       sceneKind: "studio",
     });
     await redis.del(tKey, platformSpendKey(day));
