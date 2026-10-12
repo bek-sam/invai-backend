@@ -229,7 +229,7 @@ describe("paidRunRefusal (runner refusals, B-370)", () => {
   });
   it("refuses when openai was requested but the provider resolved to the mock", () => {
     expect(paidRunRefusal({ ...ok, paid: false, providerName: "mock" })).toMatch(
-      /resolved to mock/,
+      /resolved to mock.*INVAI_PAID_AI=1/,
     );
   });
   it("refuses before any call when the ledger is at or over the budget, or the worst case would pass it", () => {

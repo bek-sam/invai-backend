@@ -18,7 +18,8 @@ import { runTrademarkJudge } from "./trademark_judge/run";
  * Eval harness entry point (T-8-5, B-48; invai-docs/decisions/0007-ai-model-policy.md). One eval
  * set per AI route, run through the real gateway (src/ai/gateway.ts) against a throwaway tenant.
  *
- * Mode: with neither ANTHROPIC_API_KEY nor OPENAI_API_KEY (CI, and any local run without one), env.mocks.ai is true and
+ * Mode: paid AI is opt-in (decision 0038): a key in .env is ignored unless INVAI_PAID_AI=1 is set in the
+ * shell, so a bare `pnpm evals` is always the free mock. With neither ANTHROPIC_API_KEY nor OPENAI_API_KEY (CI, and any local run without one), env.mocks.ai is true and
  * every call goes to the mock provider automatically (gateway.ts's aiProvider()) — this run then
  * checks the plumbing (schema-valid output, correct cardinality, the gateway/validator wiring)
  * rather than model quality, which a fixed mock can't demonstrate either way. With a key it calls

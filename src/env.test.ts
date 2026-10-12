@@ -197,11 +197,14 @@ describe("AI provider keys (decision 0021)", () => {
     expect(res.out).toContain('"ai":false');
   });
 
-  it("the AI mock is on only when neither key is set (development)", async () => {
+  it("the AI mock is on unless a key is set and paid AI is opted in (development, decision 0038)", async () => {
     expect((await boot({ NODE_ENV: "development" })).out).toContain('"ai":true');
     expect((await boot({ NODE_ENV: "development", OPENAI_API_KEY: "sk-real" })).out).toContain(
-      '"ai":false',
+      '"ai":true',
     );
+    expect(
+      (await boot({ NODE_ENV: "development", OPENAI_API_KEY: "sk-real", INVAI_PAID_AI: "1" })).out,
+    ).toContain('"ai":false');
   });
 
   it("a test run ignores AI keys, so no test can reach a paid model", async () => {

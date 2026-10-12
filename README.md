@@ -106,7 +106,10 @@ mock provider automatically when its env var is unset (`env.mocks.*` in `src/env
 `pnpm evals` (or `pnpm evals listing_copy trademark_judge` for a subset) runs the eval sets in
 `evals/<route>/cases.jsonl` through the real gateway (`src/ai/gateway.ts`) against a throwaway
 tenant, and prints pass rate, cost and latency per route (`evals/run.ts`; case format and required
-coverage in `.claude/skills/ai-feature-with-evals/eval-template.md`). With no `ANTHROPIC_API_KEY`
+coverage in `.claude/skills/ai-feature-with-evals/eval-template.md`). Paid AI is opt-in
+(decision `0038`): outside production a key in `.env` or `.env.local` is ignored (mock, with one
+startup line) unless `INVAI_PAID_AI=1` is in the shell environment of that process, e.g.
+`INVAI_PAID_AI=1 pnpm evals listing_copy`; a line in `.env` has no effect. With no key or no opt-in
 (CI, or a local run without one) every call goes to the mock provider automatically, so the run
 checks the plumbing (schema-valid output, correct cardinality, the gateway/validator wiring) rather
 than model quality — a fixed mock can't demonstrate that either way. With a key it calls the real

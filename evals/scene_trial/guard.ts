@@ -55,7 +55,7 @@ export function paidRunRefusal(opts: {
   if (!opts.requestedOpenAi) return "refused: IMAGE_GEN_PROVIDER=openai is not set in the process environment";
   if (!opts.yesPaid) return "refused: a paid run needs --yes-paid";
   if (!opts.paid)
-    return `refused: openai was requested but the provider resolved to ${opts.providerName} (missing key or sample workspace)`;
+    return `refused: openai was requested but the provider resolved to ${opts.providerName} (missing key, paid AI not opted in, or sample workspace: set INVAI_PAID_AI=1 in the shell)`;
   const v = budgetVerdict(opts);
   return v.ok ? null : `refused before any call: ${v.reason}`;
 }

@@ -4,6 +4,14 @@ import { createEnv } from "@t3-oss/env-core";
 import { z } from "zod";
 import { assertProviderAllowed, FIELD_ENCRYPTION_PROVIDERS } from "./lib/field-keys";
 
+/**
+ * Paid AI is opt-in outside production (T-40-1, decision 0038): the flag is read from the process
+ * environment as it was BEFORE .env loads, so a line in .env or .env.local can never switch it on.
+ * This must stay the first statement; never add INVAI_PAID_AI to the createEnv schema below
+ * (runtimeEnv would read it after the files loaded) and never read it anywhere else.
+ */
+const paidAiRequested = process.env.INVAI_PAID_AI === "1";
+
 // Local development reads .env (Node 24 built-in). Production injects real env vars.
 if (process.env.NODE_ENV !== "production" && !process.env.INVAI_SKIP_DOTENV) {
   for (const file of [".env", ".env.local"]) {
@@ -266,6 +274,15 @@ function assertTestRedisDbPinned(url: string): string {
 
 const isTest = raw.NODE_ENV === "test";
 const isProd = raw.NODE_ENV === "production";
+/** Keys present but ignored: not production, no opt-in (tests drop keys regardless: decision 0021). */
+const aiKeysLocked = !isProd && !paidAiRequested;
+const aiKeyLockedNotice =
+  aiKeysLocked && !isTest && !!(raw.ANTHROPIC_API_KEY || raw.OPENAI_API_KEY);
+if (aiKeyLockedNotice) {
+  console.error(
+    "AI: mock (paid AI is off; set INVAI_PAID_AI=1 in the shell to use the keys in .env)",
+  );
+}
 
 /**
  * Keys production needs so no provider silently runs on its mock. Supplier (S&S) keys are not
@@ -359,8 +376,12 @@ export const env = {
    * Under test the AI keys from .env are dropped (decision 0021): a test run must never reach a
    * paid model or send test data out. Tests that exercise a real provider stub its HTTP layer.
    */
-  ANTHROPIC_API_KEY: isTest ? undefined : raw.ANTHROPIC_API_KEY,
-  OPENAI_API_KEY: isTest ? undefined : raw.OPENAI_API_KEY,
+  ANTHROPIC_API_KEY: isTest || aiKeysLocked ? undefined : raw.ANTHROPIC_API_KEY,
+  OPENAI_API_KEY: isTest || aiKeysLocked ? undefined : raw.OPENAI_API_KEY,
+  /** INVAI_PAID_AI=1 was in the process environment before .env loaded (decision 0038). */
+  paidAi: paidAiRequested,
+  /** A key exists but is ignored because paid AI is off; evals and the scene runner say so. */
+  aiKeysLocked: aiKeyLockedNotice,
   FLOOR_TOKEN_SECRET: raw.FLOOR_TOKEN_SECRET ?? raw.BETTER_AUTH_SECRET,
   /** Undefined only in production with ALLOW_MOCKS=true; the mailer then logs instead of sending. */
   SMTP_URL: raw.SMTP_URL ?? (isProd ? undefined : "smtp://localhost:1025"),
@@ -385,7 +406,7 @@ export const env = {
   allowMocks: raw.ALLOW_MOCKS,
   mocks: {
     /** The mock only when neither AI key is set; Anthropic wins when both are (gateway.ts). */
-    ai: isTest || (!raw.ANTHROPIC_API_KEY && !raw.OPENAI_API_KEY),
+    ai: isTest || aiKeysLocked || (!raw.ANTHROPIC_API_KEY && !raw.OPENAI_API_KEY),
     carrier: !raw.EASYPOST_API_KEY,
     shopify: !raw.SHOPIFY_API_KEY || !raw.SHOPIFY_API_SECRET,
     supplier: !raw.SS_ACTIVEWEAR_ACCOUNT || !raw.SS_ACTIVEWEAR_API_KEY,
