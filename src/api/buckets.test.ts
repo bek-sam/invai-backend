@@ -2,7 +2,8 @@ import type { ProcedureMeta } from "@invai/contracts";
 import { contract, listProcedures } from "@invai/contracts";
 import { call } from "@orpc/server";
 import { beforeAll, describe, expect, it } from "vitest";
-import { checkRateLimit, RATE_BUCKET_LIMITS } from "../lib/ratelimit";
+import { redis } from "../lib/queues";
+import { checkRateLimit, RATE_BUCKET_LIMITS, rateLimitKey } from "../lib/ratelimit";
 import { createCompany, createUser } from "../test/fixtures";
 import { anonymousContext, type Context, permissionsFor } from "./context";
 import { AI_BUCKET_PROCEDURES, AI_CHEAP_READS, bucketFor, NON_GET_READS } from "./orpc";
@@ -187,5 +188,54 @@ describe("non-GET read-permission procedures are classified by hand (T-P3-1, B-2
   it("every NON_GET_READS entry really is a non-GET procedure with a read permission", () => {
     const paths = new Set(nonGetReads.map((p) => p.path));
     for (const path of NON_GET_READS) expect(paths.has(path), path).toBe(true);
+  });
+});
+
+/*
+ * T-37-5 (B-362): `files.downloadUrls` carries up to 60 keys but costs one `reads` token per
+ * call, whatever the keys are (even all unreadable), and needs `files.read`.
+ */
+describe("files.downloadUrls bucket and permission (T-37-5)", () => {
+  const DL = ["files", "downloadUrls"] as const;
+  const readsTokens = async (companyId: string) =>
+    Number(await redis.hget(rateLimitKey("reads", companyId), "tokens"));
+
+  it("is classified as reads even though it is a POST", () => {
+    expect(NON_GET_READS.has("files.downloadUrls")).toBe(true);
+    expect(bucketFor(["files", "downloadUrls"], meta(), "POST")).toBe("reads");
+  });
+
+  it("one call costs exactly one reads token, also when every key is null", async () => {
+    const company = await createCompany();
+    const user = await createUser(company.id, "owner");
+    const ctx = userContext(company.id, user.id);
+    const keys = Array.from({ length: 60 }, (_, i) => `${company.id}/artwork/none-${i}.png`);
+    // First call creates the bucket; compare the second and third.
+    await call(
+      procedureAt("files.downloadUrls"),
+      { fileKeys: [keys[0]] },
+      { context: ctx, path: DL },
+    );
+    const before = await readsTokens(company.id);
+    const res = (await call(
+      procedureAt("files.downloadUrls"),
+      { fileKeys: keys },
+      { context: ctx, path: DL },
+    )) as { items: { download: unknown }[] };
+    const after = await readsTokens(company.id);
+    expect(res.items).toHaveLength(60);
+    expect(res.items.every((i) => i.download === null)).toBe(true);
+    // Refill adds a sliver between calls; a per-key cost would have dropped it by about 60.
+    expect(before - after).toBeGreaterThan(0.5);
+    expect(before - after).toBeLessThan(1.5);
+  });
+
+  it("a caller without files.read gets FORBIDDEN", async () => {
+    const company = await createCompany();
+    const user = await createUser(company.id, "owner");
+    const ctx: Context = { ...userContext(company.id, user.id), permissions: new Set() };
+    await expect(
+      call(procedureAt("files.downloadUrls"), { fileKeys: ["a"] }, { context: ctx, path: DL }),
+    ).rejects.toMatchObject({ code: "FORBIDDEN" });
   });
 });
