@@ -42,7 +42,23 @@ const h = vi.hoisted(() => ({
   store: new Map<string, Buffer>(),
   drafts: new Map<string, unknown>(),
   attachCalls: [] as unknown[],
+  failRecordOnce: false,
 }));
+
+vi.mock("./service", async (importOriginal) => {
+  const real = await importOriginal<typeof import("./service")>();
+  return {
+    ...real,
+    // T-37-3 AC6: a crash after the composite, before the outcome is recorded.
+    recordRenders: vi.fn(async (...args: Parameters<typeof real.recordRenders>) => {
+      if (h.failRecordOnce) {
+        h.failRecordOnce = false;
+        throw new Error("simulated crash before recordRenders");
+      }
+      return real.recordRenders(...args);
+    }),
+  };
+});
 
 vi.mock("../../integrations/channels", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../integrations/channels")>();
@@ -229,7 +245,7 @@ function boxChanged(sceneBytes: Buffer, baseBytes: Buffer): boolean {
   return worst > 40;
 }
 
-type CompositeMode = "inspect" | "pass" | "drift";
+type CompositeMode = "inspect" | "pass" | "drift" | "structural" | "region";
 let compositeMode: CompositeMode = "pass";
 let compositeQueue: CompositeMode[] = [];
 const compositeCalls: { scene_key: string; xmp_subjects: string[]; preset: string }[] = [];
@@ -245,6 +261,7 @@ beforeAll(() => {
 beforeEach(() => {
   h.provider = null;
   h.store.clear();
+  h.failRecordOnce = false;
   h.attachCalls.length = 0;
   compositeMode = "pass";
   compositeQueue = [];
@@ -258,17 +275,30 @@ beforeEach(() => {
   vi.spyOn(imaging, "photoSceneComposite").mockImplementation(async (i) => {
     compositeCalls.push({ scene_key: i.scene_key, xmp_subjects: i.xmp_subjects, preset: i.preset });
     const mode = compositeQueue.shift() ?? compositeMode;
+    const region = mode === "structural" || mode === "region";
     const drift =
       mode === "drift" ||
+      region ||
       (mode === "inspect" && boxChanged(nn(h.store.get(i.scene_key)), nn(h.store.get(i.base_key))));
     return {
       key: drift ? null : i.out_key,
       checks: {
         passes: !drift,
-        failures: drift ? ["design_drift"] : [],
-        region_unchanged_score: drift ? 0.2 : 0.97,
+        failures: region ? ["region_changed"] : drift ? ["design_drift"] : [],
+        region_unchanged_score: region ? 0.41 : drift ? 0.2 : 0.97,
         design_lock_score: drift ? 0.4 : 0.96,
+        // "drift" mimics old imaging: none of the T-37-1 fields.
+        ...(region
+          ? {
+              region_reasons: ["outline_low", "registration_at_limit"],
+              box_foreign: 0.012,
+              structural: mode === "structural",
+            }
+          : {}),
       },
+      ...(region
+        ? { registration: { scale: 1.1, dx_px: 3, dy_px: -2, score: 0.5, at_limit: true } }
+        : {}),
       width_px: 2048,
       height_px: 2048,
       format: "jpeg",
@@ -959,6 +989,122 @@ describe("Shopify push (AC4)", () => {
         .where(and(eq(photoPushes.setId, a.set.id))),
     );
     expect(bRows).toHaveLength(0);
+  });
+});
+
+describe("structural failure: no paid retry (T-37-3, ADR 0036)", () => {
+  async function oneScene(count = 1) {
+    const { company, ctx, design } = await shop();
+    const fake = fakeProvider();
+    h.provider = fake.p;
+    const set = await withTenant(company.id, (tx) =>
+      svc.createSet(tx, ctx, spec(design.id, { count, sceneKinds: ["studio"] })),
+    );
+    const ids = await sceneIds(company.id, set.id);
+    return { company, ctx, set, ids, fake };
+  }
+  const compositionRow = (companyId: string, id: string) =>
+    withTenant(companyId, (tx) =>
+      tx.select().from(photoCompositions).where(eq(photoCompositions.id, id)),
+    ).then(([r]) => nn(r));
+
+  it("every failure structural: one provider call, images fail uncharged with the numbers (AC2-4)", async () => {
+    const { company, ctx, set, ids, fake } = await oneScene();
+    const id = nn(ids[0]);
+    compositeMode = "structural";
+    const out = await runJobInline(renderSceneJob, { companyId: company.id, compositionId: id });
+    expect(out).toMatchObject({ providerCalls: 1, charged: false });
+    expect(fake.calls).toHaveLength(1);
+    const got = await withTenant(company.id, (tx) => svc.getSet(tx, ctx, { id: set.id }));
+    const imgs = got.images.filter((i) => i.compositionId === id);
+    expect(imgs.length).toBeGreaterThan(0);
+    for (const i of imgs) {
+      expect(i.status).toBe("failed");
+      expect(i.error).toContain("region_changed");
+      expect(i.error).toContain("first try");
+      expect(i.error).not.toContain("two tries");
+      expect(i.checks?.failures).toEqual([
+        {
+          code: "region_changed",
+          severity: "error",
+          detail: "outline 0.41, at limit, foreign 0.012",
+        },
+      ]);
+    }
+    expect(await sceneCharges(company.id)).toHaveLength(0);
+    // Nothing written for a second attempt; the raw frame of attempt 1 is kept for diagnosis.
+    const row = await compositionRow(company.id, id);
+    expect(row.sceneAttempt).toBe(1);
+    expect(row.sceneKey).toBe(`${company.id}/photos/${set.id}/scenes/${id}-a1.png`);
+    expect(h.store.has(nn(row.sceneKey))).toBe(true);
+    expect(h.store.has(`${company.id}/photos/${set.id}/scenes/${id}-a2.png`)).toBe(false);
+  });
+
+  it("one failed result not structural, or imaging without the field: regenerate once as before (AC4)", async () => {
+    const { company, ids, fake } = await oneScene(2);
+    compositeQueue = ["structural", "region", "pass", "pass"];
+    await runJobInline(renderSceneJob, { companyId: company.id, compositionId: nn(ids[0]) });
+    expect(fake.calls).toHaveLength(2);
+    // Old imaging: design_drift with no structural field.
+    compositeQueue = ["drift", "drift"];
+    await runJobInline(renderSceneJob, { companyId: company.id, compositionId: nn(ids[1]) });
+    expect(fake.calls).toHaveLength(4);
+  });
+
+  it("a second structural failure after a regenerate says two tries (AC4)", async () => {
+    const { company, ctx, set, ids, fake } = await oneScene();
+    const id = nn(ids[0]);
+    compositeQueue = ["region", "region", "structural", "structural"];
+    await runJobInline(renderSceneJob, { companyId: company.id, compositionId: id });
+    expect(fake.calls).toHaveLength(2);
+    const got = await withTenant(company.id, (tx) => svc.getSet(tx, ctx, { id: set.id }));
+    const first = nn(got.images.find((i) => i.compositionId === id));
+    expect(first.error).toContain("after two tries");
+  });
+
+  it("a crash between the composite and the decision: the retry makes no second provider call (AC6)", async () => {
+    const { company, ids, fake } = await oneScene();
+    const id = nn(ids[0]);
+    compositeMode = "structural";
+    h.failRecordOnce = true;
+    const input = { companyId: company.id, compositionId: id };
+    await expect(runJobInline(renderSceneJob, input, { attempt: 1, attempts: 3 })).rejects.toThrow(
+      "simulated crash",
+    );
+    expect(fake.calls).toHaveLength(1);
+    expect((await compositionRow(company.id, id)).sceneAttempt).toBe(1);
+    const out = await runJobInline(renderSceneJob, input, { attempt: 2, attempts: 3 });
+    expect(fake.calls).toHaveLength(1);
+    expect(out).toMatchObject({ failed: expect.any(Number), charged: false });
+    expect(await sceneCharges(company.id)).toHaveLength(0);
+  });
+
+  it("raw frames sit under the company prefix and the purge deletes them after 7 days, attempt 1 only (AC5)", async () => {
+    const { company, set, ids } = await oneScene();
+    const id = nn(ids[0]);
+    compositeMode = "structural";
+    await runJobInline(renderSceneJob, { companyId: company.id, compositionId: id });
+    const a1 = `${company.id}/photos/${set.id}/scenes/${id}-a1.png`;
+    const row = await compositionRow(company.id, id);
+    expect(h.store.has(a1)).toBe(true);
+    expect(h.store.has(nn(row.sceneBaseKey))).toBe(true);
+    expect(h.store.has(nn(row.sceneMaskKey))).toBe(true);
+    // 6 days: kept. 8 days: gone with base and mask.
+    const age = (days: number) =>
+      withTenant(company.id, (tx) =>
+        tx
+          .update(photoCompositions)
+          .set({ createdAt: new Date(Date.now() - days * 86_400_000) })
+          .where(eq(photoCompositions.id, id)),
+      );
+    await age(6);
+    await purgePhotoFiles();
+    expect(h.store.has(a1)).toBe(true);
+    await age(8);
+    await purgePhotoFiles();
+    expect(h.store.has(a1)).toBe(false);
+    expect(h.store.has(nn(row.sceneBaseKey))).toBe(false);
+    expect(h.store.has(nn(row.sceneMaskKey))).toBe(false);
   });
 });
 

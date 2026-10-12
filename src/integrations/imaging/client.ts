@@ -264,7 +264,21 @@ export const PhotoSceneCompositeResult = z.object({
     failures: z.array(z.string()),
     region_unchanged_score: z.number().nullable(),
     design_lock_score: z.number().nullable(),
+    // Diagnostics (T-37-1); absent from older imaging, a missing `structural` counts as false.
+    region_reasons: z.array(z.string()).optional(),
+    box_foreign: z.number().nullable().optional(),
+    structural: z.boolean().optional(),
   }),
+  registration: z
+    .object({
+      scale: z.number().nullable().optional(),
+      dx_px: z.number().nullable().optional(),
+      dy_px: z.number().nullable().optional(),
+      score: z.number().nullable().optional(),
+      at_limit: z.boolean().optional(),
+    })
+    .nullable()
+    .optional(),
   width_px: z.number().int().nullable().optional(),
   height_px: z.number().int().nullable().optional(),
   format: z.string().nullable().optional(),

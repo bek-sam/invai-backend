@@ -48,6 +48,8 @@ import {
  *   -> imaging scene composite per channel preset (design-lock checks)
  *   -> record results and charge PHOTO_SCENE_CREDITS once (charge lock, set, composition).
  * A failed lock check regenerates the scene once; a second failure fails the images, uncharged.
+ * Exception (ADR 0036): when every failed result is marked structural by imaging, the paid second
+ * try is skipped and the images fail after one try, uncharged.
  * No transaction is open across imaging or the provider.
  */
 
@@ -68,8 +70,10 @@ const MSG = {
   provider: "The image service could not draw this scene. Try again later.",
   imaging: "The image service is not responding. Try again later.",
   noFront: "The design has no front print file.",
-  drift: (codes: string[]) =>
-    `The design did not match the scene after two tries (${codes.join(", ")}). Try again.`,
+  drift: (codes: string[], tries: 1 | 2) =>
+    tries === 1
+      ? `The design did not match the scene on the first try (${codes.join(", ")}). A second try would not fix it. Try another scene kind.`
+      : `The design did not match the scene after two tries (${codes.join(", ")}). Try again.`,
 };
 
 const sceneKey = (c: CompositionRow, attempt: number) =>
@@ -205,7 +209,12 @@ export async function renderScene(
       if ("refusal" in scene) return await permanent(scene.refusal);
       const results = await compositeAll(p, scene.key);
       const drifted = results.filter(({ res }) => !res.checks.passes || !res.key);
-      if (drifted.length > 0 && attempt === 1) {
+      for (const { img, res } of drifted) logDrift(companyId, compositionId, attempt, img, res);
+      // ADR 0036: skip the paid retry when every failure is structural. Writes nothing to
+      // sceneAttempt/sceneKey, so a crash-retry reaches the same verdict without a provider call.
+      const structural =
+        drifted.length > 0 && drifted.every(({ res }) => res.checks.structural === true);
+      if (drifted.length > 0 && attempt === 1 && !structural) {
         log.info("photo scene drifted, regenerating once", {
           companyId,
           compositionId,
@@ -222,7 +231,9 @@ export async function renderScene(
         continue;
       }
       return await finish(
-        results.map(({ img, res }) => toOutcome(img, res, scene.containsPerson, scene.model)),
+        results.map(({ img, res }) =>
+          toOutcome(img, res, scene.containsPerson, scene.model, attempt === 1 ? 1 : 2),
+        ),
       );
     }
   } catch (err) {
@@ -232,6 +243,40 @@ export async function renderScene(
     if (!finalAttempt && !(err instanceof RetryLater) && isTransient(err)) throw err;
     return await permanent(message);
   }
+}
+
+/** One line per failed composite; numbers only, no buyer data, URLs or keys. */
+function logDrift(
+  companyId: string,
+  compositionId: string,
+  attempt: number,
+  img: ImageRow,
+  res: PhotoSceneCompositeResult,
+) {
+  log.info("photo scene composite failed a lock check", {
+    companyId,
+    compositionId,
+    attempt,
+    preset: img.preset,
+    failures: res.checks.failures,
+    regionReasons: res.checks.region_reasons ?? [],
+    check1Score: res.checks.region_unchanged_score,
+    registrationAtLimit: res.registration?.at_limit ?? null,
+    boxForeign: res.checks.box_foreign ?? null,
+    designLockScore: res.checks.design_lock_score,
+    structural: res.checks.structural === true,
+  });
+}
+
+/** The measured numbers behind `region_changed`, for the office ("outline 0.41, at limit, foreign 0.012"). */
+function regionDetail(res: PhotoSceneCompositeResult): string | null {
+  const parts: string[] = [];
+  const score = res.checks.region_unchanged_score;
+  if (score !== null) parts.push(`outline ${score.toFixed(2)}`);
+  if (res.registration?.at_limit) parts.push("at limit");
+  const foreign = res.checks.box_foreign;
+  if (foreign !== null && foreign !== undefined) parts.push(`foreign ${foreign.toFixed(3)}`);
+  return parts.length ? parts.join(", ") : null;
 }
 
 function isTransient(err: unknown): boolean {
@@ -401,7 +446,7 @@ export function toSceneChecks(res: PhotoSceneCompositeResult): PhotoChecks {
     .map((code) => ({
       code: code as PhotoCheckFailure["code"],
       severity: "error" as const,
-      detail: null,
+      detail: code === "region_changed" ? regionDetail(res) : null,
     }));
   const w = res.width_px ?? null;
   const h = res.height_px ?? null;
@@ -423,6 +468,7 @@ function toOutcome(
   res: PhotoSceneCompositeResult,
   containsPerson: boolean,
   model: string,
+  tries: 1 | 2 = 2,
 ): RenderOutcome {
   const checks = toSceneChecks(res);
   if (!res.checks.passes || !res.key) {
@@ -430,7 +476,7 @@ function toOutcome(
     return {
       imageId: img.id,
       ok: false,
-      error: MSG.drift(codes.length ? codes : ["design_drift"]),
+      error: MSG.drift(codes.length ? codes : ["design_drift"], tries),
       checks,
     };
   }
