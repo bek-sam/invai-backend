@@ -286,14 +286,14 @@ describe("buildScenePrompt (AC5)", () => {
     expect(p.text).toContain("heather dark navy hoodie");
     expect(p.text).toContain(PRINT_AREA_RULE);
     expect(p.text.endsWith(SCENE_RULES)).toBe(true);
-    expect(p.ref).toBe("scene_prompt@3");
+    expect(p.ref).toBe("scene_prompt@4");
   });
 
   it("v3 adds no person, whatever the kind; the disclosure flags are unchanged (P1, P2)", () => {
     const kinds = ["studio", "home", "outdoor", "street", "cafe", "workplace", "flat_lay"] as const;
     for (const k of kinds) {
       const p = buildScenePrompt(null, k, "tee", "Black");
-      expect(p.ref).toBe("scene_prompt@3");
+      expect(p.ref).toBe("scene_prompt@4");
       expect(p.text).toContain("Do not add any person, body part or second figure");
       expect(p.text).not.toMatch(/fictional adult model|partly visible|stands/);
       // Same values as before v3: every kind but flat lay assumes a person (0023 section 3).
@@ -616,7 +616,7 @@ describe("assertImageGenAllowed / recordImageGen (AC4)", () => {
       ].sort(),
     );
     expect(rows.find((r) => r.provider === "openai")?.input).toMatchObject({
-      prompt: "scene_prompt@3",
+      prompt: "scene_prompt@4",
       sceneKind: "studio",
     });
     await redis.del(tKey, platformSpendKey(day));
@@ -752,20 +752,77 @@ describe("assertImageGenAllowed / recordImageGen (AC4)", () => {
   });
 });
 
-describe("studioBackdrop scaffold and the optional blank hex (T-39-2 phase 1a)", () => {
-  it("returns the light gray phrase for every input, including malformed ones", () => {
-    for (const hex of ["#ffffff", "#000000", "#1a2b3c", "", "not a color", "#fff"])
-      expect(studioBackdrop(hex)).toBe("a seamless light gray backdrop");
+describe("studioBackdrop bands and the optional blank hex (T-39-2 phase 1b)", () => {
+  const MID = "a plain seamless mid-gray backdrop, neither light nor dark";
+  const PALE = "a plain seamless very pale gray backdrop, almost white";
+  const FLAT = "flat even light, no gradient, vignette or cast shadow on the backdrop";
+  const gray = (n: number) => `#${n.toString(16).padStart(2, "0").repeat(3)}`;
+
+  it("white blanks get the mid gray, every other blank the very pale gray, each with the flat-light clause", () => {
+    for (const hex of ["#ffffff", "#fafafa", "#f5f5f0"]) {
+      const b = studioBackdrop(hex);
+      expect(b).toContain(MID);
+      expect(b).toContain(FLAT);
+      expect(b).not.toContain("light gray");
+    }
+    for (const hex of ["#d8d8d8", "#9ca3af", "#1e3a5f", "#1a2b3c", "#000000"]) {
+      const b = studioBackdrop(hex);
+      expect(b).toContain(PALE);
+      expect(b).toContain(FLAT);
+    }
   });
-  it("keeps the v3 prompt text byte-identical with a hex, without one, and for every kind", () => {
+  it("splits at luma 0.85 on imaging's scale: gray level 217 is white, 216 is not", () => {
+    expect(217 / 255).toBeGreaterThanOrEqual(0.85);
+    expect(216 / 255).toBeLessThan(0.85);
+    expect(studioBackdrop(gray(217))).toContain(MID);
+    expect(studioBackdrop(gray(216))).toContain(PALE);
+    expect(studioBackdrop(gray(218))).toContain(MID);
+    expect(studioBackdrop(gray(215))).toContain(PALE);
+  });
+  it("weights the channels like imaging (a saturated green is lighter than a saturated blue)", () => {
+    // green 0.7152 -> level 255 gives 0.715 < 0.85; luma stays below the split for pure channels
+    expect(studioBackdrop("#00ff00")).toContain(PALE);
+    expect(studioBackdrop("#ffff00")).toContain(MID); // 0.9278
+    expect(studioBackdrop("#ff00ff")).toContain(PALE); // 0.2848
+  });
+  it("keeps the v3 light gray wording for a missing or malformed hex", () => {
+    for (const hex of ["", "not a color", "#fff", "ffffff", "#ggghhh", "#ffffffff", "#ffffff "])
+      expect(studioBackdrop(hex)).toBe("a seamless light gray backdrop");
+    const bare = buildScenePrompt(null, "studio", "tee", "Black");
+    expect(bare.text).toContain(
+      "a clean photo studio with a seamless light gray backdrop and soft, even lighting",
+    );
+    expect(buildScenePrompt(null, "studio", "tee", "Black", "garbage")).toEqual(bare);
+  });
+  it("puts the band phrase into the studio prompt only; other kinds are byte-identical", () => {
     for (const k of PHOTO_SCENE_KINDS) {
       const bare = buildScenePrompt(null, k, "tee", "Black");
-      expect(buildScenePrompt(null, k, "tee", "Black", "#000000")).toEqual(bare);
-      expect(buildScenePrompt(null, k, "tee", "Black", "#ffffff")).toEqual(bare);
-      expect(buildScenePrompt(null, k, "tee", "Black", "garbage")).toEqual(bare);
+      const white = buildScenePrompt(null, k, "tee", "White", "#ffffff");
+      const black = buildScenePrompt(null, k, "tee", "Black", "#000000");
+      if (k === "studio") {
+        expect(white.text).toContain(`with ${MID}, with ${FLAT} and soft, even lighting`);
+        expect(black.text).toContain(`with ${PALE}, with ${FLAT} and soft, even lighting`);
+      } else {
+        expect(buildScenePrompt(null, k, "tee", "Black", "#000000")).toEqual(bare);
+        expect(buildScenePrompt(null, k, "tee", "Black", "#ffffff")).toEqual(bare);
+      }
     }
-    expect(buildScenePrompt(null, "studio", "tee", "Black", "#ffffff").text).toContain(
-      "a clean photo studio with a seamless light gray backdrop and soft, even lighting",
+  });
+  it("keeps the fences and the disclosure flags for every kind and band", () => {
+    for (const k of PHOTO_SCENE_KINDS) {
+      const flagsBare = buildScenePrompt(null, k, "tee", "Black").containsPerson;
+      for (const hex of ["#ffffff", "#000000", undefined]) {
+        const p = buildScenePrompt(null, k, "tee", "Black", hex);
+        expect(p.containsPerson).toBe(flagsBare);
+        expect(p.ref).toBe("scene_prompt@4");
+        expect(p.text.endsWith(SCENE_RULES)).toBe(true);
+        expect(p.text).toContain("Do not add any person, body part or second figure");
+        expect(p.text).not.toContain("#");
+      }
+    }
+    expect(buildScenePrompt(null, "studio", "tee", "Black", "#000000").containsPerson).toBe(true);
+    expect(buildScenePrompt(null, "flat_lay", "tee", "Black", "#000000").containsPerson).toBe(
+      false,
     );
   });
 });

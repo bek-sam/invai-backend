@@ -11,9 +11,13 @@ import type { ScenePrompt } from "./types";
  * v3 (T-38-2, proposed decision 0037): the prompt adds no person. The base already carries InvAI's
  * own garment (and figure) under a mask, so only the background is drawn. `containsPerson` below
  * is unchanged and still conservative: the disclosure flags do not move this wave (0023 §3).
+ *
+ * v4 (T-39-2 phase 1b): the studio backdrop tone follows the blank's luma (two fixed phrases, split
+ * at 0.85) so the backdrop stays away from the garment's own tone; T-39-1's sweep shows a "light
+ * gray" backdrop (drawn near level 200) fails white tees. Other kinds are unchanged.
  */
 
-export const SCENE_PROMPT_VERSION = 3;
+export const SCENE_PROMPT_VERSION = 4;
 export const SCENE_PROMPT_REF = `scene_prompt@${SCENE_PROMPT_VERSION}`;
 
 /** The one sentence every prompt must carry (imaging restores and composites the print area). */
@@ -40,12 +44,33 @@ function studioSetting(backdrop: string): string {
   return `a clean photo studio with ${backdrop} and soft, even lighting`;
 }
 
+/** Blank luma (imaging's scale) at or above which the blank counts as white. */
+export const STUDIO_WHITE_LUMA = 0.85;
+const FLAT_LIGHT = "flat even light, no gradient, vignette or cast shadow on the backdrop";
+const STUDIO_BACKDROP_MID_GRAY = `a plain seamless mid-gray backdrop, neither light nor dark, with ${FLAT_LIGHT}`;
+const STUDIO_BACKDROP_PALE = `a plain seamless very pale gray backdrop, almost white, with ${FLAT_LIGHT}`;
+
+/** Luma 0..1 of `#rrggbb` as imaging computes it on sRGB: (0.2126 R + 0.7152 G + 0.0722 B) / 255. */
+export function hexLuma(hex: string): number | null {
+  const m = /^#([0-9a-fA-F]{2})([0-9a-fA-F]{2})([0-9a-fA-F]{2})$/.exec(hex);
+  if (!m) return null;
+  const [r, g, b] = [m[1], m[2], m[3]].map((h) => Number.parseInt(h as string, 16)) as [
+    number,
+    number,
+    number,
+  ];
+  return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
+}
+
 /**
- * The studio backdrop phrase for a blank color (`#rrggbb`). Scaffold (phase 1a): every input,
- * including a missing or malformed hex, gets the v3 light gray phrase; the luma bands land in 1b.
+ * The studio backdrop phrase for a blank color (`#rrggbb`), from a closed list: white blanks
+ * (luma >= 0.85) get a mid gray, every other blank a very pale gray. A missing or malformed hex
+ * keeps the v3 light gray wording.
  */
-export function studioBackdrop(_blankHex: string): string {
-  return STUDIO_BACKDROP_LIGHT_GRAY;
+export function studioBackdrop(blankHex: string): string {
+  const luma = hexLuma(blankHex);
+  if (luma === null) return STUDIO_BACKDROP_LIGHT_GRAY;
+  return luma >= STUDIO_WHITE_LUMA ? STUDIO_BACKDROP_MID_GRAY : STUDIO_BACKDROP_PALE;
 }
 
 /** Per kind: the setting, and whether a person (the figure wearing the garment) appears. */

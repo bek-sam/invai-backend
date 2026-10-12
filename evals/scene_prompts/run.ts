@@ -23,7 +23,9 @@ const dir = path.dirname(fileURLToPath(import.meta.url));
  *  - keep the variable part (everything before the constant rules) free of person and brand
  *    words (child, kid, teen, celebrity, famous, logo, brand, trademark, real person);
  *  - carry the print-area rule and end with the constant rules block;
- *  - set containsPerson as expected (conservative).
+ *  - set containsPerson as expected (conservative);
+ *  - for `studio` with a blank hex (T-39-2), carry the backdrop phrase of the blank's luma band
+ *    (white >= 0.85: mid gray; otherwise very pale gray) and never the v3 "light gray" wording.
  * Then the mock provider draws the scene from a small blank base: PNG at a provider size, the
  * same containsPerson, deterministic bytes. Quality equals plumbing here: the rules are the bar.
  */
@@ -33,8 +35,17 @@ type Vars = {
   sceneKind: PhotoSceneKind;
   garment: GarmentType;
   blankName: string;
+  /** The blank's `#rrggbb` (T-39-2); absent keeps the v3 wording. */
+  blankHex?: string;
 };
-type Expect = { forbid: string[]; containsPerson: boolean };
+type Expect = {
+  forbid: string[];
+  containsPerson: boolean;
+  /** Phrases the prompt must contain (studio backdrop per luma band). */
+  contains?: string[];
+  /** Phrases the prompt must not contain. */
+  absent?: string[];
+};
 
 const PERSON_OR_BRAND =
   /\b(child|children|kid|kids|baby|babies|teen|teens|teenager|minor|celebrit\w*|famous|logo|logos|brand|brands|trademark\w*|real person)\b/i;
@@ -98,12 +109,16 @@ export async function runScenePrompts(_tenant: EvalTenant): Promise<RouteReport>
         c.vars.sceneKind,
         c.vars.garment,
         c.vars.blankName,
+        c.vars.blankHex,
       );
       const lower = p.text.toLowerCase();
       for (const w of c.expect.forbid) if (lower.includes(w.toLowerCase())) fails.push(`forbid:${w}`);
       const variable = p.text.slice(0, p.text.lastIndexOf(SCENE_RULES));
       const hit = PERSON_OR_BRAND.exec(variable);
       if (hit) fails.push(`variable:${hit[0]}`);
+      for (const w of c.expect.contains ?? []) if (!p.text.includes(w)) fails.push(`missing:${w}`);
+      for (const w of c.expect.absent ?? []) if (p.text.includes(w)) fails.push(`present:${w}`);
+      if (!p.ref.endsWith("@4")) fails.push("version");
       if (!p.text.includes(PRINT_AREA_RULE)) fails.push("print-area-rule");
       if (!p.text.endsWith(SCENE_RULES)) fails.push("rules-last");
       if (p.containsPerson !== c.expect.containsPerson) fails.push("containsPerson");
