@@ -138,6 +138,8 @@ export type BootstrapResult = {
   /** Attributes that were wrong and were fixed, as SQL keywords (`NOBYPASSRLS`, ...). */
   fixedAttributes: string[];
   passwordUpdated: boolean;
+  /** Table privileges (and default privileges) bootstrap revoked from the app role or PUBLIC. */
+  revokedPrivileges: string[];
   /** False when the server trusts the connection, so the password could not be checked. */
   passwordVerified: boolean;
 };
@@ -246,6 +248,144 @@ async function rlsBypassProblems(client: Client, appRole: string, owner: string)
 }
 
 /**
+ * Table privileges the app role never needs and that sidestep what RLS guarantees (S-65):
+ * TRUNCATE ignores row-level security (one call wipes every shop's rows); REFERENCES and TRIGGER
+ * let a role plant foreign keys and triggers on tables it does not own.
+ */
+const UNSAFE_TABLE_PRIVILEGES = ["TRUNCATE", "REFERENCES", "TRIGGER"] as const;
+
+/** Schemas the app does not own: system catalogs, TOAST and temp. Everything else is an app schema. */
+const NOT_SYSTEM_SCHEMA = `n.nspname not in ('pg_catalog', 'information_schema', 'pg_toast')
+  and n.nspname not like 'pg\\_temp\\_%' and n.nspname not like 'pg\\_toast\\_temp\\_%'`;
+
+/**
+ * Revokes TRUNCATE, REFERENCES and TRIGGER from the app role and PUBLIC on every table in the app
+ * schemas, and from the owner's default privileges, so tables created later never grant them.
+ * Runs DDL only where the catalog shows such a grant (a clean database runs none, so a second
+ * release stays `unchanged`). It removes only grants the table owner made: a grant made by
+ * another grantor stays, and `appRoleProblems` then fails naming it.
+ */
+async function revokeUnsafeTablePrivileges(client: Client, appRole: string, owner: string) {
+  const revoked: string[] = [];
+  const privs = UNSAFE_TABLE_PRIVILEGES.map((p) => `'${p}'`).join(", ");
+  const tables = await client.query<{
+    schema: string;
+    rel: string;
+    to_public: boolean;
+    privs: string[];
+  }>(
+    `select n.nspname as schema, c.relname as rel, (a.grantee = 0) as to_public,
+            array_agg(distinct a.privilege_type order by a.privilege_type) as privs
+       from pg_class c join pg_namespace n on n.oid = c.relnamespace
+       cross join lateral aclexplode(c.relacl) a
+      where c.relkind in ('r', 'p') and ${NOT_SYSTEM_SCHEMA}
+        and a.privilege_type in (${privs})
+        and a.grantor = c.relowner
+        and (a.grantee = 0 or a.grantee = (select oid from pg_roles where rolname = $1))
+      group by 1, 2, 3 order by 1, 2, 3`,
+    [appRole],
+  );
+  for (const t of tables.rows) {
+    const target = t.to_public ? "PUBLIC" : client.escapeIdentifier(appRole);
+    await client.query(
+      `REVOKE ${t.privs.join(", ")} ON TABLE ${client.escapeIdentifier(t.schema)}.${client.escapeIdentifier(t.rel)} FROM ${target}`,
+    );
+    revoked.push(
+      `${t.privs.join("+")} on ${t.schema}.${t.rel} from ${t.to_public ? "PUBLIC" : appRole}`,
+    );
+  }
+  const defaults = await client.query<{
+    schema: string | null;
+    to_public: boolean;
+    privs: string[];
+  }>(
+    `select n.nspname as schema, (a.grantee = 0) as to_public,
+            array_agg(distinct a.privilege_type order by a.privilege_type) as privs
+       from pg_default_acl d left join pg_namespace n on n.oid = d.defaclnamespace
+       cross join lateral aclexplode(d.defaclacl) a
+      where d.defaclobjtype = 'r' and d.defaclrole = (select oid from pg_roles where rolname = $2)
+        and a.privilege_type in (${privs})
+        and (a.grantee = 0 or a.grantee = (select oid from pg_roles where rolname = $1))
+      group by 1, 2 order by 1 nulls first, 2`,
+    [appRole, owner],
+  );
+  for (const d of defaults.rows) {
+    const target = d.to_public ? "PUBLIC" : client.escapeIdentifier(appRole);
+    const inSchema = d.schema ? ` IN SCHEMA ${client.escapeIdentifier(d.schema)}` : "";
+    await client.query(
+      `ALTER DEFAULT PRIVILEGES FOR ROLE ${client.escapeIdentifier(owner)}${inSchema} REVOKE ${d.privs.join(", ")} ON TABLES FROM ${target}`,
+    );
+    revoked.push(
+      `default ${d.privs.join("+")}${d.schema ? ` in ${d.schema}` : ""} from ${d.to_public ? "PUBLIC" : appRole}`,
+    );
+  }
+  return revoked;
+}
+
+/**
+ * SECURITY DEFINER functions that may legitimately exist, as `schema.name(args)`. Copy of
+ * `SECURITY_DEFINER_ALLOWLIST` in `rls-coverage.test.ts`: bootstrap must not import test code, so
+ * a change to one needs the same change in the other. Empty today.
+ */
+const SECURITY_DEFINER_ALLOWLIST = new Set<string>([]);
+
+/**
+ * The two S-65 channels that role attributes, memberships and ownership don't cover. Bootstrap
+ * only reports them, after `revokeUnsafeTablePrivileges` removed what it can:
+ * (a) the app role can still TRUNCATE a table with a `company_id` column (granted by another
+ *     grantor, or through PUBLIC/membership that survived): RLS does not apply to TRUNCATE;
+ * (b) a SECURITY DEFINER function owned by a role that bypasses RLS (superuser, BYPASSRLS, or a
+ *     table owner, membership-aware: a NOINHERIT member can SET ROLE to it) that the app role can
+ *     EXECUTE runs with those rights and reads every shop's rows.
+ * The queries are copies of the two in `src/db/rls-coverage.test.ts` ("RLS-exempt paths (S-65)"),
+ * except that (a) covers every app schema, not only `public`; keep them in step.
+ */
+async function appRoleProblems(client: Client, appRole: string) {
+  const problems: string[] = [];
+  const truncate = await client.query<{ name: string }>(
+    `select format('%s.%s', n.nspname, c.relname) as name
+       from pg_class c join pg_namespace n on n.oid = c.relnamespace
+      where c.relkind in ('r', 'p') and ${NOT_SYSTEM_SCHEMA}
+        and exists (select 1 from pg_attribute a where a.attrelid = c.oid
+          and a.attname = 'company_id' and not a.attisdropped)
+        and has_table_privilege($1, c.oid, 'TRUNCATE')
+      order by 1`,
+    [appRole],
+  );
+  if (truncate.rows.length) {
+    const names = truncate.rows.map((r) => r.name);
+    problems.push(
+      `${appRole} can TRUNCATE ${listNames(names)}; TRUNCATE ignores row-level security and would wipe every shop's rows, ` +
+        `and bootstrap could not revoke it (granted by another role or through a membership); run: REVOKE TRUNCATE ON ${names.slice(0, 5).join(", ")} ` +
+        `FROM ${sqlName(appRole)}, PUBLIC (add GRANTED BY <grantor> for a grant another role made)`,
+    );
+  }
+  const secdef = await client.query<{ fn: string }>(
+    `select format('%s.%s(%s)', n.nspname, p.proname, pg_get_function_identity_arguments(p.oid)) as fn
+       from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+       join pg_roles o on o.oid = p.proowner
+      where p.prosecdef
+        and ${NOT_SYSTEM_SCHEMA}
+        and (o.rolsuper or o.rolbypassrls
+          or exists (select 1 from pg_class c where pg_has_role(o.oid, c.relowner, 'MEMBER')
+            and c.relkind in ('r', 'p')
+            and c.relnamespace not in (select oid from pg_namespace
+              where nspname in ('pg_catalog', 'information_schema'))))
+        and has_function_privilege($1, p.oid, 'EXECUTE')
+      order by 1`,
+    [appRole],
+  );
+  const bad = secdef.rows.map((r) => r.fn).filter((fn) => !SECURITY_DEFINER_ALLOWLIST.has(fn));
+  if (bad.length) {
+    problems.push(
+      `SECURITY DEFINER function${bad.length === 1 ? "" : "s"} ${listNames(bad)} ${bad.length === 1 ? "runs" : "run"} with an owner that bypasses RLS and ${appRole} can execute ${bad.length === 1 ? "it" : "them"}, ` +
+        `so ${bad.length === 1 ? "it" : "they"} can read or change every shop's rows; run: ALTER FUNCTION <name> SECURITY INVOKER, or REVOKE EXECUTE ON FUNCTION <name> FROM PUBLIC, ${sqlName(appRole)}`,
+    );
+  }
+  return problems;
+}
+
+/**
  * Logs in as the app role with the configured password:
  * - `ok`: the server checked the password and accepted it;
  * - `wrong`: wrong password, or no such role;
@@ -311,6 +451,7 @@ export async function bootstrapAppRole(cfg: BootstrapConfig): Promise<BootstrapR
     const role = client.escapeIdentifier(cfg.appRole);
 
     let created = false;
+    let revokedPrivileges: string[] = [];
     const fixedAttributes: string[] = [];
     await client.query("BEGIN");
     try {
@@ -338,6 +479,7 @@ export async function bootstrapAppRole(cfg: BootstrapConfig): Promise<BootstrapR
         `GRANT CONNECT ON DATABASE ${client.escapeIdentifier(database)} TO ${role}`,
       );
       await client.query(`GRANT USAGE ON SCHEMA public TO ${role}`);
+      revokedPrivileges = await revokeUnsafeTablePrivileges(client, cfg.appRole, currentUser);
       await client.query("COMMIT");
     } catch (err) {
       await client.query("ROLLBACK").catch(() => {});
@@ -360,12 +502,14 @@ export async function bootstrapAppRole(cfg: BootstrapConfig): Promise<BootstrapR
     if (wrong.length) {
       throw new ReleaseStepError(`${cfg.appRole} still lacks ${wrong.join(" ")}`);
     }
-    const problems = await rlsBypassProblems(client, cfg.appRole, currentUser);
+    const problems = [
+      ...(await rlsBypassProblems(client, cfg.appRole, currentUser)),
+      ...(await appRoleProblems(client, cfg.appRole)),
+    ];
     if (problems.length) {
-      // Attribute fixes above are committed and stay; say so, since the run still fails.
-      const fixed = fixedAttributes.length
-        ? ` (fixed meanwhile: ${fixedAttributes.join(" ")})`
-        : "";
+      // Attribute fixes and revokes above are committed and stay; say so, since the run still fails.
+      const meanwhile = [...fixedAttributes, ...revokedPrivileges];
+      const fixed = meanwhile.length ? ` (fixed meanwhile: ${meanwhile.join(" ")})` : "";
       throw new ReleaseStepError(`${problems.join("; ")}${fixed}`);
     }
     const login = await checkLogin(cfg);
@@ -378,6 +522,7 @@ export async function bootstrapAppRole(cfg: BootstrapConfig): Promise<BootstrapR
       created,
       fixedAttributes,
       passwordUpdated,
+      revokedPrivileges,
       passwordVerified: login === "ok",
     };
   } finally {

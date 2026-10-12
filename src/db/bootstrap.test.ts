@@ -493,3 +493,158 @@ describe("bootstrapAppRole refuses every RLS-bypass channel (S-61)", () => {
     }
   });
 });
+
+/*
+ * S-65 (B-319): TRUNCATE-class grants and SECURITY DEFINER functions. Same shape as the S-61
+ * block: a scratch database (`invai_test_bsdrift_<tag>`, so db-safety accepts it) and a scratch
+ * app role passed as `appRole`, never `invai_app`. The scratch database has no migrations; the
+ * tables below are created by the owner, like the migrations do.
+ */
+describe("bootstrapAppRole revokes TRUNCATE-class grants and fails on SECURITY DEFINER drift (S-65)", () => {
+  const tag = `s65${Date.now().toString(36)}`;
+  const name = `invai_test_bsdrift_${tag}`;
+  const appRole = `invai_test_app_${tag}`;
+  const helperRole = `invai_test_helper_${tag}`;
+  const at = (url: string, db: string) => {
+    const u = new URL(url);
+    u.pathname = `/${db}`;
+    return u.toString();
+  };
+  const ownerUrl = at(env.MIGRATION_DATABASE_URL, name);
+  const serverUrl = at(env.MIGRATION_DATABASE_URL, "postgres");
+  const cfg: BootstrapConfig = {
+    ownerUrl,
+    ownerRole: "invai",
+    appRole,
+    appPassword: `S65-test-pw-${tag}`,
+  };
+  let owner: Client;
+  const sql = (text: string) => owner.query(text);
+  const can = async (table: string, priv: string) =>
+    (await owner.query(`select has_table_privilege('${appRole}', '${table}', '${priv}') as ok`))
+      .rows[0]?.ok;
+  const failure = (run: Promise<unknown>) =>
+    run.then(
+      () => null,
+      (e: unknown) => e as Error,
+    );
+
+  beforeAll(async () => {
+    const server = new Client({ connectionString: serverUrl });
+    await server.connect();
+    await server.query(`CREATE DATABASE "${name}"`);
+    await server.query(
+      `CREATE ROLE ${appRole} LOGIN NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION PASSWORD '${cfg.appPassword}'`,
+    );
+    await server.query(`CREATE ROLE ${helperRole} NOLOGIN`);
+    await server.end();
+    owner = new Client({ connectionString: ownerUrl });
+    await owner.connect();
+    await sql("CREATE TABLE s65_tenant (id int, company_id uuid)");
+    await sql("CREATE TABLE s65_global (id int)");
+  });
+
+  afterAll(async () => {
+    await owner?.end();
+    const server = new Client({ connectionString: serverUrl });
+    await server.connect();
+    await server.query(`DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`);
+    await server.query(`DROP ROLE IF EXISTS ${appRole}`);
+    await server.query(`DROP ROLE IF EXISTS ${helperRole}`);
+    await server.end();
+  });
+
+  it("revokes TRUNCATE, REFERENCES and TRIGGER from the app role and PUBLIC, only where granted, and the next run is unchanged", async () => {
+    expect(await bootstrapAppRole(cfg)).toMatchObject({ revokedPrivileges: [] });
+    await sql(`GRANT TRUNCATE, REFERENCES, TRIGGER, SELECT ON s65_tenant TO ${appRole}`);
+    await sql("GRANT TRUNCATE ON s65_global TO PUBLIC");
+    const first = await bootstrapAppRole(cfg);
+    expect(first.revokedPrivileges).toEqual([
+      "TRUNCATE on public.s65_global from PUBLIC",
+      `REFERENCES+TRIGGER+TRUNCATE on public.s65_tenant from ${appRole}`,
+    ]);
+    for (const t of ["s65_tenant", "s65_global"]) {
+      for (const p of ["TRUNCATE", "REFERENCES", "TRIGGER"]) expect(await can(t, p)).toBe(false);
+    }
+    // Only the unsafe privileges went: the SELECT grant is untouched.
+    expect(await can("s65_tenant", "SELECT")).toBe(true);
+    expect(await bootstrapAppRole(cfg)).toMatchObject({ revokedPrivileges: [] });
+    await sql(`REVOKE SELECT ON s65_tenant FROM ${appRole}`);
+  });
+
+  it("fails naming the table when another grantor's TRUNCATE survives the owner's REVOKE", async () => {
+    await sql(`GRANT TRUNCATE ON s65_tenant TO ${helperRole} WITH GRANT OPTION`);
+    await sql(`SET ROLE ${helperRole}`);
+    await sql(`GRANT TRUNCATE ON s65_tenant TO ${appRole}`);
+    await sql("RESET ROLE");
+    try {
+      const err = await failure(bootstrapAppRole(cfg));
+      expect(err).toBeInstanceOf(ReleaseStepError);
+      expect(err?.message).toContain(`${appRole} can TRUNCATE public.s65_tenant`);
+      expect(err?.message).toContain(
+        `REVOKE TRUNCATE ON public.s65_tenant FROM ${appRole}, PUBLIC`,
+      );
+      expect(err?.message).toContain("GRANTED BY <grantor>");
+      // The privilege is still there: bootstrap reports it and leaves the decision to an operator.
+      expect(await can("s65_tenant", "TRUNCATE")).toBe(true);
+      // A table without company_id is not what S-65 is about: only the tenant table is named.
+      expect(err?.message).not.toContain("s65_global");
+    } finally {
+      await sql(`SET ROLE ${helperRole}`);
+      await sql(`REVOKE TRUNCATE ON s65_tenant FROM ${appRole}`);
+      await sql("RESET ROLE");
+      await sql(`REVOKE TRUNCATE ON s65_tenant FROM ${helperRole}`);
+    }
+    expect(await bootstrapAppRole(cfg)).toMatchObject({ revokedPrivileges: [] });
+  });
+
+  it("a TRUNCATE default privilege is revoked, so a table created later grants nothing", async () => {
+    const planted = `FOR ROLE invai IN SCHEMA public GRANT TRUNCATE ON TABLES TO ${appRole}`;
+    await sql(`ALTER DEFAULT PRIVILEGES ${planted}`);
+    // The plant works: without bootstrap a new table grants the app role TRUNCATE.
+    await sql("CREATE TABLE s65_before (company_id uuid)");
+    expect(await can("s65_before", "TRUNCATE")).toBe(true);
+    await sql(`REVOKE TRUNCATE ON s65_before FROM ${appRole}`);
+    try {
+      const run = await bootstrapAppRole(cfg);
+      expect(run.revokedPrivileges).toEqual([`default TRUNCATE in public from ${appRole}`]);
+      await sql("CREATE TABLE s65_after (company_id uuid)");
+      expect(await can("s65_after", "TRUNCATE")).toBe(false);
+      expect(await bootstrapAppRole(cfg)).toMatchObject({ revokedPrivileges: [] });
+    } finally {
+      await sql(
+        `ALTER DEFAULT PRIVILEGES ${planted.replace("GRANT TRUNCATE ON TABLES TO", "REVOKE TRUNCATE ON TABLES FROM")}`,
+      );
+      await sql("DROP TABLE IF EXISTS s65_before, s65_after");
+    }
+  });
+
+  it("a SECURITY DEFINER function owned by the owner and executable by the app role fails, naming it", async () => {
+    await sql(
+      "CREATE FUNCTION s65_dump() RETURNS bigint LANGUAGE sql SECURITY DEFINER AS 'select count(*) from s65_tenant'",
+    );
+    try {
+      const err = await failure(bootstrapAppRole(cfg));
+      expect(err).toBeInstanceOf(ReleaseStepError);
+      expect(err?.message).toContain("SECURITY DEFINER function public.s65_dump()");
+      expect(err?.message).toContain("REVOKE EXECUTE ON FUNCTION <name> FROM PUBLIC");
+
+      // Fix 1: the app role cannot execute it any more.
+      await sql(`REVOKE EXECUTE ON FUNCTION s65_dump() FROM PUBLIC, ${appRole}`);
+      expect(await bootstrapAppRole(cfg)).toMatchObject({ revokedPrivileges: [] });
+      await sql("GRANT EXECUTE ON FUNCTION s65_dump() TO PUBLIC");
+      expect(await failure(bootstrapAppRole(cfg))).toBeInstanceOf(ReleaseStepError);
+
+      // Fix 2: SECURITY INVOKER.
+      await sql("ALTER FUNCTION s65_dump() SECURITY INVOKER");
+      expect(await bootstrapAppRole(cfg)).toMatchObject({ revokedPrivileges: [] });
+
+      // A SECURITY DEFINER function owned by a role that does not bypass RLS is not flagged.
+      await sql("ALTER FUNCTION s65_dump() SECURITY DEFINER");
+      await sql(`ALTER FUNCTION s65_dump() OWNER TO ${helperRole}`);
+      expect(await bootstrapAppRole(cfg)).toMatchObject({ revokedPrivileges: [] });
+    } finally {
+      await sql("DROP FUNCTION IF EXISTS s65_dump()");
+    }
+  });
+});

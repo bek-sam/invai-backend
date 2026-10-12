@@ -10,6 +10,7 @@ await runReleaseStep("bootstrap", async () => {
   const changes = [
     r.created ? "created" : null,
     r.fixedAttributes.length ? `fixed ${r.fixedAttributes.join(" ")}` : null,
+    r.revokedPrivileges.length ? `revoked ${r.revokedPrivileges.join("; ")}` : null,
     r.passwordUpdated ? "password updated" : null,
   ].filter(Boolean);
   const note = r.passwordVerified
