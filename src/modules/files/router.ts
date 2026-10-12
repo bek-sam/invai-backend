@@ -9,4 +9,9 @@ export const filesRouter = authed.files.router({
   downloadUrl: authed.files.downloadUrl.handler(({ input, context: { tenant } }) =>
     withTenant(tenant.companyId, (tx) => svc.downloadUrl(tx, tenant, input)),
   ),
+  // No withTenant: the batch holds no transaction across the object HEADs (A9); the vendor rule
+  // opens one short withVendor query inside the service.
+  downloadUrls: authed.files.downloadUrls.handler(({ input, context: { tenant } }) =>
+    svc.downloadUrls(tenant, input),
+  ),
 });

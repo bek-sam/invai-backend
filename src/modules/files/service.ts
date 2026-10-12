@@ -103,35 +103,91 @@ export async function presignUpload(
 
 const DOWNLOAD_TTL = 15 * 60;
 
+/**
+ * The checks that run before any storage lookup, in this order: safe key, company or vendor
+ * check, kind check. `vendorReadable` answers the vendor sheet rule (one query per call for a
+ * batch, one per key for the single call). Returns false where the answer is NOT_FOUND, so
+ * another company's key never causes a HEAD.
+ */
+async function mayRead(
+  ctx: TenantContext,
+  fileKey: string,
+  vendorReadable: (key: string) => Promise<boolean>,
+): Promise<boolean> {
+  if (!isSafeKey(fileKey)) return false;
+  const owned = fileKey.startsWith(`${ctx.companyId}/`);
+  if (!owned && !(ctx.orgType === "vendor" && (await vendorReadable(fileKey)))) return false;
+  if (owned && !canReadKind(ctx, fileKey.split("/")[1] ?? "")) return false;
+  return true;
+}
+
+/** HEAD plus signing for a key that already passed `mayRead`; null when the object is missing. */
+async function signKey(
+  fileKey: string,
+  disposition: "inline" | "attachment",
+): Promise<SignedDownload | null> {
+  const head = await headObject(fileKey);
+  if (!head.exists) return null;
+  // SVG is XML with executable <script>: never served inline (T-12-5), regardless of what the
+  // caller asked for -- forcing attachment stops a browser from rendering it as a document.
+  const forceAttachment = head.contentType === "image/svg+xml";
+  const name =
+    disposition === "attachment" || forceAttachment ? fileKey.split("/").pop() : undefined;
+  return {
+    fileKey,
+    url: await presignGet(fileKey, DOWNLOAD_TTL, name),
+    expiresAt: new Date(Date.now() + DOWNLOAD_TTL * 1000).toISOString(),
+    contentType: head.contentType,
+    sizeBytes: head.size,
+  };
+}
+
 export async function downloadUrl(
   _tx: Tx,
   ctx: TenantContext,
   input: { fileKey: string; disposition: "inline" | "attachment" },
 ): Promise<SignedDownload> {
-  if (!isSafeKey(input.fileKey)) throw notFound("file");
-  const owned = input.fileKey.startsWith(`${ctx.companyId}/`);
-  if (
-    !owned &&
-    !(ctx.orgType === "vendor" && (await vendorCanRead(ctx.companyId, input.fileKey)))
-  ) {
+  if (!(await mayRead(ctx, input.fileKey, (k) => vendorCanRead(ctx.companyId, k)))) {
     throw notFound("file");
   }
-  if (owned && !canReadKind(ctx, input.fileKey.split("/")[1] ?? "")) throw notFound("file");
-  const head = await headObject(input.fileKey);
-  if (!head.exists) throw notFound("file");
-  // SVG is XML with executable <script>: never served inline (T-12-5), regardless of what the
-  // caller asked for -- forcing attachment stops a browser from rendering it as a document.
-  const forceAttachment = head.contentType === "image/svg+xml";
-  const name =
-    input.disposition === "attachment" || forceAttachment
-      ? input.fileKey.split("/").pop()
-      : undefined;
+  const signed = await signKey(input.fileKey, input.disposition);
+  if (!signed) throw notFound("file");
+  return signed;
+}
+
+/** Concurrent object HEADs per batch call: a 60-key call must not open 60 S3 requests at once. */
+const HEAD_CONCURRENCY = 8;
+
+/**
+ * Batch form of `downloadUrl` (B-362). Same per-key rules through `mayRead` and `signKey`;
+ * `download` is null exactly where the single call answers NOT_FOUND, any other error fails the
+ * call. Holds no DB transaction: the only DB work is one vendor query for the whole list.
+ */
+export async function downloadUrls(
+  ctx: TenantContext,
+  input: { fileKeys: string[]; disposition: "inline" | "attachment" },
+): Promise<{ items: { fileKey: string; download: SignedDownload | null }[] }> {
+  const unique = [...new Set(input.fileKeys)];
+  let vendorKeys: Set<string> | null = null;
+  if (ctx.orgType === "vendor") {
+    const foreign = unique.filter((k) => isSafeKey(k) && !k.startsWith(`${ctx.companyId}/`));
+    vendorKeys = await vendorReadableKeys(ctx.companyId, foreign);
+  }
+  const results = new Map<string, SignedDownload | null>();
+  let next = 0;
+  const worker = async () => {
+    while (next < unique.length) {
+      const key = unique[next++] as string;
+      const ok = await mayRead(ctx, key, async (k) => vendorKeys?.has(k) ?? false);
+      results.set(key, ok ? await signKey(key, input.disposition) : null);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(HEAD_CONCURRENCY, unique.length) }, worker));
   return {
-    fileKey: input.fileKey,
-    url: await presignGet(input.fileKey, DOWNLOAD_TTL, name),
-    expiresAt: new Date(Date.now() + DOWNLOAD_TTL * 1000).toISOString(),
-    contentType: head.contentType,
-    sizeBytes: head.size,
+    items: input.fileKeys.map((fileKey) => ({
+      fileKey,
+      download: results.get(fileKey) ?? null,
+    })),
   };
 }
 
@@ -176,4 +232,24 @@ export async function markFileReady(tx: Tx, key: string) {
 /** Drop `files` rows whose objects were deleted (retention sweep). */
 export async function forgetFiles(tx: Tx, keys: string[]) {
   if (keys.length) await tx.delete(files).where(inArray(files.key, keys));
+}
+
+/** Which of `keys` belong to a sheet the vendor RLS policy exposes: one query for the list. */
+async function vendorReadableKeys(vendorCompanyId: string, keys: string[]): Promise<Set<string>> {
+  if (!keys.length) return new Set();
+  return withVendor(vendorCompanyId, async (tx) => {
+    const rows = await tx
+      .select({ png: gangSheets.pngKey, pdf: gangSheets.pdfKey, preview: gangSheets.previewKey })
+      .from(gangSheets)
+      .where(
+        or(
+          inArray(gangSheets.pngKey, keys),
+          inArray(gangSheets.pdfKey, keys),
+          inArray(gangSheets.previewKey, keys),
+        ),
+      );
+    const found = new Set<string>();
+    for (const r of rows) for (const k of [r.png, r.pdf, r.preview]) if (k) found.add(k);
+    return found;
+  });
 }

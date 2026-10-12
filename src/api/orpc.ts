@@ -189,6 +189,10 @@ export const AI_CHEAP_READS: ReadonlySet<string> = new Set([
 export const NON_GET_READS: ReadonlySet<string> = new Set([
   // Presigns a GET url for a file that already exists in storage. No write.
   "files.downloadUrl",
+  // Batch form of files.downloadUrl (up to 60 keys): presigns GET urls for existing objects, no
+  // write. POST only because long keys must not land in access-log query strings. One reads token
+  // per call is the point (B-362).
+  "files.downloadUrls",
   // Dry-runs a SKU rule's pattern against one sample string: regex capture + an in-memory
   // catalog-index lookup, no DB write.
   "skuRules.test",
