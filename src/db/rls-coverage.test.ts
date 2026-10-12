@@ -112,6 +112,57 @@ describe("RLS coverage", () => {
   });
 });
 
+/**
+ * S-65: SECURITY DEFINER functions that may legitimately exist, as `schema.name(args)` with a
+ * one-line reason each. Empty today: every one is a function that runs with its owner's rights,
+ * so an owner-owned one executable by the app role reads every tenant's rows.
+ */
+const SECURITY_DEFINER_ALLOWLIST = new Set<string>([]);
+
+describe("RLS-exempt paths (S-65)", () => {
+  it("the app role holds no TRUNCATE on any table with company_id", async () => {
+    // RLS does not apply to TRUNCATE. has_table_privilege covers direct grants, PUBLIC and membership.
+    const res = await db.execute<{ name: string }>(sql`
+      select c.relname as name
+      from pg_class c join pg_namespace n on n.oid = c.relnamespace
+      where n.nspname = 'public' and c.relkind in ('r', 'p')
+        and exists (select 1 from pg_attribute a where a.attrelid = c.oid
+          and a.attname = 'company_id' and not a.attisdropped)
+        and has_table_privilege('invai_app', c.oid, 'TRUNCATE')
+      order by 1`);
+    const names = res.rows.map((r) => r.name);
+    expect(
+      names,
+      `invai_app can TRUNCATE ${names.join(", ")}: TRUNCATE ignores row-level security and would ` +
+        "wipe every shop's rows. Revoke it (REVOKE TRUNCATE ON <table> FROM invai_app, and from PUBLIC) " +
+        "and fix the migration or default privilege that granted it.",
+    ).toEqual([]);
+  });
+
+  it("no SECURITY DEFINER function owned by an RLS-bypassing role is callable by the app role", async () => {
+    const res = await db.execute<{ fn: string }>(sql`
+      select format('%s.%s(%s)', n.nspname, p.proname, pg_get_function_identity_arguments(p.oid)) as fn
+      from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+      join pg_roles o on o.oid = p.proowner
+      where p.prosecdef
+        and n.nspname not in ('pg_catalog', 'information_schema', 'pg_toast')
+        and n.nspname not like 'pg\\_temp\\_%' and n.nspname not like 'pg\\_toast\\_temp\\_%'
+        and (o.rolsuper or o.rolbypassrls
+          or exists (select 1 from pg_class c where c.relowner = o.oid and c.relkind in ('r', 'p')
+            and c.relnamespace not in (select oid from pg_namespace
+              where nspname in ('pg_catalog', 'information_schema'))))
+        and has_function_privilege('invai_app', p.oid, 'EXECUTE')
+      order by 1`);
+    const bad = res.rows.map((r) => r.fn).filter((fn) => !SECURITY_DEFINER_ALLOWLIST.has(fn));
+    expect(
+      bad,
+      `SECURITY DEFINER function(s) ${bad.join(", ")} run with an owner that bypasses RLS and invai_app ` +
+        "can execute them, so they can return or change every shop's rows. Make them SECURITY INVOKER, " +
+        "or REVOKE EXECUTE ... FROM PUBLIC, invai_app. A legitimate one needs a reason in SECURITY_DEFINER_ALLOWLIST.",
+    ).toEqual([]);
+  });
+});
+
 describe("vendor policies cannot be abused", () => {
   async function shopWithSheet() {
     const shop = (await createCompany({ name: "Shop" })).id;
