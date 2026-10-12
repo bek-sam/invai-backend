@@ -71,10 +71,11 @@ type Result = {
 };
 
 /** Boots env.ts with `dotenv` as the content of a fake .env in a fresh cwd. */
-async function boot(opts: { dotenv?: string; env?: Record<string, string> }) {
+async function boot(opts: { dotenv?: string; dotenvLocal?: string; env?: Record<string, string> }) {
   const cwd = mkdtempSync(join(tmp, "case-"));
   mkdirSync(cwd, { recursive: true });
   if (opts.dotenv !== undefined) writeFileSync(join(cwd, ".env"), opts.dotenv);
+  if (opts.dotenvLocal !== undefined) writeFileSync(join(cwd, ".env.local"), opts.dotenvLocal);
   try {
     const { stdout, stderr } = await run(
       process.execPath,
@@ -160,6 +161,41 @@ describe("paid AI opt-in (decision 0038)", () => {
         paidAi: false,
       });
     }
+  });
+
+  it("B1: NODE_ENV=production written in .env or .env.local does not unlock the keys", async () => {
+    const prod = `NODE_ENV=production\nALLOW_MOCKS=true\n${KEYS_IN_FILE}`;
+    for (const opts of [
+      { dotenv: prod },
+      { dotenvLocal: prod },
+      { dotenv: KEYS_IN_FILE, dotenvLocal: "NODE_ENV=production\nALLOW_MOCKS=true\n" },
+    ]) {
+      const r = await boot(opts);
+      expect(r.ok).toBe(true);
+      expect(r.result).toMatchObject({
+        openai: null,
+        mockAi: true,
+        paidAi: false,
+        evalMode: "mock",
+        image: "mock",
+      });
+    }
+  });
+
+  it("B1: INVAI_PAID_AI=1 in .env.local does not opt in", async () => {
+    const r = await boot({
+      dotenvLocal: `INVAI_PAID_AI=1\n${KEYS_IN_FILE}`,
+      env: { NODE_ENV: "development" },
+    });
+    expect(r.result).toMatchObject({ openai: null, mockAi: true, paidAi: false });
+  });
+
+  it("B1: shell opt-in still works when the file also says production", async () => {
+    const r = await boot({
+      dotenv: `NODE_ENV=production\nALLOW_MOCKS=true\n${KEYS_IN_FILE}`,
+      env: { INVAI_PAID_AI: "1" },
+    });
+    expect(r.result).toMatchObject({ openai: FAKE_KEY, mockAi: false, paidAi: true });
   });
 
   it("AC4: production uses the keys without the flag and prints no lock line", async () => {

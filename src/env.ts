@@ -11,6 +11,8 @@ import { assertProviderAllowed, FIELD_ENCRYPTION_PROVIDERS } from "./lib/field-k
  * (runtimeEnv would read it after the files loaded) and never read it anywhere else.
  */
 const paidAiRequested = process.env.INVAI_PAID_AI === "1";
+/** Same rule for "production": only a NODE_ENV that was in the process env before the files load counts. */
+const prodBeforeDotenv = process.env.NODE_ENV === "production";
 
 // Local development reads .env (Node 24 built-in). Production injects real env vars.
 if (process.env.NODE_ENV !== "production" && !process.env.INVAI_SKIP_DOTENV) {
@@ -275,7 +277,7 @@ function assertTestRedisDbPinned(url: string): string {
 const isTest = raw.NODE_ENV === "test";
 const isProd = raw.NODE_ENV === "production";
 /** Keys present but ignored: not production, no opt-in (tests drop keys regardless: decision 0021). */
-const aiKeysLocked = !isProd && !paidAiRequested;
+const aiKeysLocked = !prodBeforeDotenv && !paidAiRequested;
 const aiKeyLockedNotice =
   aiKeysLocked && !isTest && !!(raw.ANTHROPIC_API_KEY || raw.OPENAI_API_KEY);
 if (aiKeyLockedNotice) {
