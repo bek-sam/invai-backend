@@ -33,12 +33,24 @@ export const SCENE_RULES = [
 
 type SceneDef = { setting: string; person: boolean };
 
+/** Closed list of studio backdrop phrases (T-39-2); `studioBackdrop` picks one from the blank's color. */
+const STUDIO_BACKDROP_LIGHT_GRAY = "a seamless light gray backdrop";
+
+function studioSetting(backdrop: string): string {
+  return `a clean photo studio with ${backdrop} and soft, even lighting`;
+}
+
+/**
+ * The studio backdrop phrase for a blank color (`#rrggbb`). Scaffold (phase 1a): every input,
+ * including a missing or malformed hex, gets the v3 light gray phrase; the luma bands land in 1b.
+ */
+export function studioBackdrop(_blankHex: string): string {
+  return STUDIO_BACKDROP_LIGHT_GRAY;
+}
+
 /** Per kind: the setting, and whether a person (the figure wearing the garment) appears. */
 export const SCENES: Record<PhotoSceneKind, SceneDef> = {
-  studio: {
-    setting: "a clean photo studio with a seamless light gray backdrop and soft, even lighting",
-    person: true,
-  },
+  studio: { setting: studioSetting(STUDIO_BACKDROP_LIGHT_GRAY), person: true },
   home: {
     setting: "a bright, tidy living room with a plain sofa, a potted plant and soft window light",
     person: true,
@@ -173,13 +185,19 @@ export function buildScenePrompt(
   sceneKind: PhotoSceneKind,
   garment: GarmentType,
   blankName: string,
+  /** The blank's `#rrggbb`; optional, and a missing one keeps the v3 wording. */
+  colorHex?: string,
 ): ScenePrompt {
   const scene = SCENES[sceneKind];
+  const setting =
+    sceneKind === "studio" && colorHex !== undefined
+      ? studioSetting(studioBackdrop(colorHex))
+      : scene.setting;
   const containsPerson = sceneContainsPerson(analysis, sceneKind);
   const garmentPhrase = `a ${blankColorWords(blankName)} ${GARMENT_WORDS[garment]}`;
   const text = [
     `Edit the given image of ${garmentPhrase}: the ${GARMENT_WORDS[garment]} and any figure wearing it are fixed objects and stay exactly where they are, with the same outline, size, angle and color.`,
-    `Replace only the background around them with ${scene.setting}.`,
+    `Replace only the background around them with ${setting}.`,
     "Do not add any person, body part or second figure to the image.",
     `Lighting and mood: ${moodFor(analysis)}.`,
     "",

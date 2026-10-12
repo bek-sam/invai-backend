@@ -19,7 +19,7 @@ import { runJobInline } from "../../src/lib/queues";
 import { tenantContext } from "../../src/test/fixtures";
 import { CONTROL_PROMPT_REF, controlGate, runControl } from "./control";
 import { copyKeys, maskStats } from "./frames";
-import { budgetVerdict, ledgerCents } from "./guard";
+import { ledgerCents, paidRunRefusal, parseKinds } from "./guard";
 import { getObject } from "../../src/lib/s3";
 
 /*
@@ -27,9 +27,11 @@ import { getObject } from "../../src/lib/s3";
  * design and blank color through the photos service, runs the scene jobs in process, and prints
  * one line per scene plus totals and the cost from ai_jobs.
  *
- *   tsx evals/scene_trial/run.ts --design "Good Vibes Only Agave" --color white [--scenes 6] [--yes-paid]
+ *   tsx evals/scene_trial/run.ts --design "Good Vibes Only Agave" --color white [--scenes 6] [--kinds studio,studio,studio,home,cafe,outdoor] [--yes-paid]
  *   tsx evals/scene_trial/run.ts --design "Good Vibes Only Agave" --color white --control [--yes-paid]
  *
+ * --kinds (T-39-2) names one scene kind per scene (comma list, exactly --scenes long) and is passed as
+ * lifestyle.sceneKinds; without it the service picks kinds from the analysis or its defaults.
  * --control (T-38-2 AC4) makes one provider call with a fresh scene base and a fixed prompt that
  * asks to change nothing, then prints registration, check 1 and lock scores. It counts in the
  * ledger and the daily cap, creates no photo set, image row or credit charge.
@@ -89,6 +91,13 @@ async function main() {
   );
   if (!design) fail(`no design named "${designName}"`);
 
+  let kinds: ReturnType<typeof parseKinds>;
+  try {
+    kinds = parseKinds(arg("kinds"), scenes);
+  } catch (e) {
+    fail(e instanceof Error ? e.message : String(e));
+  }
+
   // Provider and paid guards, before any call.
   const provider = await getImageProvider(owner.companyId);
   const paid = provider.name !== "mock";
@@ -97,15 +106,17 @@ async function main() {
   // A trial retries a scene once at worst; the control is one call with no retry.
   const worstCase = control ? perImage : scenes * 2 * perImage;
   const ledger = await ledgerCents(since);
-  if (paid || requestedOpenAi) {
-    if (!requestedOpenAi) fail("refused: IMAGE_GEN_PROVIDER=openai is not set in the process environment");
-    if (!flag("yes-paid")) fail("refused: a paid run needs --yes-paid");
-    if (!paid)
-      fail(`refused: openai was requested but the provider resolved to ${provider.name} (missing key or sample workspace)`);
-    const v = budgetVerdict({ ledger, worstCase, budget });
-    if (!v.ok) fail(`refused before any call: ${v.reason}`);
-    console.log(`budget ok: ${v.reason}`);
-  }
+  const refusal = paidRunRefusal({
+    paid,
+    requestedOpenAi,
+    yesPaid: flag("yes-paid"),
+    providerName: provider.name,
+    ledger,
+    worstCase,
+    budget,
+  });
+  if (refusal) fail(refusal);
+  if (paid) console.log(`budget ok: ledger ${ledger}c + worst case ${worstCase}c <= ${budget}c`);
   console.log(
     `provider ${provider.name}/${provider.model}, prompt ${control ? CONTROL_PROMPT_REF : SCENE_PROMPT_REF}, design "${designName}", blank ${color.name}, ${control ? "control call" : `scenes ${scenes}`}, worst case ${worstCase}c, imaging sha ${process.env.SCENE_TRIAL_IMAGING_SHA ?? "unset"}`,
   );
@@ -162,7 +173,7 @@ async function main() {
       views: ["front_flat"],
       channels: ["shopify", "etsy"],
       underbasePreview: true,
-      lifestyle: { count: scenes },
+      lifestyle: kinds ? { count: scenes, sceneKinds: kinds } : { count: scenes },
       idempotencyKey: `scene-trial-${crypto.randomUUID()}`,
     }),
   );

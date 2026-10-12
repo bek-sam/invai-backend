@@ -374,7 +374,13 @@ async function ensureScene(
     if (refusal) return { refusal };
   }
   const provider = await getImageProvider(c.companyId);
-  const prompt = buildScenePrompt(p.analysis, c.sceneKind ?? "studio", c.garment, c.colorName);
+  const prompt = buildScenePrompt(
+    p.analysis,
+    c.sceneKind ?? "studio",
+    c.garment,
+    c.colorName,
+    c.colorHex,
+  );
   const [baseImage, mask] = await step(() =>
     Promise.all([getObject(c.sceneBaseKey as string), getObject(c.sceneMaskKey as string)]),
   );

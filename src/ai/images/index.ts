@@ -20,6 +20,7 @@ export {
   SCENE_PROMPT_REF,
   SCENE_RULES,
   sceneContainsPerson,
+  studioBackdrop,
 } from "./scene-prompt";
 export { providerSize } from "./sizes";
 export * from "./types";

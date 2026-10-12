@@ -6,7 +6,12 @@ import {
   controlGate,
   runControl,
 } from "../../../evals/scene_trial/control";
-import { budgetVerdict, ledgerCents } from "../../../evals/scene_trial/guard";
+import {
+  budgetVerdict,
+  ledgerCents,
+  paidRunRefusal,
+  parseKinds,
+} from "../../../evals/scene_trial/guard";
 import { withSystem, withTenant } from "../../db/client";
 import { aiJobs, photoImages } from "../../db/schema";
 import { env } from "../../env";
@@ -185,5 +190,68 @@ describe("runControl (mock provider, imaging stubbed)", () => {
       tx.select().from(aiJobs).where(eq(aiJobs.companyId, shop.id)),
     );
     expect(rows.map((x) => x.status)).toEqual(["failed"]);
+  });
+});
+
+describe("paidRunRefusal (runner refusals, B-370)", () => {
+  const ok = {
+    paid: true,
+    requestedOpenAi: true,
+    yesPaid: true,
+    providerName: "openai",
+    ledger: 0,
+    worstCase: 100,
+    budget: 300,
+  };
+  it("lets a mock run through with no flags", () => {
+    expect(
+      paidRunRefusal({
+        ...ok,
+        paid: false,
+        requestedOpenAi: false,
+        yesPaid: false,
+        providerName: "mock",
+      }),
+    ).toBeNull();
+  });
+  it("lets a paid run through when every guard holds", () => {
+    expect(paidRunRefusal(ok)).toBeNull();
+  });
+  it("refuses when the provider resolved to openai but the env did not ask for it", () => {
+    expect(paidRunRefusal({ ...ok, requestedOpenAi: false })).toMatch(
+      /IMAGE_GEN_PROVIDER=openai is not set/,
+    );
+  });
+  it("refuses a paid run without --yes-paid", () => {
+    expect(paidRunRefusal({ ...ok, yesPaid: false })).toMatch(/needs --yes-paid/);
+  });
+  it("refuses when openai was requested but the provider resolved to the mock", () => {
+    expect(paidRunRefusal({ ...ok, paid: false, providerName: "mock" })).toMatch(
+      /resolved to mock/,
+    );
+  });
+  it("refuses before any call when the ledger is at or over the budget, or the worst case would pass it", () => {
+    expect(paidRunRefusal({ ...ok, ledger: 300 })).toMatch(/refused before any call/);
+    expect(paidRunRefusal({ ...ok, ledger: 450 })).toMatch(/refused before any call/);
+    expect(paidRunRefusal({ ...ok, ledger: 250 })).toMatch(/exceeds the budget 300c/);
+    expect(paidRunRefusal({ ...ok, budget: 1 })).toMatch(/refused before any call/);
+  });
+  it("checks the env request first, then --yes-paid, then the resolved provider", () => {
+    const all = { ...ok, requestedOpenAi: false, yesPaid: false, paid: false };
+    expect(paidRunRefusal({ ...all, paid: true })).toMatch(/not set/);
+    expect(paidRunRefusal({ ...all, requestedOpenAi: true })).toMatch(/--yes-paid/);
+  });
+});
+
+describe("parseKinds (--kinds)", () => {
+  it("is null without the flag", () => {
+    expect(parseKinds(null, 6)).toBeNull();
+  });
+  it("returns the kinds in order when there is one per scene", () => {
+    expect(parseKinds("studio, studio,home", 3)).toEqual(["studio", "studio", "home"]);
+  });
+  it("rejects an unknown kind and a wrong count", () => {
+    expect(() => parseKinds("studio,beach", 2)).toThrow(/"beach" is not a scene kind/);
+    expect(() => parseKinds("studio,home", 3)).toThrow(/exactly 3 kinds/);
   });
 });

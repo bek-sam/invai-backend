@@ -1,4 +1,5 @@
 import type { DesignPhotoAnalysis } from "@invai/contracts";
+import { PHOTO_SCENE_KINDS } from "@invai/contracts";
 import { eq } from "drizzle-orm";
 import OpenAI from "openai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -28,6 +29,7 @@ import {
   PRINT_AREA_RULE,
   recordImageGen,
   SCENE_RULES,
+  studioBackdrop,
 } from "./index";
 import { createOpenAiImageProvider, openAiImageProvider } from "./openai";
 import { decodePng, encodePng, type Rgba } from "./png";
@@ -747,5 +749,23 @@ describe("assertImageGenAllowed / recordImageGen (AC4)", () => {
     expect(
       (await errFor([{ status: 429, json: { error: { message: "slow down" } } }])).mayBeBilled,
     ).toBe(false);
+  });
+});
+
+describe("studioBackdrop scaffold and the optional blank hex (T-39-2 phase 1a)", () => {
+  it("returns the light gray phrase for every input, including malformed ones", () => {
+    for (const hex of ["#ffffff", "#000000", "#1a2b3c", "", "not a color", "#fff"])
+      expect(studioBackdrop(hex)).toBe("a seamless light gray backdrop");
+  });
+  it("keeps the v3 prompt text byte-identical with a hex, without one, and for every kind", () => {
+    for (const k of PHOTO_SCENE_KINDS) {
+      const bare = buildScenePrompt(null, k, "tee", "Black");
+      expect(buildScenePrompt(null, k, "tee", "Black", "#000000")).toEqual(bare);
+      expect(buildScenePrompt(null, k, "tee", "Black", "#ffffff")).toEqual(bare);
+      expect(buildScenePrompt(null, k, "tee", "Black", "garbage")).toEqual(bare);
+    }
+    expect(buildScenePrompt(null, "studio", "tee", "Black", "#ffffff").text).toContain(
+      "a clean photo studio with a seamless light gray backdrop and soft, even lighting",
+    );
   });
 });
