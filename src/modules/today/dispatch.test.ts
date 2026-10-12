@@ -357,7 +357,8 @@ describe("today.summary dispatch counts", () => {
     const cid = await shop();
     const e = (await createConnection(cid, "etsy")).id;
     const s = (await createConnection(cid, "shopify")).id;
-    for (let i = 0; i < 3; i++) await labeledOrder({ cid, conn: e }, { trackerCheckedAt: ago(1) });
+    const past = await labeledOrder({ cid, conn: e }, { trackerCheckedAt: ago(1) });
+    for (let i = 0; i < 2; i++) await labeledOrder({ cid, conn: e }, { trackerCheckedAt: ago(1) });
     for (let i = 0; i < 2; i++)
       await labeledOrder({ cid, conn: e }, { trackerCheckFailedAt: ago(1) });
     await labeledOrder({ cid, conn: s, channel: "shopify" }, { trackerCheckFailedAt: ago(1) });
@@ -374,14 +375,7 @@ describe("today.summary dispatch counts", () => {
     ]);
     expect(out.orders.dispatchUnconfirmed).toBe(3);
     // a scan lands: both drop
-    const [one] = await withSystem((tx) =>
-      tx
-        .select()
-        .from(shipments)
-        .where(and(eq(shipments.companyId, cid), eq(shipments.status, "labeled")))
-        .limit(1),
-    );
-    await setShipment(one?.id as string, { status: "in_transit" });
+    await setShipment(past.shipment.id, { status: "in_transit" });
     await pass(cid);
     const after = await withTenant(cid, (tx) =>
       summary(tx, tenantContext(cid, null, "office"), {}),
