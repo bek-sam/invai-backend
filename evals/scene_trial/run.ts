@@ -1,7 +1,10 @@
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { and, eq, inArray } from "drizzle-orm";
-import { getImageProvider, IMAGE_JOB_KIND, SCENE_PROMPT_REF } from "../../src/ai/images";
+import { getImageProvider, IMAGE_JOB_KIND, imagesUsedToday } from "../../src/ai/images";
+import { platformSpendKey, spendDay } from "../../src/ai/breaker";
+import { env } from "../../src/env";
+import { redis } from "../../src/lib/queues";
 import { imageCostCents, OPENAI_IMAGE_MODEL } from "../../src/ai/models";
 import { withSystem, withTenant } from "../../src/db/client";
 import {
@@ -19,7 +22,16 @@ import { runJobInline } from "../../src/lib/queues";
 import { tenantContext } from "../../src/test/fixtures";
 import { CONTROL_PROMPT_REF, controlGate, runControl } from "./control";
 import { copyKeys, maskStats } from "./frames";
-import { ledgerCents, paidRunRefusal, parseKinds } from "./guard";
+import {
+  computeCaps,
+  dayEndRefusal,
+  ledgerCents,
+  paidInputsRefusal,
+  paidRunRefusal,
+  parseKinds,
+  promptLabelForBlank,
+  worstCaseCents,
+} from "./guard";
 import { getObject } from "../../src/lib/s3";
 
 /*
@@ -39,7 +51,12 @@ import { getObject } from "../../src/lib/s3";
  *
  * Free with the mock provider. A real provider needs the process environment to carry
  * IMAGE_GEN_PROVIDER=openai, the --yes-paid flag, and a ledger under the budget:
- *   SCENE_TRIAL_SINCE (default 2026-10-12T00:00:00Z), SCENE_TRIAL_BUDGET_CENTS (default 600).
+ *   SCENE_TRIAL_SINCE and SCENE_TRIAL_BUDGET_CENTS: both required on a paid run (no defaults, T-41-5);
+ *   a mock run falls back to 2026-10-12T00:00:00Z and 600.
+ * T-41-5: before the first call it computes and prints its own caps from the ledger (per-shop =
+ * today's counted rows + 2 x scenes; platform = live spend counter + budget left), applies them in
+ * its own process only, and refuses when the worst case (+33c margin) does not fit the budget or
+ * would not end before 23:30Z.
  * Judges frames by metrics only; it never opens an image.
  */
 
@@ -71,8 +88,15 @@ async function main() {
   if (!control && (!Number.isInteger(scenes) || scenes < 1 || scenes > 6))
     fail("--scenes must be 1..6");
 
-  const since = new Date(process.env.SCENE_TRIAL_SINCE ?? "2026-10-12T00:00:00Z");
-  const budget = Number(process.env.SCENE_TRIAL_BUDGET_CENTS ?? 600);
+  const requestedOpenAi = process.env.IMAGE_GEN_PROVIDER === "openai";
+  const inputsRefusal = paidInputsRefusal({
+    paidPath: requestedOpenAi,
+    budgetRaw: process.env.SCENE_TRIAL_BUDGET_CENTS,
+    sinceRaw: process.env.SCENE_TRIAL_SINCE,
+  });
+  if (inputsRefusal) fail(inputsRefusal);
+  const since = new Date(process.env.SCENE_TRIAL_SINCE || "2026-10-12T00:00:00Z");
+  const budget = Number(process.env.SCENE_TRIAL_BUDGET_CENTS || 600);
   if (Number.isNaN(since.getTime()) || !Number.isFinite(budget))
     fail("SCENE_TRIAL_SINCE or SCENE_TRIAL_BUDGET_CENTS is not valid");
 
@@ -101,10 +125,9 @@ async function main() {
   // Provider and paid guards, before any call.
   const provider = await getImageProvider(owner.companyId);
   const paid = provider.name !== "mock";
-  const requestedOpenAi = process.env.IMAGE_GEN_PROVIDER === "openai";
   const perImage = imageCostCents(OPENAI_IMAGE_MODEL, "1024x1024");
   // A trial retries a scene once at worst; the control is one call with no retry.
-  const worstCase = control ? perImage : scenes * 2 * perImage;
+  const worstCase = worstCaseCents({ scenes, control, perImage });
   const ledger = await ledgerCents(since);
   const refusal = paidRunRefusal({
     paid,
@@ -117,8 +140,47 @@ async function main() {
   });
   if (refusal) fail(refusal);
   if (paid) console.log(`budget ok: ledger ${ledger}c + worst case ${worstCase}c <= ${budget}c`);
+
+  // Caps from the ledger (T-41-5 A13): computed on every run and printed; applied only when paid.
+  if ((await redis.ping()) !== "PONG") fail("valkey did not answer PONG");
+  const now = new Date();
+  const platformNow = Number((await redis.get(platformSpendKey(spendDay(now)))) ?? 0);
+  const rows = await withTenant(owner.companyId, (tx) =>
+    imagesUsedToday(tx, owner.companyId, now, provider.name),
+  );
+  const decided = computeCaps({
+    configuredShopCap: env.IMAGE_GEN_DAILY_CAP_PER_SHOP,
+    shopRowsToday: rows,
+    scenes,
+    control,
+    platformSpendNow: platformNow,
+    configuredPlatformCap: env.AI_DAILY_PLATFORM_CAP_CENTS,
+    budget,
+    ledger,
+    worstCase,
+  });
   console.log(
-    `provider ${provider.name}/${provider.model}, prompt ${control ? CONTROL_PROMPT_REF : SCENE_PROMPT_REF}, design "${designName}", blank ${color.name}, ${control ? "control call" : `scenes ${scenes}`}, worst case ${worstCase}c, imaging sha ${process.env.SCENE_TRIAL_IMAGING_SHA ?? "unset"}`,
+    `ledger since ${since.toISOString()}: ${ledger}c of ${budget}c; shop rows today ${rows} (configured cap ${env.IMAGE_GEN_DAILY_CAP_PER_SHOP}); platform spend now ${platformNow}c (configured cap ${env.AI_DAILY_PLATFORM_CAP_CENTS}c, valkey db ${new URL(env.REDIS_URL).pathname.slice(1) || "0"})`,
+  );
+  if (decided.caps)
+    console.log(
+      `computed caps: per-shop ${decided.caps.shopCap}, platform ${decided.caps.platformCap}c${paid ? " (applied to this process)" : " (mock run: printed, not applied)"}`,
+    );
+  if (paid) {
+    if (decided.refusal) fail(decided.refusal);
+    const late = dayEndRefusal({ now, calls: control ? 1 : scenes * 2 });
+    if (late) fail(late);
+    const mutable = env as unknown as {
+      IMAGE_GEN_DAILY_CAP_PER_SHOP: number;
+      AI_DAILY_PLATFORM_CAP_CENTS: number;
+    };
+    if (decided.caps) {
+      mutable.IMAGE_GEN_DAILY_CAP_PER_SHOP = decided.caps.shopCap;
+      mutable.AI_DAILY_PLATFORM_CAP_CENTS = decided.caps.platformCap;
+    }
+  } else if (decided.refusal) console.log(`(mock run, would refuse a paid one: ${decided.refusal})`);
+  console.log(
+    `provider ${provider.name}/${provider.model}, prompt ${control ? CONTROL_PROMPT_REF : promptLabelForBlank(color.hex)}, design "${designName}", blank ${color.name}, ${control ? "control call" : `scenes ${scenes}`}, worst case ${worstCase}c, imaging sha ${process.env.SCENE_TRIAL_IMAGING_SHA ?? "unset"}`,
   );
 
   if (control) {

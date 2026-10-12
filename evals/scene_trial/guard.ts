@@ -1,5 +1,6 @@
 import { PHOTO_SCENE_KINDS, type PhotoSceneKind } from "@invai/contracts";
 import { and, eq, gte, sql } from "drizzle-orm";
+import { isDarkBlank, SCENE_PROMPT_LIGHT_REF, SCENE_PROMPT_REF } from "../../src/ai/images/scene-prompt";
 import { withSystem } from "../../src/db/client";
 import { aiJobs } from "../../src/db/schema";
 
@@ -69,4 +70,85 @@ export function parseKinds(raw: string | null, scenes: number): PhotoSceneKind[]
   if (bad !== undefined) throw new Error(`--kinds: "${bad}" is not a scene kind (${PHOTO_SCENE_KINDS.join(", ")})`);
   if (kinds.length !== scenes) throw new Error(`--kinds must list exactly ${scenes} kinds (one per scene), got ${kinds.length}`);
   return kinds as PhotoSceneKind[];
+}
+
+/** Safety margin added to the worst case of every run (T-41-5 A13: 6 x 2 x 11 + 33 = 165c). */
+export const MARGIN_CENTS = 33;
+/** Stated upper time of one provider call, used for the end-of-day check (T-41-5 A13). */
+export const PER_CALL_UPPER_SECONDS = 180;
+/** A paid run must be over this long before the UTC day ends (23:30Z). */
+export const CUTOFF_UTC_MINUTES = 23 * 60 + 30;
+
+/** The prompt ref a blank's scenes use: v5 only for dark blanks (luma < 0.35), else the frozen v4. */
+export function promptLabelForBlank(blankHex: string): string {
+  return isDarkBlank(blankHex) ? SCENE_PROMPT_REF : SCENE_PROMPT_LIGHT_REF;
+}
+
+/** Worst case of a run in cents: every scene retries once, plus the margin. */
+export function worstCaseCents(opts: { scenes: number; control: boolean; perImage: number }): number {
+  const calls = opts.control ? 1 : opts.scenes * 2;
+  return calls * opts.perImage + MARGIN_CENTS;
+}
+
+/** A paid path has no defaults: budget and since must both be given (A12). Null means fine. */
+export function paidInputsRefusal(opts: {
+  paidPath: boolean;
+  budgetRaw: string | undefined;
+  sinceRaw: string | undefined;
+}): string | null {
+  if (!opts.paidPath) return null;
+  const missing = [
+    opts.budgetRaw === undefined || opts.budgetRaw === "" ? "SCENE_TRIAL_BUDGET_CENTS" : null,
+    opts.sinceRaw === undefined || opts.sinceRaw === "" ? "SCENE_TRIAL_SINCE" : null,
+  ].filter((m): m is string => m !== null);
+  return missing.length
+    ? `refused: a paid run needs ${missing.join(" and ")} set explicitly (no defaults on the paid path)`
+    : null;
+}
+
+/** Refuses when the run's worst case would not end before 23:30Z of the UTC day it starts on. */
+export function dayEndRefusal(opts: { now: Date; calls: number }): string | null {
+  const day = opts.now.toISOString().slice(0, 10);
+  const cutoff = Date.parse(`${day}T00:00:00.000Z`) + CUTOFF_UTC_MINUTES * 60_000;
+  const end = opts.now.getTime() + opts.calls * PER_CALL_UPPER_SECONDS * 1000;
+  return end > cutoff
+    ? `refused: ${opts.calls} calls at up to ${PER_CALL_UPPER_SECONDS}s would end ${new Date(end).toISOString()}, after the 23:30Z cutoff of ${day}`
+    : null;
+}
+
+export type RunCaps = { shopCap: number; platformCap: number };
+
+/**
+ * The caps the runner applies in its own process (never raising a product cap):
+ *   per-shop = today's counted rows + 2 x scenes, refused when that passes the configured cap;
+ *   platform = current spend counter + (budget - ledger), never above the configured platform cap
+ *   (0 or less there means the product cap is off), and refused when it would not cover the
+ *   worst case on top of the counter.
+ */
+export function computeCaps(opts: {
+  configuredShopCap: number;
+  shopRowsToday: number;
+  scenes: number;
+  control: boolean;
+  platformSpendNow: number;
+  configuredPlatformCap: number;
+  budget: number;
+  ledger: number;
+  worstCase: number;
+}): { caps: RunCaps; refusal: null } | { caps: null; refusal: string } {
+  const shopNeeded = opts.shopRowsToday + (opts.control ? 1 : 2 * opts.scenes);
+  if (shopNeeded > opts.configuredShopCap)
+    return {
+      caps: null,
+      refusal: `refused: shop has ${opts.shopRowsToday} rows today, the run needs up to ${shopNeeded}, over the configured per-shop cap ${opts.configuredShopCap}`,
+    };
+  const room = opts.platformSpendNow + Math.max(0, opts.budget - opts.ledger);
+  const platformCap =
+    opts.configuredPlatformCap > 0 ? Math.min(room, opts.configuredPlatformCap) : room;
+  if (platformCap < opts.platformSpendNow + opts.worstCase)
+    return {
+      caps: null,
+      refusal: `refused: platform cap ${platformCap}c (spend now ${opts.platformSpendNow}c, configured ${opts.configuredPlatformCap}c) cannot cover the worst case ${opts.worstCase}c`,
+    };
+  return { caps: { shopCap: shopNeeded, platformCap }, refusal: null };
 }

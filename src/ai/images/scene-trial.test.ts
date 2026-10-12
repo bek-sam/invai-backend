@@ -8,9 +8,14 @@ import {
 } from "../../../evals/scene_trial/control";
 import {
   budgetVerdict,
+  computeCaps,
+  dayEndRefusal,
   ledgerCents,
+  paidInputsRefusal,
   paidRunRefusal,
   parseKinds,
+  promptLabelForBlank,
+  worstCaseCents,
 } from "../../../evals/scene_trial/guard";
 import { withSystem, withTenant } from "../../db/client";
 import { aiJobs, photoImages } from "../../db/schema";
@@ -255,5 +260,109 @@ describe("parseKinds (--kinds)", () => {
   it("rejects an unknown kind and a wrong count", () => {
     expect(() => parseKinds("studio,beach", 2)).toThrow(/"beach" is not a scene kind/);
     expect(() => parseKinds("studio,home", 3)).toThrow(/exactly 3 kinds/);
+  });
+});
+
+describe("worst case (T-41-5 A13)", () => {
+  it("is scenes x 2 calls x price plus 33c, one call plus 33c for the control", () => {
+    expect(worstCaseCents({ scenes: 6, control: false, perImage: 11 })).toBe(165);
+    expect(worstCaseCents({ scenes: 2, control: false, perImage: 11 })).toBe(77);
+    expect(worstCaseCents({ scenes: 0, control: true, perImage: 11 })).toBe(44);
+  });
+});
+
+describe("computeCaps (T-41-5 A13)", () => {
+  const base = {
+    configuredShopCap: 12,
+    shopRowsToday: 0,
+    scenes: 6,
+    control: false,
+    platformSpendNow: 0,
+    configuredPlatformCap: 50_000,
+    budget: 200,
+    ledger: 0,
+    worstCase: 165,
+  };
+  it("sets the per-shop cap to today's rows + 2 x scenes", () => {
+    const r = computeCaps(base);
+    expect(r.caps?.shopCap).toBe(12);
+  });
+  it("counts a shop that already has paid rows today", () => {
+    const r = computeCaps({ ...base, configuredShopCap: 30, shopRowsToday: 5 });
+    expect(r.caps?.shopCap).toBe(17);
+  });
+  it("refuses, and never raises the product cap, when rows + 2 x scenes pass it", () => {
+    const r = computeCaps({ ...base, shopRowsToday: 1 });
+    expect(r.caps).toBeNull();
+    expect(r.refusal).toMatch(/over the configured per-shop cap 12/);
+  });
+  it("sets the platform cap to the live counter plus the budget left", () => {
+    const r = computeCaps({ ...base, platformSpendNow: 40, ledger: 20 });
+    expect(r.caps?.platformCap).toBe(40 + 180);
+  });
+  it("never goes above the configured platform cap, and refuses when that cannot cover the run", () => {
+    expect(
+      computeCaps({ ...base, platformSpendNow: 40, configuredPlatformCap: 100 }).refusal,
+    ).toMatch(/cannot cover the worst case 165c/);
+    expect(
+      computeCaps({ ...base, platformSpendNow: 40, configuredPlatformCap: 300 }).caps?.platformCap,
+    ).toBe(240);
+    expect(
+      computeCaps({ ...base, platformSpendNow: 40, configuredPlatformCap: 210 }).caps?.platformCap,
+    ).toBe(210);
+    expect(
+      computeCaps({ ...base, platformSpendNow: 200, configuredPlatformCap: 300 }).caps,
+    ).toBeNull();
+  });
+  it("treats a configured platform cap of 0 as off and uses the room", () => {
+    expect(computeCaps({ ...base, configuredPlatformCap: 0 }).caps?.platformCap).toBe(200);
+  });
+  it("the control needs one row, not 2 x scenes", () => {
+    const r = computeCaps({ ...base, scenes: 0, control: true, worstCase: 44 });
+    expect(r.caps?.shopCap).toBe(1);
+  });
+});
+
+describe("paidInputsRefusal (T-41-5 A12)", () => {
+  it("refuses a paid path without the budget, without the since date, or without both", () => {
+    expect(
+      paidInputsRefusal({ paidPath: true, budgetRaw: undefined, sinceRaw: "2026-10-13T00:00:00Z" }),
+    ).toMatch(/SCENE_TRIAL_BUDGET_CENTS set explicitly/);
+    expect(paidInputsRefusal({ paidPath: true, budgetRaw: "200", sinceRaw: undefined })).toMatch(
+      /SCENE_TRIAL_SINCE set explicitly/,
+    );
+    expect(paidInputsRefusal({ paidPath: true, budgetRaw: "", sinceRaw: "" })).toMatch(
+      /SCENE_TRIAL_BUDGET_CENTS and SCENE_TRIAL_SINCE/,
+    );
+  });
+  it("lets a paid path with both set, and any mock run, through", () => {
+    expect(
+      paidInputsRefusal({ paidPath: true, budgetRaw: "200", sinceRaw: "2026-10-13T00:00:00Z" }),
+    ).toBeNull();
+    expect(
+      paidInputsRefusal({ paidPath: false, budgetRaw: undefined, sinceRaw: undefined }),
+    ).toBeNull();
+  });
+});
+
+describe("dayEndRefusal (23:30Z)", () => {
+  it("allows a run that ends before 23:30Z and refuses one that would not", () => {
+    // 12 calls x 180 s = 36 min
+    expect(dayEndRefusal({ now: new Date("2026-10-13T10:00:00Z"), calls: 12 })).toBeNull();
+    expect(dayEndRefusal({ now: new Date("2026-10-13T22:54:00Z"), calls: 12 })).toBeNull();
+    expect(dayEndRefusal({ now: new Date("2026-10-13T22:55:00Z"), calls: 12 })).toMatch(
+      /after the 23:30Z cutoff of 2026-10-13/,
+    );
+    expect(dayEndRefusal({ now: new Date("2026-10-13T23:40:00Z"), calls: 1 })).toMatch(/cutoff/);
+  });
+});
+
+describe("promptLabelForBlank (T-41-5)", () => {
+  it("prints v5 only for blanks with luma under 0.35, v4 for every other", () => {
+    expect(promptLabelForBlank("#000000")).toBe("scene_prompt@5");
+    expect(promptLabelForBlank("#1a1a1a")).toBe("scene_prompt@5");
+    expect(promptLabelForBlank("#ffffff")).toBe("scene_prompt@4");
+    expect(promptLabelForBlank("#808080")).toBe("scene_prompt@4");
+    expect(promptLabelForBlank("not-a-hex")).toBe("scene_prompt@4");
   });
 });
