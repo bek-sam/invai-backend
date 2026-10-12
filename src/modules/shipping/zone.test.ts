@@ -122,6 +122,8 @@ const SHIPMENT_COLUMNS = [
   "order_id",
   "order_item_ids",
   "status",
+  "tracker_checked_at",
+  "tracker_check_failed_at",
   "carrier",
   "service",
   "tracking_code",

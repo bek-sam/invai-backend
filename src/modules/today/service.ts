@@ -3,7 +3,7 @@ import { and, eq, inArray, isNull, sql } from "drizzle-orm";
 import type { TenantContext } from "../../api/context";
 import type { Tx } from "../../db/client";
 import { afterCommit } from "../../db/client";
-import type { CompanySettings } from "../../db/schema";
+import type { Channel, CompanySettings } from "../../db/schema";
 import { alerts, companies } from "../../db/schema";
 import { emit } from "../../lib/outbox";
 import { keyset, type PageInput } from "../../lib/pagination";
@@ -130,6 +130,14 @@ export async function summary(tx: Tx, ctx: Ctx, input: { date?: string }): Promi
       count(*) filter (where tracking_push_status = 'failed') as push_failed
     from shipments where company_id = ${cid}`,
   );
+  const dispatchAtRisk = await tx.execute<{ channel: string; n: number }>(
+    sql`select o.channel, count(*)::int as n ${dispatchCandidates(cid)} group by o.channel order by o.channel`,
+  );
+  const dispatchUnconfirmed = await one(
+    tx,
+    sql`select count(*) as n from alerts where company_id = ${cid} and status = 'open'
+      and data->>'messageCode' = 'dispatch_overdue_unconfirmed'`,
+  );
   const staff = await one(
     tx,
     sql`select count(*) as n from members where organization_id = ${cid} and status = 'active'
@@ -160,6 +168,10 @@ export async function summary(tx: Tx, ctx: Ctx, input: { date?: string }): Promi
       atRisk: n(orders.at_risk),
       onHold: n(orders.on_hold),
       newSinceYesterday: n(orders.new_since_yesterday),
+      dispatchAtRisk: dispatchAtRisk.rows
+        .filter((r) => r.n > 0)
+        .map((r) => ({ channel: r.channel as Channel, count: r.n })),
+      dispatchUnconfirmed: n(dispatchUnconfirmed.n),
     },
     blocked: { needsMapping: n(items.needs_mapping), needsArtwork: n(items.needs_artwork) },
     sheets: {
@@ -303,6 +315,90 @@ async function resolveStale(tx: Tx, companyId: string, kinds: string[], keep: Se
       .where(inArray(alerts.id, stale));
   }
   return stale.length;
+}
+
+/** Most tracker polls one pass hands back per company (the rest follow on the next pass). */
+export const DISPATCH_POLL_CAP = 50;
+/** Most dispatch alerts one pass raises per company, oldest ship-by first. */
+export const DISPATCH_ALERT_CAP = 200;
+
+/**
+ * Labeled, unscanned shipments past the order's ship-by: not voided or in transit, order not
+ * cancelled, no unit on hold. `s` is the shipment and `o` its order.
+ */
+const dispatchCandidates = (cid: string) => sql`from shipments s
+  join orders o on o.company_id = s.company_id and o.id = s.order_id
+  where s.company_id = ${cid} and s.status = 'labeled' and o.ship_by < now()
+    and o.status <> 'cancelled'
+    and not exists (select 1 from order_items i where i.company_id = s.company_id
+      and i.order_id = o.id and i.state = 'on_hold')`;
+
+type DispatchRow = {
+  shipment_id: string;
+  order_id: string;
+  order_no: string;
+  channel: string;
+  ship_by: Date;
+  latest_ok: boolean;
+};
+
+/**
+ * Alerts for labels that passed ship-by unscanned. A tracker check made after ship-by decides:
+ * a successful one still `labeled` is `dispatch_overdue`; a failed one (or one that could not
+ * run) is `dispatch_overdue_unconfirmed`. With no check after ship-by nothing is raised yet and
+ * the shipment is handed back in `toPoll` (shipping/jobs imports this module, so the job that
+ * runs the pass enqueues the polls after the transaction commits).
+ */
+async function dispatchPass(
+  tx: Tx,
+  cid: string,
+  timezone: string,
+  shopDate: Intl.DateTimeFormat,
+  raise: (a: AlertInput) => Promise<void>,
+) {
+  const checked = await tx.execute<DispatchRow>(
+    sql`select s.id as shipment_id, o.id as order_id, o.order_no, o.channel, o.ship_by,
+        (s.tracker_checked_at is not null and s.tracker_checked_at > o.ship_by
+          and (s.tracker_check_failed_at is null or s.tracker_checked_at >= s.tracker_check_failed_at)) as latest_ok
+      ${dispatchCandidates(cid)}
+        and greatest(s.tracker_checked_at, s.tracker_check_failed_at) > o.ship_by
+      order by o.ship_by, s.id limit ${DISPATCH_ALERT_CAP}`,
+  );
+  for (const r of checked.rows) {
+    const shipBy = new Date(r.ship_by);
+    const code = r.latest_ok ? "dispatch_overdue" : "dispatch_overdue_unconfirmed";
+    await raise({
+      kind: "order_overdue",
+      severity: "critical",
+      title: `Order ${r.order_no} is past its ship-by with no carrier scan`,
+      message: r.latest_ok
+        ? `Ship-by was ${shopDate.format(shipBy)} and the carrier has not scanned the label.`
+        : `Ship-by was ${shopDate.format(shipBy)}. Carrier updates are delayed, so a scan cannot be confirmed.`,
+      entityType: "order",
+      entityId: r.order_id,
+      dedupeKey: `dispatch_scan_missing:${r.shipment_id}:overdue`,
+      messageCode: code,
+      params: {
+        orderNo: r.order_no,
+        shipBy: shipBy.toISOString(),
+        timeZone: timezone,
+        channel: r.channel as Channel,
+      },
+    });
+  }
+  const unchecked = await tx.execute<{ shipment_id: string; ship_by: Date }>(
+    sql`select s.id as shipment_id, o.ship_by
+      ${dispatchCandidates(cid)}
+        and (greatest(s.tracker_checked_at, s.tracker_check_failed_at) is null
+          or greatest(s.tracker_checked_at, s.tracker_check_failed_at) <= o.ship_by)
+      order by o.ship_by, s.id limit ${DISPATCH_POLL_CAP}`,
+  );
+  return {
+    toPoll: unchecked.rows.map((r) => ({
+      shipmentId: r.shipment_id,
+      shipBy: new Date(r.ship_by).toISOString(),
+    })),
+  };
 }
 
 /**
@@ -452,6 +548,10 @@ export async function generateAlerts(tx: Tx, ctx: Ctx) {
     });
   }
 
+  // Dispatch guard (B-143, default path: no pickup cutoff, only the overdue rule): a label bought,
+  // the order's ship-by passed and the carrier still has not scanned the box.
+  const dispatch = await dispatchPass(tx, cid, timezone, shopDate, raise);
+
   const resolved = await resolveStale(
     tx,
     cid,
@@ -465,7 +565,7 @@ export async function generateAlerts(tx: Tx, ctx: Ctx) {
     ],
     keep,
   );
-  return { open: keep.size, created, resolved };
+  return { open: keep.size, created, resolved, toPoll: dispatch.toPoll };
 }
 
 export type AlertListInput = PageInput & {

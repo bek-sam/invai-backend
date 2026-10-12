@@ -7,6 +7,7 @@ import { env } from "../../env";
 import { errorData, logger } from "../../lib/log";
 import { defineJob, LIVE_JOB_STATES, queues, safeJobId } from "../../lib/queues";
 import { DIGEST_CONFIG as C } from "../digest/config";
+import { pollTrackerJob } from "../shipping/jobs";
 import { realCompanySql } from "../tenancy/demo-flag";
 import { buildTodayActions } from "./actions";
 import { generateAlerts } from "./service";
@@ -21,9 +22,39 @@ export const generateAlertsJob = defineJob({
   name: "today.generateAlerts",
   input: z.object({ companyId: z.uuid(), bucket: z.number().int() }),
   jobId: (i) => `alerts-${i.companyId}-${i.bucket}`,
-  handler: async ({ companyId }) =>
-    withTenant(companyId, (tx) => generateAlerts(tx, systemContext(companyId))),
+  handler: async ({ companyId }) => {
+    const { toPoll, ...result } = await withTenant(companyId, (tx) =>
+      generateAlerts(tx, systemContext(companyId)),
+    );
+    const polled = await enqueueTrackerPolls(companyId, toPoll);
+    return { ...result, polled };
+  },
 });
+
+/**
+ * Hand the dispatch guard's unchecked shipments to the tracker poll once the alert pass has
+ * committed (the pass cannot import the shipping job: shipping/jobs imports today/service). The
+ * guard is DB state (a check after ship-by makes the shipment leave the list); the jobId is only
+ * a first filter. Low priority: the `ship` queue also carries label buys.
+ */
+export async function enqueueTrackerPolls(
+  companyId: string,
+  toPoll: { shipmentId: string; shipBy: string }[],
+) {
+  let enqueued = 0;
+  for (const p of toPoll) {
+    try {
+      await pollTrackerJob.enqueue(
+        { companyId, shipmentId: p.shipmentId },
+        { jobId: `poll-tracker-${p.shipmentId}-${p.shipBy}`, priority: 10 },
+      );
+      enqueued++;
+    } catch (err) {
+      log.warn("could not enqueue a dispatch tracker poll", { companyId, ...errorData(err) });
+    }
+  }
+  return enqueued;
+}
 
 /** Fan-out over every shop (cross-tenant: owner connection, ids only). */
 export const alertsSweepJob = defineJob({

@@ -193,6 +193,11 @@ async function markException(tx: Tx, ctx: TenantContext, shipmentId: string, why
  * `delivered` changes nothing). Runs inside the caller's tenant transaction, shipment locked.
  */
 async function applyReading(tx: Tx, ctx: TenantContext, shipmentId: string, r: TrackerReading) {
+  // Every reading that reaches here is a successful tracker check (T-41-2): webhook, poll, mock timer.
+  await tx
+    .update(shipments)
+    .set({ trackerCheckedAt: new Date() })
+    .where(eq(shipments.id, shipmentId));
   const move = trackerMove(r.status);
   if (move === "in_transit") {
     await markInTransit(tx, ctx, shipmentId);
@@ -472,22 +477,44 @@ export const pollTrackerJob = defineJob({
     const [s] = await withTenant(companyId, (tx) =>
       tx.select().from(shipments).where(eq(shipments.id, shipmentId)),
     );
-    if (s?.status !== "labeled" || !s.carrierShipmentId || !s.trackingCode)
-      return { skipped: true };
+    if (s?.status !== "labeled") return { skipped: true };
+    // A check that could not run on a labeled shipment counts as a failed check (the dispatch
+    // guard then says "cannot confirm" instead of polling again). Our own throttle writes nothing.
+    if (!s.carrierShipmentId || !s.trackingCode) return skipFailed(companyId, shipmentId);
     const tracking = await carrierTracking({ companyId });
     // EasyPost index and read endpoints allow about 5 requests per second per account.
     if (tracking.provider === "easypost")
       await takeToken("easypost:trackers", { capacity: 5, perMs: 1_000 }, 120_000);
-    const update = await tracking.track({
-      companyId,
-      carrierShipmentId: s.carrierShipmentId,
-      trackingCode: s.trackingCode,
-      carrier: s.carrier,
-    });
-    if (!update || update.trackingCode !== s.trackingCode) return { skipped: true };
+    let update: Awaited<ReturnType<typeof tracking.track>>;
+    try {
+      update = await tracking.track({
+        companyId,
+        carrierShipmentId: s.carrierShipmentId,
+        trackingCode: s.trackingCode,
+        carrier: s.carrier,
+      });
+    } catch (err) {
+      await markCheckFailed(companyId, shipmentId);
+      throw err;
+    }
+    if (!update || update.trackingCode !== s.trackingCode) return skipFailed(companyId, shipmentId);
     return applyTrackerUpdate(companyId, shipmentId, update);
   },
 });
+
+async function markCheckFailed(companyId: string, shipmentId: string) {
+  await withTenant(companyId, (tx) =>
+    tx
+      .update(shipments)
+      .set({ trackerCheckFailedAt: new Date() })
+      .where(and(eq(shipments.id, shipmentId), eq(shipments.status, "labeled"))),
+  );
+}
+
+async function skipFailed(companyId: string, shipmentId: string) {
+  await markCheckFailed(companyId, shipmentId);
+  return { skipped: true };
+}
 
 /** Daily fan-out: shipments still `labeled` 3+ days after the label (cross-tenant, ids only). */
 export const trackerPollSweepJob = defineJob({
