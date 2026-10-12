@@ -779,6 +779,12 @@ describe("studioBackdrop bands and the optional blank hex (T-39-2 phase 1b)", ()
     expect(studioBackdrop(gray(218))).toContain(MID);
     expect(studioBackdrop(gray(215))).toContain(PALE);
   });
+  it("puts a color exactly on luma 0.85 in the white band, and tells R/G weights apart", () => {
+    // 0.2126*127 + 0.7152*243 + 0.0722*221 = 216.8 -> 0.8503
+    expect(studioBackdrop("#7ff3dd")).toContain(MID);
+    // red and green swapped: 158.4 with the right weights, 216.8 with swapped ones
+    expect(studioBackdrop("#f37fdd")).toContain(PALE);
+  });
   it("weights the channels like imaging (a saturated green is lighter than a saturated blue)", () => {
     // green 0.7152 -> level 255 gives 0.715 < 0.85; luma stays below the split for pure channels
     expect(studioBackdrop("#00ff00")).toContain(PALE);

@@ -46,7 +46,7 @@ describe("budgetVerdict", () => {
 });
 
 describe("ledgerCents", () => {
-  it("sums image_scene cents created since the given time, and nothing older", async () => {
+  it("sums every openai row (any kind) created since the given time, and nothing older or non-openai", async () => {
     const shop = await createCompany();
     const since = new Date("2031-03-01T00:00:00Z");
     const row = (createdAt: Date, costCents: number, kind: "image_scene" | "listing_draft") => ({
@@ -62,17 +62,19 @@ describe("ledgerCents", () => {
       createdAt,
     });
     await withTenant(shop.id, (tx) =>
-      tx
-        .insert(aiJobs)
-        .values([
-          row(new Date("2031-02-28T23:59:59Z"), 50, "image_scene"),
-          row(new Date("2031-03-01T00:00:00Z"), 11, "image_scene"),
-          row(new Date("2031-03-02T10:00:00Z"), 22, "image_scene"),
-          row(new Date("2031-03-02T10:00:00Z"), 99, "listing_draft"),
-        ]),
+      tx.insert(aiJobs).values([
+        row(new Date("2031-02-28T23:59:59Z"), 50, "image_scene"),
+        row(new Date("2031-03-01T00:00:00Z"), 11, "image_scene"),
+        row(new Date("2031-03-02T10:00:00Z"), 22, "image_scene"),
+        row(new Date("2031-03-02T10:00:00Z"), 99, "listing_draft"),
+        {
+          ...row(new Date("2031-03-02T10:00:00Z"), 500, "listing_draft"),
+          provider: "mock" as const,
+        },
+      ]),
     );
-    expect(await ledgerCents(since)).toBe(33);
-    expect(await ledgerCents(new Date("2031-03-02T00:00:00Z"))).toBe(22);
+    expect(await ledgerCents(since)).toBe(132);
+    expect(await ledgerCents(new Date("2031-03-02T00:00:00Z"))).toBe(121);
     expect(await ledgerCents(new Date("2031-04-01T00:00:00Z"))).toBe(0);
   });
 });

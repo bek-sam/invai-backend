@@ -1,6 +1,5 @@
 import { PHOTO_SCENE_KINDS, type PhotoSceneKind } from "@invai/contracts";
 import { and, eq, gte, sql } from "drizzle-orm";
-import { IMAGE_JOB_KIND } from "../../src/ai/images";
 import { withSystem } from "../../src/db/client";
 import { aiJobs } from "../../src/db/schema";
 
@@ -9,13 +8,13 @@ import { aiJobs } from "../../src/db/schema";
  * test in src/ can pin it without starting the runner.
  */
 
-/** Cents spent on image_scene calls since `since`, all tenants (the dev DB is one workspace). */
+/** Cents spent on every OpenAI call (any kind, so paid text routes count too) since `since`, all tenants. */
 export async function ledgerCents(since: Date): Promise<number> {
   const [row] = await withSystem((tx) =>
     tx
       .select({ cents: sql<number>`coalesce(sum(${aiJobs.costCents}), 0)::int` })
       .from(aiJobs)
-      .where(and(eq(aiJobs.kind, IMAGE_JOB_KIND), gte(aiJobs.createdAt, since))),
+      .where(and(eq(aiJobs.provider, "openai"), gte(aiJobs.createdAt, since))),
   );
   return row?.cents ?? 0;
 }
