@@ -1,18 +1,25 @@
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { withSystem } from "../../db/client";
-import { shipments } from "../../db/schema";
+import { withSystem, withTenant } from "../../db/client";
+import { alerts, orderItems, orders, shipments } from "../../db/schema";
 import type { TrackerUpdate, TrackingAdapter } from "../../integrations/carriers";
 import * as carriersModule from "../../integrations/carriers";
 import * as ratelimit from "../../integrations/suppliers/ratelimit";
 import { runJobInline } from "../../lib/queues";
-import { createCompany, createConnection, createOrder } from "../../test/fixtures";
+import {
+  createCompany,
+  createConnection,
+  createLocation,
+  createOrder,
+  tenantContext,
+} from "../../test/fixtures";
+import { generateAlerts } from "../today/service";
 import { pollTrackerJob, processCarrierEvent } from "./jobs";
 
 /*
  * T-41-2 (B-143) A3: what counts as a tracker check on a labeled shipment. A successful reading
  * (poll, routed carrier event) sets trackerCheckedAt; a poll that could not run or got nothing
- * back sets trackerCheckFailedAt; our own throttle timing out writes nothing.
+ * back sets trackerCheckFailedAt; our own throttle timing out writes nothing on earlier attempts.
  */
 
 vi.mock("../../integrations/carriers", async (importOriginal) => {
@@ -29,6 +36,7 @@ let conn: string;
 
 beforeAll(async () => {
   companyId = (await createCompany()).id;
+  await createLocation(companyId);
   conn = (await createConnection(companyId, "etsy")).id;
 });
 
@@ -86,6 +94,8 @@ async function labeled(over: Partial<typeof shipments.$inferInsert> = {}) {
 const row = async (id: string) =>
   (await withSystem((tx) => tx.select().from(shipments).where(eq(shipments.id, id))))[0];
 const poll = (shipmentId: string) => runJobInline(pollTrackerJob, { companyId, shipmentId });
+const pollAttempt = (shipmentId: string, attempt: number) =>
+  runJobInline(pollTrackerJob, { companyId, shipmentId }, { attempt, attempts: 3 });
 
 describe("pollTrackerJob writes the check", () => {
   it("a pre-transit reading is a success: trackerCheckedAt set, still labeled; run twice, still one state", async () => {
@@ -138,15 +148,48 @@ describe("pollTrackerJob writes the check", () => {
     expect(r?.trackerCheckedAt).toBeNull();
   });
 
-  it("our own throttle timing out writes nothing", async () => {
+  it("our own throttle timing out on a non-final attempt writes nothing", async () => {
     const s = await labeled();
     useTracking("ok", "easypost");
     vi.mocked(ratelimit.takeToken).mockRejectedValue(new Error("rate limit wait exceeded"));
-    await expect(poll(s.id)).rejects.toThrow("rate limit wait");
+    await expect(pollAttempt(s.id, 1)).rejects.toThrow("rate limit wait");
+    await expect(pollAttempt(s.id, 2)).rejects.toThrow("rate limit wait");
     expect(tracks).toBe(0);
     const r = await row(s.id);
     expect(r?.trackerCheckFailedAt).toBeNull();
     expect(r?.trackerCheckedAt).toBeNull();
+  });
+
+  it("the final attempt timing out on our throttle records a failed check; the next pass alerts", async () => {
+    const s = await labeled();
+    const shipBy = new Date(Date.now() - 10 * 3_600_000);
+    await withSystem(async (tx) => {
+      await tx.update(orders).set({ shipBy }).where(eq(orders.id, s.orderId));
+      await tx.update(orderItems).set({ shipBy }).where(eq(orderItems.orderId, s.orderId));
+    });
+    useTracking("ok", "easypost");
+    vi.mocked(ratelimit.takeToken).mockRejectedValue(new Error("rate limit wait exceeded"));
+    await expect(pollAttempt(s.id, 3)).rejects.toThrow("rate limit wait");
+    const r = await row(s.id);
+    expect(r?.trackerCheckFailedAt).toBeInstanceOf(Date);
+    expect(r?.status).toBe("labeled");
+    const ctx = tenantContext(companyId, null, "owner");
+    await withTenant(companyId, (tx) => generateAlerts(tx, ctx));
+    const rows = await withSystem((tx) =>
+      tx
+        .select()
+        .from(alerts)
+        .where(
+          and(
+            eq(alerts.companyId, companyId),
+            eq(alerts.dedupeKey, `dispatch_scan_missing:${s.id}:overdue`),
+          ),
+        ),
+    );
+    expect(rows).toHaveLength(1);
+    const data = (rows[0]?.data ?? {}) as { messageCode?: string };
+    expect(data.messageCode).toBe("dispatch_overdue_unconfirmed");
+    expect(rows[0]?.severity).toBe("critical");
   });
 
   it("a shipment that is no longer labeled is skipped without a write", async () => {

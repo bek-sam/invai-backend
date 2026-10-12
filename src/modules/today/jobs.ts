@@ -46,7 +46,7 @@ export async function enqueueTrackerPolls(
     try {
       await pollTrackerJob.enqueue(
         { companyId, shipmentId: p.shipmentId },
-        { jobId: `poll-tracker-${p.shipmentId}-${p.shipBy}`, priority: 10 },
+        { jobId: `poll-tracker-${p.shipmentId}-${p.shipBy}`, priority: 10, removeOnFail: true },
       );
       enqueued++;
     } catch (err) {

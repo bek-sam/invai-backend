@@ -18,7 +18,7 @@ import { takeToken } from "../../integrations/suppliers/ratelimit";
 import { isORPCError } from "../../lib/errors";
 import { errorData, logger } from "../../lib/log";
 import { emit } from "../../lib/outbox";
-import { defineJob, onEvent, queues, redis } from "../../lib/queues";
+import { defineJob, isFinalAttempt, onEvent, queues, redis } from "../../lib/queues";
 import { publish } from "../../lib/realtime";
 import { raiseAlert } from "../today/service";
 import {
@@ -473,34 +473,46 @@ export const pollTrackerJob = defineJob({
   name: "shipping.pollTracker",
   input: z.object({ companyId: z.uuid(), shipmentId: z.uuid() }),
   options: { attempts: 3, backoff: { type: "exponential", delay: 60_000 } },
-  handler: async ({ companyId, shipmentId }) => {
+  handler: async ({ companyId, shipmentId }, job) => {
     const [s] = await withTenant(companyId, (tx) =>
       tx.select().from(shipments).where(eq(shipments.id, shipmentId)),
     );
     if (s?.status !== "labeled") return { skipped: true };
-    // A check that could not run on a labeled shipment counts as a failed check (the dispatch
-    // guard then says "cannot confirm" instead of polling again). Our own throttle writes nothing.
-    if (!s.carrierShipmentId || !s.trackingCode) return skipFailed(companyId, shipmentId);
-    const tracking = await carrierTracking({ companyId });
-    // EasyPost index and read endpoints allow about 5 requests per second per account.
-    if (tracking.provider === "easypost")
-      await takeToken("easypost:trackers", { capacity: 5, perMs: 1_000 }, 120_000);
-    let update: Awaited<ReturnType<typeof tracking.track>>;
     try {
-      update = await tracking.track({
-        companyId,
-        carrierShipmentId: s.carrierShipmentId,
-        trackingCode: s.trackingCode,
-        carrier: s.carrier,
-      });
+      return await pollOnce(companyId, shipmentId, s);
     } catch (err) {
-      await markCheckFailed(companyId, shipmentId);
+      // The guard's jobId must not go quiet: when the last attempt fails for any reason (our own
+      // throttle timing out, a DB error), record a failed check so the next pass alerts the shop.
+      // Earlier attempts write nothing here (an adapter throw still records its own).
+      if (isFinalAttempt(job)) await markCheckFailed(companyId, shipmentId);
       throw err;
     }
-    if (!update || update.trackingCode !== s.trackingCode) return skipFailed(companyId, shipmentId);
-    return applyTrackerUpdate(companyId, shipmentId, update);
   },
 });
+
+async function pollOnce(companyId: string, shipmentId: string, s: typeof shipments.$inferSelect) {
+  // A check that could not run on a labeled shipment counts as a failed check (the dispatch
+  // guard then says "cannot confirm" instead of polling again). Our own throttle writes nothing.
+  if (!s.carrierShipmentId || !s.trackingCode) return skipFailed(companyId, shipmentId);
+  const tracking = await carrierTracking({ companyId });
+  // EasyPost index and read endpoints allow about 5 requests per second per account.
+  if (tracking.provider === "easypost")
+    await takeToken("easypost:trackers", { capacity: 5, perMs: 1_000 }, 120_000);
+  let update: Awaited<ReturnType<typeof tracking.track>>;
+  try {
+    update = await tracking.track({
+      companyId,
+      carrierShipmentId: s.carrierShipmentId,
+      trackingCode: s.trackingCode,
+      carrier: s.carrier,
+    });
+  } catch (err) {
+    await markCheckFailed(companyId, shipmentId);
+    throw err;
+  }
+  if (!update || update.trackingCode !== s.trackingCode) return skipFailed(companyId, shipmentId);
+  return applyTrackerUpdate(companyId, shipmentId, update);
+}
 
 async function markCheckFailed(companyId: string, shipmentId: string) {
   await withTenant(companyId, (tx) =>

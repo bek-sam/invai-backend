@@ -327,7 +327,7 @@ describe("dispatch guard: tracker polls handed back", () => {
     expect(await enqueueTrackerPolls(companyId, [{ shipmentId: sid, shipBy }])).toBe(1);
     expect(calls[0]).toEqual({
       input: { companyId, shipmentId: sid },
-      opts: { jobId: `poll-tracker-${sid}-${shipBy}`, priority: 10 },
+      opts: { jobId: `poll-tracker-${sid}-${shipBy}`, priority: 10, removeOnFail: true },
     });
     spy.mockRestore();
     // the real id passes through safeJobId (no colons), so BullMQ accepts the ISO time
