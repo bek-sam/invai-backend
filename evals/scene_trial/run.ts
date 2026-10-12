@@ -1,5 +1,5 @@
-import { and, eq, gte, inArray, sql } from "drizzle-orm";
-import { getImageProvider, IMAGE_JOB_KIND } from "../../src/ai/images";
+import { and, eq, inArray } from "drizzle-orm";
+import { getImageProvider, IMAGE_JOB_KIND, SCENE_PROMPT_REF } from "../../src/ai/images";
 import { imageCostCents, OPENAI_IMAGE_MODEL } from "../../src/ai/models";
 import { withSystem, withTenant } from "../../src/db/client";
 import {
@@ -13,9 +13,10 @@ import {
 import { imaging } from "../../src/integrations/imaging/client";
 import { renderCompositionJob, renderSceneJob } from "../../src/modules/photos/jobs";
 import * as svc from "../../src/modules/photos/service";
-import { SCENE_SIZE_PX } from "../../src/modules/photos/service";
 import { runJobInline } from "../../src/lib/queues";
 import { tenantContext } from "../../src/test/fixtures";
+import { CONTROL_PROMPT_REF, controlGate, runControl } from "./control";
+import { budgetVerdict, ledgerCents } from "./guard";
 
 /*
  * Scene trial runner (T-37-2 AC3, AC4). Creates one photo set with lifestyle scenes for a named
@@ -23,6 +24,12 @@ import { tenantContext } from "../../src/test/fixtures";
  * one line per scene plus totals and the cost from ai_jobs.
  *
  *   tsx evals/scene_trial/run.ts --design "Good Vibes Only Agave" --color white [--scenes 6] [--yes-paid]
+ *   tsx evals/scene_trial/run.ts --design "Good Vibes Only Agave" --color white --control [--yes-paid]
+ *
+ * --control (T-38-2 AC4) makes one provider call with a fresh scene base and a fixed prompt that
+ * asks to change nothing, then prints registration, check 1 and lock scores. It counts in the
+ * ledger and the daily cap, creates no photo set, image row or credit charge.
+ * SCENE_TRIAL_IMAGING_SHA (optional) is printed so a run is tied to the imaging build (the mask).
  *
  * Free with the mock provider. A real provider needs the process environment to carry
  * IMAGE_GEN_PROVIDER=openai, the --yes-paid flag, and a ledger under the budget:
@@ -47,40 +54,16 @@ function fail(msg: string): never {
   process.exit(2);
 }
 
-/** Cents spent on image_scene calls since `since`, all tenants (the dev DB is one workspace). */
-export async function ledgerCents(since: Date): Promise<number> {
-  const [row] = await withSystem((tx) =>
-    tx
-      .select({ cents: sql<number>`coalesce(sum(${aiJobs.costCents}), 0)::int` })
-      .from(aiJobs)
-      .where(and(eq(aiJobs.kind, IMAGE_JOB_KIND), gte(aiJobs.createdAt, since))),
-  );
-  return row?.cents ?? 0;
-}
-
-/** The guard of AC4 as a pure function, so a test can pin it. */
-export function budgetVerdict(opts: {
-  ledger: number;
-  worstCase: number;
-  budget: number;
-}): { ok: boolean; reason: string } {
-  const total = opts.ledger + opts.worstCase;
-  return total > opts.budget
-    ? {
-        ok: false,
-        reason: `ledger ${opts.ledger}c + worst case ${opts.worstCase}c = ${total}c exceeds the budget ${opts.budget}c`,
-      }
-    : { ok: true, reason: `ledger ${opts.ledger}c + worst case ${opts.worstCase}c <= ${opts.budget}c` };
-}
-
 type Composite = Awaited<ReturnType<typeof imaging.photoSceneComposite>>;
 
 async function main() {
   const designName = arg("design") ?? fail("--design <name> is required");
   const colorKey = (arg("color") ?? fail("--color white|black is required")) as keyof typeof COLORS;
   const color = COLORS[colorKey] ?? fail("--color must be white or black");
-  const scenes = Number(arg("scenes") ?? 6);
-  if (!Number.isInteger(scenes) || scenes < 1 || scenes > 6) fail("--scenes must be 1..6");
+  const control = flag("control");
+  const scenes = control ? 0 : Number(arg("scenes") ?? 6);
+  if (!control && (!Number.isInteger(scenes) || scenes < 1 || scenes > 6))
+    fail("--scenes must be 1..6");
 
   const since = new Date(process.env.SCENE_TRIAL_SINCE ?? "2026-10-12T00:00:00Z");
   const budget = Number(process.env.SCENE_TRIAL_BUDGET_CENTS ?? 600);
@@ -107,7 +90,8 @@ async function main() {
   const paid = provider.name !== "mock";
   const requestedOpenAi = process.env.IMAGE_GEN_PROVIDER === "openai";
   const perImage = imageCostCents(OPENAI_IMAGE_MODEL, "1024x1024");
-  const worstCase = scenes * 2 * perImage;
+  // A trial retries a scene once at worst; the control is one call with no retry.
+  const worstCase = control ? perImage : scenes * 2 * perImage;
   const ledger = await ledgerCents(since);
   if (paid || requestedOpenAi) {
     if (!requestedOpenAi) fail("refused: IMAGE_GEN_PROVIDER=openai is not set in the process environment");
@@ -119,8 +103,33 @@ async function main() {
     console.log(`budget ok: ${v.reason}`);
   }
   console.log(
-    `provider ${provider.name}/${provider.model}, prompt scene_prompt, design "${designName}", blank ${color.name}, scenes ${scenes}, worst case ${worstCase}c`,
+    `provider ${provider.name}/${provider.model}, prompt ${control ? CONTROL_PROMPT_REF : SCENE_PROMPT_REF}, design "${designName}", blank ${color.name}, ${control ? "control call" : `scenes ${scenes}`}, worst case ${worstCase}c, imaging sha ${process.env.SCENE_TRIAL_IMAGING_SHA ?? "unset"}`,
   );
+
+  if (control) {
+    const { front } = await withTenant(owner.companyId, (tx) =>
+      svc.printFile(tx, tenantContext(owner.companyId, owner.userId, "owner"), design.id),
+    );
+    if (!front) fail(`design "${designName}" has no front print file`);
+    const r = await runControl({
+      companyId: owner.companyId,
+      userId: owner.userId,
+      provider,
+      design: front,
+      colorHex: color.hex,
+    });
+    const f = (n: number | null) => (n == null ? "-" : n.toFixed(3));
+    const g = controlGate(r.scores);
+    console.log(
+      `control: ${r.scores.passes ? "PASS" : "FAIL"} | codes ${r.scores.failures.join(",") || "-"} | reasons ${r.scores.regionReasons.join(",") || "-"} | structural ${r.scores.structural} | reg ${f(r.scores.registration)} | c1 ${f(r.scores.c1)} | lock ${f(r.scores.lock)}`,
+    );
+    console.log(`control keys: base ${r.keys.base} mask ${r.keys.mask} scene ${r.keys.scene}`);
+    console.log(`control gate: ${g.reason}`);
+    console.log(
+      `cost: ${r.cents}c for 1 image_scene ai_job ${r.aiJobId}; ledger since ${since.toISOString()} now ${await ledgerCents(since)}c of ${budget}c`,
+    );
+    return;
+  }
 
   // Capture the full imaging result of every composite (the DB keeps only part of it).
   const seen = new Map<string, Composite[]>();
@@ -146,6 +155,17 @@ async function main() {
     }),
   );
   console.log(`set ${set.id}`);
+
+  // Every trial composition is new (A10): ensureBase reuses a stored base and mask, so a stored
+  // key here would send an old mask. The set was just created; assert it.
+  const fresh = await withTenant(owner.companyId, (tx) =>
+    tx
+      .select({ id: photoCompositions.id, base: photoCompositions.sceneBaseKey })
+      .from(photoCompositions)
+      .where(eq(photoCompositions.setId, set.id)),
+  );
+  if (fresh.some((c) => c.base !== null)) fail("a trial composition already has a stored scene base");
+  console.log(`fresh compositions: ${fresh.length}, none with a stored scene base`);
 
   for (const c of await svc.openCompositionsBySource(owner.companyId, set.id)) {
     if (c.source === "ai_scene")
@@ -175,13 +195,14 @@ async function main() {
     : [];
 
   console.log(
-    "kind | attempts | calls | pass | codes | region_reasons | structural | c1 | lock | structural_skips",
+    "kind | attempts | calls | pass | codes | region_reasons | structural | c1 | lock | reg per frame | structural_skips",
   );
   let scenesPassed = 0;
   let framesPassed = 0;
   let framesTotal = 0;
   let calls = 0;
   let skips = 0;
+  const regs: number[] = [];
   for (const c of comps) {
     const imgs = images.filter((i) => i.compositionId === c.id);
     const nCalls = jobs.filter((j) => j.entityId === c.id).length;
@@ -192,6 +213,10 @@ async function main() {
     const codes = [...new Set(imgs.flatMap((i) => (i.checks?.failures ?? []).map((f) => f.code)))].join(",") || "-";
     const reasons = [...new Set(composites.flatMap((r) => r.checks.region_reasons ?? []))].join(",") || "-";
     const structural = composites.length > 0 && composites.every((r) => r.checks.structural === true);
+    const sceneRegs = composites
+      .map((r) => r.registration?.score)
+      .filter((n): n is number => typeof n === "number");
+    regs.push(...sceneRegs);
     const skipped = structural && nCalls === 1 && !ok ? 1 : 0;
     scenesPassed += ok ? 1 : 0;
     framesPassed += framesOk;
@@ -210,10 +235,20 @@ async function main() {
         structural,
         f(last?.checks.region_unchanged_score),
         f(last?.checks.design_lock_score),
+        sceneRegs.length ? sceneRegs.map((n) => n.toFixed(3)).join("/") : "-",
         skipped,
       ].join(" | "),
     );
   }
+  const sorted = [...regs].sort((a, b) => a - b);
+  const mid = sorted.length
+    ? sorted.length % 2
+      ? (sorted[(sorted.length - 1) / 2] as number)
+      : ((sorted[sorted.length / 2 - 1] as number) + (sorted[sorted.length / 2] as number)) / 2
+    : null;
+  console.log(
+    `registration over ${sorted.length} frames: min ${sorted[0]?.toFixed(3) ?? "-"} median ${mid?.toFixed(3) ?? "-"} max ${sorted.at(-1)?.toFixed(3) ?? "-"}`,
+  );
   const cents = jobs.reduce((n, j) => n + j.cents, 0);
   console.log(
     `totals: scenes ${scenesPassed}/${comps.length}, frames ${framesPassed}/${framesTotal}, provider calls ${calls}, structural skips ${skips}`,

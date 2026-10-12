@@ -1,6 +1,6 @@
 import { IMAGE_CAP_ERRORS } from "@invai/contracts";
 import { ORPCError } from "@orpc/server";
-import { and, eq, gt, gte, lt, or, sql } from "drizzle-orm";
+import { and, eq, gt, gte, lt, ne, or, sql } from "drizzle-orm";
 import { type Tx, withTenant } from "../../db/client";
 import { aiJobs } from "../../db/schema";
 import { env } from "../../env";
@@ -21,8 +21,9 @@ import {
  * Caps before every scene call (T-27-1 AC4), in the order a shop can act on them:
  *  1. the per-shop daily image cap (IMAGE_GEN_DAILY_CAP_PER_SHOP, UTC day like breaker.ts),
  *     counted from today's `image_scene` ai_jobs rows that finished or cost money (a timed-out
- *     paid call counts, S-53); mock scenes count too, so the limit can be seen and tested without
- *     spend;
+ *     paid call counts, S-53). For the mock provider every such row counts, so the limit can be seen
+ *     and tested without spend. For a real provider, free mock rows (provider 'mock' at 0 cents) do
+ *     not use up the real cap (T-38-2, B-368); any row that cost money counts, whatever its label;
  *  2. AI credits (PHOTO_SCENE_CREDITS per scene, plus credits already promised to open sets);
  *  3. the platform/tenant daily AI spend breaker with this call's estimated cost (real provider
  *     only: the mock never touches money counters).
@@ -39,9 +40,17 @@ function utcDayBounds(now: Date): { start: Date; end: Date } {
 
 /**
  * Scenes for this company today (UTC): finished ones plus failed calls that were charged (S-53).
+ * `providerName` is the provider about to be used: for a real one (not "mock") a row that is
+ * provider 'mock' with cost_cents 0 is left out; every other row counts. Without it, or for the
+ * mock, all rows count. (`ai_jobs.provider` is NOT NULL, so there is no null case.)
  * Runs inside the caller's tenant transaction.
  */
-export async function imagesUsedToday(tx: Tx, companyId: string, now = new Date()) {
+export async function imagesUsedToday(
+  tx: Tx,
+  companyId: string,
+  now = new Date(),
+  providerName?: string,
+) {
   const { start, end } = utcDayBounds(now);
   const [r] = await tx
     .select({ n: sql<number>`count(*)::int` })
@@ -51,6 +60,9 @@ export async function imagesUsedToday(tx: Tx, companyId: string, now = new Date(
         eq(aiJobs.companyId, companyId),
         eq(aiJobs.kind, IMAGE_JOB_KIND),
         or(eq(aiJobs.status, "done"), gt(aiJobs.costCents, 0)),
+        providerName === undefined || providerName === "mock"
+          ? undefined
+          : or(ne(aiJobs.provider, "mock"), gt(aiJobs.costCents, 0)),
         gte(aiJobs.createdAt, start),
         lt(aiJobs.createdAt, end),
       ),
@@ -88,7 +100,7 @@ export async function assertImageGenAllowedWith(
     throw new Error("image count must be a positive integer");
   const now = opts.now ?? new Date();
   const cap = env.IMAGE_GEN_DAILY_CAP_PER_SHOP;
-  const used = await imagesUsedToday(tx, companyId, now);
+  const used = await imagesUsedToday(tx, companyId, now, provider.name);
   if (used + count > cap) throw imageCapReached(cap, used, now);
   await assertCredits(
     tx,

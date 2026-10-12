@@ -284,7 +284,23 @@ describe("buildScenePrompt (AC5)", () => {
     expect(p.text).toContain("heather dark navy hoodie");
     expect(p.text).toContain(PRINT_AREA_RULE);
     expect(p.text.endsWith(SCENE_RULES)).toBe(true);
-    expect(p.ref).toBe("scene_prompt@2");
+    expect(p.ref).toBe("scene_prompt@3");
+  });
+
+  it("v3 adds no person, whatever the kind; the disclosure flags are unchanged (P1, P2)", () => {
+    const kinds = ["studio", "home", "outdoor", "street", "cafe", "workplace", "flat_lay"] as const;
+    for (const k of kinds) {
+      const p = buildScenePrompt(null, k, "tee", "Black");
+      expect(p.ref).toBe("scene_prompt@3");
+      expect(p.text).toContain("Do not add any person, body part or second figure");
+      expect(p.text).not.toMatch(/fictional adult model|partly visible|stands/);
+      // Same values as before v3: every kind but flat lay assumes a person (0023 section 3).
+      expect(p.containsPerson).toBe(k !== "flat_lay");
+    }
+    const a = analysis({
+      sceneSuggestions: [{ kind: "flat_lay", description: "x", containsPerson: true }],
+    });
+    expect(buildScenePrompt(a, "flat_lay", "tee", "Black").containsPerson).toBe(true);
   });
 
   it("person flag is conservative: kind default, or the analysis suggested one", () => {
@@ -598,10 +614,74 @@ describe("assertImageGenAllowed / recordImageGen (AC4)", () => {
       ].sort(),
     );
     expect(rows.find((r) => r.provider === "openai")?.input).toMatchObject({
-      prompt: "scene_prompt@2",
+      prompt: "scene_prompt@3",
       sceneKind: "studio",
     });
     await redis.del(tKey, platformSpendKey(day));
+  });
+
+  describe("real-provider cap ignores free mock rows (T-38-2, B-368)", () => {
+    const insertRow = (companyId: string, provider: "mock" | "openai", costCents: number) =>
+      withTenant(companyId, (tx) =>
+        tx.insert(aiJobs).values({
+          companyId,
+          kind: "image_scene",
+          status: "done",
+          provider,
+          model: provider === "mock" ? MOCK_IMAGE_MODEL : "gpt-image-2",
+          input: {},
+          output: {},
+          costCents,
+          credits: 0,
+        }),
+      );
+    const rows = async (
+      companyId: string,
+      provider: "mock" | "openai",
+      cents: number,
+      n: number,
+    ) => {
+      for (let i = 0; i < n; i++) await insertRow(companyId, provider, cents);
+    };
+    const check = (shop: string, n: number, provider: ImageProvider) =>
+      withTenant(shop, (tx) => assertImageGenAllowed(tx, shop, n, { provider }));
+
+    it("25 free mock rows today + a real provider at cap 30: a 6-scene request is allowed", async () => {
+      menv.IMAGE_GEN_DAILY_CAP_PER_SHOP = 30;
+      const shop = await createCompany();
+      await rows(shop.id, "mock", 0, 25);
+      await check(shop.id, 6, priced);
+      expect(
+        await withTenant(shop.id, (tx) => imagesUsedToday(tx, shop.id, new Date(), "openai")),
+      ).toBe(0);
+      // The mock path still exercises the cap: all rows count.
+      const err = await codeOf(check(shop.id, 6, mockImageProvider));
+      expect(err.code).toBe("IMAGE_DAILY_CAP_REACHED");
+      expect(err.data).toMatchObject({ cap: 30, used: 25 });
+    });
+
+    it("25 real rows: a 6-scene request is refused with used 25", async () => {
+      menv.IMAGE_GEN_DAILY_CAP_PER_SHOP = 30;
+      const shop = await createCompany();
+      await rows(shop.id, "openai", 11, 25);
+      const err = await codeOf(check(shop.id, 6, priced));
+      expect(err.code).toBe("IMAGE_DAILY_CAP_REACHED");
+      expect(err.data).toMatchObject({ cap: 30, used: 25 });
+    });
+
+    it("a row labelled mock that cost money still counts on the real path (A7)", async () => {
+      menv.IMAGE_GEN_DAILY_CAP_PER_SHOP = 30;
+      const shop = await createCompany();
+      await rows(shop.id, "mock", 0, 25);
+      await insertRow(shop.id, "mock", 7);
+      expect(
+        await withTenant(shop.id, (tx) => imagesUsedToday(tx, shop.id, new Date(), "openai")),
+      ).toBe(1);
+      menv.IMAGE_GEN_DAILY_CAP_PER_SHOP = 6;
+      await check(shop.id, 5, priced);
+      const err = await codeOf(check(shop.id, 6, priced));
+      expect(err.data).toMatchObject({ cap: 6, used: 1 });
+    });
   });
 
   it("S-53: a failed call that may be billed records the estimate and counts toward the cap; rejected ones don't", async () => {

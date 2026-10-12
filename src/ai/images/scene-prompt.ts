@@ -7,9 +7,13 @@ import type { ScenePrompt } from "./types";
  * descriptions, the blank's catalog name) is copied into the prompt, so no brand word, design
  * text or injected instruction can reach the image model. Free text is only *matched* against
  * fixed word lists to pick a fixed phrase. The rules block is constant and always last.
+ *
+ * v3 (T-38-2, proposed decision 0037): the prompt adds no person. The base already carries InvAI's
+ * own garment (and figure) under a mask, so only the background is drawn. `containsPerson` below
+ * is unchanged and still conservative: the disclosure flags do not move this wave (0023 §3).
  */
 
-export const SCENE_PROMPT_VERSION = 2;
+export const SCENE_PROMPT_VERSION = 3;
 export const SCENE_PROMPT_REF = `scene_prompt@${SCENE_PROMPT_VERSION}`;
 
 /** The one sentence every prompt must carry (imaging restores and composites the print area). */
@@ -173,13 +177,10 @@ export function buildScenePrompt(
   const scene = SCENES[sceneKind];
   const containsPerson = sceneContainsPerson(analysis, sceneKind);
   const garmentPhrase = `a ${blankColorWords(blankName)} ${GARMENT_WORDS[garment]}`;
-  const subject = containsPerson
-    ? `A fictional adult model stands partly visible beside or behind the ${GARMENT_WORDS[garment]}, face turned away or cropped out of frame; the model does not wear, hold or cover the ${GARMENT_WORDS[garment]}.`
-    : `No people or body parts appear.`;
   const text = [
-    `Edit the given image of ${garmentPhrase}: the ${GARMENT_WORDS[garment]} is a fixed object and stays exactly where it is, with the same outline, size, angle and color.`,
-    `Replace only the background around it with ${scene.setting}.`,
-    subject,
+    `Edit the given image of ${garmentPhrase}: the ${GARMENT_WORDS[garment]} and any figure wearing it are fixed objects and stay exactly where they are, with the same outline, size, angle and color.`,
+    `Replace only the background around them with ${scene.setting}.`,
+    "Do not add any person, body part or second figure to the image.",
     `Lighting and mood: ${moodFor(analysis)}.`,
     "",
     SCENE_RULES,
