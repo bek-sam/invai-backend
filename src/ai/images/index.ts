@@ -16,6 +16,7 @@ export { IMAGE_JOB_KIND, imagesUsedToday, recordImageGen } from "./caps";
 export { mockImageProvider } from "./mock";
 export {
   buildScenePrompt,
+  isDarkBlank,
   PRINT_AREA_RULE,
   SCENE_PROMPT_REF,
   SCENE_RULES,

@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import type { DesignPhotoAnalysis, GarmentType, PhotoSceneKind } from "@invai/contracts";
 import {
   buildScenePrompt,
+  isDarkBlank,
   mockImageProvider,
   PRINT_AREA_RULE,
   SCENE_RULES,
@@ -25,7 +26,8 @@ const dir = path.dirname(fileURLToPath(import.meta.url));
  *  - carry the print-area rule and end with the constant rules block;
  *  - set containsPerson as expected (conservative);
  *  - for `studio` with a blank hex (T-39-2), carry the backdrop phrase of the blank's luma band
- *    (white >= 0.85: mid gray; otherwise very pale gray) and never the v3 "light gray" wording.
+ *    (white >= 0.85: mid gray; otherwise very pale gray) and never the v3 "light gray" wording;
+ *  - for a dark blank (luma < 0.35, T-40-3 v5), carry ref @5 and the edge sentence; all others @4.
  * Then the mock provider draws the scene from a small blank base: PNG at a provider size, the
  * same containsPerson, deterministic bytes. Quality equals plumbing here: the rules are the bar.
  */
@@ -118,7 +120,7 @@ export async function runScenePrompts(_tenant: EvalTenant): Promise<RouteReport>
       if (hit) fails.push(`variable:${hit[0]}`);
       for (const w of c.expect.contains ?? []) if (!p.text.includes(w)) fails.push(`missing:${w}`);
       for (const w of c.expect.absent ?? []) if (p.text.includes(w)) fails.push(`present:${w}`);
-      if (!p.ref.endsWith("@4")) fails.push("version");
+      if (!p.ref.endsWith(isDarkBlank(c.vars.blankHex) ? "@5" : "@4")) fails.push("version");
       if (!p.text.includes(PRINT_AREA_RULE)) fails.push("print-area-rule");
       if (!p.text.endsWith(SCENE_RULES)) fails.push("rules-last");
       if (p.containsPerson !== c.expect.containsPerson) fails.push("containsPerson");

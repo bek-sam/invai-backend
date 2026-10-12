@@ -809,8 +809,9 @@ describe("studioBackdrop bands and the optional blank hex (T-39-2 phase 1b)", ()
         expect(white.text).toContain(`with ${MID}, with ${FLAT} and soft, even lighting`);
         expect(black.text).toContain(`with ${PALE}, with ${FLAT} and soft, even lighting`);
       } else {
-        expect(buildScenePrompt(null, k, "tee", "Black", "#000000")).toEqual(bare);
+        // A white hex keeps v4; a black one gets the v5 dark wording (T-40-3, scene-prompt.test.ts).
         expect(buildScenePrompt(null, k, "tee", "Black", "#ffffff")).toEqual(bare);
+        expect(black.ref).toBe("scene_prompt@5");
       }
     }
   });
@@ -820,7 +821,7 @@ describe("studioBackdrop bands and the optional blank hex (T-39-2 phase 1b)", ()
       for (const hex of ["#ffffff", "#000000", undefined]) {
         const p = buildScenePrompt(null, k, "tee", "Black", hex);
         expect(p.containsPerson).toBe(flagsBare);
-        expect(p.ref).toBe("scene_prompt@4");
+        expect(p.ref).toBe(hex === "#000000" ? "scene_prompt@5" : "scene_prompt@4");
         expect(p.text.endsWith(SCENE_RULES)).toBe(true);
         expect(p.text).toContain("Do not add any person, body part or second figure");
         expect(p.text).not.toContain("#");

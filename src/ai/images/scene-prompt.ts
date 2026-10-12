@@ -15,10 +15,21 @@ import type { ScenePrompt } from "./types";
  * v4 (T-39-2 phase 1b): the studio backdrop tone follows the blank's luma (two fixed phrases, split
  * at 0.85) so the backdrop stays away from the garment's own tone; T-39-1's sweep shows a "light
  * gray" backdrop (drawn near level 200) fails white tees. Other kinds are unchanged.
+ *
+ * v5 (T-40-3 phase 1): dark blanks (luma below 0.35, needs the blank hex) get their own scene
+ * wording; every other blank and every call without a hex keeps the v4 text and ref byte for byte.
+ * Wave 39 trial 2 (black tee, T-40-2's table): the cafe's dark backdrop (luma 0.24) removed the
+ * garment outline (check 1 0.301, structural); the home frame showed a weaker, haloed edge (66 vs
+ * 90) with the hem 0.3 in off; two of three studio frames failed or sat on edge displacement. So the
+ * dark wording keeps every setting light and plain behind the garment, keeps props off its outline,
+ * and adds one edge sentence (clean sharp edge, no halo, glow or rim light). Fixed phrases only.
  */
 
-export const SCENE_PROMPT_VERSION = 4;
+export const SCENE_PROMPT_VERSION = 5;
 export const SCENE_PROMPT_REF = `scene_prompt@${SCENE_PROMPT_VERSION}`;
+/** Version (and ref) of the text light and unknown-color blanks still get. */
+export const SCENE_PROMPT_LIGHT_VERSION = 4;
+export const SCENE_PROMPT_LIGHT_REF = `scene_prompt@${SCENE_PROMPT_LIGHT_VERSION}`;
 
 /** The one sentence every prompt must carry (imaging restores and composites the print area). */
 export const PRINT_AREA_RULE =
@@ -49,6 +60,16 @@ export const STUDIO_WHITE_LUMA = 0.85;
 const FLAT_LIGHT = "flat even light, no gradient, vignette or cast shadow on the backdrop";
 const STUDIO_BACKDROP_MID_GRAY = `a plain seamless mid-gray backdrop, neither light nor dark, with ${FLAT_LIGHT}`;
 const STUDIO_BACKDROP_PALE = `a plain seamless very pale gray backdrop, almost white, with ${FLAT_LIGHT}`;
+
+/** Blank luma below which the blank counts as dark and gets the v5 wording. */
+export const DARK_BLANK_LUMA = 0.35;
+
+/** True when `blankHex` is a valid `#rrggbb` with luma below `DARK_BLANK_LUMA`. */
+export function isDarkBlank(blankHex: string | undefined): boolean {
+  if (blankHex === undefined) return false;
+  const luma = hexLuma(blankHex);
+  return luma !== null && luma < DARK_BLANK_LUMA;
+}
 
 /** Luma 0..1 of `#rrggbb` as imaging computes it on sRGB: (0.2126 R + 0.7152 G + 0.0722 B) / 255. */
 export function hexLuma(hex: string): number | null {
@@ -102,6 +123,19 @@ export const SCENES: Record<PhotoSceneKind, SceneDef> = {
     person: false,
   },
 };
+
+/** v5 settings for dark blanks: light and plain behind the garment, props away from its outline. */
+const DARK_SETTINGS: Partial<Record<PhotoSceneKind, string>> = {
+  studio: studioSetting(STUDIO_BACKDROP_PALE),
+  home: "a bright, tidy living room with plain light walls, a pale sofa set well back and soft, even window light",
+  cafe: "a bright cafe with pale walls, light wooden tables set well back and soft, even light, background softly blurred",
+  outdoor:
+    "a sunny park path with a pale sky, light ground and soft, even natural light, background gently blurred",
+};
+
+/** v5 sentence for dark blanks: what must hold along the garment's outline. */
+export const DARK_EDGE_RULE =
+  "The background right around the garment is lighter than the garment and calm, with a clean sharp garment edge: no halo, glow, rim light or shadow along the outline, and no object touching or overlapping it.";
 
 const GARMENT_WORDS: Record<GarmentType, string> = {
   tee: "t-shirt",
@@ -214,8 +248,10 @@ export function buildScenePrompt(
   colorHex?: string,
 ): ScenePrompt {
   const scene = SCENES[sceneKind];
-  const setting =
-    sceneKind === "studio" && colorHex !== undefined
+  const dark = isDarkBlank(colorHex);
+  const setting = dark
+    ? (DARK_SETTINGS[sceneKind] ?? scene.setting)
+    : sceneKind === "studio" && colorHex !== undefined
       ? studioSetting(studioBackdrop(colorHex))
       : scene.setting;
   const containsPerson = sceneContainsPerson(analysis, sceneKind);
@@ -223,10 +259,11 @@ export function buildScenePrompt(
   const text = [
     `Edit the given image of ${garmentPhrase}: the ${GARMENT_WORDS[garment]} and any figure wearing it are fixed objects and stay exactly where they are, with the same outline, size, angle and color.`,
     `Replace only the background around them with ${setting}.`,
+    ...(dark ? [DARK_EDGE_RULE] : []),
     "Do not add any person, body part or second figure to the image.",
     `Lighting and mood: ${moodFor(analysis)}.`,
     "",
     SCENE_RULES,
   ].join("\n");
-  return { ref: SCENE_PROMPT_REF, sceneKind, containsPerson, text };
+  return { ref: dark ? SCENE_PROMPT_REF : SCENE_PROMPT_LIGHT_REF, sceneKind, containsPerson, text };
 }
