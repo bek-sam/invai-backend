@@ -148,7 +148,10 @@ describe("RLS-exempt paths (S-65)", () => {
         and n.nspname not in ('pg_catalog', 'information_schema', 'pg_toast')
         and n.nspname not like 'pg\\_temp\\_%' and n.nspname not like 'pg\\_toast\\_temp\\_%'
         and (o.rolsuper or o.rolbypassrls
-          or exists (select 1 from pg_class c where c.relowner = o.oid and c.relkind in ('r', 'p')
+          -- MEMBER (not USAGE): a member of a table owner bypasses RLS too, and a NOINHERIT
+          -- member can SET ROLE to it, so inheritance must not hide it.
+          or exists (select 1 from pg_class c where pg_has_role(o.oid, c.relowner, 'MEMBER')
+            and c.relkind in ('r', 'p')
             and c.relnamespace not in (select oid from pg_namespace
               where nspname in ('pg_catalog', 'information_schema'))))
         and has_function_privilege('invai_app', p.oid, 'EXECUTE')
