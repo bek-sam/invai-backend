@@ -34,19 +34,26 @@ export const generateAlertsJob = defineJob({
 /**
  * Hand the dispatch guard's unchecked shipments to the tracker poll once the alert pass has
  * committed (the pass cannot import the shipping job: shipping/jobs imports today/service). The
- * guard is DB state (a check after ship-by makes the shipment leave the list); the jobId is only
- * a first filter. Low priority: the `ship` queue also carries label buys.
+ * guard is DB state (a check after ship-by makes the shipment leave the list, and a re-poll is due
+ * only once the latest check is old); the jobId is only a first filter. A re-poll's id carries the
+ * check it follows, so each check yields at most one. Low priority: the `ship` queue also carries label buys.
  */
 export async function enqueueTrackerPolls(
   companyId: string,
-  toPoll: { shipmentId: string; shipBy: string }[],
+  toPoll: { shipmentId: string; shipBy: string; checkedAt?: string | null }[],
 ) {
   let enqueued = 0;
   for (const p of toPoll) {
     try {
       await pollTrackerJob.enqueue(
         { companyId, shipmentId: p.shipmentId },
-        { jobId: `poll-tracker-${p.shipmentId}-${p.shipBy}`, priority: 10, removeOnFail: true },
+        {
+          jobId: p.checkedAt
+            ? `poll-tracker-${p.shipmentId}-recheck-${p.checkedAt}`
+            : `poll-tracker-${p.shipmentId}-${p.shipBy}`,
+          priority: 10,
+          removeOnFail: true,
+        },
       );
       enqueued++;
     } catch (err) {

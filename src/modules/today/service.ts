@@ -319,6 +319,16 @@ async function resolveStale(tx: Tx, companyId: string, kinds: string[], keep: Se
 
 /** Most tracker polls one pass hands back per company (the rest follow on the next pass). */
 export const DISPATCH_POLL_CAP = 50;
+/** Of those, at most this many are re-polls of already alerted labels (first checks go first). */
+export const DISPATCH_REPOLL_CAP = 10;
+/** An alerted label whose latest tracker check is older than this is polled again. */
+export const DISPATCH_REPOLL_AFTER_MS = 6 * 3600_000;
+/**
+ * Re-polls stop this long after ship-by; the daily fallback sweep takes over. Mirrors
+ * shipping/jobs `TRACKER_POLL_AFTER_MS` (it cannot be imported here: shipping/jobs imports this
+ * module), and a test keeps the two equal.
+ */
+export const DISPATCH_REPOLL_MAX_AGE_MS = 3 * 86400_000;
 /** Most dispatch alerts one pass raises per company, oldest ship-by first. */
 export const DISPATCH_ALERT_CAP = 200;
 
@@ -393,12 +403,34 @@ async function dispatchPass(
           or greatest(s.tracker_checked_at, s.tracker_check_failed_at) <= o.ship_by)
       order by o.ship_by, s.id limit ${DISPATCH_POLL_CAP}`,
   );
-  return {
-    toPoll: unchecked.rows.map((r) => ({
+  const toPoll: { shipmentId: string; shipBy: string; checkedAt: string | null }[] =
+    unchecked.rows.map((r) => ({
       shipmentId: r.shipment_id,
       shipBy: new Date(r.ship_by).toISOString(),
-    })),
-  };
+      checkedAt: null,
+    }));
+  // Re-polls fill what the first checks leave of the total cap, at most DISPATCH_REPOLL_CAP.
+  const room = Math.min(DISPATCH_REPOLL_CAP, DISPATCH_POLL_CAP - toPoll.length);
+  if (room > 0) {
+    const due = await tx.execute<{ shipment_id: string; ship_by: Date; checked_at: Date }>(
+      sql`select s.id as shipment_id, o.ship_by,
+          greatest(s.tracker_checked_at, s.tracker_check_failed_at) as checked_at
+        ${dispatchCandidates(cid)}
+          and greatest(s.tracker_checked_at, s.tracker_check_failed_at) > o.ship_by
+          and greatest(s.tracker_checked_at, s.tracker_check_failed_at)
+            < now() - (${DISPATCH_REPOLL_AFTER_MS} * interval '1 millisecond')
+          and o.ship_by > now() - (${DISPATCH_REPOLL_MAX_AGE_MS} * interval '1 millisecond')
+          and s.carrier_shipment_id is not null and s.tracking_code is not null
+        order by o.ship_by, s.id limit ${room}`,
+    );
+    for (const r of due.rows)
+      toPoll.push({
+        shipmentId: r.shipment_id,
+        shipBy: new Date(r.ship_by).toISOString(),
+        checkedAt: new Date(r.checked_at).toISOString(),
+      });
+  }
+  return { toPoll };
 }
 
 /**
