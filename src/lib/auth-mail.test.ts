@@ -102,7 +102,6 @@ describe("account email failure log (B-306)", () => {
   });
 
   it("a timeout is logged by its name, not its text", async () => {
-    vi.spyOn(globalThis, "setTimeout");
     probe.fail = null;
     const { sendMail } = await import("../integrations/vendors/mailer");
     vi.mocked(sendMail).mockImplementationOnce(() => new Promise(() => {}));
