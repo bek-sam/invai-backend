@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   CLOSED_IMAGING_URL,
+  liveImagingUrls,
   readEnvFileImagingUrls,
   resolveTestImagingUrl,
 } from "./imaging-safety";
@@ -76,6 +77,21 @@ describe("test imaging guard (T-44-5)", () => {
     );
   });
 
+  it("applies the default port per scheme, across schemes", () => {
+    // live https without a port is :443, so an http opt-in on :443 hits it
+    expect(() => resolveTestImagingUrl("http://127.0.0.1:443", ["https://img.internal"])).toThrow(
+      /live imaging/,
+    );
+    // live http without a port is :80, so an https opt-in on :80 hits it
+    expect(() => resolveTestImagingUrl("https://127.0.0.1:80", ["http://img.internal"])).toThrow(
+      /live imaging/,
+    );
+    // and the other default is not live
+    expect(resolveTestImagingUrl("http://127.0.0.1:80", ["https://img.internal"])).toBe(
+      "http://127.0.0.1",
+    );
+  });
+
   it("accepts a loopback opt-in on a non-live port, whatever the live URLs are", () => {
     for (const host of ["127.0.0.1", "localhost.", "[::1]", "127.0.0.2"]) {
       expect(
@@ -127,5 +143,14 @@ describe("readEnvFileImagingUrls (T-45-3)", () => {
 
   it("reads the real file system and tolerates a missing path", () => {
     expect(readEnvFileImagingUrls(["/nonexistent/.env"])).toEqual([]);
+  });
+});
+
+describe("liveImagingUrls (T-45-3, A7)", () => {
+  it("returns the shell value and the env files' values, so an opt-in on the .env port is refused", () => {
+    const files: Record<string, string> = { ".env": "IMAGING_URL=http://localhost:18770\n" };
+    const live = liveImagingUrls("http://localhost:8100", [".env", ".env.local"], (f) => files[f]);
+    expect(live).toEqual(["http://localhost:8100", "http://localhost:18770"]);
+    expect(() => resolveTestImagingUrl("http://127.0.0.1:18770", live)).toThrow(/live imaging/);
   });
 });

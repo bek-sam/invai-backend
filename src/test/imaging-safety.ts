@@ -42,6 +42,19 @@ export function readEnvFileImagingUrls(
 }
 
 /**
+ * Every `IMAGING_URL` that counts as live for the guard: the shell's own value plus the values
+ * the env files name (T-45-3, A7). Global setup calls this, so dropping the file values is a
+ * test failure, not a silent hole.
+ */
+export function liveImagingUrls(
+  shellValue: string | undefined,
+  files: readonly string[] = [".env", ".env.local"],
+  read?: (file: string) => string | undefined,
+): (string | undefined)[] {
+  return [shellValue, ...readEnvFileImagingUrls(files, read)];
+}
+
+/**
  * The imaging URL for this run. `optIn` is `TEST_IMAGING_URL` as exported by the caller; unset
  * means the closed port. `liveUrls` are the shell and `.env` `IMAGING_URL` values (the "live"
  * ones). An opt-in is refused when its PORT is 8000, 8100 or the port of any live URL, on any

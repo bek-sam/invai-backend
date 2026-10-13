@@ -62,11 +62,11 @@ export default async function setup(project: TestProject) {
   // `import("../env")` below so this process and every worker (setup-env.ts) agree.
   // Both the shell value and the .env files' own values count as live (T-45-3, A7): loadEnvFile
   // never overrides, so process.env alone loses .env's port whenever the shell sets one.
-  const { resolveTestImagingUrl, readEnvFileImagingUrls } = await import("./imaging-safety");
-  const testImagingUrl = resolveTestImagingUrl(process.env.TEST_IMAGING_URL, [
-    shellImagingUrl,
-    ...readEnvFileImagingUrls([".env", ".env.local"]),
-  ]);
+  const { resolveTestImagingUrl, liveImagingUrls } = await import("./imaging-safety");
+  const testImagingUrl = resolveTestImagingUrl(
+    process.env.TEST_IMAGING_URL,
+    liveImagingUrls(shellImagingUrl),
+  );
   process.env.IMAGING_URL = testImagingUrl;
   project.provide("testImagingUrl", testImagingUrl);
 
