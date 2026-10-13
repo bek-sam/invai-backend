@@ -7,7 +7,7 @@ import { ImagingError, imaging } from "../../integrations/imaging/client";
 import { sha256Hex } from "../../lib/crypto";
 import { errorData, logger } from "../../lib/log";
 import { emit } from "../../lib/outbox";
-import { defineJob, isPermanentHttpStatus, queues } from "../../lib/queues";
+import { defineJob, isPermanentHttpStatus, queues, safeJobId } from "../../lib/queues";
 import { deleteObject, listKeysOlderThan } from "../../lib/s3";
 import {
   artworkQaFlags,
@@ -232,6 +232,8 @@ export async function purgePiiObjects(now = new Date(), only?: string[]) {
 /** The states in which `setItemArtwork` accepts artwork; the follow-up uses the same guard. */
 const ARTWORK_QA_STATES = ["imported", "needs_mapping", "ready", "needs_artwork", "on_hold"];
 
+const ARTWORK_QA_DOWN_RETRY_MS = 30_000;
+
 /**
  * Follow-up QA for artwork attached while imaging could not answer (T-43-3, S-76 / B-399).
  * Applies the same flags `setItemArtwork` would have, only if the unit still has this exact
@@ -251,11 +253,13 @@ export const itemArtworkQaJob = defineJob({
     });
     if (!row || row.artworkKey !== fileKey || !ARTWORK_QA_STATES.includes(row.state))
       return { skipped: true };
+    const ctx = { companyId, what: "item", id: itemId };
+    // Imaging down or unreachable is waiting, not failing: re-delay with the same 30-minute bound
+    // as a busy slot, so a restart of a few minutes never drops the flags (B-399, round 2).
     if (!(await imaging.isUp())) {
       log.warn("imaging down, artwork QA deferred", { companyId, itemId });
-      throw new Error("imaging down");
+      return await redelayQa(job, ARTWORK_QA_DOWN_RETRY_MS, ctx);
     }
-    const ctx = { companyId, what: "item", id: itemId };
     const turn = await takeQaTurn(companyId);
     if (!turn.ok) return await redelayQa(job, turn.retryAfterMs, ctx);
     let flags: ReturnType<typeof artworkQaFlags>;
@@ -279,6 +283,11 @@ export const itemArtworkQaJob = defineJob({
         });
         return { skipped: true };
       }
+      if (err instanceof ImagingError) {
+        // 5xx or a connection/timeout error mid-call: imaging went away after the health check.
+        log.warn("imaging unreachable, artwork QA deferred", { companyId, itemId });
+        return await redelayQa(job, ARTWORK_QA_DOWN_RETRY_MS, ctx);
+      }
       throw err;
     } finally {
       await turn.release();
@@ -300,6 +309,26 @@ export const itemArtworkQaJob = defineJob({
     });
   },
 });
+
+/**
+ * Queue the follow-up for this item and file. BullMQ keeps a finished job's id (24 h completed,
+ * 7 days failed), which would turn a second attach of the same still-unchecked file into a no-op
+ * after a give-up, so a finished job with this id is removed first. A waiting, delayed or active
+ * one is left alone: that is the dedupe.
+ */
+export async function enqueueItemArtworkQa(input: {
+  companyId: string;
+  itemId: string;
+  fileKey: string;
+}) {
+  const id = safeJobId(itemArtworkQaJob.jobId?.(input) ?? "");
+  const old = await queues.render.getJob(id);
+  if (old) {
+    const state = await old.getState();
+    if (state === "completed" || state === "failed") await old.remove();
+  }
+  return itemArtworkQaJob.enqueue(input);
+}
 
 export const purgeBuyerPiiJob = defineJob({
   queue: "reports",

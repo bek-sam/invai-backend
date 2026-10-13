@@ -488,9 +488,19 @@ export async function unacceptQaWarning(
   return getDesign(tx, ctx, input.id);
 }
 
+/** How many `/qa/check` calls a run on this design makes: one per placement file. */
+export async function qaCallCount(tx: Tx, id: string): Promise<number> {
+  const rows = await tx
+    .select({ id: designFiles.id })
+    .from(designFiles)
+    .where(eq(designFiles.designId, id));
+  return rows.length;
+}
+
 /**
  * Run imaging QA on every placement file, optionally snapping soft alpha first. Called by the
  * `catalog.runDesignQa` job after create/update and by `designs.runQa` on demand.
+ * `qaBusy.budgetMs` is one deadline for the whole call, shrinking across placements (A12).
  */
 export async function runDesignQa(
   tx: Tx,
@@ -500,6 +510,8 @@ export async function runDesignQa(
 ) {
   const files = await tx.select().from(designFiles).where(eq(designFiles.designId, id));
   if (files.length === 0) throw notFound("design", id);
+  const deadline =
+    opts.qaBusy?.budgetMs !== undefined ? Date.now() + opts.qaBusy.budgetMs : undefined;
   for (const file of files) {
     try {
       let fileKey = file.fileKey;
@@ -516,7 +528,9 @@ export async function runDesignQa(
           target_width_in: file.widthIn,
           target_height_in: file.heightIn,
         },
-        opts.qaBusy,
+        deadline === undefined
+          ? opts.qaBusy
+          : { retries: opts.qaBusy?.retries, budgetMs: Math.max(0, deadline - Date.now()) },
       );
       // One stored issue with an unknown code would fail the Design output parse of
       // designs.list for the whole shop, so drop it here (A8).

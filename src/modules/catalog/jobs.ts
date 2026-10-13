@@ -5,7 +5,7 @@ import { imaging } from "../../integrations/imaging/client";
 import { logger } from "../../lib/log";
 import { defineJob, onEvent } from "../../lib/queues";
 import { isImagingBusy, QA_NO_BUSY, redelayQa, takeQaTurn } from "./qa-turn";
-import { renderDesignPreviews, runDesignQa } from "./service";
+import { qaCallCount, renderDesignPreviews, runDesignQa } from "./service";
 
 const log = logger("catalog.jobs");
 
@@ -27,7 +27,8 @@ export const runDesignQaJob = defineJob({
       return { skipped: true };
     }
     const ctx = { companyId, what: "design", id: designId };
-    const turn = await takeQaTurn(companyId);
+    const calls = await withTenant(companyId, (tx) => qaCallCount(tx, designId));
+    const turn = await takeQaTurn(companyId, calls);
     if (!turn.ok) return await redelayQa(job, turn.retryAfterMs, ctx);
     try {
       const sys = systemContext(companyId);

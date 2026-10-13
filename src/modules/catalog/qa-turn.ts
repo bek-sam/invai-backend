@@ -15,11 +15,17 @@ const log = logger("catalog.qa-turn");
  *
  *   - a lease: at most one QA turn in flight per company across the API and all workers.
  *     `SET NX PX` with a random token, released by compare-and-delete (a turn that outlived its
- *     TTL never frees the next holder's lease). The TTL covers the worst case of one turn:
- *     two placements, each a clean-alpha and a QA call, at the client's 120 s timeout.
- *   - an allowance: a token bucket of `QA_BURST` turns refilling one per `QA_REFILL_MS`.
- *     Wave 42 measured the worst QA at 4.3 s, so a person re-running QA by hand (a few clicks,
- *     then one every 20 s) is never refused, while a loop holds the slot at most ~3 of every 60 s.
+ *     TTL never frees the next holder's lease). The TTL covers the longest allowed turn: every
+ *     placement (at most `QA_MAX_CALLS`, one per `PLACEMENTS` value) with a clean-alpha and a QA
+ *     call, each at the client's 120 s timeout.
+ *   - an allowance: a token bucket of `QA_BURST` refilling one per `QA_REFILL_MS`, charged one
+ *     token per `/qa/check` call, not per turn (S-79: a 5-placement design holds the slot five
+ *     times as long). A turn is admitted while at least one token is left and is charged all its
+ *     calls up front; the balance may go negative (a debt of at most `QA_MAX_CALLS - 1`), and the
+ *     next turn is refused until the refill has paid it back. So a design is never refused half
+ *     way, and a loop on any placement count holds the slot at most 4.3 s per 20 s (wave 42's
+ *     worst QA) once the burst is spent, while a person re-running a 1-placement design by hand
+ *     (a few clicks, then one every 20 s) is never refused.
  *
  * Valkey trouble fails open with one warn log, like `lib/fairness.ts`: the fairness guarantee is
  * lost, nobody's QA is. Callers: the router's `runQa`, the QA job, `setItemArtwork` and its
@@ -29,7 +35,9 @@ const log = logger("catalog.qa-turn");
 export const QA_BURST = 3;
 export const QA_REFILL_MS = 20_000;
 export const QA_IN_FLIGHT_RETRY_MS = 3_000;
-export const QA_LEASE_TTL_MS = 4 * 120_000;
+/** One QA call per placement; `PLACEMENTS` has five values. */
+export const QA_MAX_CALLS = 5;
+export const QA_LEASE_TTL_MS = QA_MAX_CALLS * 2 * 120_000;
 
 /** A person waiting on a manual check gives up after this much busy-waiting in total (A12). */
 export const QA_MANUAL_BUSY = { retries: 5, budgetMs: 25_000 } as const;
@@ -44,12 +52,13 @@ if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) 
 return 0
 `;
 
-/** Refill from the server clock, then take one turn if there is one; else say how long to wait. */
+/** Refill from the server clock; with at least one token, charge ARGV[3] calls (debt allowed). */
 const ALLOWANCE_SCRIPT = `
 local t = redis.call('TIME')
 local now = t[1] * 1000 + math.floor(t[2] / 1000)
 local burst = tonumber(ARGV[1])
 local refill = tonumber(ARGV[2])
+local calls = tonumber(ARGV[3])
 local h = redis.call('HMGET', KEYS[1], 'tokens', 'ts')
 local tokens = tonumber(h[1])
 local ts = tonumber(h[2])
@@ -57,12 +66,12 @@ if tokens == nil then tokens = burst; ts = now end
 tokens = math.min(burst, tokens + (now - ts) / refill)
 local wait = 0
 if tokens >= 1 then
-  tokens = tokens - 1
+  tokens = tokens - calls
 else
   wait = math.ceil((1 - tokens) * refill)
 end
 redis.call('HSET', KEYS[1], 'tokens', tostring(tokens), 'ts', tostring(now))
-redis.call('PEXPIRE', KEYS[1], burst * refill)
+redis.call('PEXPIRE', KEYS[1], (burst + tonumber(ARGV[4])) * refill)
 return wait
 `;
 
@@ -70,7 +79,9 @@ export type QaTurn =
   | { ok: true; release: () => Promise<void> }
   | { ok: false; reason: "in_flight" | "rate"; retryAfterMs: number };
 
-export async function takeQaTurn(companyId: string): Promise<QaTurn> {
+/** `calls` = the `/qa/check` calls this turn will make (one per placement), 1..QA_MAX_CALLS. */
+export async function takeQaTurn(companyId: string, calls = 1): Promise<QaTurn> {
+  const charge = Math.min(QA_MAX_CALLS, Math.max(1, Math.floor(calls)));
   const token = randomUUID();
   const none = async () => {};
   try {
@@ -93,6 +104,8 @@ export async function takeQaTurn(companyId: string): Promise<QaTurn> {
         rateKey(companyId),
         QA_BURST,
         QA_REFILL_MS,
+        charge,
+        QA_MAX_CALLS,
       )) as number;
       if (wait > 0) {
         await release();

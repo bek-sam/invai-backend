@@ -1235,8 +1235,8 @@ export async function setItemArtwork(
   if (deferQa) {
     const queued = { companyId: ctx.companyId, itemId: item.id, fileKey: input.fileKey };
     afterCommit(tx, async () => {
-      const { itemArtworkQaJob } = await import("./jobs");
-      await itemArtworkQaJob.enqueue(queued);
+      const { enqueueItemArtworkQa } = await import("./jobs");
+      await enqueueItemArtworkQa(queued);
     });
   }
   return getItem(tx, ctx, input.id);

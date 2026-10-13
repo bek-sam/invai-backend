@@ -31,7 +31,8 @@ export const designsRouter = authed.designs.router({
   // One QA turn per company (lease + allowance); over it, RATE_LIMITED at once with no imaging
   // call and no sleep (T-43-3, S-76). The lease is taken before the transaction opens.
   runQa: authed.designs.runQa.handler(async ({ input, context: { tenant } }) => {
-    const turn = await takeQaTurn(tenant.companyId);
+    const calls = await withTenant(tenant.companyId, (tx) => svc.qaCallCount(tx, input.id));
+    const turn = await takeQaTurn(tenant.companyId, calls);
     if (!turn.ok) throw rateLimited(retrySeconds(turn.retryAfterMs));
     try {
       return await withTenant(tenant.companyId, (tx) =>
