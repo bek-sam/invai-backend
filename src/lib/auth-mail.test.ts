@@ -83,6 +83,7 @@ describe("account email failure log (B-306)", () => {
     expect(all).not.toContain("user unknown");
     expect(all).not.toContain("rcpt to");
     expect(all).not.toContain("rejected");
+    expect(logged).not.toContain("@");
   });
 
   it("a plain error whose message holds the address logs only its class name", async () => {
@@ -99,6 +100,7 @@ describe("account email failure log (B-306)", () => {
     expect(logged).toContain("TypeError");
     expect(logged.toLowerCase()).not.toContain("someone@example.com");
     expect(logged).not.toContain("connect failed");
+    expect(logged).not.toContain("@");
   });
 
   it("a timeout is logged by its name, not its text", async () => {
@@ -116,6 +118,7 @@ describe("account email failure log (B-306)", () => {
     const logged = lines.join("\n");
     expect(logged).toContain("AuthMailTimeout");
     expect(logged).not.toContain("timed out");
+    expect(logged).not.toContain("@");
     expect(AUTH_MAIL_TIMEOUT_MS).toBeGreaterThan(5);
   });
 
@@ -123,6 +126,11 @@ describe("account email failure log (B-306)", () => {
     expect(
       mailErrorFields(Object.assign(new Error("x@y.z"), { code: "a@b.c", responseCode: "550" })),
     ).toEqual({ errorName: "Error", code: undefined, responseCode: undefined });
+    expect(mailErrorFields(Object.assign(new Error("x"), { name: "SendError <a@b.c>" }))).toEqual({
+      errorName: "UnknownError",
+      code: undefined,
+      responseCode: undefined,
+    });
     expect(mailErrorFields("boom <a@b.c>")).toEqual({
       errorName: "UnknownError",
       code: undefined,
