@@ -22,7 +22,7 @@ import {
 import { env } from "../../env";
 import * as channelsModule from "../../integrations/channels";
 import { ProductImagePushError } from "../../integrations/channels/types";
-import { imaging } from "../../integrations/imaging/client";
+import { imaging, PhotoSceneCompositeResult } from "../../integrations/imaging/client";
 import { runJobInline } from "../../lib/queues";
 import { createCompany, createConnection, createUser, tenantContext } from "../../test/fixtures";
 import { createDesign } from "../catalog/service";
@@ -255,6 +255,8 @@ function boxChanged(sceneBytes: Buffer, baseBytes: Buffer): boolean {
 type CompositeMode = "inspect" | "pass" | "drift" | "structural" | "region";
 let compositeMode: CompositeMode = "pass";
 let compositeQueue: CompositeMode[] = [];
+/** T-50-4: extra raw `checks` fields in the stubbed imaging answer, parsed by the real schema. */
+let compositeChecksExtra: Record<string, unknown> = {};
 const compositeCalls: { scene_key: string; xmp_subjects: string[]; preset: string }[] = [];
 
 beforeAll(() => {
@@ -272,6 +274,7 @@ beforeEach(() => {
   h.attachCalls.length = 0;
   compositeMode = "pass";
   compositeQueue = [];
+  compositeChecksExtra = {};
   compositeCalls.length = 0;
   const { base, mask } = syntheticBase();
   vi.spyOn(imaging, "photoSceneBase").mockImplementation(async (i) => {
@@ -287,7 +290,7 @@ beforeEach(() => {
       mode === "drift" ||
       region ||
       (mode === "inspect" && boxChanged(nn(h.store.get(i.scene_key)), nn(h.store.get(i.base_key))));
-    return {
+    return PhotoSceneCompositeResult.parse({
       key: drift ? null : i.out_key,
       checks: {
         passes: !drift,
@@ -302,6 +305,7 @@ beforeEach(() => {
               structural: mode === "structural",
             }
           : {}),
+        ...compositeChecksExtra,
       },
       ...(region
         ? { registration: { scale: 1.1, dx_px: 3, dy_px: -2, score: 0.5, at_limit: true } }
@@ -309,7 +313,7 @@ beforeEach(() => {
       width_px: 2048,
       height_px: 2048,
       format: "jpeg",
-    };
+    });
   });
   vi.spyOn(imaging, "photoRender").mockImplementation(async (i) => ({
     key: i.out_key,
@@ -1112,6 +1116,75 @@ describe("structural failure: no paid retry (T-37-3, ADR 0036)", () => {
     expect(h.store.has(a1)).toBe(false);
     expect(h.store.has(nn(row.sceneBaseKey))).toBe(false);
     expect(h.store.has(nn(row.sceneMaskKey))).toBe(false);
+  });
+});
+
+describe("blank colour warning reaches the shop (T-50-4, B-448)", () => {
+  async function runOne() {
+    const { company, ctx, design } = await shop();
+    h.provider = fakeProvider().p;
+    const set = await withTenant(company.id, (tx) =>
+      svc.createSet(tx, ctx, spec(design.id, { count: 1, sceneKinds: ["studio"] })),
+    );
+    const id = nn((await sceneIds(company.id, set.id))[0]);
+    const out = await runJobInline(renderSceneJob, { companyId: company.id, compositionId: id });
+    const got = await withTenant(company.id, (tx) => svc.getSet(tx, ctx, { id: set.id }));
+    return { out, imgs: got.images.filter((i) => i.compositionId === id), company };
+  }
+
+  it("warn is stored and returned, passes unchanged, no regenerate, no retry, no lock rejection", async () => {
+    compositeChecksExtra = { warnings: ["blank_color_shift"], blank_delta_e: 5.43 };
+    const { out, imgs, company } = await runOne();
+    expect(out).toMatchObject({ providerCalls: 1 });
+    expect(compositeCalls.length).toBe(imgs.length);
+    expect(imgs.length).toBeGreaterThan(0);
+    for (const i of imgs) {
+      expect(i.status).not.toBe("failed");
+      expect(i.checks?.passes).toBe(true);
+      expect(i.checks?.failures).toEqual([
+        { code: "blank_color_shift", severity: "warn", detail: "delta_e 5.4" },
+      ]);
+    }
+    const rows = await withTenant(company.id, (tx) => tx.select().from(photoImages));
+    expect(rows.some((r) => JSON.stringify(r.checks).includes("blank_color_shift"))).toBe(true);
+  });
+
+  it("detail is null when blank_delta_e is null or absent", async () => {
+    compositeChecksExtra = { warnings: ["blank_color_shift"], blank_delta_e: null };
+    const a = await runOne();
+    for (const i of a.imgs) expect(i.checks?.failures[0]?.detail).toBeNull();
+    compositeChecksExtra = { warnings: ["blank_color_shift"] };
+    const b = await runOne();
+    for (const i of b.imgs) expect(i.checks?.failures[0]?.detail).toBeNull();
+  });
+
+  it("an unknown warning is ignored, an old imaging answer still parses", async () => {
+    compositeChecksExtra = { warnings: ["something_new"], blank_delta_e: 9 };
+    const a = await runOne();
+    for (const i of a.imgs) {
+      expect(i.checks?.failures).toEqual([]);
+      expect(i.checks?.passes).toBe(true);
+    }
+    compositeChecksExtra = {};
+    const b = await runOne();
+    for (const i of b.imgs) expect(i.checks?.failures).toEqual([]);
+  });
+
+  it("a warn-only code in raw failures is not mapped as an error", async () => {
+    compositeChecksExtra = { failures: ["blank_color_shift"] };
+    const { imgs } = await runOne();
+    for (const i of imgs) expect(i.checks?.failures).toEqual([]);
+  });
+
+  it("a warning rides along with a real failure without becoming one", async () => {
+    compositeChecksExtra = { warnings: ["blank_color_shift"], blank_delta_e: 4 };
+    compositeMode = "drift";
+    const { imgs } = await runOne();
+    for (const i of imgs) {
+      expect(i.status).toBe("failed");
+      expect(i.checks?.passes).toBe(false);
+      expect(i.checks?.failures.map((f) => f.code)).toEqual(["design_drift", "blank_color_shift"]);
+    }
   });
 });
 

@@ -302,6 +302,9 @@ export const PhotoSceneCompositeResult = z.object({
     region_reasons: z.array(z.string()).optional(),
     box_foreign: z.number().nullable().optional(),
     structural: z.boolean().optional(),
+    // T-50-4 (B-448): non-blocking warnings; absent from older imaging.
+    blank_delta_e: z.number().nullable().optional(),
+    warnings: z.array(z.string()).optional(),
   }),
   registration: z
     .object({

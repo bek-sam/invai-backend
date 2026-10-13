@@ -61,7 +61,9 @@ type ImageRow = typeof photoImages.$inferSelect;
 /** Amazon's XMP subject for a photoreal AI person (ADR 0023 §3). */
 export const SYNTHETIC_PERFORMER_SUBJECT = "contains-synthetic-performer";
 const LOCK_CODES = new Set(["design_drift", "region_changed"]);
-const CHECK_CODES = new Set<string>(PHOTO_CHECK_CODES);
+/** Warn-only codes imaging reports in `checks.warnings`; they never fail an image (B-448). */
+const SCENE_WARNING_CODES = new Set<string>(["blank_color_shift"]);
+const CHECK_CODES = new Set<string>(PHOTO_CHECK_CODES.filter((c) => !SCENE_WARNING_CODES.has(c)));
 
 const MSG = {
   cap: "Today's limit for AI scene images is reached. Try again tomorrow.",
@@ -456,6 +458,21 @@ export function toSceneChecks(res: PhotoSceneCompositeResult): PhotoChecks {
       severity: "error" as const,
       detail: code === "region_changed" ? regionDetail(res) : null,
     }));
+  const dropped = new Set<string>();
+  for (const code of new Set(res.checks.warnings ?? [])) {
+    if (SCENE_WARNING_CODES.has(code))
+      failures.push({
+        code: code as PhotoCheckFailure["code"],
+        severity: "warn",
+        detail:
+          typeof res.checks.blank_delta_e === "number"
+            ? `delta_e ${res.checks.blank_delta_e.toFixed(1)}`
+            : null,
+      });
+    else dropped.add(code);
+  }
+  if (dropped.size)
+    log.warn("photo scene: unknown imaging warning ignored", { warnings: [...dropped] });
   const w = res.width_px ?? null;
   const h = res.height_px ?? null;
   return {

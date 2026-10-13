@@ -39,4 +39,18 @@ describe("PhotoSceneCompositeResult", () => {
         .checks.box_foreign,
     ).toBeNull();
   });
+
+  it("accepts blank_delta_e and warnings (T-50-4), and an old answer lacks them", () => {
+    const r = PhotoSceneCompositeResult.parse({
+      ...OLD,
+      checks: { ...OLD.checks, blank_delta_e: 5.4, warnings: ["blank_color_shift", "x"] },
+    });
+    expect(r.checks.blank_delta_e).toBe(5.4);
+    expect(r.checks.warnings).toEqual(["blank_color_shift", "x"]);
+    expect(PhotoSceneCompositeResult.parse(OLD).checks.warnings).toBeUndefined();
+    expect(
+      PhotoSceneCompositeResult.parse({ ...OLD, checks: { ...OLD.checks, blank_delta_e: null } })
+        .checks.blank_delta_e,
+    ).toBeNull();
+  });
 });
