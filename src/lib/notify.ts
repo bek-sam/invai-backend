@@ -20,7 +20,8 @@ import {
 } from "../integrations/vendors/mailer";
 import { conflict, forbidden } from "./errors";
 import { signLink } from "./links";
-import { errorData, logger } from "./log";
+import { logger } from "./log";
+import { MailSendError, mailErrorFields, mailFailureReason } from "./mail-errors";
 
 const log = logger("notify");
 
@@ -496,9 +497,12 @@ export async function sendUserEmail(input: SendUserEmailInput): Promise<SendUser
     log.info("user email sent", { ...ctx, messageId: input.messageId });
     return { status: "sent", messageId: input.messageId };
   } catch (err) {
-    await settle(input, claim.id, { status: "failed", reason: String(errorData(err).error) });
-    log.error("user email failed", { ...ctx, ...errorData(err) });
-    throw err;
+    // The transport error quotes the recipient: only a closed reason and safe codes leave here,
+    // and the rethrown error carries no cause (B-441, S-88).
+    const reason = mailFailureReason(err);
+    await settle(input, claim.id, { status: "failed", reason });
+    log.error("user email failed", { ...ctx, reason, ...mailErrorFields(err) });
+    throw new MailSendError(`mail transport failed (${reason})`);
   }
 }
 

@@ -1,6 +1,7 @@
 import { env } from "../env";
 import { escapeHtml, sendMail } from "../integrations/vendors/mailer";
 import { logger } from "./log";
+import { mailErrorFields } from "./mail-errors";
 
 /*
  * Account emails from Better Auth (src/auth.ts): verify your email, reset your password, and
@@ -11,6 +12,8 @@ import { logger } from "./log";
  * (and in about the same time) whether or not the email exists, so mail goes out in the
  * background and failures are logged, not thrown.
  */
+
+export { mailErrorFields };
 
 const log = logger("auth-mail");
 
@@ -156,30 +159,9 @@ export function accountLockedEmail(locale: AuthMailLocale, minutes: number): Aut
 /** How long an account email may wait on the mail server before it is logged as not sent. */
 export const AUTH_MAIL_TIMEOUT_MS = 15_000;
 
-const SAFE_CODE = /^[A-Za-z0-9_.-]{1,40}$/;
-const safeCode = (v: unknown) => (typeof v === "string" && SAFE_CODE.test(v) ? v : undefined);
-
 /** Marks our own timeout so the log can say so without the message text. */
 class AuthMailTimeout extends Error {
   override name = "AuthMailTimeout";
-}
-
-/**
- * What the log may say about a failed send (B-306, S-29 class). SMTP errors quote the recipient
- * ("550 5.1.1 <someone@example.com>: user unknown"), so the message, `response` and `command`
- * never reach the log: only the error class name, a short code, and the numeric SMTP reply code.
- */
-export function mailErrorFields(err: unknown): {
-  errorName: string;
-  code?: string;
-  responseCode?: number;
-} {
-  const e = (err ?? {}) as { name?: unknown; code?: unknown; responseCode?: unknown };
-  return {
-    errorName: safeCode(e.name) ?? "UnknownError",
-    code: safeCode(e.code),
-    responseCode: typeof e.responseCode === "number" ? e.responseCode : undefined,
-  };
 }
 
 /**
