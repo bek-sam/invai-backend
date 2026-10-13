@@ -1,6 +1,6 @@
 import { eq } from "drizzle-orm";
 import OpenAI from "openai";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { withTenant } from "../../db/client";
 import { aiJobs } from "../../db/schema";
 import { env } from "../../env";
@@ -173,4 +173,50 @@ describe("image spend controls (security, S-77)", () => {
       await redis.del(tKey, pKey);
     }
   });
+});
+
+/*
+ * T-45-2 r2: the production default client (no injected client) must not retry. openai.ts builds it
+ * with maxRetries 0; the SDK default is 2, so a 5xx or a dropped connection would otherwise send
+ * three billable requests per generateScene. Fresh module graph per test (the client is a module
+ * singleton), fake key, unroutable stub host, global fetch stubbed: nothing leaves the process.
+ */
+describe("default OpenAI image client sends one request (security, T-45-2)", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+    vi.resetModules();
+  });
+
+  for (const mode of ["503", "connection error"] as const) {
+    it(`one generateScene is one request on a ${mode}`, async () => {
+      vi.resetModules();
+      vi.stubEnv("OPENAI_BASE_URL", "http://openai.stub.invalid/v1");
+      const fresh = await import("../../env");
+      (fresh.env as unknown as { OPENAI_API_KEY: string }).OPENAI_API_KEY = "sk-test-not-a-key";
+      const { createOpenAiImageProvider: create } = await import("./openai");
+      const hosts: string[] = [];
+      const fetchStub = async (url: string | URL | Request) => {
+        hosts.push(new URL(String(url)).host);
+        if (mode === "connection error") throw new TypeError("fetch failed");
+        return new Response(JSON.stringify({ error: { message: "busy" } }), {
+          status: 503,
+          headers: { "content-type": "application/json" },
+        });
+      };
+      Object.assign(fetchStub, { Response });
+      vi.stubGlobal("fetch", fetchStub);
+      const png = tinyPng();
+      const prompt = buildScenePrompt(null, "studio", "tee", "Black");
+      const error = await create()
+        .generateScene({ baseImage: png, mask: png, prompt, sizePx: 1024 })
+        .then(
+          () => null,
+          (e: unknown) => e,
+        );
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).name).toBe("ImageGenError");
+      expect(hosts).toEqual(["openai.stub.invalid"]);
+    });
+  }
 });
