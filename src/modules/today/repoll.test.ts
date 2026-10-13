@@ -94,7 +94,7 @@ async function bulk(cid: string, conn: string, specs: Spec[]) {
             carrier: "usps" as const,
             trackingCode: c.noTracking ? null : `9400${Math.random().toString().slice(2, 18)}`,
             carrierShipmentId: c.noCarrierId ? null : `shp_${Math.random().toString(36).slice(2)}`,
-            labeledAt: ago(300),
+            labeledAt: ago(1), // keeps these out of the daily 3-day fallback sweep (500 oldest, all shops)
             trackerCheckedAt: c.checkAgoH !== null && !c.failed ? ago(c.checkAgoH) : null,
             trackerCheckFailedAt: c.checkAgoH !== null && c.failed ? ago(c.checkAgoH) : null,
           })),
