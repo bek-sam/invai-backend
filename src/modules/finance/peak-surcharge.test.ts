@@ -1,3 +1,4 @@
+import { eq } from "drizzle-orm";
 import { beforeAll, describe, expect, it } from "vitest";
 import { withSystem, withTenant } from "../../db/client";
 import { shipments } from "../../db/schema";
@@ -49,6 +50,21 @@ describe("true profit with a bought (possibly peak-surcharged) label", () => {
     const rate = quote.rates.find((r) => r.service === "GroundAdvantage");
     if (!rate) throw new Error("no Ground Advantage rate");
     const feeCents = 7;
+    // An earlier, cheaper label on another order, so the bought cost, the 90-day average and the
+    // no-label estimate are three different numbers (an estimate shown as bought must fail).
+    const earlierCents = 100 + feeCents;
+    const earlier = await createOrder(companyId, conn.id, { units: 1, state: "shipped" });
+    await withSystem((tx) =>
+      tx.insert(shipments).values({
+        companyId,
+        orderId: earlier.order.id,
+        orderItemIds: earlier.items.map((i) => i.id),
+        status: "labeled",
+        postageCents: 100,
+        labelFeeCents: feeCents,
+        labeledAt: new Date(Date.now() - 5 * 86400_000),
+      }),
+    );
     await withSystem((tx) =>
       tx.insert(shipments).values({
         companyId,
@@ -61,17 +77,22 @@ describe("true profit with a bought (possibly peak-surcharged) label", () => {
       }),
     );
 
-    const [row] = await withTenant(companyId, (tx) => tx.select().from(shipments).limit(1));
+    const [row] = await withTenant(companyId, (tx) =>
+      tx.select().from(shipments).where(eq(shipments.orderId, bought.order.id)).limit(1),
+    );
     expect(row?.postageCents).toBe(rate.rateCents);
 
     const p = await withTenant(companyId, (tx) => svc.orderProfit(tx, ctx, bought.order.id));
     expect(p.labelCost).toBe(rate.rateCents + feeCents);
     expect(p.estimated).not.toContain("labelCost");
+    const average = Math.round((rate.rateCents + feeCents + earlierCents) / 2);
+    expect(rate.rateCents + feeCents).not.toBe(average);
+    expect(average).not.toBe(earlierCents);
 
     // An order with no label yet: the 90-day average of non-voided labels, marked estimated.
     const open = await createOrder(companyId, conn.id, { units: 1, state: "imported" });
     const e = await withTenant(companyId, (tx) => svc.orderProfit(tx, ctx, open.order.id));
-    expect(e.labelCost).toBe(rate.rateCents + feeCents);
+    expect(e.labelCost).toBe(average);
     expect(e.estimated).toContain("labelCost");
   });
 });
