@@ -1188,7 +1188,7 @@ export async function setItemArtwork(
   let unique: ReturnType<typeof artworkQaFlags> = [];
   let deferQa = true;
   if (await imaging.isUp()) {
-    const turn = await takeQaTurn(ctx.companyId);
+    const turn = await takeQaTurn(ctx.companyId, 1, "artwork");
     if (turn.ok) {
       try {
         const qa = await imaging.qaCheck(

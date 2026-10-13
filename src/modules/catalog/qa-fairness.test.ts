@@ -11,7 +11,7 @@ import { redis } from "../../lib/queues";
 import { createCompany, createUser, tenantContext } from "../../test/fixtures";
 import { runDesignQaJob } from "./jobs";
 import { type QaStub, startQaStub } from "./qa-stub.testutil";
-import { QA_BURST, takeQaTurn } from "./qa-turn";
+import { QA_BURST, scaleQaTiming, takeQaTurn } from "./qa-turn";
 import * as svc from "./service";
 
 /*
@@ -104,11 +104,18 @@ describe("criterion 1: a looping shop A does not starve shop B", () => {
 
   // S-79: the allowance is charged per /qa/check call, so a 5-placement loop can't hold the slot
   // longer than the refill. Wave 42's worst QA (4.3 s) and imaging's default Retry-After (5 s).
-  it("same with A looping a 5-placement design at 4.3 s a call", () => crit1(5, 4_300, 5), 150_000);
+  // Run at 1/5 of the wall-clock time (stub delay, Retry-After, refill and in-flight hint all
+  // scaled together) so the unchanged 30 s / 60 s bounds have real room instead of ~0.7 s.
+  it(
+    "same with A looping a 5-placement design at 4.3 s a call",
+    () => crit1(5, 860, 1, 0.2),
+    150_000,
+  );
 });
 
-async function crit1(aPlacements: number, delayMs: number, retryAfterSec: number) {
+async function crit1(aPlacements: number, delayMs: number, retryAfterSec: number, scale = 1) {
   try {
+    scaleQaTiming(scale);
     stub.delayMs = delayMs;
     stub.retryAfterSec = retryAfterSec;
     const a = await shop();
@@ -167,7 +174,7 @@ async function crit1(aPlacements: number, delayMs: number, retryAfterSec: number
     stop = true;
     await loopA;
     process.stderr.write(
-      `T-43-3 crit1: B job ${JSON.stringify(jobRes)} B manual ${JSON.stringify(manualRes)} A ok ${aOk} refused ${aRefused}\n`,
+      `T-43-3 crit1 (scale ${scale}): B job ${JSON.stringify(jobRes)} B manual ${JSON.stringify(manualRes)} A ok ${aOk} refused ${aRefused} margin to 30 s ${30_000 - manualRes.ms} ms\n`,
     );
 
     expect(jobRes.error).toBeUndefined();
@@ -178,6 +185,7 @@ async function crit1(aPlacements: number, delayMs: number, retryAfterSec: number
     expect(await qaStatusOf(b, bManualDesign.id)).toBe("passed");
     expect(aRefused).toBeGreaterThan(0);
   } finally {
+    scaleQaTiming(1);
     stub.retryAfterSec = 1;
   }
 }
@@ -204,7 +212,7 @@ describe("criterion 2: per-company lease and allowance", () => {
     stub.delayMs = 5;
     const s = await shop();
     const d = await design(s);
-    const held = await takeQaTurn(s.id);
+    const held = await takeQaTurn(s.id, 1, "design");
     expect(held.ok).toBe(true);
     const before = stub.calls["/qa/check"] ?? 0;
     const err = await runQa(s, d.id).catch((e) => e);
@@ -230,9 +238,9 @@ describe("criterion 2: per-company lease and allowance", () => {
 
   it("release is compare-and-delete: an expired holder never frees the next lease", async () => {
     const s = await shop();
-    const first = await takeQaTurn(s.id);
+    const first = await takeQaTurn(s.id, 1, "design");
     await redis.del(`qa:lease:${s.id}`); // the TTL ran out
-    const second = await takeQaTurn(s.id);
+    const second = await takeQaTurn(s.id, 1, "design");
     expect(second.ok).toBe(true);
     if (first.ok) await first.release();
     expect(await redis.exists(`qa:lease:${s.id}`)).toBe(1);
@@ -243,7 +251,7 @@ describe("criterion 2: per-company lease and allowance", () => {
   it("fails open with a warning when Valkey errors", async () => {
     const s = await shop();
     const spy = vi.spyOn(redis, "set").mockRejectedValueOnce(new Error("valkey down"));
-    const t = await takeQaTurn(s.id);
+    const t = await takeQaTurn(s.id, 1, "design");
     expect(t.ok).toBe(true);
     spy.mockRestore();
   });
@@ -273,7 +281,7 @@ describe("criterion 3: the QA job never sleeps on a busy slot", () => {
   it("a held company lease re-delays the job without calling imaging", async () => {
     const s = await shop();
     const d = await design(s);
-    const held = await takeQaTurn(s.id);
+    const held = await takeQaTurn(s.id, 1, "design");
     const before = stub.calls["/qa/check"] ?? 0;
     const { job } = stubJob();
     await expect(
@@ -392,21 +400,21 @@ describe("criterion 6: tenancy", () => {
   it("one company's lease and allowance never block another's; keys hold only the company id", async () => {
     const a = await shop();
     const b = await shop();
-    const heldA = await takeQaTurn(a.id);
+    const heldA = await takeQaTurn(a.id, 1, "design");
     for (let i = 0; i < QA_BURST; i++) {
-      const t = await takeQaTurn(b.id);
+      const t = await takeQaTurn(b.id, 1, "design");
       expect(t.ok).toBe(true);
       if (t.ok) await t.release();
     }
-    const aSecond = await takeQaTurn(a.id);
+    const aSecond = await takeQaTurn(a.id, 1, "design");
     expect(aSecond).toMatchObject({ ok: false, reason: "in_flight" });
-    const bNext = await takeQaTurn(b.id);
+    const bNext = await takeQaTurn(b.id, 1, "design");
     expect(bNext).toMatchObject({ ok: false, reason: "rate" }); // B used its own burst
     if (heldA.ok) await heldA.release();
     const cShop = await shop();
-    expect((await takeQaTurn(cShop.id)).ok).toBe(true);
+    expect((await takeQaTurn(cShop.id, 1, "design")).ok).toBe(true);
     const keys = [...(await redis.keys("qa:*"))];
-    const uuid = /^qa:(lease|rate):[0-9a-f-]{36}$/;
+    const uuid = /^qa:(lease|rate:(design|artwork)):[0-9a-f-]{36}$/;
     expect(keys.length).toBeGreaterThan(0);
     for (const k of keys) expect(k).toMatch(uuid);
   });

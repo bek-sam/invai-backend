@@ -28,7 +28,7 @@ export const runDesignQaJob = defineJob({
     }
     const ctx = { companyId, what: "design", id: designId };
     const calls = await withTenant(companyId, (tx) => qaCallCount(tx, designId));
-    const turn = await takeQaTurn(companyId, calls);
+    const turn = await takeQaTurn(companyId, calls, "design");
     if (!turn.ok) return await redelayQa(job, turn.retryAfterMs, ctx);
     try {
       const sys = systemContext(companyId);

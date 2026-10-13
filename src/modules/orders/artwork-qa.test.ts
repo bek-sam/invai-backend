@@ -84,7 +84,11 @@ const run = (id: string, name: string, cid = companyId) =>
 describe("setItemArtwork follow-up QA (T-43-3 criterion 4)", () => {
   // Every QA path spends the company's allowance (3 burst); each case starts with a full one.
   beforeEach(async () => {
-    await redis.del(`qa:rate:${companyId}`, `qa:lease:${companyId}`);
+    await redis.del(
+      `qa:rate:artwork:${companyId}`,
+      `qa:rate:design:${companyId}`,
+      `qa:lease:${companyId}`,
+    );
   });
 
   it("answers at once when imaging is free: flags now, no follow-up job", async () => {
@@ -116,7 +120,7 @@ describe("setItemArtwork follow-up QA (T-43-3 criterion 4)", () => {
   it("a held company lease defers too, and imaging down defers", async () => {
     enqueue.mockClear();
     const id = await newItem();
-    const held = await takeQaTurn(companyId);
+    const held = await takeQaTurn(companyId, 1, "artwork");
     await attach(id, "lowdpi-c");
     expect(enqueue).toHaveBeenCalledTimes(1);
     if (held.ok) await held.release();

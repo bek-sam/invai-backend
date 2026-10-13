@@ -54,7 +54,11 @@ afterAll(async () => {
 });
 beforeEach(async () => {
   vi.restoreAllMocks();
-  await redis.del(`qa:rate:${companyId}`, `qa:lease:${companyId}`);
+  await redis.del(
+    `qa:rate:artwork:${companyId}`,
+    `qa:rate:design:${companyId}`,
+    `qa:lease:${companyId}`,
+  );
 });
 
 async function itemWithArtwork(name: string) {
@@ -178,7 +182,9 @@ describe("a finished (given-up) follow-up does not block queueing the same file 
     const noop = await itemArtworkQaJob.enqueue(input);
     expect(await noop.getState()).toBe("completed");
     const again = await enqueueItemArtworkQa(input);
-    expect(await again.getState()).toBe("waiting");
+    // Follow-ups carry BULK_PRIORITY (T-43-3 r3), and BullMQ reports a prioritized job as such.
+    expect(await again.getState()).toBe("prioritized");
+    expect(again.opts.priority).toBe(10);
     await again.remove();
   });
 });

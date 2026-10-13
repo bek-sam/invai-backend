@@ -5,6 +5,7 @@ import { buyerPii, companies, orderItems, orders } from "../../db/schema";
 import { env } from "../../env";
 import { ImagingError, imaging } from "../../integrations/imaging/client";
 import { sha256Hex } from "../../lib/crypto";
+import { BULK_PRIORITY } from "../../lib/fairness";
 import { errorData, logger } from "../../lib/log";
 import { emit } from "../../lib/outbox";
 import { defineJob, isPermanentHttpStatus, queues, safeJobId } from "../../lib/queues";
@@ -244,6 +245,8 @@ const ARTWORK_QA_DOWN_RETRY_MS = 30_000;
 export const itemArtworkQaJob = defineJob({
   queue: "render",
   name: "orders.itemArtworkQa",
+  // A waiting design QA job on `render` goes first (architect ruling, T-43-3 r3).
+  options: { priority: BULK_PRIORITY },
   input: z.object({ companyId: z.uuid(), itemId: z.uuid(), fileKey: z.string().min(1) }),
   jobId: (i) => `artwork-qa-${i.itemId}-${sha256Hex(i.fileKey).slice(0, 16)}`,
   handler: async ({ companyId, itemId, fileKey }, job) => {
@@ -260,7 +263,7 @@ export const itemArtworkQaJob = defineJob({
       log.warn("imaging down, artwork QA deferred", { companyId, itemId });
       return await redelayQa(job, ARTWORK_QA_DOWN_RETRY_MS, ctx);
     }
-    const turn = await takeQaTurn(companyId);
+    const turn = await takeQaTurn(companyId, 1, "artwork");
     if (!turn.ok) return await redelayQa(job, turn.retryAfterMs, ctx);
     let flags: ReturnType<typeof artworkQaFlags>;
     try {

@@ -27,6 +27,8 @@ const log = logger("catalog.qa-turn");
  *     worst QA) once the burst is spent, while a person re-running a 1-placement design by hand
  *     (a few clicks, then one every 20 s) is never refused.
  *
+ * The allowance is split in two buckets per company, `design` (runQa, the QA job) and `artwork`
+ * (item artwork follow-ups, the inline check), each with this burst and refill; the lease is shared.
  * Valkey trouble fails open with one warn log, like `lib/fairness.ts`: the fairness guarantee is
  * lost, nobody's QA is. Callers: the router's `runQa`, the QA job, `setItemArtwork` and its
  * follow-up job. Not `runDesignQa` itself: the seed runs it in sequence and stays unthrottled.
@@ -35,6 +37,15 @@ const log = logger("catalog.qa-turn");
 export const QA_BURST = 3;
 export const QA_REFILL_MS = 20_000;
 export const QA_IN_FLIGHT_RETRY_MS = 3_000;
+/**
+ * Live timing, equal to the constants above. Only tests call `scaleQaTiming`, to run the same
+ * dynamics at a fraction of the wall-clock time; the bounds they assert are never scaled.
+ */
+const timing = { refillMs: QA_REFILL_MS, inFlightRetryMs: QA_IN_FLIGHT_RETRY_MS };
+export function scaleQaTiming(factor: number): void {
+  timing.refillMs = Math.round(QA_REFILL_MS * factor);
+  timing.inFlightRetryMs = Math.round(QA_IN_FLIGHT_RETRY_MS * factor);
+}
 /** One QA call per placement; `PLACEMENTS` has five values. */
 export const QA_MAX_CALLS = 5;
 export const QA_LEASE_TTL_MS = QA_MAX_CALLS * 2 * 120_000;
@@ -45,7 +56,9 @@ export const QA_MANUAL_BUSY = { retries: 5, budgetMs: 25_000 } as const;
 export const QA_NO_BUSY = { retries: 0 } as const;
 
 const leaseKey = (companyId: string) => `qa:lease:${companyId}`;
-const rateKey = (companyId: string) => `qa:rate:${companyId}`;
+/** Two allowances per company (architect ruling, T-43-3 r3): a shop's artwork backlog can't eat its design checks. */
+export type QaBucket = "design" | "artwork";
+const rateKey = (companyId: string, bucket: QaBucket) => `qa:rate:${bucket}:${companyId}`;
 
 const RELEASE_SCRIPT = `
 if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end
@@ -80,7 +93,11 @@ export type QaTurn =
   | { ok: false; reason: "in_flight" | "rate"; retryAfterMs: number };
 
 /** `calls` = the `/qa/check` calls this turn will make (one per placement), 1..QA_MAX_CALLS. */
-export async function takeQaTurn(companyId: string, calls = 1): Promise<QaTurn> {
+export async function takeQaTurn(
+  companyId: string,
+  calls: number,
+  bucket: QaBucket,
+): Promise<QaTurn> {
   const charge = Math.min(QA_MAX_CALLS, Math.max(1, Math.floor(calls)));
   const token = randomUUID();
   const none = async () => {};
@@ -88,7 +105,7 @@ export async function takeQaTurn(companyId: string, calls = 1): Promise<QaTurn> 
     const got = await redis.set(leaseKey(companyId), token, "PX", QA_LEASE_TTL_MS, "NX");
     if (got !== "OK") {
       // A turn is normally a few seconds (wave 42: worst 4.3 s), so ask again soon.
-      return { ok: false, reason: "in_flight", retryAfterMs: QA_IN_FLIGHT_RETRY_MS };
+      return { ok: false, reason: "in_flight", retryAfterMs: timing.inFlightRetryMs };
     }
     const release = async () => {
       try {
@@ -101,9 +118,9 @@ export async function takeQaTurn(companyId: string, calls = 1): Promise<QaTurn> 
       const wait = (await redis.eval(
         ALLOWANCE_SCRIPT,
         1,
-        rateKey(companyId),
+        rateKey(companyId, bucket),
         QA_BURST,
-        QA_REFILL_MS,
+        timing.refillMs,
         charge,
         QA_MAX_CALLS,
       )) as number;
