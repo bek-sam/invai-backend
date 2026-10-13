@@ -24,6 +24,7 @@ import {
   tenantContext,
 } from "../../test/fixtures";
 import { classify } from "../production/sheets";
+import { setQaCooldown } from "./qa-turn";
 
 /*
  * T-42-5 (B-380 C3): imaging stubbed; everything else runs against invai_test with RLS.
@@ -69,6 +70,8 @@ const err = (code: string, extra: Record<string, unknown> = {}) => ({
   message: `${code} error`,
   ...extra,
 });
+
+beforeAll(() => setQaCooldown(0)); // S-81: several turns in a row per company
 
 describe("QA warnings (T-42-5)", () => {
   let companyId: string;

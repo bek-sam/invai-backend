@@ -61,7 +61,7 @@ import { logger } from "../../lib/log";
 import { emit } from "../../lib/outbox";
 import { isPermanentHttpStatus } from "../../lib/queues";
 import { publish } from "../../lib/realtime";
-import { artworkQaFlags, QA_NO_BUSY, takeQaTurn } from "../catalog/qa-turn";
+import { artworkQaFlags, isImagingBusy, QA_NO_BUSY, takeQaTurn } from "../catalog/qa-turn";
 import { releaseForItems } from "../inventory/service";
 import { guardShipmentsForItems } from "../shipping/service";
 import { ARTWORK_ITEM_FLAGS, withFlags } from "./flags";
@@ -1190,6 +1190,7 @@ export async function setItemArtwork(
   if (await imaging.isUp()) {
     const turn = await takeQaTurn(ctx.companyId, 1, "artwork");
     if (turn.ok) {
+      let busy = false;
       try {
         const qa = await imaging.qaCheck(
           {
@@ -1203,10 +1204,11 @@ export async function setItemArtwork(
         deferQa = false;
       } catch (err) {
         log.warn("artwork QA failed", { itemId: item.id, error: String(err) });
+        busy = isImagingBusy(err);
         if (err instanceof ImagingError && err.status !== 429 && isPermanentHttpStatus(err.status))
           deferQa = false;
       } finally {
-        await turn.release();
+        await turn.release({ busy });
       }
     }
   }

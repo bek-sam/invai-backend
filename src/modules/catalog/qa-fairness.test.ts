@@ -8,10 +8,18 @@ import { withTenant } from "../../db/client";
 import { designFiles } from "../../db/schema";
 import { ImagingError } from "../../integrations/imaging/client";
 import { redis } from "../../lib/queues";
-import { createCompany, createUser, tenantContext } from "../../test/fixtures";
+import {
+  createCompany,
+  createConnection,
+  createOrder,
+  createUser,
+  tenantContext,
+} from "../../test/fixtures";
+import { itemArtworkQaJob } from "../orders/jobs";
+import { setItemArtwork } from "../orders/service";
 import { runDesignQaJob } from "./jobs";
 import { type QaStub, startQaStub } from "./qa-stub.testutil";
-import { QA_BURST, scaleQaTiming, takeQaTurn } from "./qa-turn";
+import { QA_BURST, scaleQaTiming, setQaCooldown, takeQaTurn } from "./qa-turn";
 import * as svc from "./service";
 
 /*
@@ -94,6 +102,7 @@ function stubJob(over: Partial<Job> = {}) {
 beforeAll(async () => {
   stub = await startQaStub();
   where.url = stub.url;
+  setQaCooldown(0); // S-81: only the crit-1 / S-81 cases run with the cooldown on
 });
 afterAll(async () => {
   await stub.close();
@@ -113,7 +122,14 @@ describe("criterion 1: a looping shop A does not starve shop B", () => {
   );
 });
 
-async function crit1(aPlacements: number, delayMs: number, retryAfterSec: number, scale = 1) {
+async function crit1(
+  aPlacements: number,
+  delayMs: number,
+  retryAfterSec: number,
+  scale = 1,
+  artworkLoop = false,
+) {
+  const enqueue = vi.spyOn(itemArtworkQaJob, "enqueue").mockResolvedValue(undefined as never);
   try {
     scaleQaTiming(scale);
     stub.delayMs = delayMs;
@@ -138,6 +154,24 @@ async function crit1(aPlacements: number, delayMs: number, retryAfterSec: number
             await sleep(25);
           } else await sleep(25); // base: upstream errors are not what we measure here
         }
+      }
+    })();
+    let artworkAttaches = 0;
+    const loopArtwork = (async () => {
+      if (!artworkLoop) return;
+      const conn = await createConnection(a.id);
+      const itemId = (await createOrder(a.id, conn.id)).items[0]?.id as string;
+      let k = 0;
+      while (!stop) {
+        // A fresh key each time, so every attach asks for a QA call (S-81: the second bucket).
+        await withTenant(a.id, (tx) =>
+          setItemArtwork(tx, tenantContext(a.id, null, "office"), {
+            id: itemId,
+            fileKey: `${a.id}/art/s81-${k++}.png`,
+          }),
+        ).catch(() => {});
+        artworkAttaches++;
+        await sleep(25);
       }
     })();
     await sleep(100); // A is in the middle of a call
@@ -172,9 +206,9 @@ async function crit1(aPlacements: number, delayMs: number, retryAfterSec: number
     })();
     const [jobRes, manualRes] = await Promise.all([jobRun, manualRun]);
     stop = true;
-    await loopA;
+    await Promise.all([loopA, loopArtwork]);
     process.stderr.write(
-      `T-43-3 crit1 (scale ${scale}): B job ${JSON.stringify(jobRes)} B manual ${JSON.stringify(manualRes)} A ok ${aOk} refused ${aRefused} margin to 30 s ${30_000 - manualRes.ms} ms\n`,
+      `T-43-3 crit1 (scale ${scale}): B job ${JSON.stringify(jobRes)} B manual ${JSON.stringify(manualRes)} A ok ${aOk} refused ${aRefused} artwork attaches ${artworkAttaches} margin to 30 s ${30_000 - manualRes.ms} ms\n`,
     );
 
     expect(jobRes.error).toBeUndefined();
@@ -186,9 +220,22 @@ async function crit1(aPlacements: number, delayMs: number, retryAfterSec: number
     expect(aRefused).toBeGreaterThan(0);
   } finally {
     scaleQaTiming(1);
+    setQaCooldown(0);
+    enqueue.mockRestore();
     stub.retryAfterSec = 1;
   }
 }
+
+// S-81: one shop loops design Run QA and artwork attaches at once. Real timing (4.3 s a call,
+// Retry-After 5 s, 20 s refill, 6 s cooldown); without the cooldown the two buckets' bursts run
+// back to back and the victim's Run QA needs three clicks over 42 s.
+describe("S-81: a shop looping design QA and artwork attaches together", () => {
+  it(
+    "victim shop B: manual result within 30 s, design job within 60 s",
+    () => crit1(5, 4_300, 5, 1, true),
+    200_000,
+  );
+});
 
 describe("criterion 2: per-company lease and allowance", () => {
   it("refuses over the burst with RATE_LIMITED at once and no imaging call", async () => {
@@ -246,6 +293,37 @@ describe("criterion 2: per-company lease and allowance", () => {
     expect(await redis.exists(`qa:lease:${s.id}`)).toBe(1);
     if (second.ok) await second.release();
     expect(await redis.exists(`qa:lease:${s.id}`)).toBe(0);
+  });
+
+  it("the lease is kept for the cooldown after a turn, only the holder shortens it (S-81)", async () => {
+    const s = await shop();
+    setQaCooldown(6_000);
+    try {
+      const first = await takeQaTurn(s.id, 1, "design");
+      expect(first.ok).toBe(true);
+      if (first.ok) await first.release();
+      const ttl = await redis.pttl(`qa:lease:${s.id}`);
+      expect(ttl).toBeGreaterThan(0);
+      expect(ttl).toBeLessThanOrEqual(6_000);
+      expect(await takeQaTurn(s.id, 1, "artwork")).toMatchObject({
+        ok: false,
+        reason: "in_flight",
+      });
+      // an old holder (its lease expired and was taken by another) must not shorten the new lease
+      await redis.del(`qa:lease:${s.id}`);
+      const stale = first;
+      setQaCooldown(0);
+      const second = await takeQaTurn(s.id, 1, "design");
+      setQaCooldown(6_000);
+      expect(second.ok).toBe(true);
+      const before = await redis.pttl(`qa:lease:${s.id}`);
+      if (stale.ok) await stale.release();
+      expect(await redis.pttl(`qa:lease:${s.id}`)).toBeGreaterThan(before - 50);
+      expect(await redis.pttl(`qa:lease:${s.id}`)).toBeGreaterThan(6_000);
+      await redis.del(`qa:lease:${s.id}`);
+    } finally {
+      setQaCooldown(0);
+    }
   });
 
   it("fails open with a warning when Valkey errors", async () => {

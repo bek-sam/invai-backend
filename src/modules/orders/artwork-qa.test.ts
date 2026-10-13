@@ -5,7 +5,7 @@ import { orderItems } from "../../db/schema";
 import { redis } from "../../lib/queues";
 import { createCompany, createConnection, createOrder, tenantContext } from "../../test/fixtures";
 import { type QaStub, startQaStub } from "../catalog/qa-stub.testutil";
-import { takeQaTurn } from "../catalog/qa-turn";
+import { setQaCooldown, takeQaTurn } from "../catalog/qa-turn";
 import { itemArtworkQaJob } from "./jobs";
 import { setItemArtwork } from "./service";
 
@@ -38,6 +38,7 @@ let otherId: string;
 const enqueue = vi.spyOn(itemArtworkQaJob, "enqueue");
 
 beforeAll(async () => {
+  setQaCooldown(0); // S-81: these tests take several turns in a row
   stub = await startQaStub();
   where.url = stub.url;
   stub.delayMs = 5;

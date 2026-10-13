@@ -30,6 +30,7 @@ export const runDesignQaJob = defineJob({
     const calls = await withTenant(companyId, (tx) => qaCallCount(tx, designId));
     const turn = await takeQaTurn(companyId, calls, "design");
     if (!turn.ok) return await redelayQa(job, turn.retryAfterMs, ctx);
+    let busy = false;
     try {
       const sys = systemContext(companyId);
       const design = await withTenant(companyId, (tx) =>
@@ -37,10 +38,13 @@ export const runDesignQaJob = defineJob({
       );
       return { qaStatus: design.qaStatus };
     } catch (err) {
-      if (isImagingBusy(err)) return await redelayQa(job, err.retryAfterMs ?? 5_000, ctx);
+      if (isImagingBusy(err)) {
+        busy = true;
+        return await redelayQa(job, err.retryAfterMs ?? 5_000, ctx);
+      }
       throw err;
     } finally {
-      await turn.release();
+      await turn.release({ busy });
     }
   },
 });

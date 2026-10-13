@@ -6,7 +6,7 @@ import { orderItems } from "../../db/schema";
 import { queues, redis } from "../../lib/queues";
 import { createCompany, createConnection, createOrder, tenantContext } from "../../test/fixtures";
 import { type QaStub, startQaStub } from "../catalog/qa-stub.testutil";
-import { QA_WAIT_LIMIT_MS } from "../catalog/qa-turn";
+import { QA_WAIT_LIMIT_MS, setQaCooldown } from "../catalog/qa-turn";
 import { enqueueItemArtworkQa, itemArtworkQaJob } from "./jobs";
 import { setItemArtwork } from "./service";
 
@@ -38,6 +38,7 @@ let stub: QaStub;
 let companyId: string;
 
 beforeAll(async () => {
+  setQaCooldown(0); // S-81: these tests take several turns in a row
   stub = await startQaStub();
   where.url = stub.url;
   stub.delayMs = 5;

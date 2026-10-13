@@ -16,7 +16,7 @@ import {
 } from "../../test/fixtures";
 import { itemArtworkQaJob } from "../orders/jobs";
 import { type QaStub, startQaStub } from "./qa-stub.testutil";
-import { QA_BURST, takeQaTurn } from "./qa-turn";
+import { QA_BURST, setQaCooldown, takeQaTurn } from "./qa-turn";
 import * as svc from "./service";
 
 /*
@@ -44,6 +44,7 @@ vi.mock("../../integrations/imaging/client", async (orig) => {
 
 let stub: QaStub;
 beforeAll(async () => {
+  setQaCooldown(0); // S-81: these tests take several turns in a row
   stub = await startQaStub();
   where.url = stub.url;
   stub.delayMs = 5;

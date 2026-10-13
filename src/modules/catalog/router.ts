@@ -34,6 +34,7 @@ export const designsRouter = authed.designs.router({
     const calls = await withTenant(tenant.companyId, (tx) => svc.qaCallCount(tx, input.id));
     const turn = await takeQaTurn(tenant.companyId, calls, "design");
     if (!turn.ok) throw rateLimited(retrySeconds(turn.retryAfterMs));
+    let busy = false;
     try {
       return await withTenant(tenant.companyId, (tx) =>
         svc.runDesignQa(tx, tenant, input.id, {
@@ -42,10 +43,13 @@ export const designsRouter = authed.designs.router({
         }),
       );
     } catch (err) {
-      if (isImagingBusy(err)) throw rateLimited(retrySeconds(err.retryAfterMs ?? 5_000));
+      if (isImagingBusy(err)) {
+        busy = true;
+        throw rateLimited(retrySeconds(err.retryAfterMs ?? 5_000));
+      }
       throw err;
     } finally {
-      await turn.release();
+      await turn.release({ busy });
     }
   }),
   acceptQaWarning: authed.designs.acceptQaWarning.handler(({ input, context: { tenant } }) =>

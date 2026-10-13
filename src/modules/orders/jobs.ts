@@ -266,6 +266,7 @@ export const itemArtworkQaJob = defineJob({
     const turn = await takeQaTurn(companyId, 1, "artwork");
     if (!turn.ok) return await redelayQa(job, turn.retryAfterMs, ctx);
     let flags: ReturnType<typeof artworkQaFlags>;
+    let busy = false;
     try {
       const qa = await imaging.qaCheck(
         {
@@ -277,7 +278,10 @@ export const itemArtworkQaJob = defineJob({
       );
       flags = artworkQaFlags(qa.issues);
     } catch (err) {
-      if (isImagingBusy(err)) return await redelayQa(job, err.retryAfterMs ?? 5_000, ctx);
+      if (isImagingBusy(err)) {
+        busy = true;
+        return await redelayQa(job, err.retryAfterMs ?? 5_000, ctx);
+      }
       if (err instanceof ImagingError && isPermanentHttpStatus(err.status)) {
         log.warn("imaging rejected the artwork; no QA flags", {
           companyId,
@@ -293,7 +297,7 @@ export const itemArtworkQaJob = defineJob({
       }
       throw err;
     } finally {
-      await turn.release();
+      await turn.release({ busy });
     }
     return withTenant(companyId, async (tx) => {
       const [locked] = await tx

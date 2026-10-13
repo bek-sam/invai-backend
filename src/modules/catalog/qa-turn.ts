@@ -29,6 +29,8 @@ const log = logger("catalog.qa-turn");
  *
  * The allowance is split in two buckets per company, `design` (runQa, the QA job) and `artwork`
  * (item artwork follow-ups, the inline check), each with this burst and refill; the lease is shared.
+ * A finished turn does not delete the lease but shortens it to `QA_COOLDOWN_MS` (S-81), so one
+ * company's design and artwork bursts can't run back to back; only the token holder may shorten it.
  * Valkey trouble fails open with one warn log, like `lib/fairness.ts`: the fairness guarantee is
  * lost, nobody's QA is. Callers: the router's `runQa`, the QA job, `setItemArtwork` and its
  * follow-up job. Not `runDesignQa` itself: the seed runs it in sequence and stays unthrottled.
@@ -38,13 +40,27 @@ export const QA_BURST = 3;
 export const QA_REFILL_MS = 20_000;
 export const QA_IN_FLIGHT_RETRY_MS = 3_000;
 /**
+ * After a turn the company keeps its lease this long (S-81): imaging's Retry-After (5 s) + 1 s, so
+ * another shop retrying on that hint always finds the slot between two turns of the same company.
+ */
+export const QA_COOLDOWN_MS = 6_000;
+/**
  * Live timing, equal to the constants above. Only tests call `scaleQaTiming`, to run the same
  * dynamics at a fraction of the wall-clock time; the bounds they assert are never scaled.
  */
-const timing = { refillMs: QA_REFILL_MS, inFlightRetryMs: QA_IN_FLIGHT_RETRY_MS };
+const timing = {
+  refillMs: QA_REFILL_MS,
+  inFlightRetryMs: QA_IN_FLIGHT_RETRY_MS,
+  cooldownMs: QA_COOLDOWN_MS,
+};
 export function scaleQaTiming(factor: number): void {
   timing.refillMs = Math.round(QA_REFILL_MS * factor);
   timing.inFlightRetryMs = Math.round(QA_IN_FLIGHT_RETRY_MS * factor);
+  timing.cooldownMs = Math.round(QA_COOLDOWN_MS * factor);
+}
+/** Test-only: tests that take several turns in a row for one company switch the cooldown off (0). */
+export function setQaCooldown(ms: number): void {
+  timing.cooldownMs = ms;
 }
 /** One QA call per placement; `PLACEMENTS` has five values. */
 export const QA_MAX_CALLS = 5;
@@ -62,6 +78,12 @@ const rateKey = (companyId: string, bucket: QaBucket) => `qa:rate:${bucket}:${co
 
 const RELEASE_SCRIPT = `
 if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end
+return 0
+`;
+
+/** Only the token holder shortens its own lease to the cooldown; another holder's lease is untouched. */
+const COOLDOWN_SCRIPT = `
+if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('PEXPIRE', KEYS[1], ARGV[2]) end
 return 0
 `;
 
@@ -89,7 +111,7 @@ return wait
 `;
 
 export type QaTurn =
-  | { ok: true; release: () => Promise<void> }
+  | { ok: true; release: (opts?: { busy?: boolean }) => Promise<void> }
   | { ok: false; reason: "in_flight" | "rate"; retryAfterMs: number };
 
 /** `calls` = the `/qa/check` calls this turn will make (one per placement), 1..QA_MAX_CALLS. */
@@ -107,9 +129,18 @@ export async function takeQaTurn(
       // A turn is normally a few seconds (wave 42: worst 4.3 s), so ask again soon.
       return { ok: false, reason: "in_flight", retryAfterMs: timing.inFlightRetryMs };
     }
-    const release = async () => {
+    const free = async () => {
       try {
         await redis.eval(RELEASE_SCRIPT, 1, leaseKey(companyId), token);
+      } catch (err) {
+        log.warn("qa lease release failed", { companyId, error: String(err) });
+      }
+    };
+    // `busy`: imaging answered 429, so this turn never held the slot and owes no cooldown.
+    const release = async (opts?: { busy?: boolean }) => {
+      if (opts?.busy) return free();
+      try {
+        await redis.eval(COOLDOWN_SCRIPT, 1, leaseKey(companyId), token, timing.cooldownMs);
       } catch (err) {
         log.warn("qa lease release failed", { companyId, error: String(err) });
       }
@@ -125,11 +156,11 @@ export async function takeQaTurn(
         QA_MAX_CALLS,
       )) as number;
       if (wait > 0) {
-        await release();
+        await free(); // no turn ran, so no cooldown
         return { ok: false, reason: "rate", retryAfterMs: wait };
       }
     } catch (err) {
-      await release();
+      await free();
       throw err;
     }
     return { ok: true, release };
