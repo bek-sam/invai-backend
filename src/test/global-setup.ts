@@ -26,6 +26,10 @@ import "./provided-context";
  * may carry rows from an earlier run.
  */
 process.env.NODE_ENV = "test";
+// T-43-6: S3_BUCKET as the caller exported it, read before `.env` (which names the dev bucket)
+// is loaded below. env.ts never overrides an already-set variable, so the bucket chosen in setup()
+// is the one every import sees.
+const shellS3Bucket = process.env.S3_BUCKET;
 // Mirrors env.ts's own dotenv loading (duplicated, not imported — see the note on `env` below):
 // we need the raw DATABASE_URL/MIGRATION_DATABASE_URL/REDIS_URL from `.env` *before* claiming a
 // per-run database and Redis DB, and before setting TEST_DATABASE_URL etc., which env.ts must
@@ -44,6 +48,12 @@ export default async function setup(project: TestProject) {
   const rawDatabaseUrl = requireEnv("DATABASE_URL");
   const rawMigrationUrl = requireEnv("MIGRATION_DATABASE_URL");
   const rawRedisUrl = requireEnv("REDIS_URL");
+
+  // Hermetic storage: abort before anything else if the bucket is not a test bucket.
+  const { resolveTestBucket } = await import("./bucket-safety");
+  const testBucket = resolveTestBucket(shellS3Bucket, Boolean(process.env.CI));
+  process.env.S3_BUCKET = testBucket;
+  project.provide("testS3Bucket", testBucket);
 
   const dbClaim = await claimTestDatabase({
     appUrl: rawDatabaseUrl,
@@ -79,8 +89,32 @@ export default async function setup(project: TestProject) {
   await runMigrations(env.MIGRATION_DATABASE_URL, { quiet: true });
   const { truncateAll } = await import("./fixtures");
   await truncateAll();
-  const { ensureBucket } = await import("../lib/s3");
+  const { ensureBucket, s3, bucket } = await import("../lib/s3");
+  // Last line of defence: what s3.ts actually bound to must still be the test bucket.
+  const { assertTestBucket } = await import("./bucket-safety");
+  assertTestBucket(bucket, Boolean(process.env.CI));
   await ensureBucket();
+  // Test files expire by themselves after a day; the suite has no delete code for them.
+  const { PutBucketLifecycleConfigurationCommand, DeleteBucketPolicyCommand } = await import(
+    "@aws-sdk/client-s3"
+  );
+  await s3.send(
+    new PutBucketLifecycleConfigurationCommand({
+      Bucket: bucket,
+      LifecycleConfiguration: {
+        Rules: [
+          {
+            ID: "expire-test-objects",
+            Status: "Enabled",
+            Filter: { Prefix: "" },
+            Expiration: { Days: 1 },
+          },
+        ],
+      },
+    }),
+  );
+  // Anonymous access none: drop any bucket policy (a new bucket is private by default).
+  await s3.send(new DeleteBucketPolicyCommand({ Bucket: bucket })).catch(() => {});
 
   return async () => {
     // This process imported the db pools and (through fixtures) the queues and Redis; left open

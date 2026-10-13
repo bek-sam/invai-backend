@@ -18,6 +18,8 @@ declare module "vitest" {
     testMigrationDatabaseUrl?: string;
     /** `REDIS_URL` to use in every worker, or undefined when pinned. */
     testRedisUrl?: string;
+    /** `S3_BUCKET` to use in every worker (T-43-6): always a test bucket, never the dev one. */
+    testS3Bucket?: string;
   }
 }
 

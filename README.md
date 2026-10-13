@@ -95,6 +95,13 @@ at — even if pinned via `TEST_DATABASE_URL`/`TEST_MIGRATION_DATABASE_URL` by m
 (`src/test/setup-env.ts`, `src/test/provided-context.ts`), not by relying on `process.env`
 propagating into a worker thread or fork for free.
 
+Test storage is hermetic too (T-43-6): `global-setup.ts` sets `S3_BUCKET` to `invai-test` before
+anything imports `env.ts`, ignoring the dev bucket in `.env`, and hands it to workers through
+`provide()`/`inject()`. An exported `S3_BUCKET` is checked, not swapped: only `invai-test`,
+`invai-test-<suffix>`, or `invai-ci` with `CI` set pass (`src/test/bucket-safety.ts`); anything else
+(`invai-local` included) aborts the run before a test starts. Setup creates the bucket if missing and
+expires every object after 1 day, so the suite has no cleanup code for stored files.
+
 No real API keys are needed: every integration (Claude, EasyPost, Shopify, S&S) falls back to a
 mock provider automatically when its env var is unset (`env.mocks.*` in `src/env.ts`). See
 `invai-docs/build/runbook.md` for the env var reference and the mock-to-real switches, and

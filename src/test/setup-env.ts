@@ -16,7 +16,10 @@ import "./provided-context";
 const testDatabaseUrl = inject("testDatabaseUrl");
 const testMigrationDatabaseUrl = inject("testMigrationDatabaseUrl");
 const testRedisUrl = inject("testRedisUrl");
+const testS3Bucket = inject("testS3Bucket");
 
 if (testDatabaseUrl) process.env.TEST_DATABASE_URL = testDatabaseUrl;
 if (testMigrationDatabaseUrl) process.env.TEST_MIGRATION_DATABASE_URL = testMigrationDatabaseUrl;
 if (testRedisUrl) process.env.TEST_REDIS_URL = testRedisUrl;
+// T-43-6: the dev bucket from `.env` is never used by tests; the bucket global-setup chose wins.
+if (testS3Bucket) process.env.S3_BUCKET = testS3Bucket;
