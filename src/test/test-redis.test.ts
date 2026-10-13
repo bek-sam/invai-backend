@@ -4,10 +4,12 @@ import { readFileSync } from "node:fs";
 import { Redis } from "ioredis";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  CLAIM_TTL_MS,
   type ClaimDescriptor,
   type ClaimedTestRedis,
   claimTestRedisDb,
   cleanClaimedDbLeftovers,
+  HEARTBEAT_MS,
   isLoopbackHost,
   MAX_DB,
   MIN_DB,
@@ -131,6 +133,15 @@ describe("claimTestRedisDb: claim, expiry, release", () => {
 
   it("the default range is 1-8 (R2): never 0, 9-14 or 15", () => {
     expect([MIN_DB, MAX_DB]).toEqual([1, 8]);
+  });
+
+  it("defaults: TTL at most 120 s and a heartbeat of at most a third of it (AC1)", async () => {
+    expect(CLAIM_TTL_MS).toBeLessThanOrEqual(120_000);
+    expect(HEARTBEAT_MS).toBeLessThanOrEqual(CLAIM_TTL_MS / 3);
+    const c = await claim({ ttlMs: undefined, heartbeatMs: undefined });
+    const ttl = await admin.pttl(`${KEY_PREFIX}${c.db}`);
+    expect(ttl).toBeGreaterThan(0);
+    expect(ttl).toBeLessThanOrEqual(120_000);
   });
 
   it("two concurrent unpinned claims get two different DBs", async () => {
@@ -353,6 +364,23 @@ describe("scoped clean-up (AC5)", () => {
       // nothing left to clean: the clean-up emptied the DB this run claimed
       claimed.disconnect();
       app0.disconnect();
+    }
+  });
+
+  it("claiming never cleans: a claim (even on a DB with leftovers) removes nothing", async () => {
+    // A real claim makes this DB ours; a test-prefix claim on the same number must still leave it alone.
+    const mine = await claimTestRedisDb({ baseUrl: BASE_URL, reapWaitMs: 20_000, signals: false });
+    open.push(mine);
+    const db = mine.db as number;
+    const r = new Redis(url(db), { maxRetriesPerRequest: 1 });
+    try {
+      const sentinel = `sentinel:${randomUUID()}`;
+      await r.set(sentinel, "keep");
+      await claim({ minDb: db, maxDb: db });
+      expect(await r.get(sentinel)).toBe("keep");
+      await r.del(sentinel);
+    } finally {
+      r.disconnect();
     }
   });
 
