@@ -434,7 +434,7 @@ export async function acceptQaWarning(
   const { file, issue } = await lockQaIssue(tx, input);
   if (issue.severity !== "warn") throw qaNotWarning(input.id, input.placement, input.code);
   if (!issue.acceptedAt) {
-    const acceptedBy = ctx.user?.name?.trim() || "A teammate";
+    const acceptedBy = (ctx.user?.name?.trim().slice(0, 200) ?? "") || "A teammate";
     const acceptedAt = new Date().toISOString();
     await tx
       .update(designFiles)

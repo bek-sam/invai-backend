@@ -250,6 +250,22 @@ describe("QA warnings (T-42-5)", () => {
     expect((after[0]?.c ?? 0) - (before[0]?.c ?? 0)).toBe(1);
   });
 
+  it("caps a very long display name at 200 characters so accept, list and get keep working", async () => {
+    const longName = ` ${"N".repeat(250)} `;
+    const wordy = await createUser(companyId, "designer", { name: longName });
+    const d = await designWith([warn("white_box")]);
+    const input = { id: d.id, placement: "front" as const, code: "white_box" as const };
+    const ok = await call(router.designs.acceptQaWarning, input, {
+      context: routerCtx(companyId, wordy, "designer"),
+    });
+    expect(front(ok)[0]?.acceptedBy).toHaveLength(200);
+    const ctxOf = { context: routerCtx(companyId, wordy, "designer") };
+    const list = await call(router.designs.list, { limit: 50 }, ctxOf);
+    expect(list.items.some((x) => x.id === d.id)).toBe(true);
+    const got = await call(router.designs.get, { id: d.id }, ctxOf);
+    expect(front(got)[0]?.acceptedBy).toHaveLength(200);
+  });
+
   it("refuses an error (QA_NOT_WARNING) and a missing code or placement (QA_ISSUE_NOT_FOUND)", async () => {
     const d = await designWith([err("thin_line"), warn("non_srgb")]);
     await expect(accept(d.id, "thin_line")).rejects.toMatchObject({
