@@ -118,6 +118,7 @@ describe("channel validators", () => {
         tags: ["Cactus", "cactus", " "],
         disclosures: [],
       }),
+      { aiUse: "unknown" },
     );
     expect(n.title).toBe("a b");
     expect(n.tags).toEqual(["Cactus"]);
@@ -165,6 +166,7 @@ describe("mock provider", () => {
           // must have one configured to publish there.
           productionPartner: channel === "etsy" ? "Cactus Print Co" : null,
         }),
+        { aiUse: "unknown" },
       );
       const r = validateListing(channel, content);
       expect(r.errors, `${channel}: ${JSON.stringify(r.errors)}`).toEqual([]);

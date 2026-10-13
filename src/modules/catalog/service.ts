@@ -187,6 +187,7 @@ export async function createDesign(
       name: input.name,
       tags: input.tags,
       personalizationTemplateId: input.personalizationTemplateId,
+      aiUse: input.aiUse ?? "unknown",
     })
     .returning();
   if (!row) throw new Error("design insert failed");
@@ -208,6 +209,7 @@ export async function createDesign(
     entityType: "design",
     entityId: row.id,
     summary: `Design ${row.code} created`,
+    data: { aiUse: row.aiUse },
   });
   await emit(tx, ctx.companyId, "design.updated", { designId: row.id, qaRequested: true });
   return getDesign(tx, ctx, row.id);
@@ -237,8 +239,20 @@ export async function updateDesign(
         input.personalizationTemplateId === undefined
           ? row.personalizationTemplateId
           : input.personalizationTemplateId,
+      aiUse: input.aiUse ?? row.aiUse,
     })
     .where(eq(designs.id, input.id));
+  // Only a real change is audited: who said what about the design's AI use, and when (B-274).
+  if (input.aiUse !== undefined && input.aiUse !== row.aiUse)
+    await audit(tx, {
+      companyId: ctx.companyId,
+      actor: ctx.actor,
+      action: "settings.changed",
+      entityType: "design",
+      entityId: row.id,
+      summary: `Design ${row.code}: made with AI changed from ${row.aiUse} to ${input.aiUse}`,
+      data: { field: "aiUse", from: row.aiUse, to: input.aiUse },
+    });
   let qaRequested = false;
   if (input.placements) {
     assertOwnFiles(ctx, input.placements);

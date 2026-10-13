@@ -1,6 +1,7 @@
 import {
   CHANNEL_RULES,
   type Channel,
+  type DesignAiUse,
   type ListingContent,
   type ValidationResult,
 } from "@invai/contracts";
@@ -88,10 +89,25 @@ function bi(en: string, es: string): string {
  * the *design* and never claims AI made the finished physical product — production (the DTF print
  * and press) is ours, disclosed separately by PARTNER_DISCLOSURE below.
  */
-export const AI_DISCLOSURE = bi(
-  "This design was created with the use of AI, based on our own prompts, then produced by us as a made-to-order DTF print.",
-  "Este diseño se creó con el uso de IA, a partir de nuestras propias indicaciones, y luego lo producimos como una transferencia DTF por encargo.",
-);
+const AI_SENTENCE_EN =
+  "This design was created with the use of AI, then produced by us as a made-to-order DTF print.";
+const AI_SENTENCE_ES =
+  "Este diseño se creó con el uso de IA, y luego lo producimos como una transferencia DTF por encargo.";
+/** Wording before compliance review r1 (B-274): never written again, still matched and replaced. */
+const LEGACY_AI_SENTENCE_EN =
+  "This design was created with the use of AI, based on our own prompts, then produced by us as a made-to-order DTF print.";
+const LEGACY_AI_SENTENCE_ES =
+  "Este diseño se creó con el uso de IA, a partir de nuestras propias indicaciones, y luego lo producimos como una transferencia DTF por encargo.";
+export const AI_DISCLOSURE = bi(AI_SENTENCE_EN, AI_SENTENCE_ES);
+/** Every form of the AI-use line a draft may hold: combined (new, old) and each language alone. */
+const AI_SENTENCES = [
+  bi(LEGACY_AI_SENTENCE_EN, LEGACY_AI_SENTENCE_ES),
+  AI_DISCLOSURE,
+  LEGACY_AI_SENTENCE_EN,
+  LEGACY_AI_SENTENCE_ES,
+  AI_SENTENCE_EN,
+  AI_SENTENCE_ES,
+];
 /**
  * Etsy Creativity Standards, "designed by a seller": "Sellers must disclose that an item is made
  * by a production partner, and provide accurate information about where the item will ship from."
@@ -344,12 +360,57 @@ export function normalizeListing(channel: Channel, content: ListingContent): Lis
   };
 }
 
-/** Append the AI-use and production-partner disclosures (always; Etsy requires them). */
-export function withDisclosures(content: ListingContent): ListingContent {
-  const disclosures = [...content.disclosures];
-  for (const d of [AI_DISCLOSURE, PARTNER_DISCLOSURE])
-    if (!disclosures.includes(d)) disclosures.push(d);
-  return { ...content, disclosures };
+/** Remove every AI-use sentence from free text; the whitespace around a cut becomes one blank line. */
+function stripAiSentences(text: string): string {
+  let out = text;
+  for (const sentence of AI_SENTENCES) {
+    for (;;) {
+      const at = out.indexOf(sentence);
+      if (at < 0) break;
+      const before = out.slice(0, at).trimEnd();
+      const after = out.slice(at + sentence.length).trimStart();
+      out = before && after ? `${before}\n\n${after}` : `${before}${after}`;
+    }
+  }
+  return out;
+}
+
+/** True when the text holds any form of the AI-use line (used to describe a published draft). */
+export function hasAiSentence(content: Pick<ListingContent, "description" | "disclosures">) {
+  return [content.description, ...content.disclosures].some((t) =>
+    AI_SENTENCES.some((sentence) => t.includes(sentence)),
+  );
+}
+
+/**
+ * The one place the AI-use line is decided (B-274, spec decisions 2 and 4). `none` (the shop's own
+ * statement) removes the line everywhere; `ai` and `unknown` keep exactly one copy, in the
+ * disclosures, in the current wording. The production-partner line is added for every value.
+ * Pure and idempotent, so it can run at generation, on read, at approval and at export.
+ */
+export function withDisclosures(
+  content: ListingContent,
+  opts: { aiUse: DesignAiUse },
+): ListingContent {
+  const wantsAi = opts.aiUse !== "none";
+  const disclosures: string[] = [];
+  let aiPlaced = false;
+  for (const d of content.disclosures) {
+    const isAi = AI_SENTENCES.some((sentence) => d.includes(sentence));
+    if (!isAi) {
+      disclosures.push(d);
+      continue;
+    }
+    const rest = stripAiSentences(d).trim();
+    if (wantsAi && !aiPlaced) {
+      disclosures.push(AI_DISCLOSURE);
+      aiPlaced = true;
+    }
+    if (rest) disclosures.push(rest);
+  }
+  if (wantsAi && !aiPlaced) disclosures.push(AI_DISCLOSURE);
+  if (!disclosures.includes(PARTNER_DISCLOSURE)) disclosures.push(PARTNER_DISCLOSURE);
+  return { ...content, description: stripAiSentences(content.description), disclosures };
 }
 
 /** Plain-text list of issues for the one retry prompt. */

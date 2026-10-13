@@ -2,6 +2,7 @@ import type {
   AssistantEvent,
   Channel,
   CreditEntry,
+  DesignAiUse,
   ListingContent,
   ListingDraft,
   PublishStatus as PublishStatusSchema,
@@ -23,6 +24,7 @@ import { ASSISTANT_PROMPT, type ListingCopy, listingCopyPrompt } from "../../ai/
 import { storedErrorText } from "../../ai/stored-error";
 import {
   describeIssues,
+  hasAiSentence,
   IMAGE_AI_DISCLOSURE,
   normalizeListing,
   validateListing,
@@ -72,7 +74,44 @@ const EXPORT_PREFIX = "s3:";
 
 /* ---------------------------------- mapping ---------------------------------- */
 
-async function toDraft(row: DraftRow, designName: string): Promise<ListingDraft> {
+/** A draft that is being or has been sent keeps what went out (spec decisions 6 and 9). */
+function isFrozen(row: DraftRow) {
+  return row.status === "publishing" || row.status === "published";
+}
+
+/**
+ * The content a reader should see: the AI-use line recomputed from the design's current value
+ * (B-274). Read-time only; the stored row is untouched. A draft with no content yet (queued,
+ * generating, failed before any copy) and a frozen draft are returned as stored.
+ */
+export function currentContent(row: DraftRow, aiUse: DesignAiUse): ListingContent {
+  if (isFrozen(row) || row.status === "generating" || !row.content.title) return row.content;
+  return withDisclosures(row.content, { aiUse });
+}
+
+/** The design value this draft's notice follows; a frozen draft is described by what went out. */
+function noticeFor(row: DraftRow, aiUse: DesignAiUse): DesignAiUse {
+  if (!isFrozen(row)) return aiUse;
+  return hasAiSentence(row.content) ? "ai" : "none";
+}
+
+/** Designs' current `ai_use`; a missing or unreadable design reads as `unknown` (notice on). */
+async function designAiUses(tx: Tx, ids: string[]) {
+  const out = new Map<string, DesignAiUse>();
+  if (!ids.length) return out;
+  const rows = await tx
+    .select({ id: designs.id, aiUse: designs.aiUse })
+    .from(designs)
+    .where(inArray(designs.id, [...new Set(ids)]));
+  for (const r of rows) out.set(r.id, r.aiUse);
+  return out;
+}
+
+async function toDraft(
+  row: DraftRow,
+  designName: string,
+  aiUse: DesignAiUse = "unknown",
+): Promise<ListingDraft> {
   let publishedUrl: string | null = row.publishedUrl;
   if (publishedUrl?.startsWith(EXPORT_PREFIX)) {
     publishedUrl = await presignGet(
@@ -89,7 +128,8 @@ async function toDraft(row: DraftRow, designName: string): Promise<ListingDraft>
     connectionId: row.connectionId,
     productId: row.productId,
     status: row.status,
-    content: row.content,
+    content: currentContent(row, aiUse),
+    designAiUse: noticeFor(row, aiUse),
     validation: (row.validation as ValidationResult | null) ?? null,
     trademark: (row.trademark as TrademarkCheck | null) ?? null,
     trademarkReview: row.trademarkReviewedBy
@@ -128,7 +168,13 @@ async function mapDrafts(tx: Tx, rows: DraftRow[]) {
     tx,
     rows.map((r) => r.designId),
   );
-  return Promise.all(rows.map((r) => toDraft(r, names.get(r.designId) ?? "")));
+  const uses = await designAiUses(
+    tx,
+    rows.map((r) => r.designId),
+  );
+  return Promise.all(
+    rows.map((r) => toDraft(r, names.get(r.designId) ?? "", uses.get(r.designId) ?? "unknown")),
+  );
 }
 
 async function loadDraft(tx: Tx, ctx: Pick<Ctx, "companyId">, id: string, lock = false) {
@@ -481,8 +527,10 @@ export async function generateDraft(companyId: string, draftId: string, userId: 
     };
     let first = await runStructured(meta, listingCopyPrompt, vars);
     let credits = first.credits;
+    const aiUse = gen.design.aiUse;
     let content = withDisclosures(
       normalizeListing(row.channel, toContent(first.output, gen.price, gen.productionPartner)),
+      { aiUse },
     );
     let validation = validateListing(row.channel, content);
     if (!validation.ok) {
@@ -494,6 +542,7 @@ export async function generateDraft(companyId: string, draftId: string, userId: 
       first = retry;
       content = withDisclosures(
         normalizeListing(row.channel, toContent(retry.output, gen.price, gen.productionPartner)),
+        { aiUse },
       );
       validation = validateListing(row.channel, content);
     }
@@ -590,8 +639,9 @@ export async function updateDraft(
   const row = await loadDraft(tx, ctx, id, true);
   if (row.status === "generating" || row.status === "publishing" || row.status === "published")
     throw conflict(`Draft is ${row.status} and cannot be edited`);
-  const content: ListingContent = { ...row.content, ...patch };
-  const validation = validateListing(row.channel, content);
+  const aiUse = (await designAiUses(tx, [row.designId])).get(row.designId) ?? "unknown";
+  const content: ListingContent = { ...currentContent(row, aiUse), ...patch };
+  const validation = validateListing(row.channel, currentContent({ ...row, content }, aiUse));
   const textChanged =
     (patch.title !== undefined && patch.title !== row.content.title) ||
     (patch.tags !== undefined && JSON.stringify(patch.tags) !== JSON.stringify(row.content.tags)) ||
@@ -727,7 +777,8 @@ export async function approveDraft(tx: Tx, ctx: Ctx, id: string) {
   const row = await loadDraft(tx, ctx, id, true);
   if (row.status !== "needs_review")
     throw invalidTransition("listing_draft", id, row.status, "approved");
-  const validation = validateListing(row.channel, row.content);
+  const aiUse = (await designAiUses(tx, [row.designId])).get(row.designId) ?? "unknown";
+  const validation = validateListing(row.channel, currentContent(row, aiUse));
   if (!validation.ok)
     throw new ORPCError("VALIDATION_FAILED", {
       status: 422,
@@ -1041,8 +1092,10 @@ async function variantRowsForDraft(
   );
   if (!matched.length)
     throw badRequest(`No blank variants match ${product.name} for draft ${row.id}`);
+  const aiUse = (await designAiUses(tx, [row.designId])).get(row.designId) ?? "unknown";
+  const content = currentContent(row, aiUse);
   return matched.map((v) => ({
-    content: row.content,
+    content,
     sku: v.sku,
     color: v.color,
     size: v.size,
@@ -1132,14 +1185,20 @@ export async function publishDraft(
     row.channel === "etsy"
       ? ((await productionPartner(tx, ctx.companyId))?.etsyPartnerId ?? null)
       : null;
-  await putObject(
-    key,
-    exportCsv(row.channel, await variantRowsForDraft(tx, ctx, row, etsyPartnerId)),
-    "text/csv",
-  );
+  const exportRows = await variantRowsForDraft(tx, ctx, row, etsyPartnerId);
+  await putObject(key, exportCsv(row.channel, exportRows), "text/csv");
+  // What went out is what the draft keeps: persist the content the CSV was built from, so a
+  // later change to the design's AI use cannot rewrite a draft that was already sent (B-274).
+  const sent = exportRows[0]?.content ?? row.content;
   await tx
     .update(listingDrafts)
-    .set({ status: "approved", connectionId, publishedUrl: `${EXPORT_PREFIX}${key}`, error: null })
+    .set({
+      status: "approved",
+      content: sent,
+      connectionId,
+      publishedUrl: `${EXPORT_PREFIX}${key}`,
+      error: null,
+    })
     .where(eq(listingDrafts.id, id));
   await audit(tx, {
     companyId: ctx.companyId,
