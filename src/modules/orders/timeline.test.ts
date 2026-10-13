@@ -178,9 +178,9 @@ describe("orders.timeline orders steps inside one millisecond (B-418)", () => {
     // Same millisecond, microseconds apart. The ids run opposite to time, so a millisecond sort
     // (id tiebreak) would return oldest first.
     const steps = [
-      { id: "00000000-0000-4000-8000-000000000003", us: "123300", to: "pressed" },
+      { id: "00000000-0000-4000-8000-000000000001", us: "123300", to: "pressed" },
       { id: "00000000-0000-4000-8000-000000000002", us: "123200", to: "transfer_in" },
-      { id: "00000000-0000-4000-8000-000000000001", us: "123100", to: "on_sheet" },
+      { id: "00000000-0000-4000-8000-000000000003", us: "123100", to: "on_sheet" },
     ] as const;
     await withTenant(companyId, async (tx) => {
       for (const s of steps) {
