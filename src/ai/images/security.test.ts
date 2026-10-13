@@ -97,3 +97,65 @@ describe("image spend controls (security, S-53)", () => {
     }
   });
 });
+
+/*
+ * S-77 (T-43-2 security co-review): `generateScene` retries a 5xx once inside the provider. The
+ * code's own billing model (mapError, S-53) says a 5xx may already be billed, yet when the retry
+ * succeeds only the success is recorded, so one call can cost two estimates while the ledger, the
+ * spend counters and any per-call limit (the scene-trial --max-calls wrapper) see one. Remove
+ * `.fails` once a 5xx-then-success books both requests or the in-provider retry is dropped
+ * (owner: ai-engineer).
+ */
+function fiveHundredThenOk(image: Buffer) {
+  let requests = 0;
+  const fetchStub = async () => {
+    requests += 1;
+    if (requests === 1)
+      return new Response(JSON.stringify({ error: { message: "busy" } }), {
+        status: 503,
+        headers: { "content-type": "application/json" },
+      });
+    return new Response(
+      JSON.stringify({ created: 1, data: [{ b64_json: image.toString("base64") }] }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+  };
+  Object.assign(fetchStub, { Response });
+  const client = new OpenAI({
+    apiKey: "sk-test-not-a-key",
+    baseURL: "http://openai.stub.invalid/v1",
+    maxRetries: 0,
+    timeout: 5_000,
+    fetch: fetchStub as typeof fetch,
+  });
+  return { client, requests: () => requests };
+}
+
+describe("image spend controls (security, S-77)", () => {
+  it.fails("a 5xx retried inside the provider is booked for every request that may be billed", async () => {
+    menv.AI_DAILY_PLATFORM_CAP_CENTS = 0;
+    menv.AI_DAILY_TENANT_CAP_CENTS = 0;
+    const shop = await createCompany();
+    const day = spendDay(new Date());
+    const tKey = tenantSpendKey(shop.id, day);
+    const png = tinyPng();
+    const stub = fiveHundredThenOk(png);
+    const provider = createOpenAiImageProvider(() => stub.client);
+    const prompt = buildScenePrompt(null, "studio", "tee", "Black");
+    try {
+      const result = await provider.generateScene({
+        baseImage: png,
+        mask: png,
+        prompt,
+        sizePx: 1024,
+      });
+      await recordImageGen({ companyId: shop.id, userId: null, prompt, provider, result });
+      expect(stub.requests()).toBe(2);
+      expect(Number(await redis.get(tKey))).toBeGreaterThanOrEqual(
+        stub.requests() * provider.estimateCents(1024),
+      );
+    } finally {
+      await redis.del(tKey, platformSpendKey(day));
+    }
+  });
+});
