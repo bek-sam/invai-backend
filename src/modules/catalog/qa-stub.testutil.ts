@@ -20,6 +20,8 @@ export type QaStub = {
   issues: { when: string; list: unknown[] }[];
   /** One entry per upcoming /qa/check: true = answer 429, false = serve (then it runs dry). */
   script: boolean[];
+  /** The next n /qa/check answers are 500 (after the script is used up). */
+  failNext: number;
   /** Hold the slot for ms without a request (a foreign shop's long check). */
   hold(ms: number): void;
   close(): Promise<void>;
@@ -36,6 +38,7 @@ export async function startQaStub(): Promise<QaStub> {
     calls: {},
     issues: [],
     script: [],
+    failNext: 0,
     hold(ms) {
       st.busy = true;
       setTimeout(() => {
@@ -65,6 +68,10 @@ export async function startQaStub(): Promise<QaStub> {
         return json(res, 429, { detail: "busy" }, { "retry-after": String(st.retryAfterSec) });
       }
       if (path !== "/qa/check") return json(res, 404, { detail: "no" });
+      if (st.failNext > 0) {
+        st.failNext--;
+        return json(res, 500, { detail: "boom" });
+      }
       const key = (JSON.parse(body) as { file_key: string }).file_key;
       st.busy = true;
       st.served++;

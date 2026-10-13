@@ -5,6 +5,7 @@ import { router } from "../../api/router";
 import { withTenant } from "../../db/client";
 import { createCompany, createUser, tenantContext } from "../../test/fixtures";
 import { type QaStub, startQaStub } from "./qa-stub.testutil";
+import { setQaSleep } from "./qa-turn";
 import * as svc from "./service";
 
 /*
@@ -39,8 +40,14 @@ beforeAll(async () => {
   stub = await startQaStub();
   where.url = stub.url;
   stub.delayMs = 5;
+  // T-46-3: a manual caller's busy sleeps happen in qa-turn now, so fake them the same way
+  setQaSleep(async (ms) => {
+    where.sleeps.push(ms);
+    vi.setSystemTime(Date.now() + ms);
+  });
 });
 afterAll(async () => {
+  setQaSleep();
   await stub.close();
 });
 afterEach(() => {

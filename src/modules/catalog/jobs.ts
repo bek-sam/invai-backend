@@ -34,7 +34,7 @@ export const runDesignQaJob = defineJob({
     try {
       const sys = systemContext(companyId);
       const design = await withTenant(companyId, (tx) =>
-        runDesignQa(tx, sys, designId, { qaBusy: QA_NO_BUSY }),
+        runDesignQa(tx, sys, designId, { qaBusy: QA_NO_BUSY, turn: true }),
       );
       return { qaStatus: design.qaStatus };
     } catch (err) {

@@ -31,6 +31,28 @@ const log = logger("catalog.qa-turn");
  * (item artwork follow-ups, the inline check), each with this burst and refill; the lease is shared.
  * A finished turn does not delete the lease but shortens it to `QA_COOLDOWN_MS` (S-81), so one
  * company's design and artwork bursts can't run back to back; only the token holder may shorten it.
+ *
+ * Yield to a waiting person (T-46-3, S-81 residual). A turn is up to five calls, so a manual Run
+ * QA of another shop used to wait through the whole of it: 29.35 s at 4.3 s a call, 30.04 s at
+ * 5 s. Now a manual caller whose call imaging refused (429) is registered in the sorted set
+ * `qa:manual-waiting` (member = company id, score = server ms) from its first 429 until that call
+ * ends (served, given up or failed), and removed again in `finally`. Two uses of that set, both for
+ * OTHER companies only (a shop never waits for itself):
+ *   - `yieldToManualCaller`: before placement 2.. a turn that holds its lease waits, polling, while
+ *     a foreign caller is registered, at most `yieldMaxMs` per placement (imaging's Retry-After +
+ *     1 s) and `yieldTotalMs` per turn. The lease stays held through the wait (one call in flight
+ *     per company, the artwork bucket can't take it) and the turn then goes on, so a design is
+ *     never refused half way. The wait costs one pooled DB connection: `runQa` and the job hold
+ *     their `withTenant` transaction across it (router.ts), like they already do across imaging.
+ *   - `takeQaTurn` refuses a NEW turn (`in_flight`) while a foreign caller is registered, so the
+ *     shop that just yielded can't start its next turn ahead of the person it yielded to.
+ * Livelock: a caller is registered only inside its own busy call, never while it yields at a
+ * placement boundary, so two shops' multi-placement turns can't yield to each other. A registration older
+ * than `QA_MANUAL_BUDGET_MS` is pruned (a crashed caller), and the caps bound every wait.
+ * Design note: the card suggested `qa:manual:<company>` keys registered when `runQa` starts and a
+ * "registration older than the turn" test; that can't help a victim who arrives in the middle of
+ * the attacker's turn (the attacker's own registration is older), and key scans cost O(keyspace).
+ *
  * Valkey trouble fails open with one warn log, like `lib/fairness.ts`: the fairness guarantee is
  * lost, nobody's QA is. Callers: the router's `runQa`, the QA job, `setItemArtwork` and its
  * follow-up job. Not `runDesignQa` itself: the seed runs it in sequence and stays unthrottled.
@@ -48,6 +70,10 @@ export const QA_COOLDOWN_MS = 6_000;
 export const QA_REDELAY_FLOOR_MS = 1_000;
 /** A person waiting on a manual check gives up after this much busy-waiting in total (A12). */
 const QA_MANUAL_BUDGET_MS = 25_000;
+/** One yield waits at most imaging's Retry-After (5 s) + 1 s; a turn yields at most twice that in total. */
+export const QA_YIELD_MAX_MS = 6_000;
+export const QA_YIELD_TOTAL_MS = 12_000;
+export const QA_YIELD_POLL_MS = 100;
 /**
  * Live timing, equal to the constants above. Only tests call `scaleQaTiming`, to run the same
  * dynamics at a fraction of the wall-clock time. It scales every timer this module owns (refill,
@@ -59,6 +85,9 @@ const timing = {
   inFlightRetryMs: QA_IN_FLIGHT_RETRY_MS,
   cooldownMs: QA_COOLDOWN_MS,
   redelayFloorMs: QA_REDELAY_FLOOR_MS,
+  yieldMaxMs: QA_YIELD_MAX_MS,
+  yieldTotalMs: QA_YIELD_TOTAL_MS,
+  yieldPollMs: QA_YIELD_POLL_MS,
 };
 /** Test-only: the live values, so a test can assert the defaults. */
 export const qaTimingNow = () => ({ ...timing, manualBudgetMs: QA_MANUAL_BUSY.budgetMs });
@@ -67,7 +96,15 @@ export function scaleQaTiming(factor: number): void {
   timing.inFlightRetryMs = Math.round(QA_IN_FLIGHT_RETRY_MS * factor);
   timing.cooldownMs = Math.round(QA_COOLDOWN_MS * factor);
   timing.redelayFloorMs = Math.round(QA_REDELAY_FLOOR_MS * factor);
+  timing.yieldMaxMs = Math.round(QA_YIELD_MAX_MS * factor);
+  timing.yieldTotalMs = Math.round(QA_YIELD_TOTAL_MS * factor);
+  timing.yieldPollMs = Math.max(5, Math.round(QA_YIELD_POLL_MS * factor));
   QA_MANUAL_BUSY.budgetMs = Math.round(QA_MANUAL_BUDGET_MS * factor);
+}
+/** Test-only: replaces the sleep a waiting person does between busy retries (see `qaCallAwaitingSlot`). */
+const sleeper = { sleep: (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)) };
+export function setQaSleep(fn?: (ms: number) => Promise<void>): void {
+  sleeper.sleep = fn ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
 }
 /** Test-only: tests that take several turns in a row for one company switch the cooldown off (0). */
 export function setQaCooldown(ms: number): void {
@@ -89,6 +126,29 @@ const leaseKey = (companyId: string) => `qa:lease:${companyId}`;
 /** Two allowances per company (architect ruling, T-43-3 r3): a shop's artwork backlog can't eat its design checks. */
 export type QaBucket = "design" | "artwork";
 const rateKey = (companyId: string, bucket: QaBucket) => `qa:rate:${bucket}:${companyId}`;
+
+/** Sorted set of companies whose manual QA is sleeping on a 429 (member = company id, score = ms). */
+const WAITING_KEY = "qa:manual-waiting";
+
+/** Register (ARGV[1]) and prune entries older than ARGV[2] ms, from the server clock. */
+const WAIT_SCRIPT = `
+local t = redis.call('TIME')
+local now = t[1] * 1000 + math.floor(t[2] / 1000)
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now - tonumber(ARGV[2]))
+redis.call('ZADD', KEYS[1], now, ARGV[1])
+redis.call('PEXPIRE', KEYS[1], ARGV[2])
+return 1
+`;
+
+/** How many companies other than ARGV[1] are registered (after pruning entries older than ARGV[2] ms). */
+const FOREIGN_SCRIPT = `
+local t = redis.call('TIME')
+local now = t[1] * 1000 + math.floor(t[2] / 1000)
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now - tonumber(ARGV[2]))
+local n = redis.call('ZCARD', KEYS[1])
+if redis.call('ZSCORE', KEYS[1], ARGV[1]) then n = n - 1 end
+return n
+`;
 
 const RELEASE_SCRIPT = `
 if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end
@@ -138,6 +198,9 @@ export async function takeQaTurn(
   const token = randomUUID();
   const none = async () => {};
   try {
+    if (await foreignManualWaiting(companyId)) {
+      return { ok: false, reason: "in_flight", retryAfterMs: timing.inFlightRetryMs };
+    }
     const got = await redis.set(leaseKey(companyId), token, "PX", QA_LEASE_TTL_MS, "NX");
     if (got !== "OK") {
       // A turn is normally a few seconds (wave 42: worst 4.3 s), so ask again soon.
@@ -181,6 +244,93 @@ export async function takeQaTurn(
   } catch (err) {
     log.warn("qa turn check failed (allowing)", { companyId, error: String(err) });
     return { ok: true, release: none };
+  }
+}
+
+/** True while another company's manual QA is sleeping on a 429. Valkey trouble: false (one warn). */
+export async function foreignManualWaiting(companyId: string): Promise<boolean> {
+  try {
+    const n = (await redis.eval(
+      FOREIGN_SCRIPT,
+      1,
+      WAITING_KEY,
+      companyId,
+      QA_MANUAL_BUDGET_MS,
+    )) as number;
+    return n > 0;
+  } catch (err) {
+    log.warn("qa waiting check failed (allowing)", { companyId, error: String(err) });
+    return false;
+  }
+}
+
+async function markManualWaiting(companyId: string): Promise<void> {
+  try {
+    await redis.eval(WAIT_SCRIPT, 1, WAITING_KEY, companyId, QA_MANUAL_BUDGET_MS);
+  } catch (err) {
+    log.warn("qa waiting mark failed (allowing)", { companyId, error: String(err) });
+  }
+}
+
+async function clearManualWaiting(companyId: string): Promise<void> {
+  try {
+    await redis.zrem(WAITING_KEY, companyId);
+  } catch (err) {
+    log.warn("qa waiting clear failed", { companyId, error: String(err) });
+  }
+}
+
+/**
+ * Before placement 2.. of a turn that holds its lease: wait while another company's manual QA is
+ * sleeping on a 429, within `yieldMaxMs` here and `yieldTotalMs` for the turn (`state.spentMs`).
+ * The lease is untouched. Returns how long it waited.
+ */
+export async function yieldToManualCaller(
+  companyId: string,
+  state: { spentMs: number },
+  sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
+): Promise<number> {
+  const limit = Math.min(timing.yieldMaxMs, timing.yieldTotalMs - state.spentMs);
+  let waited = 0;
+  while (waited < limit && (await foreignManualWaiting(companyId))) {
+    const step = Math.min(timing.yieldPollMs, limit - waited);
+    await sleep(step);
+    waited += step;
+  }
+  state.spentMs += waited;
+  return waited;
+}
+
+/**
+ * One imaging call for a person who waits on a busy slot (`busy.retries` > 0): the same retry
+ * rules as the client (hint from the 429, `retries`, total `budgetMs`), but the sleeps happen here
+ * so the company is registered from its first 429 until the call ends (served, refused for good
+ * or failed), and always removed again.
+ * Anyone else (a worker with `retries: 0`, the seed) calls straight through.
+ */
+export async function qaCallAwaitingSlot<T>(
+  companyId: string,
+  busy: { retries?: number; budgetMs?: number } | undefined,
+  call: (busy: { retries: number; budgetMs?: number } | undefined) => Promise<T>,
+): Promise<T> {
+  const retries = busy?.retries ?? 0;
+  if (retries <= 0) return call(busy ? { retries: 0 } : undefined);
+  let waited = 0;
+  try {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await call({ retries: 0 });
+      } catch (err) {
+        if (!isImagingBusy(err) || attempt >= retries) throw err;
+        const wait = err.retryAfterMs ?? 5_000;
+        if (busy?.budgetMs !== undefined && waited + wait > busy.budgetMs) throw err;
+        waited += wait;
+        await markManualWaiting(companyId);
+        await sleeper.sleep(wait);
+      }
+    }
+  } finally {
+    await clearManualWaiting(companyId);
   }
 }
 

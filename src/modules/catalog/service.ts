@@ -32,6 +32,7 @@ import { keyset, type PageInput } from "../../lib/pagination";
 import { isPermanentHttpStatus } from "../../lib/queues";
 import { deleteObject, getObject, isCompanyKey, objectKey, presignGet } from "../../lib/s3";
 import { backfillItemPreviews } from "../orders/preview-backfill";
+import { qaCallAwaitingSlot, yieldToManualCaller } from "./qa-turn";
 
 const log = logger("catalog");
 
@@ -536,18 +537,28 @@ export async function qaCallCount(tx: Tx, id: string): Promise<number> {
  * Run imaging QA on every placement file, optionally snapping soft alpha first. Called by the
  * `catalog.runDesignQa` job after create/update and by `designs.runQa` on demand.
  * `qaBusy.budgetMs` is one deadline for the whole call, shrinking across placements (A12).
+ * `turn: true` (the router and the QA job, which hold a lease from `takeQaTurn`): before each
+ * placement after the first the turn yields to another shop's person waiting on imaging, and a
+ * person waiting (`qaBusy.retries` > 0) is registered while it sleeps on a 429 (T-46-3). The seed
+ * leaves it off and stays unthrottled.
  */
 export async function runDesignQa(
   tx: Tx,
   ctx: TenantContext,
   id: string,
-  opts: { cleanAlpha?: boolean; qaBusy?: { retries?: number; budgetMs?: number } } = {},
+  opts: {
+    cleanAlpha?: boolean;
+    qaBusy?: { retries?: number; budgetMs?: number };
+    turn?: boolean;
+  } = {},
 ) {
   const files = await tx.select().from(designFiles).where(eq(designFiles.designId, id));
   if (files.length === 0) throw notFound("design", id);
   const deadline =
     opts.qaBusy?.budgetMs !== undefined ? Date.now() + opts.qaBusy.budgetMs : undefined;
-  for (const file of files) {
+  const yielded = { spentMs: 0 };
+  for (const [index, file] of files.entries()) {
+    if (opts.turn && index > 0) await yieldToManualCaller(ctx.companyId, yielded);
     try {
       let fileKey = file.fileKey;
       if (opts.cleanAlpha) {
@@ -557,16 +568,20 @@ export async function runDesignQa(
         });
         fileKey = cleaned.key;
       }
-      const qa = await imaging.qaCheck(
-        {
-          file_key: fileKey,
-          target_width_in: file.widthIn,
-          target_height_in: file.heightIn,
-        },
+      const checkInput = {
+        file_key: fileKey,
+        target_width_in: file.widthIn,
+        target_height_in: file.heightIn,
+      };
+      const busyNow = () =>
         deadline === undefined
           ? opts.qaBusy
-          : { retries: opts.qaBusy?.retries, budgetMs: Math.max(0, deadline - Date.now()) },
-      );
+          : { retries: opts.qaBusy?.retries, budgetMs: Math.max(0, deadline - Date.now()) };
+      const qa = opts.turn
+        ? await qaCallAwaitingSlot(ctx.companyId, busyNow(), (busy) =>
+            imaging.qaCheck(checkInput, busy),
+          )
+        : await imaging.qaCheck(checkInput, busyNow());
       // One stored issue with an unknown code would fail the Design output parse of
       // designs.list for the whole shop, so drop it here (A8).
       let issues: QaIssue[] = [];

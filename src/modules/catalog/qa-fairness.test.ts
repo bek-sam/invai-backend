@@ -145,7 +145,9 @@ async function crit1(
   // Real timing keeps the product lines 30 s / 60 s. The S-81 case runs scaled by f, and then
   // asserts B = f x 30 s + S81_SLACK_MS (job: f x 60 s + S81_SLACK_MS), see S81_SLACK_MS.
   const scaledBounds = artworkLoop && scale < 1;
-  const manualBound = scaledBounds ? 30_000 * scale + S81_SLACK_MS : 30_000;
+  const manualBound = scaledBounds ? 30_000 * scale + S81_SLACK_MS : 30_000; // the test's give-up
+  // T-46-3: the victim's result must also leave 2 s of the 30 s line free (headroom), scaled.
+  const resultBound = scaledBounds ? 28_000 * scale + S81_SLACK_MS : 30_000;
   const jobBound = scaledBounds ? 60_000 * scale + S81_SLACK_MS : 60_000;
   const enqueue = vi.spyOn(itemArtworkQaJob, "enqueue").mockResolvedValue(undefined as never);
   try {
@@ -233,7 +235,7 @@ async function crit1(
     expect(jobRes.ms).toBeLessThan(jobBound);
     expect(await qaStatusOf(b, bJobDesign.id)).toBe("passed");
     expect(manualRes.error).toBeUndefined();
-    expect(manualRes.ms).toBeLessThan(manualBound);
+    expect(manualRes.ms).toBeLessThan(resultBound);
     expect(await qaStatusOf(b, bManualDesign.id)).toBe("passed");
     expect(aRefused).toBeGreaterThan(0);
   } finally {
@@ -267,12 +269,23 @@ describe("S-81: a shop looping design QA and artwork attaches together", () => {
     200_000,
   );
 
+  // T-46-3: imaging at its slow end, 5 s a call and the unchanged Retry-After of 5 s. Before the
+  // yield the victim needed 30.04 s here (T-44-2 review); now 28 s is the ceiling, 2 s under the line.
+  it(
+    "victim shop B at 5.0 s a call: manual result within f x 28 s + s",
+    () => crit1(5, 5_000 * S81_SCALE, 5 * S81_SCALE, S81_SCALE, true),
+    200_000,
+  );
+
   it("timing hooks default to the live constants and reset after a scaled run", () => {
     expect(LIVE_TIMING).toEqual({
       refillMs: 20_000,
       inFlightRetryMs: 3_000,
       cooldownMs: 6_000,
       redelayFloorMs: 1_000,
+      yieldMaxMs: 6_000,
+      yieldTotalMs: 12_000,
+      yieldPollMs: 100,
       manualBudgetMs: 25_000,
     });
     expect(QA_REFILL_MS).toBe(20_000);
@@ -560,4 +573,185 @@ describe("criterion 6: tenancy", () => {
     const err = await runQa(b, d.id).catch((e) => e);
     expect(err.code).toBe("NOT_FOUND");
   });
+});
+
+// T-46-3 (S-81 residual, B-415): a turn yields to another shop's person who is waiting on imaging.
+// Run at 1/10 of the wall-clock time (every timer scales, see scaleQaTiming); durations asserted
+// below are lower bounds from the stub's delays and the scaled yield cap, or generous upper bounds.
+const WAITING = "qa:manual-waiting";
+const Y_SCALE = 0.1;
+describe("T-46-3: yield to a waiting person of another shop", () => {
+  const lease = (s: Shop) => `qa:lease:${s.id}`;
+  const tick = () => new Promise<void>((r) => setImmediate(r));
+  async function scaled<T>(fn: () => Promise<T>): Promise<T> {
+    scaleQaTiming(Y_SCALE);
+    setQaCooldown(0); // scaleQaTiming scales the cooldown; these cases take several turns in a row
+    stub.delayMs = 300;
+    try {
+      return await fn();
+    } finally {
+      scaleQaTiming(1);
+      setQaCooldown(0);
+      stub.delayMs = 300;
+      stub.retryAfterSec = 1;
+      stub.script = [];
+      stub.failNext = 0;
+      await redis.del(WAITING);
+    }
+  }
+
+  it("waits before placement 2 while another shop is waiting, holds its lease, then finishes the design", async () => {
+    await scaled(async () => {
+      const a = await shop();
+      const c = await shop();
+      const d = await design(a, 2);
+      const base = stub.served;
+      const t0 = Date.now();
+      const run = runQa(a, d.id);
+      await vi.waitFor(() => expect(stub.served).toBe(base + 1));
+      await redis.zadd(WAITING, Date.now(), c.id); // shop C's person is told "busy" meanwhile
+      let sawFree = false;
+      while (stub.served === base + 1) {
+        if ((await redis.exists(lease(a))) === 0) sawFree = true;
+        await tick();
+      }
+      await run;
+      const ms = Date.now() - t0;
+      expect(sawFree).toBe(false); // one call in flight per company: the lease is kept while yielding
+      expect(stub.served).toBe(base + 2); // never refused half way
+      expect(await qaStatusOf(a, d.id)).toBe("passed");
+      // two 300 ms calls plus the whole per-placement yield cap (the waiter never went away)
+      expect(ms).toBeGreaterThanOrEqual(2 * 300 + qaTimingNow().yieldMaxMs - 50);
+      // ... and not longer: the cap bounds the wait (an uncapped yield runs until the entry is pruned, 2.5 s)
+      expect(ms).toBeLessThan(2 * 300 + qaTimingNow().yieldMaxMs + 1_000);
+    });
+  }, 30_000);
+
+  it("a waiting person of the SAME company is not waited for, and does not refuse its own turn", async () => {
+    await scaled(async () => {
+      const a = await shop();
+      const d = await design(a, 2);
+      stub.delayMs = 5;
+      await redis.zadd(WAITING, Date.now(), a.id);
+      const t0 = Date.now();
+      await expect(runQa(a, d.id)).resolves.toMatchObject({ id: d.id });
+      expect(Date.now() - t0).toBeLessThan(qaTimingNow().yieldMaxMs / 2);
+      expect(await qaStatusOf(a, d.id)).toBe("passed");
+    });
+  }, 30_000);
+
+  it("a NEW turn is refused with the in-flight hint while another shop's person waits, and costs nothing", async () => {
+    await scaled(async () => {
+      const a = await shop();
+      const c = await shop();
+      await redis.zadd(WAITING, Date.now(), c.id);
+      const refused = await takeQaTurn(a.id, 1, "design");
+      expect(refused).toMatchObject({
+        ok: false,
+        reason: "in_flight",
+        retryAfterMs: qaTimingNow().inFlightRetryMs,
+      });
+      expect((await takeQaTurn(a.id, 1, "artwork")).ok).toBe(false);
+      expect(await redis.exists(lease(a))).toBe(0);
+      await redis.zrem(WAITING, c.id);
+      const turn = await takeQaTurn(a.id, 1, "design");
+      expect(turn.ok).toBe(true); // the refusals took no allowance token
+      if (turn.ok) await turn.release();
+    });
+  });
+
+  it("a person is registered only while waiting on a 429, and removed on success, give-up and failure", async () => {
+    await scaled(async () => {
+      stub.retryAfterSec = 0.1;
+      const watch = async (s: Shop, id: string) => {
+        let seen = false;
+        const p = runQa(s, id).then(
+          (r) => ({ r }),
+          (e) => ({ e }),
+        );
+        let done = false;
+        void p.then(() => {
+          done = true;
+        });
+        while (!done) {
+          if ((await redis.zscore(WAITING, s.id)) !== null) seen = true;
+          await tick();
+        }
+        return { seen, out: await p };
+      };
+      const b = await shop();
+      const d = await design(b);
+
+      stub.script = [true, true]; // two 429s, then served
+      const served = await watch(b, d.id);
+      expect(served.seen).toBe(true);
+      expect("r" in served.out).toBe(true);
+      expect(await redis.zcard(WAITING)).toBe(0);
+
+      stub.script = [true];
+      stub.failNext = 1; // a 429, then imaging fails
+      const failed = await watch(b, d.id);
+      expect(failed.seen).toBe(true);
+      expect((failed.out as { e: { code: string } }).e.code).toBe("UPSTREAM_FAILED");
+      expect(await redis.zcard(WAITING)).toBe(0);
+
+      stub.script = Array(8).fill(true); // busy for good: the budget runs out
+      const gaveUp = await watch(b, d.id);
+      expect((gaveUp.out as { e: { code: string } }).e.code).toBe("RATE_LIMITED");
+      expect(await redis.zcard(WAITING)).toBe(0);
+    });
+  }, 30_000);
+
+  it("two shops' multi-placement manual runs both finish, nobody is refused half way", async () => {
+    await scaled(async () => {
+      stub.retryAfterSec = 0.1;
+      const a = await shop();
+      const b = await shop();
+      const da = await design(a, 2);
+      const db = await design(b, 2);
+      const base = stub.served;
+      const t0 = Date.now();
+      const runA = runQa(a, da.id);
+      await vi.waitFor(() => expect(stub.served).toBe(base + 1));
+      const runB = runQa(b, db.id); // B's first call gets 429 and B waits; A yields at its boundary
+      await Promise.all([runA, runB]);
+      expect(stub.served).toBe(base + 4);
+      expect(await qaStatusOf(a, da.id)).toBe("passed");
+      expect(await qaStatusOf(b, db.id)).toBe("passed");
+      // 4 calls of 300 ms plus at most one yield each: far below the scaled manual budget
+      expect(Date.now() - t0).toBeLessThan(4 * 300 + 2 * qaTimingNow().yieldMaxMs + 1_000);
+      expect(await redis.zcard(WAITING)).toBe(0);
+    });
+  }, 30_000);
+
+  it("the attacker's own interactive Run QA is still served while its own background job runs", async () => {
+    await scaled(async () => {
+      const a = await shop();
+      const jobDesign = await design(a);
+      const mine = await design(a);
+      const { job } = stubJob();
+      const base = stub.served;
+      const background = runDesignQaJob.handler({ companyId: a.id, designId: jobDesign.id }, job);
+      await vi.waitFor(() => expect(stub.served).toBe(base + 1)); // A's own job holds the slot
+      const t0 = Date.now();
+      let refusals = 0;
+      for (;;) {
+        try {
+          await runQa(a, mine.id);
+          break;
+        } catch (e) {
+          const err = e as { code?: string; data?: { retryAfterSec?: number } };
+          expect(err.code).toBe("RATE_LIMITED"); // own lease busy: asked to retry, never a failure
+          expect(++refusals).toBeLessThan(5);
+          await sleep((err.data?.retryAfterSec ?? 1) * 1000);
+        }
+      }
+      await background;
+      expect(Date.now() - t0).toBeLessThan(30_000 * Y_SCALE + S81_SLACK_MS);
+      expect(refusals).toBeGreaterThan(0);
+      expect(await qaStatusOf(a, mine.id)).toBe("passed");
+      expect(await qaStatusOf(a, jobDesign.id)).toBe("passed");
+      expect(await redis.zcard(WAITING)).toBe(0);
+    });
+  }, 60_000);
 });

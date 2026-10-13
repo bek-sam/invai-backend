@@ -40,6 +40,7 @@ export const designsRouter = authed.designs.router({
         svc.runDesignQa(tx, tenant, input.id, {
           cleanAlpha: input.cleanAlpha,
           qaBusy: QA_MANUAL_BUSY,
+          turn: true,
         }),
       );
     } catch (err) {
