@@ -17,9 +17,12 @@ const testDatabaseUrl = inject("testDatabaseUrl");
 const testMigrationDatabaseUrl = inject("testMigrationDatabaseUrl");
 const testRedisUrl = inject("testRedisUrl");
 const testS3Bucket = inject("testS3Bucket");
+const testImagingUrl = inject("testImagingUrl");
 
 if (testDatabaseUrl) process.env.TEST_DATABASE_URL = testDatabaseUrl;
 if (testMigrationDatabaseUrl) process.env.TEST_MIGRATION_DATABASE_URL = testMigrationDatabaseUrl;
 if (testRedisUrl) process.env.TEST_REDIS_URL = testRedisUrl;
 // T-43-6: the dev bucket from `.env` is never used by tests; the bucket global-setup chose wins.
 if (testS3Bucket) process.env.S3_BUCKET = testS3Bucket;
+// T-44-5: tests never reach a live imaging service; the shell/.env IMAGING_URL is overridden.
+if (testImagingUrl) process.env.IMAGING_URL = testImagingUrl;

@@ -30,6 +30,9 @@ process.env.NODE_ENV = "test";
 // is loaded below. env.ts never overrides an already-set variable, so the bucket chosen in setup()
 // is the one every import sees.
 const shellS3Bucket = process.env.S3_BUCKET;
+// T-44-5: the shell/.env IMAGING_URL is never used (the gate exports a live one); remembered only
+// so the guard can refuse an opt-in that points at it.
+const shellImagingUrl = process.env.IMAGING_URL;
 // Mirrors env.ts's own dotenv loading (duplicated, not imported — see the note on `env` below):
 // we need the raw DATABASE_URL/MIGRATION_DATABASE_URL/REDIS_URL from `.env` *before* claiming a
 // per-run database and Redis DB, and before setting TEST_DATABASE_URL etc., which env.ts must
@@ -54,6 +57,17 @@ export default async function setup(project: TestProject) {
   const testBucket = resolveTestBucket(shellS3Bucket, Boolean(process.env.CI));
   process.env.S3_BUCKET = testBucket;
   project.provide("testS3Bucket", testBucket);
+
+  // Hermetic imaging (T-44-5): a closed port unless TEST_IMAGING_URL opts in. Set before
+  // `import("../env")` below so this process and every worker (setup-env.ts) agree.
+  const { resolveTestImagingUrl } = await import("./imaging-safety");
+  const dotenvImagingUrl = process.env.IMAGING_URL;
+  const testImagingUrl = resolveTestImagingUrl(
+    process.env.TEST_IMAGING_URL,
+    shellImagingUrl ?? dotenvImagingUrl,
+  );
+  process.env.IMAGING_URL = testImagingUrl;
+  project.provide("testImagingUrl", testImagingUrl);
 
   const dbClaim = await claimTestDatabase({
     appUrl: rawDatabaseUrl,

@@ -20,6 +20,8 @@ declare module "vitest" {
     testRedisUrl?: string;
     /** `S3_BUCKET` to use in every worker (T-43-6): always a test bucket, never the dev one. */
     testS3Bucket?: string;
+    /** `IMAGING_URL` to use in every worker (T-44-5): a closed port unless `TEST_IMAGING_URL` opted in. */
+    testImagingUrl?: string;
   }
 }
 
