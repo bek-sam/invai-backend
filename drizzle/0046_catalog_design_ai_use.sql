@@ -1,0 +1,1 @@
+ALTER TABLE "designs" ADD COLUMN "ai_use" text DEFAULT 'unknown' NOT NULL;

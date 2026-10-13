@@ -96,6 +96,7 @@ function toDesign(row: DesignRow, files: DesignFileRow[], ordersLast30d: number)
     personalizationTemplateId: row.personalizationTemplateId,
     qaStatus: worstQa(files),
     ocrText: row.ocrText,
+    aiUse: row.aiUse,
     ordersLast30d,
     createdAt: row.createdAt.toISOString(),
     updatedAt: row.updatedAt.toISOString(),

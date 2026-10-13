@@ -1,3 +1,4 @@
+import { DESIGN_AI_USES } from "@invai/contracts";
 import {
   doublePrecision,
   foreignKey,
@@ -33,6 +34,8 @@ export const designs = pgTable(
     personalizationTemplateId: uuid(),
     /** Text found in the artwork by OCR, used by the trademark check. */
     ocrText: text(),
+    /** The shop's own statement of whether AI tools made the design (B-274). `unknown` keeps the listing notice. */
+    aiUse: text(enumText(DESIGN_AI_USES)).notNull().default("unknown"),
     ...timestamps,
   },
   (t) => [
