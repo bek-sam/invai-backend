@@ -3,6 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { eq } from "drizzle-orm";
+import OpenAI from "openai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   CONTROL_PROMPT,
@@ -33,6 +34,7 @@ import { imaging } from "../../integrations/imaging/client";
 import { getObject, putObject } from "../../lib/s3";
 import { createCompany } from "../../test/fixtures";
 import { getImageProvider, ImageGenError, type ImageProvider, mockImageProvider } from "./index";
+import { createOpenAiImageProvider } from "./openai";
 import { encodePng } from "./png";
 
 /*
@@ -522,6 +524,46 @@ describe("--max-calls (T-43-2)", () => {
       restore();
     }
     expect(mockImageProvider.generateScene).toBe(real);
+  });
+
+  it("T-45-2: a 5xx is one HTTP request and one counted call, so --max-calls counts requests", async () => {
+    let requests = 0;
+    const fetchStub = async () => {
+      requests += 1;
+      return new Response(JSON.stringify({ error: { message: "busy" } }), {
+        status: 503,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    Object.assign(fetchStub, { Response });
+    const provider = createOpenAiImageProvider(
+      () =>
+        new OpenAI({
+          apiKey: "sk-test-not-a-key",
+          baseURL: "http://openai.stub.invalid/v1",
+          maxRetries: 0,
+          fetch: fetchStub as typeof fetch,
+        }),
+    );
+    const png = encodePng({ width: 4, height: 4, data: new Uint8Array(64).fill(255) });
+    const l = createCallLimiter({ maxCalls: 1, scenes: 1 });
+    const restore = limitProviderCalls(provider, l);
+    try {
+      l.begin();
+      const first = await provider
+        .generateScene({ baseImage: png, mask: png, prompt: CONTROL_PROMPT, sizePx: 1024 })
+        .catch((e: unknown) => e);
+      expect((first as ImageGenError).mayBeBilled).toBe(true);
+      expect(requests).toBe(1);
+      expect(l.calls).toBe(1);
+      const second = await provider
+        .generateScene({ baseImage: png, mask: png, prompt: CONTROL_PROMPT, sizePx: 1024 })
+        .catch((e: unknown) => e);
+      expect((second as ImageGenError).message).toMatch(/refused before the provider/);
+      expect(requests).toBe(1); // the refused call never reached HTTP
+    } finally {
+      restore();
+    }
   });
 
   it("a refusal books a 0c row (non-retryable ImageGenError), where a plain Error books the 11c estimate", async () => {

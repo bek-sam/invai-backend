@@ -1,7 +1,6 @@
 import OpenAI, { APIConnectionTimeoutError, APIError, toFile } from "openai";
 import type { ImageEditParamsNonStreaming, ImagesResponse } from "openai/resources/images";
 import { env } from "../../env";
-import { logger } from "../../lib/log";
 import { imageCostCents, OPENAI_IMAGE_MODEL, OPENAI_IMAGE_QUALITY } from "../models";
 import { isPng, pngSize } from "./png";
 import { providerSize } from "./sizes";
@@ -15,10 +14,10 @@ import { type GeneratedScene, ImageGenError, type ImageProvider, ImageRefusalErr
  * so the print area is restored and checked by invai-imaging afterwards (ADR 0023 §2).
  * Nothing about the buyer or the shop is sent: no `user` field, no design pixels, no names.
  * `input_fidelity` is not sent: gpt-image-2 ignores it and always reads inputs at high fidelity.
- * At most one retry, and only on a 5xx; timeouts are not retried here (the call may be billed).
+ * No retry inside the provider: one generateScene is one HTTP request. A 5xx or a timeout may already
+ * be billed, and the provider has no shop to re-check the daily caps for, so a second request here
+ * would spend past both the ledger row and the caps (S-77). The caller books the failed call once.
  */
-
-const log = logger("ai.images.openai");
 
 /** The edit call usually takes 20-60 s at medium quality; the photos job's lock must exceed this. */
 export const IMAGE_TIMEOUT_MS = 120_000;
@@ -63,10 +62,6 @@ function mapError(err: unknown): Error {
   );
 }
 
-function isRetryable5xx(err: unknown): boolean {
-  return err instanceof APIError && typeof err.status === "number" && err.status >= 500;
-}
-
 export function createOpenAiImageProvider(getClient: () => OpenAI = client): ImageProvider {
   const model = OPENAI_IMAGE_MODEL;
   return {
@@ -93,18 +88,7 @@ export function createOpenAiImageProvider(getClient: () => OpenAI = client): Ima
       try {
         res = await getClient().images.edit(params);
       } catch (err) {
-        if (!isRetryable5xx(err)) throw mapError(err);
-        log.warn("image edit 5xx, retrying once", { status: (err as APIError).status });
-        try {
-          // Files are streams: build them again for the retry.
-          res = await getClient().images.edit({
-            ...params,
-            image: await toFile(input.baseImage, "base.png", { type: "image/png" }),
-            mask: await toFile(input.mask, "mask.png", { type: "image/png" }),
-          });
-        } catch (err2) {
-          throw mapError(err2);
-        }
+        throw mapError(err);
       }
       const b64 = res.data?.[0]?.b64_json;
       if (!b64) throw new ImageGenError("OpenAI returned no image", false, null, true);

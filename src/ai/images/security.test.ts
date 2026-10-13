@@ -1,11 +1,13 @@
+import { eq } from "drizzle-orm";
 import OpenAI from "openai";
 import { afterEach, describe, expect, it } from "vitest";
 import { withTenant } from "../../db/client";
+import { aiJobs } from "../../db/schema";
 import { env } from "../../env";
 import { redis } from "../../lib/queues";
 import { createCompany } from "../../test/fixtures";
 import { platformSpendKey, spendDay, tenantSpendKey } from "../breaker";
-import { assertImageGenAllowed, buildScenePrompt, recordImageGen } from "./index";
+import { assertImageGenAllowed, buildScenePrompt, ImageGenError, recordImageGen } from "./index";
 import { createOpenAiImageProvider } from "./openai";
 import { encodePng } from "./png";
 
@@ -99,12 +101,10 @@ describe("image spend controls (security, S-53)", () => {
 });
 
 /*
- * S-77 (T-43-2 security co-review): `generateScene` retries a 5xx once inside the provider. The
- * code's own billing model (mapError, S-53) says a 5xx may already be billed, yet when the retry
- * succeeds only the success is recorded, so one call can cost two estimates while the ledger, the
- * spend counters and any per-call limit (the scene-trial --max-calls wrapper) see one. Remove
- * `.fails` once a 5xx-then-success books both requests or the in-provider retry is dropped
- * (owner: ai-engineer).
+ * S-77 (T-43-2 security co-review, fixed in T-45-2): `generateScene` used to retry a 5xx once inside
+ * the provider, so one call could cost two estimates while the ledger, the spend counters and the
+ * scene-trial --max-calls wrapper saw one. The retry is dropped: one call is one HTTP request, and
+ * the failed call books the estimate once.
  */
 function fiveHundredThenOk(image: Buffer) {
   let requests = 0;
@@ -132,30 +132,45 @@ function fiveHundredThenOk(image: Buffer) {
 }
 
 describe("image spend controls (security, S-77)", () => {
-  it.fails("a 5xx retried inside the provider is booked for every request that may be billed", async () => {
+  it("a 5xx is one request, booked once at the estimate on the ledger and both spend counters", async () => {
     menv.AI_DAILY_PLATFORM_CAP_CENTS = 0;
     menv.AI_DAILY_TENANT_CAP_CENTS = 0;
     const shop = await createCompany();
     const day = spendDay(new Date());
     const tKey = tenantSpendKey(shop.id, day);
+    const pKey = platformSpendKey(day);
     const png = tinyPng();
     const stub = fiveHundredThenOk(png);
     const provider = createOpenAiImageProvider(() => stub.client);
     const prompt = buildScenePrompt(null, "studio", "tee", "Black");
+    const est = provider.estimateCents(1024);
     try {
-      const result = await provider.generateScene({
-        baseImage: png,
-        mask: png,
+      const platformBefore = Number(await redis.get(pKey)) || 0;
+      const error = await provider
+        .generateScene({ baseImage: png, mask: png, prompt, sizePx: 1024 })
+        .then(
+          () => null,
+          (e: unknown) => e,
+        );
+      expect(error).toBeInstanceOf(ImageGenError);
+      expect((error as ImageGenError).mayBeBilled).toBe(true);
+      await recordImageGen({
+        companyId: shop.id,
+        userId: null,
         prompt,
-        sizePx: 1024,
+        provider,
+        result: null,
+        error,
       });
-      await recordImageGen({ companyId: shop.id, userId: null, prompt, provider, result });
-      expect(stub.requests()).toBe(2);
-      expect(Number(await redis.get(tKey))).toBeGreaterThanOrEqual(
-        stub.requests() * provider.estimateCents(1024),
+      expect(stub.requests()).toBe(1);
+      expect(Number(await redis.get(tKey))).toBe(est);
+      expect(Number(await redis.get(pKey)) - platformBefore).toBe(est);
+      const rows = await withTenant(shop.id, (tx) =>
+        tx.select().from(aiJobs).where(eq(aiJobs.companyId, shop.id)),
       );
+      expect(rows.map((r) => r.costCents)).toEqual([est]);
     } finally {
-      await redis.del(tKey, platformSpendKey(day));
+      await redis.del(tKey, pKey);
     }
   });
 });

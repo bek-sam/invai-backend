@@ -395,26 +395,28 @@ describe("OpenAI image provider (AC2, stubbed)", () => {
     expect(res.costCents).toBe(Math.ceil(4.1 + IMAGE_INPUT_ALLOWANCE_CENTS));
   });
 
-  it("retries a 5xx once, then succeeds", async () => {
+  // T-45-2 (S-77): replaces "retries a 5xx once, then succeeds" and "two 5xx: one retry only". The
+  // in-provider retry is dropped on purpose: one generateScene is one HTTP request.
+  it("a 5xx is not retried inside the provider: one request, then a non-retryable maybe-billed error", async () => {
     const stub = stubClient([{ status: 503, json: { error: { message: "busy" } } }, ok]);
-    const res = await createOpenAiImageProvider(() => stub.client).generateScene({
-      baseImage: base,
-      mask,
-      prompt,
-      sizePx: 1024,
-    });
-    expect(stub.forms).toHaveLength(2);
-    expect(res.costCents).toBe(11);
+    const err = await createOpenAiImageProvider(() => stub.client)
+      .generateScene({ baseImage: base, mask, prompt, sizePx: 1024 })
+      .catch((e) => e);
+    expect(err).toBeInstanceOf(ImageGenError);
+    expect(err.retryable).toBe(false);
+    expect(err.mayBeBilled).toBe(true);
+    expect(stub.forms).toHaveLength(1);
   });
 
-  it("two 5xx: one retry only, then a non-retryable ImageGenError", async () => {
+  it("a 500 is one request too, with the same non-retryable maybe-billed error", async () => {
     const stub = stubClient([{ status: 500, json: { error: { message: "x" } } }]);
     const err = await createOpenAiImageProvider(() => stub.client)
       .generateScene({ baseImage: base, mask, prompt, sizePx: 1024 })
       .catch((e) => e);
     expect(err).toBeInstanceOf(ImageGenError);
     expect(err.retryable).toBe(false);
-    expect(stub.forms).toHaveLength(2);
+    expect(err.mayBeBilled).toBe(true);
+    expect(stub.forms).toHaveLength(1);
   });
 
   it("a moderation 400 is a refusal; a 429 is retryable; other 4xx are not; no retry for any", async () => {
