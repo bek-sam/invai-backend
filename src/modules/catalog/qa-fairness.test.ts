@@ -55,16 +55,20 @@ const rctx = (s: Shop) => ({
   role: "owner" as const,
   permissions: permissionsFor("owner"),
 });
-async function design(s: Shop) {
+const ALL_PLACEMENTS = ["front", "back", "left_chest", "sleeve_left", "sleeve_right"] as const;
+async function design(s: Shop, count = 1) {
   n++;
   return withTenant(s.id, (tx) =>
     svc.createDesign(tx, tenantContext(s.id, s.userId, "designer"), {
       code: `QF${n}-${Math.random().toString(36).slice(2, 6)}`,
       name: `QF ${n}`,
       tags: [],
-      placements: [
-        { placement: "front", fileKey: `${s.id}/design/qf-${n}.png`, widthIn: 10, heightIn: 10 },
-      ],
+      placements: ALL_PLACEMENTS.slice(0, count).map((placement) => ({
+        placement,
+        fileKey: `${s.id}/design/qf-${n}-${placement}.png`,
+        widthIn: 10,
+        heightIn: 10,
+      })),
       personalizationTemplateId: null,
     }),
   );
@@ -96,11 +100,20 @@ afterAll(async () => {
 });
 
 describe("criterion 1: a looping shop A does not starve shop B", () => {
-  it("B's job and B's manual QA finish; A is the one refused", async () => {
-    stub.delayMs = 300;
+  it("B's job and B's manual QA finish; A is the one refused", () => crit1(1, 300, 1), 120_000);
+
+  // S-79: the allowance is charged per /qa/check call, so a 5-placement loop can't hold the slot
+  // longer than the refill. Wave 42's worst QA (4.3 s) and imaging's default Retry-After (5 s).
+  it("same with A looping a 5-placement design at 4.3 s a call", () => crit1(5, 4_300, 5), 150_000);
+});
+
+async function crit1(aPlacements: number, delayMs: number, retryAfterSec: number) {
+  try {
+    stub.delayMs = delayMs;
+    stub.retryAfterSec = retryAfterSec;
     const a = await shop();
     const b = await shop();
-    const aDesign = await design(a);
+    const aDesign = await design(a, aPlacements);
     const bJobDesign = await design(b);
     const bManualDesign = await design(b);
 
@@ -136,12 +149,18 @@ describe("criterion 1: a looping shop A does not starve shop B", () => {
         }
       }
     })();
+    // A person who is told to wait clicks Run QA again after the retry hint; the clock keeps running.
     const manualRun = (async () => {
-      try {
-        await runQa(b, bManualDesign.id);
-        return { ms: Date.now() - t0 };
-      } catch (e) {
-        return { ms: Date.now() - t0, error: String((e as { code?: string }).code ?? e) };
+      for (;;) {
+        try {
+          await runQa(b, bManualDesign.id);
+          return { ms: Date.now() - t0 };
+        } catch (e) {
+          const err = e as { code?: string; data?: { retryAfterSec?: number } };
+          if (err.code !== "RATE_LIMITED" || Date.now() - t0 > 30_000)
+            return { ms: Date.now() - t0, error: String(err.code ?? e) };
+          await sleep((err.data?.retryAfterSec ?? 1) * 1000);
+        }
       }
     })();
     const [jobRes, manualRes] = await Promise.all([jobRun, manualRun]);
@@ -158,8 +177,10 @@ describe("criterion 1: a looping shop A does not starve shop B", () => {
     expect(manualRes.ms).toBeLessThan(30_000);
     expect(await qaStatusOf(b, bManualDesign.id)).toBe("passed");
     expect(aRefused).toBeGreaterThan(0);
-  }, 120_000);
-});
+  } finally {
+    stub.retryAfterSec = 1;
+  }
+}
 
 describe("criterion 2: per-company lease and allowance", () => {
   it("refuses over the burst with RATE_LIMITED at once and no imaging call", async () => {

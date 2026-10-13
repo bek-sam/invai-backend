@@ -18,6 +18,8 @@ export type QaStub = {
   calls: Record<string, number>;
   /** Issues returned for a file key containing the given text. */
   issues: { when: string; list: unknown[] }[];
+  /** One entry per upcoming /qa/check: true = answer 429, false = serve (then it runs dry). */
+  script: boolean[];
   /** Hold the slot for ms without a request (a foreign shop's long check). */
   hold(ms: number): void;
   close(): Promise<void>;
@@ -33,6 +35,7 @@ export async function startQaStub(): Promise<QaStub> {
     refused: 0,
     calls: {},
     issues: [],
+    script: [],
     hold(ms) {
       st.busy = true;
       setTimeout(() => {
@@ -54,7 +57,10 @@ export async function startQaStub(): Promise<QaStub> {
     });
     req.on("end", () => {
       if (path === "/health") return json(res, 200, { ok: true });
-      if (path === "/qa/clean-alpha" || (path === "/qa/check" && st.busy)) {
+      if (
+        path === "/qa/clean-alpha" ||
+        (path === "/qa/check" && (st.busy || st.script.shift() === true))
+      ) {
         st.refused++;
         return json(res, 429, { detail: "busy" }, { "retry-after": String(st.retryAfterSec) });
       }
