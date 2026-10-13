@@ -25,11 +25,43 @@ export class ImagingError extends Error {
 
 const Health = z.object({ ok: z.boolean(), vips_version: z.string().optional() });
 
-const QaIssue = z.object({
-  code: z.string(),
-  severity: z.enum(["error", "warn"]),
-  message: z.string(),
+const clamp01 = (n: number) => Math.min(1, Math.max(0, n));
+const QaRegion = z.object({
+  left: z.number(),
+  top: z.number(),
+  width: z.number(),
+  height: z.number(),
 });
+/**
+ * Imaging answers snake_case (`measured_in`); this is the one place it becomes camelCase, so
+ * catalog and orders both get `measuredIn` (T-42-5, B-380). Defensive on purpose: a missing or
+ * null value is absent, a non-positive `measuredIn` is dropped, region ratios are clamped to
+ * 0..1 and only the first 20 regions are kept (the contract caps them at 20).
+ */
+const QaIssue = z
+  .object({
+    code: z.string(),
+    severity: z.enum(["error", "warn"]),
+    message: z.string(),
+    measured_in: z.number().nullish(),
+    regions: z.array(QaRegion).nullish(),
+  })
+  .transform(({ measured_in, regions, ...rest }) => ({
+    ...rest,
+    ...(measured_in != null && Number.isFinite(measured_in) && measured_in > 0
+      ? { measuredIn: measured_in }
+      : {}),
+    ...(regions && regions.length > 0
+      ? {
+          regions: regions.slice(0, 20).map((r) => ({
+            left: clamp01(r.left),
+            top: clamp01(r.top),
+            width: clamp01(r.width),
+            height: clamp01(r.height),
+          })),
+        }
+      : {}),
+  }));
 const QaCheckResult = z.object({
   width_px: z.number(),
   height_px: z.number(),

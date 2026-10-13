@@ -31,6 +31,12 @@ export const designsRouter = authed.designs.router({
       svc.runDesignQa(tx, tenant, input.id, { cleanAlpha: input.cleanAlpha }),
     ),
   ),
+  acceptQaWarning: authed.designs.acceptQaWarning.handler(({ input, context: { tenant } }) =>
+    withTenant(tenant.companyId, (tx) => svc.acceptQaWarning(tx, tenant, input)),
+  ),
+  unacceptQaWarning: authed.designs.unacceptQaWarning.handler(({ input, context: { tenant } }) =>
+    withTenant(tenant.companyId, (tx) => svc.unacceptQaWarning(tx, tenant, input)),
+  ),
 });
 
 export const blanksRouter = authed.blanks.router({

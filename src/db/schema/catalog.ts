@@ -44,9 +44,24 @@ export const designs = pgTable(
 ).enableRLS();
 
 export type QaIssue = {
-  code: "low_dpi" | "soft_alpha" | "no_alpha" | "tiny_file" | "unreadable";
+  code:
+    | "low_dpi"
+    | "soft_alpha"
+    | "no_alpha"
+    | "tiny_file"
+    | "unreadable"
+    | "thin_line"
+    | "small_text"
+    | "white_box"
+    | "non_srgb";
   severity: "error" | "warn";
   message: string;
+  /** Inches, unrounded (thin_line: thinnest stroke; small_text: tallest small mark). */
+  measuredIn?: number;
+  regions?: { left: number; top: number; width: number; height: number }[];
+  /** ISO timestamp + display name of whoever accepted this warning; kept while the file stays. */
+  acceptedAt?: string;
+  acceptedBy?: string;
 };
 
 /** One print file per placement. Dimensions are inches at print size. */

@@ -4,7 +4,9 @@ import {
   BlankVariantInput as BlankVariantInputSchema,
   type DesignInput as DesignInputSchema,
   type ProductInput as ProductInputSchema,
+  QA_ISSUE_CODES,
 } from "@invai/contracts";
+import { ORPCError } from "@orpc/server";
 import { and, desc, eq, gt, ilike, inArray, isNotNull, or, type SQL, sql } from "drizzle-orm";
 import type { z } from "zod";
 import type { TenantContext } from "../../api/context";
@@ -244,24 +246,45 @@ export async function updateDesign(
     // this column.
     const previewPrefix = `${ctx.companyId}/preview/design/`;
     const oldFiles = await tx
-      .select({ previewKey: designFiles.previewKey })
+      .select({
+        placement: designFiles.placement,
+        fileKey: designFiles.fileKey,
+        widthIn: designFiles.widthIn,
+        heightIn: designFiles.heightIn,
+        qaIssues: designFiles.qaIssues,
+        previewKey: designFiles.previewKey,
+      })
       .from(designFiles)
-      .where(eq(designFiles.designId, input.id));
+      .where(eq(designFiles.designId, input.id))
+      .for("update");
     const oldPreviewKeys = oldFiles
       .map((f) => f.previewKey)
       .filter(
         (k): k is string => !!k && isCompanyKey(ctx.companyId, k) && k.startsWith(previewPrefix),
       );
     await tx.delete(designFiles).where(eq(designFiles.designId, input.id));
+    // A save deletes and re-inserts every file row. Carry the stored QA issues (with any
+    // accepted warning) to a row whose placement, file key and size are unchanged, so an
+    // unrelated save (rename, tags) never throws away a person's acceptance (T-42-5 A6). A
+    // replaced file starts clean; the QA job that follows re-checks either way.
     await tx.insert(designFiles).values(
-      input.placements.map((p) => ({
-        companyId: ctx.companyId,
-        designId: input.id,
-        placement: p.placement,
-        fileKey: p.fileKey,
-        widthIn: p.widthIn,
-        heightIn: p.heightIn,
-      })),
+      input.placements.map((p) => {
+        const old = oldFiles.find((o) => o.placement === p.placement);
+        const same =
+          old &&
+          old.fileKey === p.fileKey &&
+          old.widthIn === p.widthIn &&
+          old.heightIn === p.heightIn;
+        return {
+          companyId: ctx.companyId,
+          designId: input.id,
+          placement: p.placement,
+          fileKey: p.fileKey,
+          widthIn: p.widthIn,
+          heightIn: p.heightIn,
+          ...(same ? { qaIssues: old.qaIssues } : {}),
+        };
+      }),
     );
     qaRequested = true;
     if (oldPreviewKeys.length > 0) {
@@ -340,6 +363,131 @@ export async function setDesignStatus(
   return getDesign(tx, ctx, id);
 }
 
+const KNOWN_QA_CODES = new Set<string>(QA_ISSUE_CODES);
+
+/**
+ * Keep an accepted warning only while it is still the same warning on the same file: same file
+ * key (cleanAlpha writes a new key, so it drops acceptance on purpose) and still severity warn.
+ */
+function carryAcceptance(
+  prev: { fileKey: string; qaIssues: QaIssue[] },
+  fileKey: string,
+  issues: QaIssue[],
+): QaIssue[] {
+  if (prev.fileKey !== fileKey) return issues;
+  return issues.map((i) => {
+    const old = prev.qaIssues.find((p) => p.code === i.code);
+    if (i.severity === "warn" && old?.acceptedAt && old.acceptedBy)
+      return { ...i, acceptedAt: old.acceptedAt, acceptedBy: old.acceptedBy };
+    return i;
+  });
+}
+
+function qaIssueNotFound(id: string, placement: string, code: string) {
+  return new ORPCError("QA_ISSUE_NOT_FOUND", {
+    status: 404,
+    message: "No such issue on this placement",
+    data: { id, placement, code },
+  });
+}
+
+function qaNotWarning(id: string, placement: string, code: string) {
+  return new ORPCError("QA_NOT_WARNING", {
+    status: 409,
+    message: "This problem must be fixed, not accepted",
+    data: { id, placement, code },
+  });
+}
+
+/** Lock the one print file the accept/unaccept call is about; every miss is a 404. */
+async function lockQaIssue(
+  tx: Tx,
+  input: { id: string; placement: DesignFileRow["placement"]; code: string },
+) {
+  const [design] = await tx
+    .select({ id: designs.id })
+    .from(designs)
+    .where(eq(designs.id, input.id))
+    .limit(1);
+  if (!design) throw notFound("design", input.id);
+  const [file] = await tx
+    .select()
+    .from(designFiles)
+    .where(and(eq(designFiles.designId, input.id), eq(designFiles.placement, input.placement)))
+    .for("update")
+    .limit(1);
+  const issue = file?.qaIssues.find((i) => i.code === input.code);
+  if (!file || !issue) throw qaIssueNotFound(input.id, input.placement, input.code);
+  return { file, issue };
+}
+
+/**
+ * Accept a warning on one placement (B-380). Errors can't be accepted. Idempotent: a second call
+ * keeps the first acceptedAt. The file row is locked so it can't race a QA re-run or an undo.
+ * Writes an audit row; no `design.updated` event, because that would re-run imaging.
+ */
+export async function acceptQaWarning(
+  tx: Tx,
+  ctx: TenantContext,
+  input: { id: string; placement: DesignFileRow["placement"]; code: string },
+): Promise<Design> {
+  const { file, issue } = await lockQaIssue(tx, input);
+  if (issue.severity !== "warn") throw qaNotWarning(input.id, input.placement, input.code);
+  if (!issue.acceptedAt) {
+    const acceptedBy = ctx.user?.name?.trim() || "A teammate";
+    const acceptedAt = new Date().toISOString();
+    await tx
+      .update(designFiles)
+      .set({
+        qaIssues: file.qaIssues.map((i) =>
+          i.code === input.code ? { ...i, acceptedAt, acceptedBy } : i,
+        ),
+      })
+      .where(eq(designFiles.id, file.id));
+    await audit(tx, {
+      companyId: ctx.companyId,
+      actor: ctx.actor,
+      action: "settings.changed",
+      entityType: "design",
+      entityId: input.id,
+      summary: `QA warning ${input.code} accepted on ${input.placement}`,
+      data: { placement: input.placement, code: input.code, change: "qa_accepted" },
+    });
+  }
+  return getDesign(tx, ctx, input.id);
+}
+
+/** Undo an accept. Not accepted: the design comes back unchanged, no error, no audit row. */
+export async function unacceptQaWarning(
+  tx: Tx,
+  ctx: TenantContext,
+  input: { id: string; placement: DesignFileRow["placement"]; code: string },
+): Promise<Design> {
+  const { file, issue } = await lockQaIssue(tx, input);
+  if (issue.acceptedAt || issue.acceptedBy) {
+    await tx
+      .update(designFiles)
+      .set({
+        qaIssues: file.qaIssues.map((i) => {
+          if (i.code !== input.code) return i;
+          const { acceptedAt: _a, acceptedBy: _b, ...rest } = i;
+          return rest;
+        }),
+      })
+      .where(eq(designFiles.id, file.id));
+    await audit(tx, {
+      companyId: ctx.companyId,
+      actor: ctx.actor,
+      action: "settings.changed",
+      entityType: "design",
+      entityId: input.id,
+      summary: `QA warning ${input.code} acceptance undone on ${input.placement}`,
+      data: { placement: input.placement, code: input.code, change: "qa_unaccepted" },
+    });
+  }
+  return getDesign(tx, ctx, input.id);
+}
+
 /**
  * Run imaging QA on every placement file, optionally snapping soft alpha first. Called by the
  * `catalog.runDesignQa` job after create/update and by `designs.runQa` on demand.
@@ -367,9 +515,28 @@ export async function runDesignQa(
         target_width_in: file.widthIn,
         target_height_in: file.heightIn,
       });
-      const status: QaStatus = qa.issues.some((i) => i.severity === "error")
+      // One stored issue with an unknown code would fail the Design output parse of
+      // designs.list for the whole shop, so drop it here (A8).
+      let issues: QaIssue[] = [];
+      for (const i of qa.issues) {
+        if (!KNOWN_QA_CODES.has(i.code)) {
+          log.warn("dropping unknown qa issue code", { designId: id, code: i.code });
+          continue;
+        }
+        issues.push(i as QaIssue);
+      }
+      // Imaging answered with no lock held on the row, so an accept may have landed meanwhile.
+      // Re-read the row FOR UPDATE and merge acceptance from that fresh read (A7).
+      const [fresh] = await tx
+        .select()
+        .from(designFiles)
+        .where(eq(designFiles.id, file.id))
+        .for("update");
+      if (!fresh) continue;
+      issues = carryAcceptance(fresh, fileKey, issues);
+      const status: QaStatus = issues.some((i) => i.severity === "error")
         ? "failed"
-        : qa.issues.length > 0
+        : issues.length > 0
           ? "warn"
           : "passed";
       await tx
@@ -379,7 +546,7 @@ export async function runDesignQa(
           widthPx: qa.width_px,
           heightPx: qa.height_px,
           effectiveDpi: qa.effective_dpi ?? null,
-          qaIssues: qa.issues as QaIssue[],
+          qaIssues: issues,
           qaStatus: status,
           qaCheckedAt: new Date(),
         })
