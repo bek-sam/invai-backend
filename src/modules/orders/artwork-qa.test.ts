@@ -3,6 +3,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 import { withSystem, withTenant } from "../../db/client";
 import { orderItems } from "../../db/schema";
 import { redis } from "../../lib/queues";
+import { putObject } from "../../lib/s3";
 import { createCompany, createConnection, createOrder, tenantContext } from "../../test/fixtures";
 import { type QaStub, startQaStub } from "../catalog/qa-stub.testutil";
 import { setQaCooldown, takeQaTurn } from "../catalog/qa-turn";
@@ -62,13 +63,16 @@ async function newItem(cid = companyId) {
   const { items } = await createOrder(cid, conn.id);
   return items[0]?.id as string;
 }
-const attach = (id: string, name: string, cid = companyId) =>
-  withTenant(cid, (tx) =>
+// T-48-2: setItemArtwork requires the uploaded object to exist.
+const attach = async (id: string, name: string, cid = companyId) => {
+  await putObject(`${cid}/art/${name}.png`, "x", "image/png");
+  return withTenant(cid, (tx) =>
     setItemArtwork(tx, tenantContext(cid, null, "office"), {
       id,
       fileKey: `${cid}/art/${name}.png`,
     }),
   );
+};
 const row = async (id: string, cid = companyId) =>
   withTenant(
     cid,

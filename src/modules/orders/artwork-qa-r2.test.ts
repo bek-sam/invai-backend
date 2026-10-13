@@ -4,6 +4,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 import { withSystem, withTenant } from "../../db/client";
 import { orderItems } from "../../db/schema";
 import { queues, redis } from "../../lib/queues";
+import { putObject } from "../../lib/s3";
 import { createCompany, createConnection, createOrder, tenantContext } from "../../test/fixtures";
 import { type QaStub, startQaStub } from "../catalog/qa-stub.testutil";
 import { QA_WAIT_LIMIT_MS, setQaCooldown } from "../catalog/qa-turn";
@@ -68,6 +69,7 @@ async function itemWithArtwork(name: string) {
   const id = items[0]?.id as string;
   // Attach while the slot is busy so the item carries the artwork and no flags yet.
   stub.hold(200);
+  await putObject(`${companyId}/art/${name}.png`, "x", "image/png"); // T-48-2: the object must exist
   vi.spyOn(itemArtworkQaJob, "enqueue").mockResolvedValue(undefined as never);
   await withTenant(companyId, (tx) =>
     setItemArtwork(tx, tenantContext(companyId, null, "office"), {

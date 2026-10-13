@@ -14,7 +14,7 @@ import {
 } from "drizzle-orm";
 import type { PgColumn } from "drizzle-orm/pg-core";
 import { type Tx, withSystem, withTenant } from "../../db/client";
-import { gangSheets } from "../../db/schema";
+import { gangSheets, itemArtwork, orderItems } from "../../db/schema";
 import { errorData, logger } from "../../lib/log";
 import { deleteObject, isCompanyKey, listKeysOlderThan } from "../../lib/s3";
 import { forgetFiles } from "../files/service";
@@ -288,45 +288,82 @@ export function storageKeyColumns(): KeyColumn[] {
   return out;
 }
 
+/** What a reference check skips: a privacy-owned file and the units being purged in this run. */
+export type ReferenceIgnore = { orderItemIds?: string[]; tables?: string[] };
+
+const uuidList = (ids: string[]) =>
+  sql`array[${sql.join(
+    ids.map((i) => sql`${i}::uuid`),
+    sql`, `,
+  )}]::uuid[]`;
+
 /** Keys in jsonb columns: a photo slot's value in `item_artwork.values`, a personalization file. */
-async function referencedInJson(tx: Tx, keys: string[]): Promise<string[]> {
+async function referencedInJson(
+  tx: Tx,
+  keys: string[],
+  ignore?: ReferenceIgnore,
+): Promise<string[]> {
   const list = sql.join(
     keys.map((k) => sql`${k}`),
     sql`, `,
   );
-  const values = await tx.execute<{ k: string }>(sql`select distinct v.value as k
+  const ids = ignore?.orderItemIds?.length ? ignore.orderItemIds : null;
+  const notArt = ids ? sql` and a.order_item_id <> all(${uuidList(ids)})` : sql``;
+  const notItem = ids ? sql` and i.id <> all(${uuidList(ids)})` : sql``;
+  const values = ignore?.tables?.includes("item_artwork")
+    ? { rows: [] as { k: string }[] }
+    : await tx.execute<{ k: string }>(sql`select distinct v.value as k
     from item_artwork a cross join lateral jsonb_each_text(
       case when jsonb_typeof(a."values") = 'object' then a."values" else '{}'::jsonb end) v
-    where v.value in (${list})`);
-  const personalization = await tx.execute<{ k: string }>(sql`select distinct x.k
+    where v.value in (${list})${notArt}`);
+  const personalization = ignore?.tables?.includes("order_items")
+    ? { rows: [] as { k: string }[] }
+    : await tx.execute<{ k: string }>(sql`select distinct x.k
     from order_items i
     cross join lateral jsonb_array_elements(
       case when jsonb_typeof(i.personalization) = 'array' then i.personalization else '[]'::jsonb end) e
     cross join lateral (values (e->>'fileUrl'), (e->>'answer')) x(k)
-    where x.k in (${list})`);
+    where x.k in (${list})${notItem}`);
   return [...values.rows, ...personalization.rows].map((r) => r.k);
 }
 
-/** The subset of `keys` (at most REF_CHUNK) that some row of this tenant points at. */
-export async function referencedKeys(tx: Tx, keys: string[]): Promise<Set<string>> {
+/**
+ * The subset of `keys` (at most REF_CHUNK) that some row of this tenant points at. `ignore`
+ * leaves out whole tables (the `files` registry row of a privacy-owned object) and the
+ * `order_items` / `item_artwork` rows of units the caller is purging right now.
+ */
+export async function referencedKeys(
+  tx: Tx,
+  keys: string[],
+  ignore?: ReferenceIgnore,
+): Promise<Set<string>> {
   if (keys.length > REF_CHUNK) throw new Error(`at most ${REF_CHUNK} keys per reference query`);
   const found = new Set<string>();
   if (keys.length === 0) return found;
   const wanted = new Set(keys);
+  const ids = ignore?.orderItemIds?.length ? ignore.orderItemIds : null;
   for (const c of storageKeyColumns()) {
+    if (ignore?.tables?.includes(c.table)) continue;
     const table = tenantTables().find((t) => t.name === c.table)?.table;
     if (!table) continue;
+    const match = c.array ? arrayOverlaps(c.col, keys) : inArray(c.col, keys);
+    const skip =
+      ids && c.table === "order_items"
+        ? sql`${orderItems.id} <> all(${uuidList(ids)})`
+        : ids && c.table === "item_artwork"
+          ? sql`${itemArtwork.orderItemId} <> all(${uuidList(ids)})`
+          : undefined;
     const rows = await tx
       .select({ k: c.col })
       .from(table)
-      .where(c.array ? arrayOverlaps(c.col, keys) : inArray(c.col, keys));
+      .where(skip ? and(match, skip) : match);
     for (const r of rows) {
       const v = r.k as unknown;
       for (const k of Array.isArray(v) ? v : [v])
         if (typeof k === "string" && wanted.has(k)) found.add(k);
     }
   }
-  for (const k of await referencedInJson(tx, keys)) found.add(k);
+  for (const k of await referencedInJson(tx, keys, ignore)) found.add(k);
   return found;
 }
 

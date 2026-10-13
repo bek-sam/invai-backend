@@ -61,8 +61,10 @@ import { logger } from "../../lib/log";
 import { emit } from "../../lib/outbox";
 import { isPermanentHttpStatus } from "../../lib/queues";
 import { publish } from "../../lib/realtime";
+import { headObject } from "../../lib/s3";
 import { artworkQaFlags, isImagingBusy, QA_NO_BUSY, takeQaTurn } from "../catalog/qa-turn";
 import { releaseForItems } from "../inventory/service";
+import { lockObjects } from "../privacy/object-locks";
 import { guardShipmentsForItems } from "../shipping/service";
 import { ARTWORK_ITEM_FLAGS, withFlags } from "./flags";
 import { ALL_ADDRESS_FIELDS, buyerPiiRow, upsertBuyerPii } from "./pii";
@@ -1223,6 +1225,10 @@ export async function setItemArtwork(
       }
     }
   }
+  // T-48-2: the buyer-data purge takes this lock before it checks references and deletes. Once we
+  // hold it the file is either still there (and our update makes it referenced) or already gone.
+  await lockObjects(tx, [input.fileKey]);
+  if (!(await headObject(input.fileKey)).exists) throw notFound("file");
   await tx
     .update(orderItems)
     .set({

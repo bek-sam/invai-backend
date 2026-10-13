@@ -16,7 +16,6 @@ import {
   isNull,
   lt,
   ne,
-  notInArray,
   notLike,
   or,
   type SQL,
@@ -68,9 +67,14 @@ import {
 import { forgetFiles } from "../files/service";
 import { ARTWORK_ITEM_FLAGS, withFlags } from "../orders/flags";
 import { createJobRow, toJob, updateJobRow } from "../production/service";
+import { lockObjects } from "./object-locks";
+import { REF_CHUNK, referencedKeys } from "./print-files";
 import { createZip, ZipLimitError } from "./zip";
 
 const log = logger("privacy");
+
+/** Kinds (second key segment) of objects a unit's own art can be: all others are shop art. */
+const PURGEABLE_KINDS = new Set(["artwork", "photo", "other"]);
 
 /*
  * Channel privacy requests (Shopify compliance webhooks, B-06; playbook
@@ -232,27 +236,6 @@ export async function redactBuyerText(
   for (const r of reprintNotes)
     reprintsByItem.set(r.orderItemId, [...(reprintsByItem.get(r.orderItemId) ?? []), r.id]);
 
-  // An item's own artwork keys that are not its artwork row's render (a manual upload) are
-  // deleted only when they are artwork keys and no other item points at them.
-  const itemKeys = new Set<string>();
-  for (const i of items)
-    for (const k of [i.artworkKey, i.artworkPreviewKey])
-      if (k?.startsWith(`${i.companyId}/artwork/`)) itemKeys.add(k);
-  const shared = new Set<string>();
-  if (itemKeys.size) {
-    const keys = [...itemKeys];
-    const others = await tx
-      .select({ k1: orderItems.artworkKey, k2: orderItems.artworkPreviewKey })
-      .from(orderItems)
-      .where(
-        and(
-          or(inArray(orderItems.artworkKey, keys), inArray(orderItems.artworkPreviewKey, keys)),
-          notInArray(orderItems.id, itemIds),
-        ),
-      );
-    for (const o of others) for (const k of [o.k1, o.k2]) if (k) shared.add(k);
-  }
-
   type Plan = {
     item: (typeof items)[number];
     answers: boolean;
@@ -273,46 +256,50 @@ export async function redactBuyerText(
     const keys = new Set<string>();
     const photos = new Set<string>();
     if (art) {
-      const own = (k: string | null | undefined): k is string =>
-        !!k && isCompanyKey(i.companyId, k);
       if (row) {
-        if (own(row.a.fileKey)) keys.add(row.a.fileKey);
-        if (own(row.a.previewKey)) keys.add(row.a.previewKey);
+        if (row.a.fileKey) keys.add(row.a.fileKey);
+        if (row.a.previewKey) keys.add(row.a.previewKey);
         // A photo slot's value is the storage key of the buyer's photo.
         for (const slot of row.slots ?? []) {
           const v = row.a.values[slot.name];
-          if (slot.kind === "photo" && own(v) && v.startsWith(`${i.companyId}/photo/`))
+          if (
+            slot.kind === "photo" &&
+            typeof v === "string" &&
+            v.startsWith(`${i.companyId}/photo/`)
+          )
             photos.add(v);
         }
       }
-      for (const k of [i.artworkKey, i.artworkPreviewKey])
-        if (k && itemKeys.has(k) && !shared.has(k)) keys.add(k);
+      // A manual upload (`setItemArtwork`) or the unit's own render copy.
+      for (const k of [i.artworkKey, i.artworkPreviewKey]) if (k) keys.add(k);
     }
     plans.push({ item: i, answers, art, reprintIds, keys: [...keys], photos: [...photos] });
   }
 
-  // A buyer photo another unit's artwork still uses (a reorder, a second order) stays until the
-  // last unit using it is purged (S-59).
-  const photoKeys = [...new Set(plans.flatMap((p) => p.photos))];
-  const sharedPhotos = new Set<string>();
-  if (photoKeys.length) {
-    const purging = plans.filter((p) => p.art).map((p) => p.item.id);
-    const list = sql.join(
-      photoKeys.map((k) => sql`${k}`),
-      sql`, `,
-    );
-    const ids = sql.join(
-      purging.map((k) => sql`${k}::uuid`),
-      sql`, `,
-    );
-    const users = await tx.execute<{ k: string }>(sql`select distinct v.value as k
-      from item_artwork a cross join lateral jsonb_each_text(
-        case when jsonb_typeof(a."values") = 'object' then a."values" else '{}'::jsonb end) v
-      where v.value in (${list}) and a.order_item_id not in (${ids})`);
-    for (const r of users.rows) sharedPhotos.add(r.k);
-    res.sharedPhotosKept = sharedPhotos.size;
+  // T-48-2 (decision 0027, amendment): a unit's object is deleted only when it is the company's own
+  // key, of a kind a unit's art or a buyer's photo can have, and no row outside this run points at
+  // it. Anything else (a design's file, another unit's render or upload, a template background, a
+  // listing mockup) is shop art or another unit's: its key is cleared here, the object stays.
+  // Candidates are locked first (sorted) so `setItemArtwork` can't attach one mid-check.
+  const companyOf = new Map(plans.map((p) => [p.item.id, p.item.companyId]));
+  const eligibleOf = (p: Plan) =>
+    [...new Set([...p.keys, ...p.photos])].filter((k) => {
+      const c = companyOf.get(p.item.id) as string;
+      return isCompanyKey(c, k) && PURGEABLE_KINDS.has(k.split("/")[1] ?? "");
+    });
+  const eligible = [...new Set(plans.flatMap(eligibleOf))].sort();
+  const referenced = new Set<string>();
+  if (eligible.length) {
+    await lockObjects(tx, eligible);
+    const ignore = { orderItemIds: plans.map((p) => p.item.id), tables: ["files"] };
+    for (let n = 0; n < eligible.length; n += REF_CHUNK)
+      for (const k of await referencedKeys(tx, eligible.slice(n, n + REF_CHUNK), ignore))
+        referenced.add(k);
   }
-  for (const p of plans) p.keys.push(...p.photos.filter((k) => !sharedPhotos.has(k)));
+  const photoKeys = new Set(plans.flatMap((p) => p.photos));
+  res.sharedPhotosKept = [...referenced].filter((k) => photoKeys.has(k)).length;
+  const deletable = new Set(eligible.filter((k) => !referenced.has(k)));
+  for (const p of plans) p.keys = eligibleOf(p).filter((k) => deletable.has(k));
 
   // Storage first.
   const failed = new Set<string>();
