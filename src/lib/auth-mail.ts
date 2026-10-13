@@ -156,6 +156,32 @@ export function accountLockedEmail(locale: AuthMailLocale, minutes: number): Aut
 /** How long an account email may wait on the mail server before it is logged as not sent. */
 export const AUTH_MAIL_TIMEOUT_MS = 15_000;
 
+const SAFE_CODE = /^[A-Za-z0-9_.-]{1,40}$/;
+const safeCode = (v: unknown) => (typeof v === "string" && SAFE_CODE.test(v) ? v : undefined);
+
+/** Marks our own timeout so the log can say so without the message text. */
+class AuthMailTimeout extends Error {
+  override name = "AuthMailTimeout";
+}
+
+/**
+ * What the log may say about a failed send (B-306, S-29 class). SMTP errors quote the recipient
+ * ("550 5.1.1 <someone@example.com>: user unknown"), so the message, `response` and `command`
+ * never reach the log: only the error class name, a short code, and the numeric SMTP reply code.
+ */
+export function mailErrorFields(err: unknown): {
+  errorName: string;
+  code?: string;
+  responseCode?: number;
+} {
+  const e = (err ?? {}) as { name?: unknown; code?: unknown; responseCode?: unknown };
+  return {
+    errorName: safeCode(e.name) ?? "UnknownError",
+    code: safeCode(e.code),
+    responseCode: typeof e.responseCode === "number" ? e.responseCode : undefined,
+  };
+}
+
 /**
  * Send an account email without making the caller wait. Returns the delivery promise (it never
  * rejects) so tests can await it; auth callbacks don't.
@@ -170,13 +196,16 @@ export function sendAuthMail(
   return Promise.race([
     sendMail({ to, ...mail }, "account"),
     new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`timed out after ${timeoutMs} ms`)), timeoutMs);
+      timer = setTimeout(
+        () => reject(new AuthMailTimeout(`timed out after ${timeoutMs} ms`)),
+        timeoutMs,
+      );
     }),
   ])
     .then(() => true)
     .catch((err) => {
-      // No address in the log: the kind is enough to find the failure.
-      log.warn("account email not sent", { kind, error: String(err) });
+      // No address and no raw error text in the log: the kind plus a safe code find the failure.
+      log.warn("account email not sent", { kind, ...mailErrorFields(err) });
       return false;
     })
     .finally(() => clearTimeout(timer));
