@@ -174,21 +174,21 @@ describe("a hand-uploaded unit file on the 30-day clock", () => {
   it("AC4: a key of another company put straight into the row is never deleted; the other tenant is untouched", async () => {
     const b = (await createCompany()).id;
     const bConn = (await createConnection(b)).id;
-    const foreign = await blob(b, "other");
-    const bUnit = await manualUnit(foreign, { company: b, conn: bConn, state: "ready", age: 1 });
+    const foreign = await blob(b, "other"); // nothing in B points at it: only the company check saves it
     const a = await manualUnit(foreign); // the DB-level insert the API would refuse
-    // Same relative path under each company: only A's own is deleted.
+    // Same relative path under each company: only A's own is deleted; B's unit still uses its own.
     const rel = `other/${uniq()}.png`;
     const aKey = await putObject(`${companyId}/${rel}`, "a", "image/png");
     const bKey = await putObject(`${b}/${rel}`, "b", "image/png");
     const aOwn = await manualUnit(aKey);
+    const bUnit = await manualUnit(bKey, { company: b, conn: bConn, state: "ready", age: 1 });
     await purgeBuyerPii();
     expect(await exists(foreign)).toBe(true);
     expect(await unitRow(a)).toMatchObject({ artworkKey: null, artworkStatus: "purged" });
     expect(await exists(aKey)).toBe(false);
     expect(await unitRow(aOwn)).toMatchObject({ artworkStatus: "purged" });
     expect(await exists(bKey)).toBe(true);
-    expect(await unitRow(bUnit)).toMatchObject({ artworkKey: foreign });
+    expect(await unitRow(bUnit)).toMatchObject({ artworkKey: bKey });
   });
 
   it("only unit-art kinds are deleted: an unreferenced design-kind key stays", async () => {
