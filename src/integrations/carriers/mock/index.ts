@@ -17,6 +17,7 @@ import {
   type RateRequest,
   scanFormObjectKey,
 } from "../types";
+import { peakSurchargeCents } from "./peak-surcharge";
 
 /*
  * Sandbox carrier used when no EASYPOST_API_KEY is set. Rates are deterministic from weight and a
@@ -142,7 +143,9 @@ export function mockRates(
       carrier: s.carrier,
       service: s.service,
       serviceLabel: s.label,
-      rateCents: s.price(req.parcel.weightOz, zone),
+      rateCents:
+        s.price(req.parcel.weightOz, zone) +
+        peakSurchargeCents(s.carrier, req.parcel.weightOz, now),
       deliveryDays: days,
       estimatedDeliveryAt: new Date(now.getTime() + days * 86400_000).toISOString(),
     };
