@@ -32,6 +32,7 @@ import { keyset, type PageInput } from "../../lib/pagination";
 import { isPermanentHttpStatus } from "../../lib/queues";
 import { deleteObject, getObject, isCompanyKey, objectKey, presignGet } from "../../lib/s3";
 import { backfillItemPreviews } from "../orders/preview-backfill";
+import { acceptedByName } from "./accepted-by";
 import { qaCallAwaitingSlot, qaCallsRan, yieldToManualCaller } from "./qa-turn";
 
 const log = logger("catalog");
@@ -470,7 +471,7 @@ export async function acceptQaWarning(
   const { file, issue } = await lockQaIssue(tx, input);
   if (issue.severity !== "warn") throw qaNotWarning(input.id, input.placement, input.code);
   if (!issue.acceptedAt) {
-    const acceptedBy = (ctx.user?.name?.trim().slice(0, 200) ?? "") || "A teammate";
+    const acceptedBy = acceptedByName(ctx.user?.name);
     const acceptedAt = new Date().toISOString();
     await tx
       .update(designFiles)
