@@ -238,7 +238,7 @@ async function main() {
       underbasePreview: true,
       lifestyle: kinds ? { count: scenes, sceneKinds: kinds } : { count: scenes },
       idempotencyKey: `scene-trial-${crypto.randomUUID()}`,
-    }),
+    }, { dispatch: false }),
   );
   console.log(`set ${set.id}`);
 

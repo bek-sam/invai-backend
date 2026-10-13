@@ -63,6 +63,11 @@ export const dispatchSetJob = defineJob({
   jobId: (i) => `photo-dispatch-${i.setId}`,
   handler: async ({ companyId, setId }) => {
     const open = await openCompositionsBySource(companyId, setId);
+    if (open.length === 0) {
+      // A finished set (or a stray, re-delivered event): nothing to render, nothing to enqueue.
+      log.info("photo set had nothing open", { companyId, setId });
+      return { enqueued: 0, scenes: 0 };
+    }
     for (const c of open) {
       if (c.source === "ai_scene") await renderSceneJob.enqueue({ companyId, compositionId: c.id });
       else await renderCompositionJob.enqueue({ companyId, compositionId: c.id });

@@ -662,6 +662,8 @@ export async function createSet(
   tx: Tx,
   ctx: TenantContext,
   input: PhotoSetCreateInput,
+  /** `dispatch: false` writes no `photo_set.created` event: a trial set nobody should render by event. */
+  opts: { dispatch?: boolean } = {},
 ): Promise<PhotoSet> {
   const hash = specHash(input);
   const [existing] = await tx
@@ -803,11 +805,12 @@ export async function createSet(
   }
   await tx.insert(photoImages).values(images);
   const allComps = [...comps, ...sceneComps];
-  await emit(tx, ctx.companyId, "photo_set.created", {
-    setId: set.id,
-    designId: set.designId,
-    compositionIds: allComps.map((c) => c.id),
-  });
+  if (opts.dispatch !== false)
+    await emit(tx, ctx.companyId, "photo_set.created", {
+      setId: set.id,
+      designId: set.designId,
+      compositionIds: allComps.map((c) => c.id),
+    });
   await audit(tx, {
     companyId: ctx.companyId,
     actor: ctx.actor,
@@ -1403,6 +1406,8 @@ export async function renderComposition(
     return prep.noCredits;
   }
   const { c, s, open, file } = prep;
+  // Every image already terminal (a re-delivered job): no render, no row, no event.
+  if (open.length === 0) return { rendered: 0, failed: 0, charged: false, skipped: true };
 
   const outcomes: RenderOutcome[] = [];
   let retryLater: unknown = null;

@@ -25,7 +25,13 @@ import { imaging } from "../../integrations/imaging/client";
 import { runJobInline } from "../../lib/queues";
 import { createCompany, createConnection, createUser, tenantContext } from "../../test/fixtures";
 import { createDesign } from "../catalog/service";
-import { analyzeDesignJob, pushImagesJob, renderCompositionJob, renderSceneJob } from "./jobs";
+import {
+  analyzeDesignJob,
+  dispatchSetJob,
+  pushImagesJob,
+  renderCompositionJob,
+  renderSceneJob,
+} from "./jobs";
 import { purgePhotoFiles } from "./purge";
 import * as push from "./push";
 import * as svc from "./service";
@@ -1186,5 +1192,50 @@ describe("Shopify push errors (B-343)", () => {
     );
     expect(row?.status).toBe("failed");
     expect(row?.error).toBe("Rejected");
+  });
+});
+
+describe("a finished scene set and a re-delivered photo_set.created (T-42-1, B-392)", () => {
+  it("dispatches nothing and never calls the provider again; the stored scene and rows stay byte-identical", async () => {
+    const { company, ctx, design } = await shop();
+    const first = fakeProvider();
+    h.provider = first.p;
+    const set = await withTenant(company.id, (tx) =>
+      svc.createSet(tx, ctx, spec(design.id, { count: 1, sceneKinds: ["studio"] })),
+    );
+    await renderEverything(company.id, set.id);
+    expect(first.calls).toHaveLength(1);
+    const snap = () =>
+      withTenant(company.id, async (tx) => ({
+        comps: await tx
+          .select()
+          .from(photoCompositions)
+          .where(eq(photoCompositions.setId, set.id))
+          .orderBy(photoCompositions.id),
+        set: await tx.select().from(photoSets).where(eq(photoSets.id, set.id)),
+        jobs: await tx.select().from(aiJobs).orderBy(aiJobs.id),
+        ledger: await tx.select().from(aiCreditLedger).orderBy(aiCreditLedger.id),
+      }));
+    const before = await snap();
+    expect(before.comps.some((c) => c.source === "ai_scene" && c.sceneKey)).toBe(true);
+
+    // The stray event arrives later, with a different (mock-like) provider configured.
+    const second = fakeProvider();
+    h.provider = second.p;
+    const enq = vi.spyOn(renderSceneJob, "enqueue");
+    const enqC = vi.spyOn(renderCompositionJob, "enqueue");
+    const input = { companyId: company.id, setId: set.id };
+    expect(await runJobInline(dispatchSetJob, input)).toEqual({ enqueued: 0, scenes: 0 });
+    expect(await runJobInline(dispatchSetJob, input)).toEqual({ enqueued: 0, scenes: 0 });
+    for (const c of before.comps) {
+      const compositionId = c.id;
+      if (c.source === "ai_scene")
+        await runJobInline(renderSceneJob, { companyId: company.id, compositionId });
+      else await runJobInline(renderCompositionJob, { companyId: company.id, compositionId });
+    }
+    expect(second.calls).toHaveLength(0);
+    expect(enq).not.toHaveBeenCalled();
+    expect(enqC).not.toHaveBeenCalled();
+    expect(await snap()).toEqual(before);
   });
 });
