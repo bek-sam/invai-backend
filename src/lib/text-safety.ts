@@ -36,3 +36,29 @@ export function sanitizeDeep<T>(value: T): T {
   }
   return value;
 }
+
+const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
+/**
+ * Cut user text to at most `maxUnits` UTF-16 units without splitting a character (S-86). A plain
+ * `.slice(0, n)` can leave half of an emoji (a lone surrogate), which Postgres jsonb refuses (22P02)
+ * and `encodeURIComponent` throws on. Lone surrogates in the input become U+FFFD first, even when
+ * the text is short. The result is the longest prefix of whole grapheme clusters that fits; a
+ * single grapheme longer than the cap is cut by code point. No trimming, no fallback text.
+ */
+export function cutWhole(text: string, maxUnits: number): string {
+  const s = text.replace(LONE_SURROGATE, "�");
+  if (maxUnits <= 0) return "";
+  if (s.length <= maxUnits) return s;
+  let out = "";
+  for (const { segment } of graphemes.segment(s)) {
+    if (out.length + segment.length > maxUnits) break;
+    out += segment;
+  }
+  if (out) return out;
+  for (const ch of s) {
+    if (out.length + ch.length > maxUnits) break;
+    out += ch;
+  }
+  return out;
+}

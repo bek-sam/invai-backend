@@ -5,7 +5,7 @@ import { aiJobs } from "../db/schema";
 import { env } from "../env";
 import { upstream } from "../lib/errors";
 import { errorData, logger } from "../lib/log";
-import { sanitizeDeep, sanitizeText } from "../lib/text-safety";
+import { cutWhole, sanitizeDeep, sanitizeText } from "../lib/text-safety";
 import { isSampleWorkspace } from "../modules/tenancy/demo-flag";
 import { assertSpendAvailable, recordSpend } from "./breaker";
 import { assertCredits, type CreditKind, chargeCredits } from "./credits";
@@ -279,7 +279,7 @@ export async function* runAssistant(
   const clean = scrubAssistantRun({ ...run, tools: recordToolOutputs(run.tools, outputs) });
   const aiJobId = await startJob(
     meta,
-    { prompt: promptRef(ASSISTANT_PROMPT), message: clean.message.slice(0, 500) },
+    { prompt: promptRef(ASSISTANT_PROMPT), message: cutWhole(clean.message, 500) },
     provider,
   );
   let text = "";

@@ -18,6 +18,7 @@ import { sha256Hex } from "../../lib/crypto";
 import { badRequest, conflict, notFound } from "../../lib/errors";
 import { errorData, logger } from "../../lib/log";
 import { isCompanyKey, presignGet } from "../../lib/s3";
+import { cutWhole } from "../../lib/text-safety";
 import { getDesign } from "../catalog/service";
 import { freshChannelConn, getConnectionRow } from "../channels/service";
 import {
@@ -359,7 +360,7 @@ export async function runPush(
   const images = await Promise.all(
     send.map(async ({ i, c }) => ({
       url: await presignGet(i.key as string, PUSH_URL_TTL_S),
-      alt: (i.altText ?? `${plan.designName} ${c.garment} in ${c.colorName}`).slice(0, 250),
+      alt: cutWhole(i.altText ?? `${plan.designName} ${c.garment} in ${c.colorName}`, 250),
       filename: `${i.id}.jpg`,
     })),
   );

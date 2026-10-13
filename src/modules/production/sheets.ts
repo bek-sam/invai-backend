@@ -44,6 +44,7 @@ import { emit } from "../../lib/outbox";
 import { keyset, type PageInput } from "../../lib/pagination";
 import { publish } from "../../lib/realtime";
 import { headObject, objectKey, presignGet } from "../../lib/s3";
+import { cutWhole } from "../../lib/text-safety";
 import { transitionItem } from "../orders/state-machine";
 import { createJobRow, updateJobRow } from "./job-rows";
 import { type ItemView, loadItemViews, placementOf, toOrderItem } from "./views";
@@ -575,7 +576,7 @@ export async function composeSheet(
     const orderNos = [
       ...new Set(rows.map((r) => r.label?.order_no).filter((v): v is string => !!v)),
     ];
-    const filenameHint = [sheet.name, ...orderNos].join(" ").slice(0, 150);
+    const filenameHint = cutWhole([sheet.name, ...orderNos].join(" "), 150);
     await imaging.compose({
       width_in: sheet.widthIn,
       length_in: sheet.lengthIn,

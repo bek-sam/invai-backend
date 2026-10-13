@@ -5,6 +5,7 @@ import {
   type PHOTO_VIEWS,
   type PhotoChannel,
 } from "@invai/contracts";
+import { cutWhole } from "../../lib/text-safety";
 import type { PhotoAnalysisOutput, PhotoAnalysisVars } from "../prompts";
 
 /*
@@ -203,7 +204,7 @@ export function rankBlanks(palette: Palette, blanks: BlankColor[] = STANDARD_BLA
 function clip(text: string, max: number): string {
   const t = text.trim();
   if (t.length <= max) return t;
-  const cut = t.slice(0, max - 1);
+  const cut = cutWhole(t, max - 1);
   const space = cut.lastIndexOf(" ");
   return `${(space > max / 2 ? cut.slice(0, space) : cut).trimEnd()}…`;
 }

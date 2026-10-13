@@ -12,6 +12,7 @@ import {
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { env } from "../env";
 import { logger } from "./log";
+import { cutWhole } from "./text-safety";
 
 const log = logger("s3");
 
@@ -97,7 +98,7 @@ export async function presignPut(
 /** `attachment` header value with an ASCII-safe fallback name and an RFC 5987 UTF-8 name. */
 export function contentDisposition(filename: string): string {
   const ascii = filename.replace(/[^\x20-\x7e]|["\\]/g, "_").slice(0, 150) || "download";
-  return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(filename.slice(0, 150))}`;
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(cutWhole(filename, 150))}`;
 }
 
 export async function presignGet(key: string, expiresIn = 3600, downloadName?: string) {

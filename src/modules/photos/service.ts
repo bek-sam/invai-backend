@@ -46,6 +46,7 @@ import { keyset, type PageInput } from "../../lib/pagination";
 import { isPermanentHttpStatus } from "../../lib/queues";
 import { publish } from "../../lib/realtime";
 import { isCompanyKey, presignGet } from "../../lib/s3";
+import { cutWhole } from "../../lib/text-safety";
 import { analyzeDesignForPhotos } from "../ai/photo-analysis";
 import { attachPhotosToDraft } from "../ai/photo-attach";
 import { getDraft } from "../ai/service";
@@ -773,7 +774,7 @@ export async function createSet(
         gIdx(a.garment) - gIdx(b.garment) ||
         cIdx(a.colorHex) - cIdx(b.colorHex),
     );
-    const alt = analysis?.altText?.[channel]?.slice(0, 250) ?? null;
+    const alt = cutWhole(analysis?.altText?.[channel] ?? "", 250) || null;
     ordered.forEach((c, slot) => {
       images.push({
         companyId: ctx.companyId,
