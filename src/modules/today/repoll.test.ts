@@ -91,7 +91,7 @@ async function bulk(cid: string, conn: string, specs: Spec[]) {
             companyId: cid,
             orderId: ords[j]?.id as string,
             status: c.status ?? ("labeled" as const),
-            carrier: "usps",
+            carrier: "usps" as const,
             trackingCode: c.noTracking ? null : `9400${Math.random().toString().slice(2, 18)}`,
             carrierShipmentId: c.noCarrierId ? null : `shp_${Math.random().toString(36).slice(2)}`,
             labeledAt: ago(300),
