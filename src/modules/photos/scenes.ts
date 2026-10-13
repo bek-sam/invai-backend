@@ -268,9 +268,11 @@ function logDrift(
   });
 }
 
-/** The measured numbers behind `region_changed`, for the office ("outline 0.41, at limit, foreign 0.012"). */
+/** The measured numbers behind `region_changed`, for the office ("placement off, outline 0.41, at limit, foreign 0.012"). */
 function regionDetail(res: PhotoSceneCompositeResult): string | null {
   const parts: string[] = [];
+  // Only the known reason is named; other codes stay internal. Imaging has no placement numbers yet (B-376).
+  if (res.checks.region_reasons?.includes("placement_off")) parts.push("placement off");
   const score = res.checks.region_unchanged_score;
   if (score !== null) parts.push(`outline ${score.toFixed(2)}`);
   if (res.registration?.at_limit) parts.push("at limit");
