@@ -1199,7 +1199,14 @@ export async function setItemArtwork(
       log.warn("artwork QA failed", { itemId: item.id, error: String(err) });
     }
   }
-  const unique = qaFlags.filter((f, idx) => qaFlags.findIndex((x) => x.code === f.code) === idx);
+  // One flag per code; when several issues map to the same code the worst severity wins and its
+  // message is the one shown, whatever order imaging listed them in (T-42-5).
+  const worst = new Map<string, (typeof qaFlags)[number]>();
+  for (const f of qaFlags) {
+    const cur = worst.get(f.code);
+    if (!cur || (cur.severity !== "error" && f.severity === "error")) worst.set(f.code, f);
+  }
+  const unique = [...worst.values()];
   await tx
     .update(orderItems)
     .set({
