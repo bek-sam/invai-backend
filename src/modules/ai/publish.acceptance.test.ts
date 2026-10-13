@@ -1,5 +1,5 @@
 import { eq } from "drizzle-orm";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import { withSystem, withTenant } from "../../db/client";
 import {
   auditLog,
@@ -106,25 +106,61 @@ describe("T-20-3 publishDraft is repeatable", () => {
         .then((rows) => rows.filter((r) => r.action === "listing_draft.export")),
     );
 
-  it("publishing twice writes one file at one key and keeps the draft approved", async () => {
-    const draft = await approvedDraft();
+  async function publishTwiceAndCheck(draftId: string) {
     const publish = () =>
-      withTenant(companyId, (tx) => svc.publishDraft(tx, ctx, draft.id, connectionId));
+      withTenant(companyId, (tx) => svc.publishDraft(tx, ctx, draftId, connectionId));
     const first = await publish();
+    const storedFirst = (await draftRow(draftId)).publishedUrl;
     const again = await publish();
+    const row = await draftRow(draftId);
     expect(first).toMatchObject({ status: "approved", pendingApproval: true });
-    expect(again.publishedUrl).toBe(first.publishedUrl);
-    const row = await draftRow(draft.id);
+    // T-50-3 (B-449): the response URL is presigned, so its query (signing time) may differ across
+    // a second boundary. Compare what must be equal: the stored key and the URL without its query.
+    expect(storedFirst?.startsWith("s3:")).toBe(true);
+    expect(row.publishedUrl).toBe(storedFirst);
+    expect(again.publishedUrl?.split("?")[0]).toBe(first.publishedUrl?.split("?")[0]);
     const key = (row.publishedUrl as string).replace(/^s3:/, "");
     expect(key.startsWith(`${companyId}/`)).toBe(true);
     // One object for this draft: the key carries the draft id, so a repeat overwrites.
     const objects = await listObjects(`${companyId}/listing-export/`);
-    expect(objects.filter((o) => o.key.includes(draft.id))).toHaveLength(1);
+    expect(objects.filter((o) => o.key.includes(draftId))).toHaveLength(1);
     const csv = (await getObject(key)).toString("utf8");
     expect(parseCsvObjects(csv).rows).toHaveLength(2); // one row per allowed SKU
     expect(csv).toMatch(/T203-PUB-BLK-S/);
-    expect(await exportAudits(draft.id)).toHaveLength(2);
+    expect(await exportAudits(draftId)).toHaveLength(2);
     expect(row).toMatchObject({ status: "approved", connectionId, error: null });
+    return { first, again };
+  }
+
+  it("publishing twice writes one file at one key and keeps the draft approved", async () => {
+    const draft = await approvedDraft();
+    await publishTwiceAndCheck(draft.id);
+  });
+
+  it("publishing in two different seconds signs two URLs but still one key and one file", async () => {
+    const draft = await approvedDraft();
+    // Start at the real "now" (whole second): MinIO rejects a request signed far from its clock,
+    // and the SDK would then cache a clock offset that breaks later tests in this file.
+    const t0 = new Date(Math.floor(Date.now() / 1000) * 1000);
+    // Fake only Date: the signer reads the clock, the DB and S3 clients keep real timers.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      const publish = () =>
+        withTenant(companyId, (tx) => svc.publishDraft(tx, ctx, draft.id, connectionId));
+      vi.setSystemTime(t0);
+      const first = await publish();
+      vi.setSystemTime(new Date(t0.getTime() + 1000));
+      const again = await publish();
+      // Proves the crossing happened: the whole signed URLs differ, which is what made the old
+      // whole-URL toBe flaky.
+      expect(again.publishedUrl).not.toBe(first.publishedUrl);
+      expect(again.publishedUrl?.split("?")[0]).toBe(first.publishedUrl?.split("?")[0]);
+      expect((await draftRow(draft.id)).publishedUrl?.startsWith("s3:")).toBe(true);
+      const objects = await listObjects(`${companyId}/listing-export/`);
+      expect(objects.filter((o) => o.key.includes(draft.id))).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("two concurrent publishes land on the same key and the draft is still approved", async () => {
