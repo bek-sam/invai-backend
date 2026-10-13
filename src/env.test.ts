@@ -210,6 +210,7 @@ describe("AI provider keys (decision 0021)", () => {
   it("a test run ignores AI keys, so no test can reach a paid model", async () => {
     const res = await boot({
       NODE_ENV: "test",
+      REDIS_URL: "redis://localhost:6379/12", // test mode has no fallback Redis DB (T-49-3)
       OPENAI_API_KEY: "sk-real",
       ANTHROPIC_API_KEY: "sk-ant-real",
     });
@@ -245,7 +246,15 @@ describe("image generation switches (T-27-1)", () => {
     expect(dev.ok).toBe(false);
     expect(dev.out).toContain("IMAGE_GEN_MOCK_DRIFT is a test-only switch");
     expect((await boot({ ...prod, IMAGE_GEN_MOCK_DRIFT: "1" })).ok).toBe(false);
-    expect((await boot({ NODE_ENV: "test", IMAGE_GEN_MOCK_DRIFT: "1" })).ok).toBe(true);
+    expect(
+      (
+        await boot({
+          NODE_ENV: "test",
+          IMAGE_GEN_MOCK_DRIFT: "1",
+          REDIS_URL: "redis://localhost:6379/12",
+        })
+      ).ok,
+    ).toBe(true);
   });
 });
 
