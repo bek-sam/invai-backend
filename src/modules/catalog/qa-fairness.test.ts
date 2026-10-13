@@ -777,4 +777,23 @@ describe("T-46-3: yield to a waiting person of another shop", () => {
       expect(Number(await redis.hget(`qa:rate:design:${b.id}`, "tokens"))).toBeLessThan(1.5);
     });
   });
+
+  it("a turn yields at most yieldTotalMs over all its placements, however long the other person waits", async () => {
+    await scaled(async () => {
+      const a = await shop();
+      const c = await shop();
+      const d = await design(a, 4);
+      const base = stub.served;
+      const t0 = Date.now();
+      const run = runQa(a, d.id);
+      await vi.waitFor(() => expect(stub.served).toBe(base + 1));
+      await redis.zadd(WAITING, Date.now(), c.id);
+      await run;
+      const ms = Date.now() - t0;
+      const { yieldTotalMs } = qaTimingNow();
+      expect(stub.served).toBe(base + 4);
+      expect(ms).toBeGreaterThanOrEqual(4 * 300 + yieldTotalMs - 50); // two full yields used up the total
+      expect(ms).toBeLessThan(4 * 300 + yieldTotalMs + 500); // the third placement did not yield
+    });
+  }, 30_000);
 });
