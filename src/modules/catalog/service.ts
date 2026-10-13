@@ -251,30 +251,37 @@ export async function updateDesign(
         fileKey: designFiles.fileKey,
         widthIn: designFiles.widthIn,
         heightIn: designFiles.heightIn,
+        id: designFiles.id,
+        qaStatus: designFiles.qaStatus,
         qaIssues: designFiles.qaIssues,
+        qaCheckedAt: designFiles.qaCheckedAt,
+        effectiveDpi: designFiles.effectiveDpi,
+        widthPx: designFiles.widthPx,
+        heightPx: designFiles.heightPx,
         previewKey: designFiles.previewKey,
       })
       .from(designFiles)
       .where(eq(designFiles.designId, input.id))
       .for("update");
-    const oldPreviewKeys = oldFiles
-      .map((f) => f.previewKey)
-      .filter(
-        (k): k is string => !!k && isCompanyKey(ctx.companyId, k) && k.startsWith(previewPrefix),
-      );
     await tx.delete(designFiles).where(eq(designFiles.designId, input.id));
-    // A save deletes and re-inserts every file row. Carry the stored QA issues (with any
-    // accepted warning) to a row whose placement, file key and size are unchanged, so an
-    // unrelated save (rename, tags) never throws away a person's acceptance (T-42-5 A6). A
-    // replaced file starts clean; the QA job that follows re-checks either way.
-    await tx.insert(designFiles).values(
-      input.placements.map((p) => {
-        const old = oldFiles.find((o) => o.placement === p.placement);
-        const same =
-          old &&
-          old.fileKey === p.fileKey &&
-          old.widthIn === p.widthIn &&
-          old.heightIn === p.heightIn;
+    // A save deletes and re-inserts every file row (delete-plus-insert on purpose: an in-place
+    // update would let a QA still running write the old file key back over a replaced file,
+    // T-43-5 A20). A row whose placement, file key and print size are unchanged is re-inserted
+    // with its old id and its whole QA result (status, issues with any acceptance, check time,
+    // DPI, pixel size) and its preview, so an unrelated save (rename, tags) neither unblocks a
+    // failed file nor throws away a person's acceptance (T-42-5 A6, B-393). A changed or new
+    // placement starts pending.
+    const carriedPreviews = new Set<string>();
+    let needsWork = false;
+    const rows = input.placements.map((p) => {
+      const old = oldFiles.find((o) => o.placement === p.placement);
+      const same =
+        old &&
+        old.fileKey === p.fileKey &&
+        old.widthIn === p.widthIn &&
+        old.heightIn === p.heightIn;
+      if (!same) {
+        needsWork = true;
         return {
           companyId: ctx.companyId,
           designId: input.id,
@@ -282,11 +289,39 @@ export async function updateDesign(
           fileKey: p.fileKey,
           widthIn: p.widthIn,
           heightIn: p.heightIn,
-          ...(same ? { qaIssues: old.qaIssues } : {}),
         };
-      }),
-    );
-    qaRequested = true;
+      }
+      if (old.qaStatus === "pending" || !old.previewKey) needsWork = true;
+      if (old.previewKey) carriedPreviews.add(old.previewKey);
+      return {
+        id: old.id,
+        companyId: ctx.companyId,
+        designId: input.id,
+        placement: p.placement,
+        fileKey: p.fileKey,
+        widthIn: p.widthIn,
+        heightIn: p.heightIn,
+        qaStatus: old.qaStatus,
+        qaIssues: old.qaIssues,
+        qaCheckedAt: old.qaCheckedAt,
+        effectiveDpi: old.effectiveDpi,
+        widthPx: old.widthPx,
+        heightPx: old.heightPx,
+        previewKey: old.previewKey,
+      };
+    });
+    await tx.insert(designFiles).values(rows);
+    qaRequested = needsWork;
+    // A carried row still points at its preview object: only the others are cleaned up.
+    const oldPreviewKeys = oldFiles
+      .map((f) => f.previewKey)
+      .filter(
+        (k): k is string =>
+          !!k &&
+          !carriedPreviews.has(k) &&
+          isCompanyKey(ctx.companyId, k) &&
+          k.startsWith(previewPrefix),
+      );
     if (oldPreviewKeys.length > 0) {
       afterCommit(tx, () => cleanupOldPreviewKeys(ctx.companyId, oldPreviewKeys));
     }
