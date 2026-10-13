@@ -1,6 +1,8 @@
 import type { OrderItemState } from "@invai/contracts";
 import { beforeAll, describe, expect, it } from "vitest";
+import { sql } from "drizzle-orm";
 import { withTenant } from "../../db/client";
+import { orderItemTransitions } from "../../db/schema";
 import {
   createCompany,
   createConnection,
@@ -156,6 +158,57 @@ describe("orders.timeline keeps steps of one transaction in order (B-418)", () =
         timeline(tx, ctx, { id: order.id, limit: 1, cursor }),
       );
       for (const e of page.items) if (e.kind === "state_changed") seen.push(e.to as string);
+      if (!page.nextCursor) break;
+      cursor = page.nextCursor;
+    }
+    expect(seen).toEqual(want);
+  });
+});
+
+describe("orders.timeline orders steps inside one millisecond (B-418)", () => {
+  it("sorts and pages on microseconds, not milliseconds", async () => {
+    const companyId = (await createCompany()).id;
+    const office = await createUser(companyId, "office");
+    const ctx = tenantContext(companyId, office.id, "office");
+    await createLocation(companyId);
+    const conn = await createConnection(companyId);
+    const { order, items } = await createOrder(companyId, conn.id, { units: 1, state: "ready" });
+    const item = items[0];
+    if (!item) throw new Error("no item");
+    // Same millisecond, microseconds apart. The ids run opposite to time, so a millisecond sort
+    // (id tiebreak) would return oldest first.
+    const steps = [
+      { id: "00000000-0000-4000-8000-000000000003", us: "123300", to: "pressed" },
+      { id: "00000000-0000-4000-8000-000000000002", us: "123200", to: "transfer_in" },
+      { id: "00000000-0000-4000-8000-000000000001", us: "123100", to: "on_sheet" },
+    ] as const;
+    await withTenant(companyId, async (tx) => {
+      for (const s of steps) {
+        await tx.insert(orderItemTransitions).values({
+          id: s.id,
+          companyId,
+          orderItemId: item.id,
+          orderId: order.id,
+          fromState: "ready",
+          toState: s.to,
+          actorKind: "system",
+          createdAt: sql`${`2030-01-01T00:00:00.${s.us}Z`}::timestamptz`,
+        });
+      }
+    });
+    const want = steps.map((s) => s.to as string);
+    const isStep = (e: { id: string }) => steps.some((s) => s.id === e.id);
+
+    const all = await withTenant(companyId, (tx) => timeline(tx, ctx, { id: order.id, limit: 50 }));
+    expect(all.items.filter(isStep).map((e) => e.to)).toEqual(want);
+
+    const seen: string[] = [];
+    let cursor: string | undefined;
+    for (let i = 0; i < 20; i++) {
+      const page = await withTenant(companyId, (tx) =>
+        timeline(tx, ctx, { id: order.id, limit: 1, cursor }),
+      );
+      for (const e of page.items) if (isStep(e)) seen.push(e.to as string);
       if (!page.nextCursor) break;
       cursor = page.nextCursor;
     }
