@@ -161,6 +161,13 @@ describe("a hand-uploaded unit file on the 30-day clock", () => {
   it("AC3: another unit's render (item_artwork) of that key keeps it", async () => {
     const other = await manualUnit(await blob(companyId, "artwork"), { state: "ready", age: 1 });
     const art = await seedItemArt(companyId, other.itemId, templateId);
+    // Only the other unit's render row (item_artwork) points at the file, not its order_items row.
+    await withSystem((tx) =>
+      tx
+        .update(orderItems)
+        .set({ artworkKey: null, artworkPreviewKey: null })
+        .where(eq(orderItems.id, other.itemId)),
+    );
     const u = await manualUnit(art.fileKey);
     await purgeBuyerPii();
     expect(await exists(art.fileKey)).toBe(true);
