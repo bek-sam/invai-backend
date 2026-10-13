@@ -645,26 +645,15 @@ describe("T-46-3: yield to a waiting person of another shop", () => {
     });
   }, 30_000);
 
-  it("a NEW turn is refused with the in-flight hint while another shop's person waits, and costs nothing", async () => {
+  it("a NEW manual Run QA is served, not refused, while another shop's person waits (S-85)", async () => {
     await scaled(async () => {
       const a = await shop();
       const c = await shop();
+      const d = await design(a);
+      stub.delayMs = 5;
       await redis.zadd(WAITING, Date.now(), c.id);
-      const refused = await takeQaTurn(a.id, 1, "design", { person: true });
-      expect(refused).toMatchObject({
-        ok: false,
-        reason: "in_flight",
-        retryAfterMs: qaTimingNow().inFlightRetryMs,
-      });
-      expect(await redis.exists(lease(a))).toBe(0);
-      // a job or an artwork check does not ask the question: it re-delays on its own
-      const job = await takeQaTurn(a.id, 1, "design");
-      expect(job.ok).toBe(true);
-      if (job.ok) await job.release();
-      await redis.zrem(WAITING, c.id);
-      const turn = await takeQaTurn(a.id, 1, "design", { person: true });
-      expect(turn.ok).toBe(true); // the refusal took no allowance token
-      if (turn.ok) await turn.release();
+      await expect(runQa(a, d.id)).resolves.toMatchObject({ id: d.id });
+      expect(await qaStatusOf(a, d.id)).toBe("passed");
     });
   });
 
@@ -782,6 +771,95 @@ describe("T-46-3: yield to a waiting person of another shop", () => {
       expect(Number(await redis.hget(`qa:rate:design:${b.id}`, "tokens"))).toBeLessThan(1.5);
     });
   });
+
+  // T-46-3 r2 (B1): the refund's `ran` count, end to end. A 3-placement design is served at
+  // placement 1 and refused at placement 2: 3 tokens charged up front, 2 refunded, 1 stays charged.
+  const designTokens = async (s: Shop) =>
+    Number(await redis.hget(`qa:rate:design:${s.id}`, "tokens"));
+  it("job path: placement 1 served, placement 2 answers 429 -> exactly one token stays charged", async () => {
+    await scaled(async () => {
+      const a = await shop();
+      const d = await design(a, 3);
+      stub.script = [false, true];
+      const { job } = stubJob();
+      await expect(
+        runDesignQaJob.handler({ companyId: a.id, designId: d.id }, job),
+      ).rejects.toBeInstanceOf(DelayedError);
+      expect(stub.script).toEqual([]); // placement 2 was the refused call
+      const tokens = await designTokens(a);
+      expect(tokens).toBeGreaterThan(1.9); // 3 - 1 charged = 2 (plus a few ms of refill)
+      expect(tokens).toBeLessThan(2.5);
+    });
+  });
+
+  it("runQa path: placement 1 served, placement 2 refused until give-up -> exactly one token stays charged", async () => {
+    await scaled(async () => {
+      stub.retryAfterSec = 0.1;
+      const a = await shop();
+      const d = await design(a, 3);
+      stub.script = [false, ...Array(8).fill(true)];
+      const err = await runQa(a, d.id).catch((e) => e);
+      expect(err.code).toBe("RATE_LIMITED");
+      const tokens = await designTokens(a);
+      expect(tokens).toBeGreaterThan(1.9);
+      expect(tokens).toBeLessThan(2.6);
+    });
+  }, 30_000);
+
+  // T-46-3 r2 (S-85): four shops loop manual Run QA at 5 s a call (scale 0.2); a victim shop's
+  // manual Run QA is served within f x 28 s + slack each time. With the round 1 refusal of new
+  // manual turns behind any registered caller, the victim was refused until the attackers paused.
+  it("S-85: a victim's manual Run QA is served within the line while 4 shops loop manual Run QA", async () => {
+    const f = 0.2;
+    scaleQaTiming(f); // keeps the scaled cooldown on, like production
+    stub.delayMs = 5_000 * f;
+    stub.retryAfterSec = 5 * f;
+    const timings: number[] = [];
+    try {
+      const attackers = [await shop(), await shop(), await shop(), await shop()];
+      const designs = await Promise.all(attackers.map((s) => design(s)));
+      let stop = false;
+      const loops = attackers.map(async (s, i) => {
+        while (!stop) {
+          try {
+            await runQa(s, (designs[i] as { id: string }).id);
+          } catch {
+            await sleep(25);
+          }
+        }
+      });
+      await sleep(2_000); // steady state: every attacker has taken a few turns
+      for (let k = 0; k < 6; k++) {
+        const v = await shop();
+        const vd = await design(v);
+        const t0 = Date.now();
+        for (;;) {
+          try {
+            await runQa(v, vd.id);
+            break;
+          } catch (e) {
+            const err = e as { code?: string; data?: { retryAfterSec?: number } };
+            if (err.code !== "RATE_LIMITED" || Date.now() - t0 > 60_000 * f) break;
+            await sleep((err.data?.retryAfterSec ?? 1) * 1000);
+          }
+        }
+        timings.push(Date.now() - t0);
+        expect(await qaStatusOf(v, vd.id)).toBe("passed");
+      }
+      stop = true;
+      await Promise.all(loops);
+      process.stderr.write(
+        `T-46-3 S-85 victims (scale ${f}, real-time x${1 / f}): ${timings.join(", ")} ms\n`,
+      );
+      for (const ms of timings) expect(ms).toBeLessThan(28_000 * f + S81_SLACK_MS);
+    } finally {
+      scaleQaTiming(1);
+      setQaCooldown(0);
+      stub.delayMs = 300;
+      stub.retryAfterSec = 1;
+      await redis.del(WAITING);
+    }
+  }, 120_000);
 
   it("a turn yields at most yieldTotalMs over all its placements, however long the other person waits", async () => {
     await scaled(async () => {

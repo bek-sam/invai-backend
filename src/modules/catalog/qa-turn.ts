@@ -36,7 +36,7 @@ const log = logger("catalog.qa-turn");
  * QA of another shop used to wait through the whole of it: 29.35 s at 4.3 s a call, 30.04 s at
  * 5 s. Now a manual caller whose call imaging refused (429) is registered in the sorted set
  * `qa:manual-waiting` (member = company id, score = server ms) from its first 429 until that call
- * ends (served, given up or failed), and removed again in `finally`. Two uses of that set, both for
+ * ends (served, given up or failed), and removed again in `finally`. One use of that set, for
  * OTHER companies only (a shop never waits for itself):
  *   - `yieldToManualCaller`: before placement 2.. a turn that holds its lease waits, polling, while
  *     a foreign caller is registered, at most `yieldMaxMs` per placement (imaging's Retry-After +
@@ -44,11 +44,11 @@ const log = logger("catalog.qa-turn");
  *     per company, the artwork bucket can't take it) and the turn then goes on, so a design is
  *     never refused half way. The wait costs one pooled DB connection: `runQa` and the job hold
  *     their `withTenant` transaction across it (router.ts), like they already do across imaging.
- *   - `takeQaTurn(.., { person: true })` (a manual Run QA) refuses a NEW turn (`in_flight`) while a
- *     foreign caller is registered, so the shop that just yielded can't start its next manual turn
- *     ahead of the person it yielded to. Jobs and artwork checks don't ask: a job already waits by
- *     re-delaying, and refusing it behind a shop's waiting person starved the victim's job (42-62 s
- *     where 17-23 s is normal, measured while building T-46-3).
+ * Not done, on purpose (S-85): refusing a NEW manual turn while any foreign caller is registered. A few
+ * shops looping manual Run QA keep a registration live nearly all the time, so a victim shop was
+ * refused at once and never joined the race for the free slot (21-60+ s at 5 s a call). The 6 s
+ * cooldown already stops the shop that yielded from starting its next turn ahead of the person it
+ * yielded to. Jobs and artwork checks never asked either.
  * Livelock: a caller is registered only inside its own busy call, never while it yields at a
  * placement boundary, so two shops' multi-placement turns can't yield to each other. A registration older
  * than `QA_MANUAL_BUDGET_MS` is pruned (a crashed caller), and the caps bound every wait.
@@ -216,15 +216,11 @@ export async function takeQaTurn(
   companyId: string,
   calls: number,
   bucket: QaBucket,
-  opts: { person?: boolean } = {},
 ): Promise<QaTurn> {
   const charge = Math.min(QA_MAX_CALLS, Math.max(1, Math.floor(calls)));
   const token = randomUUID();
   const none = async () => {};
   try {
-    if (opts.person && (await foreignManualWaiting(companyId))) {
-      return { ok: false, reason: "in_flight", retryAfterMs: timing.inFlightRetryMs };
-    }
     const got = await redis.set(leaseKey(companyId), token, "PX", QA_LEASE_TTL_MS, "NX");
     if (got !== "OK") {
       // A turn is normally a few seconds (wave 42: worst 4.3 s), so ask again soon.
