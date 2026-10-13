@@ -19,12 +19,23 @@ import { itemArtworkQaJob } from "../orders/jobs";
 import { setItemArtwork } from "../orders/service";
 import { runDesignQaJob } from "./jobs";
 import { type QaStub, startQaStub } from "./qa-stub.testutil";
-import { QA_BURST, scaleQaTiming, setQaCooldown, takeQaTurn } from "./qa-turn";
+import {
+  QA_BURST,
+  QA_COOLDOWN_MS,
+  QA_IN_FLIGHT_RETRY_MS,
+  QA_MANUAL_BUSY,
+  QA_REDELAY_FLOOR_MS,
+  QA_REFILL_MS,
+  qaTimingNow,
+  scaleQaTiming,
+  setQaCooldown,
+  takeQaTurn,
+} from "./qa-turn";
 import * as svc from "./service";
 
 /*
  * T-43-3 (S-76 / B-399): one shop looping print-file QA can't starve another shop's QA.
- * Imaging is an in-process stub (one global slot, 429 + Retry-After). Valkey is DB 14 only.
+ * Imaging is an in-process stub (one global slot, 429 + Retry-After). Valkey is the harness-claimed DB (src/test), bucket invai-test.
  */
 const where = vi.hoisted(() => ({ url: "" }));
 vi.mock("../../integrations/imaging/client", async (orig) => {
@@ -45,6 +56,8 @@ vi.mock("../../integrations/imaging/client", async (orig) => {
   };
 });
 
+// Captured at import, before beforeAll switches the cooldown off: the module's live values.
+const LIVE_TIMING = qaTimingNow();
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 let stub: QaStub;
 let n = 0;
@@ -129,6 +142,11 @@ async function crit1(
   scale = 1,
   artworkLoop = false,
 ) {
+  // Real timing keeps the product lines 30 s / 60 s. The S-81 case runs scaled by f, and then
+  // asserts B = f x 30 s + S81_SLACK_MS (job: f x 60 s + S81_SLACK_MS), see S81_SLACK_MS.
+  const scaledBounds = artworkLoop && scale < 1;
+  const manualBound = scaledBounds ? 30_000 * scale + S81_SLACK_MS : 30_000;
+  const jobBound = scaledBounds ? 60_000 * scale + S81_SLACK_MS : 60_000;
   const enqueue = vi.spyOn(itemArtworkQaJob, "enqueue").mockResolvedValue(undefined as never);
   try {
     scaleQaTiming(scale);
@@ -198,7 +216,7 @@ async function crit1(
           return { ms: Date.now() - t0 };
         } catch (e) {
           const err = e as { code?: string; data?: { retryAfterSec?: number } };
-          if (err.code !== "RATE_LIMITED" || Date.now() - t0 > 30_000)
+          if (err.code !== "RATE_LIMITED" || Date.now() - t0 > manualBound)
             return { ms: Date.now() - t0, error: String(err.code ?? e) };
           await sleep((err.data?.retryAfterSec ?? 1) * 1000);
         }
@@ -208,33 +226,70 @@ async function crit1(
     stop = true;
     await Promise.all([loopA, loopArtwork]);
     process.stderr.write(
-      `T-43-3 crit1 (scale ${scale}): B job ${JSON.stringify(jobRes)} B manual ${JSON.stringify(manualRes)} A ok ${aOk} refused ${aRefused} artwork attaches ${artworkAttaches} margin to 30 s ${30_000 - manualRes.ms} ms\n`,
+      `T-43-3 crit1 (scale ${scale}): B job ${JSON.stringify(jobRes)} B manual ${JSON.stringify(manualRes)} A ok ${aOk} refused ${aRefused} artwork attaches ${artworkAttaches} bound ${manualBound} ms, margin ${manualBound - manualRes.ms} ms; job bound ${jobBound} ms, margin ${jobBound - jobRes.ms} ms; B manual ${manualRes.ms} ms\n`,
     );
 
     expect(jobRes.error).toBeUndefined();
-    expect(jobRes.ms).toBeLessThan(60_000);
+    expect(jobRes.ms).toBeLessThan(jobBound);
     expect(await qaStatusOf(b, bJobDesign.id)).toBe("passed");
     expect(manualRes.error).toBeUndefined();
-    expect(manualRes.ms).toBeLessThan(30_000);
+    expect(manualRes.ms).toBeLessThan(manualBound);
     expect(await qaStatusOf(b, bManualDesign.id)).toBe("passed");
     expect(aRefused).toBeGreaterThan(0);
   } finally {
-    scaleQaTiming(1);
+    scaleQaTiming(1); // also resets the re-delay floor and the manual busy budget
     setQaCooldown(0);
     enqueue.mockRestore();
     stub.retryAfterSec = 1;
   }
 }
 
-// S-81: one shop loops design Run QA and artwork attaches at once. Real timing (4.3 s a call,
-// Retry-After 5 s, 20 s refill, 6 s cooldown); without the cooldown the two buckets' bursts run
-// back to back and the victim's Run QA needs three clicks over 42 s.
+// S-81: one shop loops design Run QA and artwork attaches at once (4.3 s a call, Retry-After 5 s,
+// 20 s refill, 6 s cooldown). Without the cooldown the two buckets' bursts run back to back and the
+// victim's Run QA needs three clicks over ~42 s at real timing.
+//
+// The case runs at S81_SCALE = f of the wall-clock time: every timer scales (stub delay and
+// Retry-After, refill, in-flight hint, cooldown, re-delay floor and jitter, manual busy budget,
+// the test's own give-up). Bounds are B = f x 30 s + s for the manual result and f x 60 s + s for
+// the design job; they scale by the same factor, plus a fixed slack s that does not scale:
+//   - RATE_LIMITED carries a whole-second hint (router `retrySeconds`, ceil, read-only): up to
+//     +1 s per refusal on the victim's path, at most two refusals before it is served;
+//   - the 25 ms loop sleeps, the 100 ms head start, Valkey round trips and event-loop lag.
+// s = 2 s (measured: see the T-44-2 report; the largest overhead seen was well below it). The
+// hint rounding makes the test stricter than real timing, never looser. The S-81 bug (lease
+// deleted at once) gives the three-click path: ~f x 42 s, which is above B + s by f x 12 s - 2 s.
+const S81_SCALE = 0.5;
+const S81_SLACK_MS = 2_000;
 describe("S-81: a shop looping design QA and artwork attaches together", () => {
   it(
-    "victim shop B: manual result within 30 s, design job within 60 s",
-    () => crit1(5, 4_300, 5, 1, true),
+    "victim shop B: manual result within f x 30 s + s, design job within f x 60 s + s",
+    () => crit1(5, 4_300 * S81_SCALE, 5 * S81_SCALE, S81_SCALE, true),
     200_000,
   );
+
+  it("timing hooks default to the live constants and reset after a scaled run", () => {
+    expect(LIVE_TIMING).toEqual({
+      refillMs: 20_000,
+      inFlightRetryMs: 3_000,
+      cooldownMs: 6_000,
+      redelayFloorMs: 1_000,
+      manualBudgetMs: 25_000,
+    });
+    expect(QA_REFILL_MS).toBe(20_000);
+    expect(QA_IN_FLIGHT_RETRY_MS).toBe(3_000);
+    expect(QA_REDELAY_FLOOR_MS).toBe(1_000);
+    expect(QA_COOLDOWN_MS).toBe(6_000);
+    expect(QA_MANUAL_BUSY).toEqual({ retries: 5, budgetMs: 25_000 });
+    scaleQaTiming(S81_SCALE);
+    try {
+      expect(qaTimingNow().redelayFloorMs).toBe(QA_REDELAY_FLOOR_MS * S81_SCALE);
+      expect(QA_MANUAL_BUSY.budgetMs).toBe(25_000 * S81_SCALE);
+    } finally {
+      scaleQaTiming(1);
+      setQaCooldown(0);
+    }
+    expect(QA_MANUAL_BUSY.budgetMs).toBe(25_000);
+  });
 });
 
 describe("criterion 2: per-company lease and allowance", () => {

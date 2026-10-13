@@ -44,19 +44,30 @@ export const QA_IN_FLIGHT_RETRY_MS = 3_000;
  * another shop retrying on that hint always finds the slot between two turns of the same company.
  */
 export const QA_COOLDOWN_MS = 6_000;
+/** `redelayQa` waits at least this long, plus up to the same again as jitter. */
+export const QA_REDELAY_FLOOR_MS = 1_000;
+/** A person waiting on a manual check gives up after this much busy-waiting in total (A12). */
+const QA_MANUAL_BUDGET_MS = 25_000;
 /**
  * Live timing, equal to the constants above. Only tests call `scaleQaTiming`, to run the same
- * dynamics at a fraction of the wall-clock time; the bounds they assert are never scaled.
+ * dynamics at a fraction of the wall-clock time. It scales every timer this module owns (refill,
+ * in-flight hint, cooldown, the re-delay floor and jitter, the manual busy budget); the caller
+ * scales the bounds it asserts by the same factor.
  */
 const timing = {
   refillMs: QA_REFILL_MS,
   inFlightRetryMs: QA_IN_FLIGHT_RETRY_MS,
   cooldownMs: QA_COOLDOWN_MS,
+  redelayFloorMs: QA_REDELAY_FLOOR_MS,
 };
+/** Test-only: the live values, so a test can assert the defaults. */
+export const qaTimingNow = () => ({ ...timing, manualBudgetMs: QA_MANUAL_BUSY.budgetMs });
 export function scaleQaTiming(factor: number): void {
   timing.refillMs = Math.round(QA_REFILL_MS * factor);
   timing.inFlightRetryMs = Math.round(QA_IN_FLIGHT_RETRY_MS * factor);
   timing.cooldownMs = Math.round(QA_COOLDOWN_MS * factor);
+  timing.redelayFloorMs = Math.round(QA_REDELAY_FLOOR_MS * factor);
+  QA_MANUAL_BUSY.budgetMs = Math.round(QA_MANUAL_BUDGET_MS * factor);
 }
 /** Test-only: tests that take several turns in a row for one company switch the cooldown off (0). */
 export function setQaCooldown(ms: number): void {
@@ -66,8 +77,11 @@ export function setQaCooldown(ms: number): void {
 export const QA_MAX_CALLS = 5;
 export const QA_LEASE_TTL_MS = QA_MAX_CALLS * 2 * 120_000;
 
-/** A person waiting on a manual check gives up after this much busy-waiting in total (A12). */
-export const QA_MANUAL_BUSY = { retries: 5, budgetMs: 25_000 } as const;
+/** A person waiting on a manual check gives up after this much busy-waiting in total (A12). The budget is mutable only for `scaleQaTiming`. */
+export const QA_MANUAL_BUSY: { retries: number; budgetMs: number } = {
+  retries: 5,
+  budgetMs: QA_MANUAL_BUDGET_MS,
+};
 /** Workers never sleep on a 429: they re-delay themselves instead. */
 export const QA_NO_BUSY = { retries: 0 } as const;
 
@@ -215,7 +229,9 @@ export async function redelayQa(
     log.warn("qa still waiting for a turn, giving up", ctx);
     return { gaveUp: true };
   }
-  const delay = Math.max(1_000, retryAfterMs) + Math.floor(Math.random() * 1_000);
+  const delay =
+    Math.max(timing.redelayFloorMs, retryAfterMs) +
+    Math.floor(Math.random() * timing.redelayFloorMs);
   await job.moveToDelayed(now + delay, job.token);
   throw new DelayedError();
 }
