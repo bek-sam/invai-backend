@@ -15,6 +15,7 @@ import {
   outboxEvents,
   photoAnalyses,
   photoCompositions,
+  photoImages,
   photoPushes,
   photoSets,
 } from "../../db/schema";
@@ -1213,11 +1214,20 @@ describe("a finished scene set and a re-delivered photo_set.created (T-42-1, B-3
           .where(eq(photoCompositions.setId, set.id))
           .orderBy(photoCompositions.id),
         set: await tx.select().from(photoSets).where(eq(photoSets.id, set.id)),
+        images: await tx
+          .select({ id: photoImages.id, status: photoImages.status, key: photoImages.key })
+          .from(photoImages)
+          .where(eq(photoImages.setId, set.id))
+          .orderBy(photoImages.id),
         jobs: await tx.select().from(aiJobs).orderBy(aiJobs.id),
         ledger: await tx.select().from(aiCreditLedger).orderBy(aiCreditLedger.id),
       }));
     const before = await snap();
     expect(before.comps.some((c) => c.source === "ai_scene" && c.sceneKey)).toBe(true);
+    expect(before.images.length).toBeGreaterThan(0);
+    expect(before.images.every((i) => i.status === "rendered" && i.key)).toBe(true);
+    const baseCalls = vi.mocked(imaging.photoSceneBase).mock.calls.length;
+    const compositeCalls = vi.mocked(imaging.photoSceneComposite).mock.calls.length;
 
     // The stray event arrives later, with a different (mock-like) provider configured.
     const second = fakeProvider();
@@ -1234,6 +1244,8 @@ describe("a finished scene set and a re-delivered photo_set.created (T-42-1, B-3
       else await runJobInline(renderCompositionJob, { companyId: company.id, compositionId });
     }
     expect(second.calls).toHaveLength(0);
+    expect(vi.mocked(imaging.photoSceneBase).mock.calls).toHaveLength(baseCalls);
+    expect(vi.mocked(imaging.photoSceneComposite).mock.calls).toHaveLength(compositeCalls);
     expect(enq).not.toHaveBeenCalled();
     expect(enqC).not.toHaveBeenCalled();
     expect(await snap()).toEqual(before);
