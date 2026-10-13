@@ -342,6 +342,21 @@ describe("AI-use notice follows the design (T-48-4)", () => {
     }
   });
 
+  it("AC6b-approve: approval judges the recomputed content (a stored draft with no disclosures still approves)", async () => {
+    const designId = await mkDesign("none");
+    const id = await generate(designId);
+    const row = await storedRow(id);
+    await withSystem((tx) =>
+      tx
+        .update(listingDrafts)
+        .set({ content: { ...(row?.content as object), disclosures: [] } as never })
+        .where(eq(listingDrafts.id, id)),
+    );
+    const approved = await call(router.ai.listings.approve, { id }, { context: rctx });
+    expect(approved.status).toBe("approved");
+    expect(approved.content.disclosures).toEqual([PARTNER_DISCLOSURE]);
+  });
+
   /* ------------------------------ AC7: what went out stays ------------------------------ */
 
   it("AC7: publishing a draft persists the recomputed content; a later design change leaves a published draft as sent", async () => {

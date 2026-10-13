@@ -37,7 +37,13 @@ import {
 } from "./prompts";
 import { mockListingCopy, mockProvider, planAssistantCalls } from "./providers/mock";
 import type { AssistantTool } from "./providers/types";
-import { normalizeListing, validateListing, withDisclosures } from "./validators/listing";
+import {
+  AI_DISCLOSURE,
+  normalizeListing,
+  PARTNER_DISCLOSURE,
+  validateListing,
+  withDisclosures,
+} from "./validators/listing";
 
 const base: ListingContent = {
   title: "Desert Sunset Cactus Shirt",
@@ -123,6 +129,17 @@ describe("channel validators", () => {
     expect(n.title).toBe("a b");
     expect(n.tags).toEqual(["Cactus"]);
     expect(n.disclosures).toHaveLength(2);
+  });
+
+  it("withDisclosures: 'none' drops the AI line, ai and unknown keep exactly one, the partner line stays (B-274)", () => {
+    const none = withDisclosures({ ...base, disclosures: [AI_DISCLOSURE] }, { aiUse: "none" });
+    expect(none.disclosures).toEqual([PARTNER_DISCLOSURE]);
+    for (const aiUse of ["ai", "unknown"] as const)
+      expect(withDisclosures(none, { aiUse }).disclosures).toEqual([
+        PARTNER_DISCLOSURE,
+        AI_DISCLOSURE,
+      ]);
+    expect(AI_DISCLOSURE).not.toMatch(/our own prompts|nuestras propias indicaciones/);
   });
 });
 
