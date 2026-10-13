@@ -4,6 +4,7 @@ import { withTenant } from "../../db/client";
 import { imaging } from "../../integrations/imaging/client";
 import { logger } from "../../lib/log";
 import { defineJob, onEvent } from "../../lib/queues";
+import { isImagingBusy, QA_NO_BUSY, redelayQa, takeQaTurn } from "./qa-turn";
 import { renderDesignPreviews, runDesignQa } from "./service";
 
 const log = logger("catalog.jobs");
@@ -20,14 +21,26 @@ export const runDesignQaJob = defineJob({
   name: "catalog.runDesignQa",
   input: z.object({ companyId: z.uuid(), designId: z.uuid() }),
   jobId: (i) => `design-qa-${i.designId}`,
-  handler: async ({ companyId, designId }) => {
+  handler: async ({ companyId, designId }, job) => {
     if (!(await imaging.isUp())) {
       log.warn("imaging down, leaving QA pending", { designId });
       return { skipped: true };
     }
-    const ctx = systemContext(companyId);
-    const design = await withTenant(companyId, (tx) => runDesignQa(tx, ctx, designId));
-    return { qaStatus: design.qaStatus };
+    const ctx = { companyId, what: "design", id: designId };
+    const turn = await takeQaTurn(companyId);
+    if (!turn.ok) return await redelayQa(job, turn.retryAfterMs, ctx);
+    try {
+      const sys = systemContext(companyId);
+      const design = await withTenant(companyId, (tx) =>
+        runDesignQa(tx, sys, designId, { qaBusy: QA_NO_BUSY }),
+      );
+      return { qaStatus: design.qaStatus };
+    } catch (err) {
+      if (isImagingBusy(err)) return await redelayQa(job, err.retryAfterMs ?? 5_000, ctx);
+      throw err;
+    } finally {
+      await turn.release();
+    }
   },
 });
 

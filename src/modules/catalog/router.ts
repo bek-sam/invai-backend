@@ -1,5 +1,7 @@
 import { authed } from "../../api/orpc";
 import { withTenant } from "../../db/client";
+import { rateLimited } from "../../lib/errors";
+import { isImagingBusy, QA_MANUAL_BUSY, retrySeconds, takeQaTurn } from "./qa-turn";
 import * as svc from "./service";
 
 /*
@@ -26,11 +28,25 @@ export const designsRouter = authed.designs.router({
   unarchive: authed.designs.unarchive.handler(({ input, context: { tenant } }) =>
     withTenant(tenant.companyId, (tx) => svc.setDesignStatus(tx, tenant, input.id, "active")),
   ),
-  runQa: authed.designs.runQa.handler(({ input, context: { tenant } }) =>
-    withTenant(tenant.companyId, (tx) =>
-      svc.runDesignQa(tx, tenant, input.id, { cleanAlpha: input.cleanAlpha }),
-    ),
-  ),
+  // One QA turn per company (lease + allowance); over it, RATE_LIMITED at once with no imaging
+  // call and no sleep (T-43-3, S-76). The lease is taken before the transaction opens.
+  runQa: authed.designs.runQa.handler(async ({ input, context: { tenant } }) => {
+    const turn = await takeQaTurn(tenant.companyId);
+    if (!turn.ok) throw rateLimited(retrySeconds(turn.retryAfterMs));
+    try {
+      return await withTenant(tenant.companyId, (tx) =>
+        svc.runDesignQa(tx, tenant, input.id, {
+          cleanAlpha: input.cleanAlpha,
+          qaBusy: QA_MANUAL_BUSY,
+        }),
+      );
+    } catch (err) {
+      if (isImagingBusy(err)) throw rateLimited(retrySeconds(err.retryAfterMs ?? 5_000));
+      throw err;
+    } finally {
+      await turn.release();
+    }
+  }),
   acceptQaWarning: authed.designs.acceptQaWarning.handler(({ input, context: { tenant } }) =>
     withTenant(tenant.companyId, (tx) => svc.acceptQaWarning(tx, tenant, input)),
   ),

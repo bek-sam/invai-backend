@@ -53,13 +53,15 @@ import {
   stations,
   users,
 } from "../../db/schema";
-import { imaging } from "../../integrations/imaging/client";
+import { ImagingError, imaging } from "../../integrations/imaging/client";
 import { audit } from "../../lib/audit";
 import { sha256Hex } from "../../lib/crypto";
 import { badRequest, conflict, notFound, ORPCError } from "../../lib/errors";
 import { logger } from "../../lib/log";
 import { emit } from "../../lib/outbox";
+import { isPermanentHttpStatus } from "../../lib/queues";
 import { publish } from "../../lib/realtime";
+import { artworkQaFlags, QA_NO_BUSY, takeQaTurn } from "../catalog/qa-turn";
 import { releaseForItems } from "../inventory/service";
 import { guardShipmentsForItems } from "../shipping/service";
 import { ARTWORK_ITEM_FLAGS, withFlags } from "./flags";
@@ -1180,33 +1182,34 @@ export async function setItemArtwork(
     !["imported", "needs_mapping", "ready", "needs_artwork", "on_hold"].includes(item.state)
   )
     throw conflict(`Artwork cannot change once the item is ${item.state.replace(/_/g, " ")}`);
-  const qaFlags: { code: string; severity: ItemFlag["severity"]; message: string }[] = [];
+  // One QA turn per company (T-43-3, S-76). No QA result for any transient reason (imaging down,
+  // busy, a held lease or allowance, a timeout) still attaches the artwork; a follow-up job then
+  // applies the flags (B-399). A permanent 4xx from imaging is logged and not retried.
+  let unique: ReturnType<typeof artworkQaFlags> = [];
+  let deferQa = true;
   if (await imaging.isUp()) {
-    try {
-      const qa = await imaging.qaCheck({
-        file_key: input.fileKey,
-        target_width_in: input.widthIn ?? item.printWidthIn ?? undefined,
-        target_height_in: input.heightIn ?? item.printHeightIn ?? undefined,
-      });
-      for (const issue of qa.issues) {
-        qaFlags.push({
-          code: issue.code === "low_dpi" ? "artwork_low_dpi" : "artwork_qa_failed",
-          severity: issue.severity === "error" ? "error" : "warn",
-          message: issue.message,
-        });
+    const turn = await takeQaTurn(ctx.companyId);
+    if (turn.ok) {
+      try {
+        const qa = await imaging.qaCheck(
+          {
+            file_key: input.fileKey,
+            target_width_in: input.widthIn ?? item.printWidthIn ?? undefined,
+            target_height_in: input.heightIn ?? item.printHeightIn ?? undefined,
+          },
+          QA_NO_BUSY,
+        );
+        unique = artworkQaFlags(qa.issues);
+        deferQa = false;
+      } catch (err) {
+        log.warn("artwork QA failed", { itemId: item.id, error: String(err) });
+        if (err instanceof ImagingError && err.status !== 429 && isPermanentHttpStatus(err.status))
+          deferQa = false;
+      } finally {
+        await turn.release();
       }
-    } catch (err) {
-      log.warn("artwork QA failed", { itemId: item.id, error: String(err) });
     }
   }
-  // One flag per code; when several issues map to the same code the worst severity wins and its
-  // message is the one shown, whatever order imaging listed them in (T-42-5).
-  const worst = new Map<string, (typeof qaFlags)[number]>();
-  for (const f of qaFlags) {
-    const cur = worst.get(f.code);
-    if (!cur || (cur.severity !== "error" && f.severity === "error")) worst.set(f.code, f);
-  }
-  const unique = [...worst.values()];
   await tx
     .update(orderItems)
     .set({
@@ -1229,6 +1232,13 @@ export async function setItemArtwork(
   });
   if (item.state === "needs_artwork")
     await transitionItem(tx, item.id, "ready", { actor: ctx.actor, reason: "artwork_uploaded" });
+  if (deferQa) {
+    const queued = { companyId: ctx.companyId, itemId: item.id, fileKey: input.fileKey };
+    afterCommit(tx, async () => {
+      const { itemArtworkQaJob } = await import("./jobs");
+      await itemArtworkQaJob.enqueue(queued);
+    });
+  }
   return getItem(tx, ctx, input.id);
 }
 

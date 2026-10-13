@@ -496,7 +496,7 @@ export async function runDesignQa(
   tx: Tx,
   ctx: TenantContext,
   id: string,
-  opts: { cleanAlpha?: boolean } = {},
+  opts: { cleanAlpha?: boolean; qaBusy?: { retries?: number; budgetMs?: number } } = {},
 ) {
   const files = await tx.select().from(designFiles).where(eq(designFiles.designId, id));
   if (files.length === 0) throw notFound("design", id);
@@ -510,11 +510,14 @@ export async function runDesignQa(
         });
         fileKey = cleaned.key;
       }
-      const qa = await imaging.qaCheck({
-        file_key: fileKey,
-        target_width_in: file.widthIn,
-        target_height_in: file.heightIn,
-      });
+      const qa = await imaging.qaCheck(
+        {
+          file_key: fileKey,
+          target_width_in: file.widthIn,
+          target_height_in: file.heightIn,
+        },
+        opts.qaBusy,
+      );
       // One stored issue with an unknown code would fail the Design output parse of
       // designs.list for the whole shop, so drop it here (A8).
       let issues: QaIssue[] = [];
@@ -552,6 +555,9 @@ export async function runDesignQa(
         })
         .where(eq(designFiles.id, file.id));
     } catch (err) {
+      // Imaging busy is not a failure of this design: pass the 429 through so the caller can
+      // answer RATE_LIMITED or re-delay (T-43-3, A10).
+      if (err instanceof ImagingError && err.status === 429) throw err;
       log.warn("qa failed", { designId: id, placement: file.placement, error: String(err) });
       throw upstream("imaging", err instanceof Error ? err.message : String(err));
     }

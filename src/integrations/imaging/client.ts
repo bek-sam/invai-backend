@@ -18,6 +18,8 @@ export class ImagingError extends Error {
     public readonly endpoint: string,
     public readonly status: number,
     public readonly detail: string,
+    /** On a 429 only: Retry-After from imaging, clamped (T-43-3, S-76). */
+    public readonly retryAfterMs?: number,
   ) {
     super(`imaging ${endpoint} failed (${status}): ${detail}`);
   }
@@ -346,13 +348,22 @@ export function createImagingClient(
     endpoint: string,
     body: unknown,
     schema: z.ZodType<T>,
-    init: { method?: "GET" | "POST"; timeoutMs?: number } = {},
+    init: {
+      method?: "GET" | "POST";
+      timeoutMs?: number;
+      /** Busy retries (default `IMAGING_BUSY_RETRIES`); 0 = surface the first 429 at once. */
+      busyRetries?: number;
+      /** Stop retrying once the sleeps would add up to more than this (default: no cap). */
+      busyBudgetMs?: number;
+    } = {},
   ): Promise<T> {
     const method = init.method ?? "POST";
     const headers: Record<string, string> = {};
     if (method === "POST") headers["content-type"] = "application/json";
     if (secret) headers["x-imaging-secret"] = secret;
     let res: Response;
+    const maxRetries = init.busyRetries ?? IMAGING_BUSY_RETRIES;
+    let waited = 0;
     // A 429 is sent before imaging does any work, so retrying it is always safe.
     for (let attempt = 0; ; attempt++) {
       res = await fetch(`${baseUrl}${endpoint}`, {
@@ -363,8 +374,10 @@ export function createImagingClient(
       }).catch((err) => {
         throw new ImagingError(endpoint, 0, err instanceof Error ? err.message : String(err));
       });
-      if (res.status !== 429 || attempt >= IMAGING_BUSY_RETRIES) break;
+      if (res.status !== 429 || attempt >= maxRetries) break;
       const waitMs = retryAfterMs(res.headers.get("retry-after"));
+      if (init.busyBudgetMs !== undefined && waited + waitMs > init.busyBudgetMs) break;
+      waited += waitMs;
       log.warn("imaging busy, retrying", { endpoint, attempt: attempt + 1, waitMs });
       await res.body?.cancel();
       await sleep(waitMs);
@@ -375,7 +388,12 @@ export function createImagingClient(
       try {
         detail = JSON.stringify((JSON.parse(text) as { detail?: unknown }).detail ?? text);
       } catch {}
-      throw new ImagingError(endpoint, res.status, detail);
+      throw new ImagingError(
+        endpoint,
+        res.status,
+        detail,
+        res.status === 429 ? retryAfterMs(res.headers.get("retry-after")) : undefined,
+      );
     }
     const parsed = schema.safeParse(JSON.parse(text));
     if (!parsed.success) {
@@ -398,8 +416,19 @@ export function createImagingClient(
     health: () => call("/health", undefined, Health, { method: "GET", timeoutMs: 3_000 }),
     isUp: checkHealthy,
 
-    qaCheck: (input: { file_key: string; target_width_in?: number; target_height_in?: number }) =>
-      call("/qa/check", input, QaCheckResult),
+    /**
+     * `busy` tunes the 429 handling for this call only (T-43-3, S-76): a worker passes
+     * `{ retries: 0 }` and re-delays itself, a person waiting passes a capped total. Omitted =
+     * the usual 5 retries, which the seed and every other caller keep.
+     */
+    qaCheck: (
+      input: { file_key: string; target_width_in?: number; target_height_in?: number },
+      busy?: { retries?: number; budgetMs?: number },
+    ) =>
+      call("/qa/check", input, QaCheckResult, {
+        busyRetries: busy?.retries,
+        busyBudgetMs: busy?.budgetMs,
+      }),
 
     cleanAlpha: (input: { file_key: string; out_key: string; threshold?: number }) =>
       call("/qa/clean-alpha", input, KeyResult),

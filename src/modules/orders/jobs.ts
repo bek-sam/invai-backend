@@ -1,11 +1,21 @@
-import { and, inArray, isNotNull, isNull, lt, or, sql } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, isNull, lt, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import { withSystem, withTenant } from "../../db/client";
-import { buyerPii, companies, orders } from "../../db/schema";
+import { buyerPii, companies, orderItems, orders } from "../../db/schema";
 import { env } from "../../env";
+import { ImagingError, imaging } from "../../integrations/imaging/client";
+import { sha256Hex } from "../../lib/crypto";
 import { errorData, logger } from "../../lib/log";
-import { defineJob, queues } from "../../lib/queues";
+import { emit } from "../../lib/outbox";
+import { defineJob, isPermanentHttpStatus, queues } from "../../lib/queues";
 import { deleteObject, listKeysOlderThan } from "../../lib/s3";
+import {
+  artworkQaFlags,
+  isImagingBusy,
+  QA_NO_BUSY,
+  redelayQa,
+  takeQaTurn,
+} from "../catalog/qa-turn";
 import { forgetFiles } from "../files/service";
 import {
   companiesWithPurgedSheets,
@@ -13,6 +23,7 @@ import {
   sweepOrphanRenders,
 } from "../privacy/print-files";
 import { holdsBuyerText, redactBuyerText } from "../privacy/service";
+import { ARTWORK_ITEM_FLAGS, withFlags } from "./flags";
 
 const log = logger("orders.jobs");
 
@@ -217,6 +228,78 @@ export async function purgePiiObjects(now = new Date(), only?: string[]) {
   }
   return { objects: deleted, orphanRendersDeleted, orphanRendersFailed };
 }
+
+/** The states in which `setItemArtwork` accepts artwork; the follow-up uses the same guard. */
+const ARTWORK_QA_STATES = ["imported", "needs_mapping", "ready", "needs_artwork", "on_hold"];
+
+/**
+ * Follow-up QA for artwork attached while imaging could not answer (T-43-3, S-76 / B-399).
+ * Applies the same flags `setItemArtwork` would have, only if the unit still has this exact
+ * `artworkKey` and is still in an artwork-editable state (not `on_sheet` or later). The jobId
+ * is the item plus the file, so a re-upload of another file is its own job. Never sleeps on a
+ * busy imaging slot: it re-delays itself.
+ */
+export const itemArtworkQaJob = defineJob({
+  queue: "render",
+  name: "orders.itemArtworkQa",
+  input: z.object({ companyId: z.uuid(), itemId: z.uuid(), fileKey: z.string().min(1) }),
+  jobId: (i) => `artwork-qa-${i.itemId}-${sha256Hex(i.fileKey).slice(0, 16)}`,
+  handler: async ({ companyId, itemId, fileKey }, job) => {
+    const row = await withTenant(companyId, async (tx) => {
+      const [r] = await tx.select().from(orderItems).where(eq(orderItems.id, itemId)).limit(1);
+      return r;
+    });
+    if (!row || row.artworkKey !== fileKey || !ARTWORK_QA_STATES.includes(row.state))
+      return { skipped: true };
+    if (!(await imaging.isUp())) {
+      log.warn("imaging down, artwork QA deferred", { companyId, itemId });
+      throw new Error("imaging down");
+    }
+    const ctx = { companyId, what: "item", id: itemId };
+    const turn = await takeQaTurn(companyId);
+    if (!turn.ok) return await redelayQa(job, turn.retryAfterMs, ctx);
+    let flags: ReturnType<typeof artworkQaFlags>;
+    try {
+      const qa = await imaging.qaCheck(
+        {
+          file_key: fileKey,
+          target_width_in: row.printWidthIn ?? undefined,
+          target_height_in: row.printHeightIn ?? undefined,
+        },
+        QA_NO_BUSY,
+      );
+      flags = artworkQaFlags(qa.issues);
+    } catch (err) {
+      if (isImagingBusy(err)) return await redelayQa(job, err.retryAfterMs ?? 5_000, ctx);
+      if (err instanceof ImagingError && isPermanentHttpStatus(err.status)) {
+        log.warn("imaging rejected the artwork; no QA flags", {
+          companyId,
+          itemId,
+          status: err.status,
+        });
+        return { skipped: true };
+      }
+      throw err;
+    } finally {
+      await turn.release();
+    }
+    return withTenant(companyId, async (tx) => {
+      const [locked] = await tx
+        .select()
+        .from(orderItems)
+        .where(eq(orderItems.id, itemId))
+        .for("update");
+      if (!locked || locked.artworkKey !== fileKey || !ARTWORK_QA_STATES.includes(locked.state))
+        return { skipped: true };
+      await tx
+        .update(orderItems)
+        .set({ flags: withFlags(locked.flags, flags, [...ARTWORK_ITEM_FLAGS, "artwork_low_dpi"]) })
+        .where(eq(orderItems.id, itemId));
+      await emit(tx, companyId, "order.updated", { orderId: locked.orderId });
+      return { flags: flags.length };
+    });
+  },
+});
 
 export const purgeBuyerPiiJob = defineJob({
   queue: "reports",
