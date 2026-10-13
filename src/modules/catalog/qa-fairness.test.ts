@@ -645,17 +645,20 @@ describe("T-46-3: yield to a waiting person of another shop", () => {
       const a = await shop();
       const c = await shop();
       await redis.zadd(WAITING, Date.now(), c.id);
-      const refused = await takeQaTurn(a.id, 1, "design");
+      const refused = await takeQaTurn(a.id, 1, "design", { person: true });
       expect(refused).toMatchObject({
         ok: false,
         reason: "in_flight",
         retryAfterMs: qaTimingNow().inFlightRetryMs,
       });
-      expect((await takeQaTurn(a.id, 1, "artwork")).ok).toBe(false);
       expect(await redis.exists(lease(a))).toBe(0);
+      // a job or an artwork check does not ask the question: it re-delays on its own
+      const job = await takeQaTurn(a.id, 1, "design");
+      expect(job.ok).toBe(true);
+      if (job.ok) await job.release();
       await redis.zrem(WAITING, c.id);
-      const turn = await takeQaTurn(a.id, 1, "design");
-      expect(turn.ok).toBe(true); // the refusals took no allowance token
+      const turn = await takeQaTurn(a.id, 1, "design", { person: true });
+      expect(turn.ok).toBe(true); // the refusal took no allowance token
       if (turn.ok) await turn.release();
     });
   });
@@ -754,4 +757,24 @@ describe("T-46-3: yield to a waiting person of another shop", () => {
       expect(await redis.zcard(WAITING)).toBe(0);
     });
   }, 60_000);
+
+  it("a turn imaging refused costs only the calls that ran: polling a busy slot burns no tokens", async () => {
+    await scaled(async () => {
+      const a = await shop();
+      for (let i = 0; i < QA_BURST + 3; i++) {
+        const t = await takeQaTurn(a.id, 1, "design");
+        expect(t.ok).toBe(true); // the 4th poll would be refused for rate without the refund
+        if (t.ok) await t.release({ busy: true });
+      }
+      const b = await shop();
+      const turn = await takeQaTurn(b.id, 3, "design"); // burst 3, charged 3: empty
+      if (turn.ok) await turn.release({ busy: true, ran: 1 }); // 1 of 3 ran, 2 come back
+      const tokens = Number(await redis.hget(`qa:rate:design:${b.id}`, "tokens"));
+      expect(tokens).toBeGreaterThan(1.9);
+      expect(tokens).toBeLessThan(2.5); // refill over a few ms only
+      const kept = await takeQaTurn(b.id, 1, "design");
+      if (kept.ok) await kept.release({ ran: 1 }); // a turn that ended any other way keeps its charge
+      expect(Number(await redis.hget(`qa:rate:design:${b.id}`, "tokens"))).toBeLessThan(1.5);
+    });
+  });
 });

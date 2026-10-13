@@ -32,7 +32,7 @@ import { keyset, type PageInput } from "../../lib/pagination";
 import { isPermanentHttpStatus } from "../../lib/queues";
 import { deleteObject, getObject, isCompanyKey, objectKey, presignGet } from "../../lib/s3";
 import { backfillItemPreviews } from "../orders/preview-backfill";
-import { qaCallAwaitingSlot, yieldToManualCaller } from "./qa-turn";
+import { qaCallAwaitingSlot, qaCallsRan, yieldToManualCaller } from "./qa-turn";
 
 const log = logger("catalog");
 
@@ -621,7 +621,10 @@ export async function runDesignQa(
     } catch (err) {
       // Imaging busy is not a failure of this design: pass the 429 through so the caller can
       // answer RATE_LIMITED or re-delay (T-43-3, A10).
-      if (err instanceof ImagingError && err.status === 429) throw err;
+      if (err instanceof ImagingError && err.status === 429) {
+        qaCallsRan.set(err, index);
+        throw err;
+      }
       log.warn("qa failed", { designId: id, placement: file.placement, error: String(err) });
       throw upstream("imaging", err instanceof Error ? err.message : String(err));
     }

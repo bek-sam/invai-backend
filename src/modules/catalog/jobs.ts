@@ -4,7 +4,7 @@ import { withTenant } from "../../db/client";
 import { imaging } from "../../integrations/imaging/client";
 import { logger } from "../../lib/log";
 import { defineJob, onEvent } from "../../lib/queues";
-import { isImagingBusy, QA_NO_BUSY, redelayQa, takeQaTurn } from "./qa-turn";
+import { isImagingBusy, QA_NO_BUSY, qaCallsRan, redelayQa, takeQaTurn } from "./qa-turn";
 import { qaCallCount, renderDesignPreviews, runDesignQa } from "./service";
 
 const log = logger("catalog.jobs");
@@ -31,6 +31,7 @@ export const runDesignQaJob = defineJob({
     const turn = await takeQaTurn(companyId, calls, "design");
     if (!turn.ok) return await redelayQa(job, turn.retryAfterMs, ctx);
     let busy = false;
+    let ran = 0;
     try {
       const sys = systemContext(companyId);
       const design = await withTenant(companyId, (tx) =>
@@ -40,11 +41,12 @@ export const runDesignQaJob = defineJob({
     } catch (err) {
       if (isImagingBusy(err)) {
         busy = true;
+        ran = qaCallsRan.get(err) ?? 0;
         return await redelayQa(job, err.retryAfterMs ?? 5_000, ctx);
       }
       throw err;
     } finally {
-      await turn.release({ busy });
+      await turn.release({ busy, ran });
     }
   },
 });

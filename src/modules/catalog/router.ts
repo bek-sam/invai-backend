@@ -1,7 +1,7 @@
 import { authed } from "../../api/orpc";
 import { withTenant } from "../../db/client";
 import { rateLimited } from "../../lib/errors";
-import { isImagingBusy, QA_MANUAL_BUSY, retrySeconds, takeQaTurn } from "./qa-turn";
+import { isImagingBusy, QA_MANUAL_BUSY, qaCallsRan, retrySeconds, takeQaTurn } from "./qa-turn";
 import * as svc from "./service";
 
 /*
@@ -32,9 +32,10 @@ export const designsRouter = authed.designs.router({
   // call and no sleep (T-43-3, S-76). The lease is taken before the transaction opens.
   runQa: authed.designs.runQa.handler(async ({ input, context: { tenant } }) => {
     const calls = await withTenant(tenant.companyId, (tx) => svc.qaCallCount(tx, input.id));
-    const turn = await takeQaTurn(tenant.companyId, calls, "design");
+    const turn = await takeQaTurn(tenant.companyId, calls, "design", { person: true });
     if (!turn.ok) throw rateLimited(retrySeconds(turn.retryAfterMs));
     let busy = false;
+    let ran = 0;
     try {
       return await withTenant(tenant.companyId, (tx) =>
         svc.runDesignQa(tx, tenant, input.id, {
@@ -46,11 +47,12 @@ export const designsRouter = authed.designs.router({
     } catch (err) {
       if (isImagingBusy(err)) {
         busy = true;
+        ran = qaCallsRan.get(err) ?? 0;
         throw rateLimited(retrySeconds(err.retryAfterMs ?? 5_000));
       }
       throw err;
     } finally {
-      await turn.release({ busy });
+      await turn.release({ busy, ran });
     }
   }),
   acceptQaWarning: authed.designs.acceptQaWarning.handler(({ input, context: { tenant } }) =>

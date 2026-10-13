@@ -44,8 +44,11 @@ const log = logger("catalog.qa-turn");
  *     per company, the artwork bucket can't take it) and the turn then goes on, so a design is
  *     never refused half way. The wait costs one pooled DB connection: `runQa` and the job hold
  *     their `withTenant` transaction across it (router.ts), like they already do across imaging.
- *   - `takeQaTurn` refuses a NEW turn (`in_flight`) while a foreign caller is registered, so the
- *     shop that just yielded can't start its next turn ahead of the person it yielded to.
+ *   - `takeQaTurn(.., { person: true })` (a manual Run QA) refuses a NEW turn (`in_flight`) while a
+ *     foreign caller is registered, so the shop that just yielded can't start its next manual turn
+ *     ahead of the person it yielded to. Jobs and artwork checks don't ask: a job already waits by
+ *     re-delaying, and refusing it behind a shop's waiting person starved the victim's job (42-62 s
+ *     where 17-23 s is normal, measured while building T-46-3).
  * Livelock: a caller is registered only inside its own busy call, never while it yields at a
  * placement boundary, so two shops' multi-placement turns can't yield to each other. A registration older
  * than `QA_MANUAL_BUDGET_MS` is pruned (a crashed caller), and the caps bound every wait.
@@ -150,6 +153,13 @@ if redis.call('ZSCORE', KEYS[1], ARGV[1]) then n = n - 1 end
 return n
 `;
 
+const REFUND_SCRIPT = `
+local tokens = tonumber(redis.call('HGET', KEYS[1], 'tokens'))
+if tokens == nil then return 0 end
+redis.call('HSET', KEYS[1], 'tokens', tostring(math.min(tonumber(ARGV[1]), tokens + tonumber(ARGV[2]))))
+return 1
+`;
+
 const RELEASE_SCRIPT = `
 if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('DEL', KEYS[1]) end
 return 0
@@ -184,8 +194,21 @@ redis.call('PEXPIRE', KEYS[1], (burst + tonumber(ARGV[4])) * refill)
 return wait
 `;
 
+/**
+ * How a turn ends. `busy`: imaging answered 429. The allowance is charged up front, so without a
+ * refund a worker polling a busy slot burnt a token per poll and was then held back by the refill
+ * (10 s a token) while the slot was free between the attacker's turns (T-46-3: the victim's job
+ * took 42-62 s in a third of the runs). `ran` = calls of this turn that reached imaging before it
+ * answered busy (default 0); the other charged calls are refunded. A turn that ended any other way
+ * keeps its full charge (S-79).
+ */
+export type QaRelease = { busy?: boolean; ran?: number };
+
+/** `runDesignQa` notes here how many placements had been checked when imaging answered 429. */
+export const qaCallsRan = new WeakMap<object, number>();
+
 export type QaTurn =
-  | { ok: true; release: (opts?: { busy?: boolean }) => Promise<void> }
+  | { ok: true; release: (opts?: QaRelease) => Promise<void> }
   | { ok: false; reason: "in_flight" | "rate"; retryAfterMs: number };
 
 /** `calls` = the `/qa/check` calls this turn will make (one per placement), 1..QA_MAX_CALLS. */
@@ -193,12 +216,13 @@ export async function takeQaTurn(
   companyId: string,
   calls: number,
   bucket: QaBucket,
+  opts: { person?: boolean } = {},
 ): Promise<QaTurn> {
   const charge = Math.min(QA_MAX_CALLS, Math.max(1, Math.floor(calls)));
   const token = randomUUID();
   const none = async () => {};
   try {
-    if (await foreignManualWaiting(companyId)) {
+    if (opts.person && (await foreignManualWaiting(companyId))) {
       return { ok: false, reason: "in_flight", retryAfterMs: timing.inFlightRetryMs };
     }
     const got = await redis.set(leaseKey(companyId), token, "PX", QA_LEASE_TTL_MS, "NX");
@@ -214,8 +238,19 @@ export async function takeQaTurn(
       }
     };
     // `busy`: imaging answered 429, so this turn never held the slot and owes no cooldown.
-    const release = async (opts?: { busy?: boolean }) => {
-      if (opts?.busy) return free();
+    const release = async (opts?: QaRelease) => {
+      if (opts?.busy) {
+        // Imaging refused, so the calls that did not run were charged for nothing (see QaRelease).
+        const unused = Math.max(0, charge - Math.floor(opts.ran ?? 0));
+        if (unused > 0) {
+          try {
+            await redis.eval(REFUND_SCRIPT, 1, rateKey(companyId, bucket), QA_BURST, unused);
+          } catch (err) {
+            log.warn("qa allowance refund failed", { companyId, error: String(err) });
+          }
+        }
+        return free();
+      }
       try {
         await redis.eval(COOLDOWN_SCRIPT, 1, leaseKey(companyId), token, timing.cooldownMs);
       } catch (err) {
