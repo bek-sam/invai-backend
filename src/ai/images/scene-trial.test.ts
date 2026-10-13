@@ -13,11 +13,16 @@ import {
 import {
   budgetVerdict,
   computeCaps,
+  createCallLimiter,
   dayEndRefusal,
   ledgerCents,
+  limitProviderCalls,
+  maxCallsFor,
   paidInputsRefusal,
   paidRunRefusal,
+  parseChannels,
   parseKinds,
+  parseMaxCalls,
   promptLabelForBlank,
   worstCaseCents,
 } from "../../../evals/scene_trial/guard";
@@ -27,7 +32,7 @@ import { env } from "../../env";
 import { imaging } from "../../integrations/imaging/client";
 import { getObject, putObject } from "../../lib/s3";
 import { createCompany } from "../../test/fixtures";
-import { type ImageProvider, mockImageProvider } from "./index";
+import { getImageProvider, ImageGenError, type ImageProvider, mockImageProvider } from "./index";
 import { encodePng } from "./png";
 
 /*
@@ -416,5 +421,168 @@ describe("promptLabelForBlank (T-41-5)", () => {
     expect(promptLabelForBlank("#ffffff")).toBe("scene_prompt@4");
     expect(promptLabelForBlank("#808080")).toBe("scene_prompt@4");
     expect(promptLabelForBlank("not-a-hex")).toBe("scene_prompt@4");
+  });
+});
+
+describe("--max-calls (T-43-2)", () => {
+  const MAX_ENV = { paid: true, requestedOpenAi: true, yesPaid: true, providerName: "openai" };
+
+  it("worst case is min(scenes x 2, N) calls plus the 33c margin; no N keeps every current run", () => {
+    expect(worstCaseCents({ scenes: 6, control: false, perImage: 11 })).toBe(165);
+    expect(worstCaseCents({ scenes: 6, control: false, perImage: 11, maxCalls: 6 })).toBe(99);
+    expect(worstCaseCents({ scenes: 6, control: false, perImage: 11, maxCalls: 50 })).toBe(165);
+    expect(worstCaseCents({ scenes: 0, control: true, perImage: 11, maxCalls: 3 })).toBe(44);
+    expect(maxCallsFor({ scenes: 3, control: false, maxCalls: 4 })).toBe(4);
+    expect(maxCallsFor({ scenes: 3, control: false })).toBe(6);
+  });
+
+  it("at budget 100 a 6-scene run is refused without N (165c) and accepted with N = 6 (99c)", () => {
+    const base = { ...MAX_ENV, ledger: 0, budget: 100 };
+    const without = worstCaseCents({ scenes: 6, control: false, perImage: 11 });
+    expect(paidRunRefusal({ ...base, worstCase: without })).toMatch(/165c exceeds the budget 100c/);
+    const withN = worstCaseCents({ scenes: 6, control: false, perImage: 11, maxCalls: 6 });
+    expect(paidRunRefusal({ ...base, worstCase: withN })).toBeNull();
+    expect(paidRunRefusal({ ...base, ledger: 2, worstCase: withN })).toMatch(/exceeds the budget/);
+  });
+
+  it("the 23:30Z check uses min(N, 2 x scenes) calls", () => {
+    const now = new Date("2026-10-13T22:58:00Z");
+    expect(
+      dayEndRefusal({ now, calls: maxCallsFor({ scenes: 6, control: false }) }),
+    ).not.toBeNull();
+    expect(
+      dayEndRefusal({ now, calls: maxCallsFor({ scenes: 6, control: false, maxCalls: 2 }) }),
+    ).toBeNull();
+  });
+
+  it("parses N as a positive whole number", () => {
+    expect(parseMaxCalls(null)).toBeNull();
+    expect(parseMaxCalls("6")).toBe(6);
+    for (const bad of ["0", "-1", "2.5", "six", ""])
+      expect(() => parseMaxCalls(bad)).toThrow(/--max-calls/);
+  });
+
+  it("refuses call N+1, and a retry that would take a reserved first try", () => {
+    const l = createCallLimiter({ maxCalls: 6, scenes: 6 });
+    for (let i = 0; i < 6; i++) {
+      l.begin();
+      expect(l.take()).toBeNull();
+    }
+    l.begin();
+    expect(l.take()).toMatch(/reached/);
+    expect(l.calls).toBe(6);
+
+    // N = 7 for 6 scenes: scene 1 may retry only while calls left exceed the waiting scenes.
+    const m = createCallLimiter({ maxCalls: 7, scenes: 6 });
+    m.begin();
+    expect(m.take()).toBeNull();
+    expect(m.take()).toBeNull(); // 6 left, 5 waiting: the retry fits
+    for (let i = 0; i < 5; i++) {
+      m.begin();
+      expect(m.take()).toBeNull();
+    }
+    expect(m.calls).toBe(7);
+    const k = createCallLimiter({ maxCalls: 6, scenes: 6 });
+    k.begin();
+    expect(k.take()).toBeNull();
+    expect(k.take()).toMatch(/reserved for 5 scene/); // 5 left, 5 waiting: refused
+    expect(k.calls).toBe(1);
+  });
+
+  it("a retry runs when every scene has had its first try", () => {
+    const l = createCallLimiter({ maxCalls: 8, scenes: 6 });
+    for (let i = 0; i < 6; i++) {
+      l.begin();
+      expect(l.take()).toBeNull();
+    }
+    expect(l.take()).toBeNull(); // last scene retries: 2 left, 0 waiting
+    expect(l.take()).toBeNull();
+    expect(l.take()).toMatch(/reached/);
+  });
+
+  it("wraps the object getImageProvider returns, so a caller that fetches it itself is counted", async () => {
+    const shop = await createCompany();
+    const l = createCallLimiter({ maxCalls: 1, scenes: 1 });
+    const real = mockImageProvider.generateScene;
+    const restore = limitProviderCalls(await getImageProvider(shop.id), l);
+    try {
+      const fetched = await getImageProvider(shop.id);
+      expect(fetched).toBe(mockImageProvider);
+      expect(fetched.generateScene).not.toBe(real);
+      const input = { baseImage: Buffer.alloc(0), mask: Buffer.alloc(0), sizePx: 64 } as never;
+      l.begin();
+      vi.spyOn(mockImageProvider, "estimateCents");
+      await fetched.generateScene(input).catch(() => undefined);
+      expect(l.calls).toBe(1);
+      const refused = await fetched.generateScene(input).catch((e: unknown) => e);
+      expect(refused).toBeInstanceOf(ImageGenError);
+      expect((refused as ImageGenError).retryable).toBe(false);
+      expect(l.calls).toBe(1);
+    } finally {
+      restore();
+    }
+    expect(mockImageProvider.generateScene).toBe(real);
+  });
+
+  it("a refusal books a 0c row (non-retryable ImageGenError), where a plain Error books the 11c estimate", async () => {
+    const png = encodePng({ width: 8, height: 8, data: new Uint8Array(8 * 8 * 4).fill(255) });
+    const design = { fileKey: "x/design.png", widthIn: 10, heightIn: 11 };
+    const rowsFor = async (companyId: string) =>
+      withTenant(companyId, (tx) =>
+        tx.select().from(aiJobs).where(eq(aiJobs.companyId, companyId)),
+      );
+    const paidLike = (fail: Error): ImageProvider => ({
+      name: "openai",
+      model: "fake-paid",
+      estimateCents: () => 11,
+      generateScene: async () => {
+        throw fail;
+      },
+    });
+    const run = async (provider: ImageProvider) => {
+      const shop = await createCompany();
+      const base = `${shop.id}/photos/control/t-base.png`;
+      const mask = `${shop.id}/photos/control/t-mask.png`;
+      await putObject(base, png, "image/png");
+      await putObject(mask, png, "image/png");
+      vi.spyOn(imaging, "photoSceneBase").mockResolvedValue({
+        key: base,
+        mask_key: mask,
+        print_box_px: [1, 1, 5, 5],
+      });
+      await runControl({
+        companyId: shop.id,
+        userId: null,
+        provider,
+        design,
+        colorHex: "#fff",
+      }).catch(() => undefined);
+      return rowsFor(shop.id);
+    };
+    // Refused through the wrapper (limiter already used up).
+    const l = createCallLimiter({ maxCalls: 1, scenes: 1 });
+    l.begin();
+    l.take();
+    const inner = paidLike(new Error("must not be reached"));
+    const wrapped: ImageProvider = { ...inner };
+    limitProviderCalls(wrapped, l);
+    const refusedRows = await run(wrapped);
+    expect(refusedRows).toHaveLength(1);
+    expect(refusedRows[0]).toMatchObject({ status: "failed", costCents: 0, provider: "openai" });
+    // Contrast: a plain Error is treated as billed.
+    const plainRows = await run(paidLike(new Error("refused")));
+    expect(plainRows[0]?.costCents).toBe(11);
+  });
+});
+
+describe("--channels (T-43-2)", () => {
+  it("defaults to shopify,etsy and accepts a validated comma list", () => {
+    expect(parseChannels(null)).toEqual(["shopify", "etsy"]);
+    expect(parseChannels("etsy")).toEqual(["etsy"]);
+    expect(parseChannels("etsy, shopify")).toEqual(["etsy", "shopify"]);
+  });
+  it("rejects a channel without a photo preset, an unknown one, an empty list and a repeat", () => {
+    for (const bad of ["csv", "ebay", "etsyy", "", "etsy,etsy", "etsy,"])
+      expect(() => parseChannels(bad)).toThrow(/--channels/);
   });
 });

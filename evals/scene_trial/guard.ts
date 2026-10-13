@@ -1,4 +1,5 @@
-import { PHOTO_SCENE_KINDS, type PhotoSceneKind } from "@invai/contracts";
+import { PHOTO_CHANNELS, PHOTO_SCENE_KINDS, type PhotoChannel, type PhotoSceneKind } from "@invai/contracts";
+import { ImageGenError, type ImageProvider } from "../../src/ai/images/types";
 import { and, eq, gte, sql } from "drizzle-orm";
 import { isDarkBlank, SCENE_PROMPT_LIGHT_REF, SCENE_PROMPT_REF } from "../../src/ai/images/scene-prompt";
 import { withSystem } from "../../src/db/client";
@@ -84,10 +85,93 @@ export function promptLabelForBlank(blankHex: string): string {
   return isDarkBlank(blankHex) ? SCENE_PROMPT_REF : SCENE_PROMPT_LIGHT_REF;
 }
 
-/** Worst case of a run in cents: every scene retries once, plus the margin. */
-export function worstCaseCents(opts: { scenes: number; control: boolean; perImage: number }): number {
-  const calls = opts.control ? 1 : opts.scenes * 2;
-  return calls * opts.perImage + MARGIN_CENTS;
+/** Calls a trial can make at most: every scene retries once, or fewer when --max-calls (N) says so. */
+export function maxCallsFor(opts: { scenes: number; control: boolean; maxCalls?: number | null }): number {
+  if (opts.control) return 1;
+  const full = opts.scenes * 2;
+  return opts.maxCalls == null ? full : Math.min(full, opts.maxCalls);
+}
+
+/** Worst case of a run in cents: min(scenes x 2, N) calls at the price, plus the margin (T-43-2). */
+export function worstCaseCents(opts: {
+  scenes: number;
+  control: boolean;
+  perImage: number;
+  maxCalls?: number | null;
+}): number {
+  return maxCallsFor(opts) * opts.perImage + MARGIN_CENTS;
+}
+
+/** `--max-calls N`: a positive whole number; null when the flag is absent. */
+export function parseMaxCalls(raw: string | null): number | null {
+  if (raw === null) return null;
+  if (!/^[1-9][0-9]*$/.test(raw.trim())) throw new Error(`--max-calls must be a positive whole number, got "${raw}"`);
+  return Number(raw.trim());
+}
+
+/** `--channels etsy,shopify` checked against the photo channel enum; the default stays shopify,etsy. */
+export function parseChannels(raw: string | null): PhotoChannel[] {
+  if (raw === null) return ["shopify", "etsy"];
+  const list = raw.split(",").map((c) => c.trim());
+  const valid = new Set<string>(PHOTO_CHANNELS);
+  const bad = list.find((c) => !valid.has(c));
+  if (bad !== undefined) throw new Error(`--channels: "${bad}" is not a photo channel (${PHOTO_CHANNELS.join(", ")})`);
+  if (list.length === 0 || new Set(list).size !== list.length) throw new Error("--channels must list each channel once");
+  return list as PhotoChannel[];
+}
+
+/**
+ * The call limit of a trial (--max-calls N). Compositions run one after another; `begin()` marks
+ * the start of the next scene. A call is refused when N calls were made already, and a retry (a
+ * second call inside one scene) is refused when the calls left would take a first try from a
+ * scene that has not started (first tries are reserved). A refusal never reaches the provider.
+ */
+export function createCallLimiter(opts: { maxCalls: number; scenes: number }) {
+  let total = 0;
+  let begun = 0;
+  let inScene = 0;
+  return {
+    begin() {
+      begun += 1;
+      inScene = 0;
+    },
+    /** Null when the call may go ahead (and counts it); else why it is refused. */
+    take(): string | null {
+      const left = opts.maxCalls - total;
+      if (left <= 0) return `--max-calls ${opts.maxCalls} reached: ${total} calls made`;
+      if (inScene >= 1) {
+        const waiting = Math.max(0, opts.scenes - begun);
+        if (left <= waiting)
+          return `--max-calls ${opts.maxCalls}: ${left} call(s) left are reserved for ${waiting} scene(s) without a first try`;
+      }
+      total += 1;
+      inScene += 1;
+      return null;
+    },
+    get calls() {
+      return total;
+    },
+  };
+}
+
+/**
+ * Wraps generateScene on the provider object itself (the singleton getImageProvider returns, which
+ * renderSceneJob fetches on its own). A refused call throws a non-retryable ImageGenError that is
+ * never billed. Returns the restore function.
+ */
+export function limitProviderCalls(
+  provider: ImageProvider,
+  limiter: ReturnType<typeof createCallLimiter>,
+): () => void {
+  const real = provider.generateScene;
+  provider.generateScene = async (input) => {
+    const refusal = limiter.take();
+    if (refusal) throw new ImageGenError(`refused before the provider: ${refusal}`, false);
+    return real.call(provider, input);
+  };
+  return () => {
+    provider.generateScene = real;
+  };
 }
 
 /** A paid path has no defaults: budget and since must both be given (A12). Null means fine. */

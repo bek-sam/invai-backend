@@ -25,11 +25,16 @@ import { CONTROL_PROMPT_REF, controlGate, runControl } from "./control";
 import { copyKeys, maskStats } from "./frames";
 import {
   computeCaps,
+  createCallLimiter,
   dayEndRefusal,
   ledgerCents,
+  limitProviderCalls,
+  maxCallsFor,
   paidInputsRefusal,
   paidRunRefusal,
+  parseChannels,
   parseKinds,
+  parseMaxCalls,
   promptLabelForBlank,
   worstCaseCents,
 } from "./guard";
@@ -40,11 +45,15 @@ import { getObject } from "../../src/lib/s3";
  * design and blank color through the photos service, runs the scene jobs in process, and prints
  * one line per scene plus totals and the cost from ai_jobs.
  *
- *   tsx evals/scene_trial/run.ts --design "Good Vibes Only Agave" --color white [--scenes 6] [--kinds studio,studio,studio,home,cafe,outdoor] [--yes-paid]
+ *   tsx evals/scene_trial/run.ts --design "Good Vibes Only Agave" --color white [--scenes 6] [--kinds studio,studio,studio,home,cafe,outdoor] [--channels etsy] [--max-calls 6] [--yes-paid]
  *   tsx evals/scene_trial/run.ts --design "Good Vibes Only Agave" --color white --control [--yes-paid]
  *
  * --kinds (T-39-2) names one scene kind per scene (comma list, exactly --scenes long) and is passed as
  * lifestyle.sceneKinds; without it the service picks kinds from the analysis or its defaults.
+ * --channels (T-43-2) lists the photo channels of the set (default shopify,etsy).
+ * --max-calls N (T-43-2) caps the provider calls: worst case = min(scenes x 2, N) x price + 33c, enforced on the
+ * provider object itself; first tries are reserved (a retry is refused when the calls left belong to
+ * scenes that have not started); a refused call throws a non-retryable, unbilled ImageGenError.
  * --control (T-38-2 AC4) makes one provider call with a fresh scene base and a fixed prompt that
  * asks to change nothing, then prints registration, check 1 and lock scores. It counts in the
  * ledger and the daily cap, creates no photo set, image row or credit charge.
@@ -117,8 +126,12 @@ async function main() {
   if (!design) fail(`no design named "${designName}"`);
 
   let kinds: ReturnType<typeof parseKinds>;
+  let channels: ReturnType<typeof parseChannels>;
+  let maxCalls: number | null;
   try {
     kinds = parseKinds(arg("kinds"), scenes);
+    channels = parseChannels(arg("channels"));
+    maxCalls = parseMaxCalls(arg("max-calls"));
   } catch (e) {
     fail(e instanceof Error ? e.message : String(e));
   }
@@ -128,7 +141,7 @@ async function main() {
   const paid = provider.name !== "mock";
   const perImage = imageCostCents(OPENAI_IMAGE_MODEL, "1024x1024");
   // A trial retries a scene once at worst; the control is one call with no retry.
-  const worstCase = worstCaseCents({ scenes, control, perImage });
+  const worstCase = worstCaseCents({ scenes, control, perImage, maxCalls });
   const ledger = await ledgerCents(since);
   const refusal = paidRunRefusal({
     paid,
@@ -169,7 +182,7 @@ async function main() {
     );
   if (paid) {
     if (decided.refusal) fail(decided.refusal);
-    const late = dayEndRefusal({ now, calls: control ? 1 : scenes * 2 });
+    const late = dayEndRefusal({ now, calls: maxCallsFor({ scenes, control, maxCalls }) });
     if (late) fail(late);
     const mutable = env as unknown as {
       IMAGE_GEN_DAILY_CAP_PER_SHOP: number;
@@ -234,7 +247,7 @@ async function main() {
       garments: ["tee"],
       colors: [color],
       views: ["front_flat"],
-      channels: ["shopify", "etsy"],
+      channels,
       underbasePreview: true,
       lifestyle: kinds ? { count: scenes, sceneKinds: kinds } : { count: scenes },
       idempotencyKey: `scene-trial-${crypto.randomUUID()}`,
@@ -253,11 +266,20 @@ async function main() {
   if (fresh.some((c) => c.base !== null)) fail("a trial composition already has a stored scene base");
   console.log(`fresh compositions: ${fresh.length}, none with a stored scene base`);
 
-  for (const c of await svc.openCompositionsBySource(owner.companyId, set.id)) {
-    if (c.source === "ai_scene")
-      await runJobInline(renderSceneJob, { companyId: owner.companyId, compositionId: c.id });
-    else await runJobInline(renderCompositionJob, { companyId: owner.companyId, compositionId: c.id });
+  // The limit sits on the singleton renderSceneJob fetches, not on the local `provider` (A4).
+  const limiter = createCallLimiter({ maxCalls: maxCallsFor({ scenes, control, maxCalls }), scenes });
+  const unlimit = limitProviderCalls(await getImageProvider(owner.companyId), limiter);
+  try {
+    for (const c of await svc.openCompositionsBySource(owner.companyId, set.id)) {
+      if (c.source === "ai_scene") {
+        limiter.begin();
+        await runJobInline(renderSceneJob, { companyId: owner.companyId, compositionId: c.id });
+      } else await runJobInline(renderCompositionJob, { companyId: owner.companyId, compositionId: c.id });
+    }
+  } finally {
+    unlimit();
   }
+  console.log(`provider calls reaching the wrapper: ${limiter.calls} of at most ${maxCallsFor({ scenes, control, maxCalls })}`);
 
   const comps = await withTenant(owner.companyId, (tx) =>
     tx
