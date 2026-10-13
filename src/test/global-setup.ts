@@ -70,20 +70,40 @@ export default async function setup(project: TestProject) {
   process.env.IMAGING_URL = testImagingUrl;
   project.provide("testImagingUrl", testImagingUrl);
 
-  const dbClaim = await claimTestDatabase({
-    appUrl: rawDatabaseUrl,
-    migrationUrl: rawMigrationUrl,
-    pinnedAppUrl: process.env.TEST_DATABASE_URL,
-    pinnedMigrationUrl: process.env.TEST_MIGRATION_DATABASE_URL,
-  });
-  const redisClaim = await claimTestRedisDb({
-    baseUrl: rawRedisUrl,
-    pinnedUrl: process.env.TEST_REDIS_URL ?? pinnedNonZeroRedisUrl(rawRedisUrl),
-  });
+  const redisPin = process.env.TEST_REDIS_URL ?? pinnedNonZeroRedisUrl(rawRedisUrl);
+  if (redisPin) assertPinnedRedisDb(redisPin);
+  const redisClaim = await claimTestRedisDb({ baseUrl: rawRedisUrl, pinnedUrl: redisPin });
+  if (redisClaim.db !== undefined) {
+    process.env.INVAI_TEST_REDIS_CLAIMED = String(redisClaim.db);
+    project.provide("testRedisClaimedDb", redisClaim.db);
+    // Leftovers of earlier runs, only in the DB this run holds the claim on (never a pin).
+    const { cleanClaimedDbLeftovers } = await import("./test-redis");
+    const removed = await cleanClaimedDbLeftovers(redisClaim.descriptor);
+    console.log(
+      `[test-redis] claimed Valkey DB ${redisClaim.db} (registry DB 15); cleared ${removed} leftover keys`,
+    );
+  } else {
+    console.log(
+      `[test-redis] using pinned Valkey DB ${new URL(redisClaim.redisUrl).pathname.slice(1)}`,
+    );
+  }
+  // Set before anything below imports env.ts (the DB claim migrates through it).
+  process.env.TEST_REDIS_URL = redisClaim.redisUrl;
+  let dbClaim: Awaited<ReturnType<typeof claimTestDatabase>>;
+  try {
+    dbClaim = await claimTestDatabase({
+      appUrl: rawDatabaseUrl,
+      migrationUrl: rawMigrationUrl,
+      pinnedAppUrl: process.env.TEST_DATABASE_URL,
+      pinnedMigrationUrl: process.env.TEST_MIGRATION_DATABASE_URL,
+    });
+  } catch (err) {
+    await redisClaim.cleanup();
+    throw err;
+  }
 
   process.env.TEST_DATABASE_URL = dbClaim.databaseUrl;
   process.env.TEST_MIGRATION_DATABASE_URL = dbClaim.migrationDatabaseUrl;
-  process.env.TEST_REDIS_URL = redisClaim.redisUrl;
   // Same-process consumers (this file, below) already see the env vars just set. Every worker
   // gets them through this instead — see provided-context.ts.
   project.provide("testDatabaseUrl", dbClaim.databaseUrl);
@@ -151,6 +171,17 @@ function requireEnv(name: string): string {
 
 /** Mirrors env.ts's `isPinnedNonZeroDb`: a caller-chosen non-zero `REDIS_URL` DB wins unchanged
  *  (the `team/agent-brief.md` pattern), same as an explicit `TEST_REDIS_URL`. */
+/** A pinned test run must sit on 10-14 (R2); mirrors the check env.ts makes in each worker. */
+function assertPinnedRedisDb(url: string): void {
+  const db = Number(new URL(url).pathname.replace(/^\//, ""));
+  if (!(db >= 10 && db <= 14)) {
+    throw new Error(
+      `pinned test Redis DB must be 10-14 (got "${url}"). 1-8 are harness claims, 9 the gate's, ` +
+        "15 the claim registry; DB 0 is the app's.",
+    );
+  }
+}
+
 function pinnedNonZeroRedisUrl(url: string): string | undefined {
   const path = new URL(url).pathname.replace(/^\//, "");
   return /^[1-9]\d*$/.test(path) ? url : undefined;

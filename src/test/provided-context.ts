@@ -18,6 +18,8 @@ declare module "vitest" {
     testMigrationDatabaseUrl?: string;
     /** `REDIS_URL` to use in every worker, or undefined when pinned. */
     testRedisUrl?: string;
+    /** The Valkey DB (1-8) global-setup claimed, or undefined when pinned (T-49-3). */
+    testRedisClaimedDb?: number;
     /** `S3_BUCKET` to use in every worker (T-43-6): always a test bucket, never the dev one. */
     testS3Bucket?: string;
     /** `IMAGING_URL` to use in every worker (T-44-5): a closed port unless `TEST_IMAGING_URL` opted in. */

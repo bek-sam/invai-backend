@@ -210,7 +210,11 @@ describe("paid AI opt-in (decision 0038)", () => {
   });
 
   it("AC4: NODE_ENV=test still drops the keys even with the opt-in", async () => {
-    const r = await boot({ dotenv: KEYS_IN_FILE, env: { NODE_ENV: "test", INVAI_PAID_AI: "1" } });
+    const r = await boot({
+      dotenv: KEYS_IN_FILE,
+      // Test mode has no fallback Redis DB (T-49-3): pin one on 10-14.
+      env: { NODE_ENV: "test", INVAI_PAID_AI: "1", REDIS_URL: "redis://localhost:6379/12" },
+    });
     expect(r.result).toMatchObject({ openai: null, mockAi: true });
   });
 

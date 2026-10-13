@@ -30,7 +30,9 @@ function baseEnv(extra: Record<string, string>) {
     INVAI_SKIP_DOTENV: "1",
     DATABASE_URL: env.DATABASE_URL,
     MIGRATION_DATABASE_URL: env.MIGRATION_DATABASE_URL,
-    REDIS_URL: env.REDIS_URL,
+    // A dev-mode child may not sit on the harness's claimed DB 1-8 (env.ts Redis DB policy,
+    // T-49-3); a pinned 10-14 stack is allowed and these CLIs open no Redis connection.
+    REDIS_URL: `redis://${new URL(env.REDIS_URL).host}/12`,
     S3_BUCKET: "invai-local",
     IMAGING_URL: "http://localhost:8000",
     BETTER_AUTH_SECRET: "x".repeat(32),

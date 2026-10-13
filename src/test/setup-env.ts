@@ -16,12 +16,16 @@ import "./provided-context";
 const testDatabaseUrl = inject("testDatabaseUrl");
 const testMigrationDatabaseUrl = inject("testMigrationDatabaseUrl");
 const testRedisUrl = inject("testRedisUrl");
+const testRedisClaimedDb = inject("testRedisClaimedDb");
 const testS3Bucket = inject("testS3Bucket");
 const testImagingUrl = inject("testImagingUrl");
 
 if (testDatabaseUrl) process.env.TEST_DATABASE_URL = testDatabaseUrl;
 if (testMigrationDatabaseUrl) process.env.TEST_MIGRATION_DATABASE_URL = testMigrationDatabaseUrl;
 if (testRedisUrl) process.env.TEST_REDIS_URL = testRedisUrl;
+// T-49-3: env.ts accepts a DB in 1-8 only when the harness claimed exactly that one.
+if (testRedisClaimedDb !== undefined)
+  process.env.INVAI_TEST_REDIS_CLAIMED = String(testRedisClaimedDb);
 // T-43-6: the dev bucket from `.env` is never used by tests; the bucket global-setup chose wins.
 if (testS3Bucket) process.env.S3_BUCKET = testS3Bucket;
 // T-44-5: tests never reach a live imaging service; the shell/.env IMAGING_URL is overridden.

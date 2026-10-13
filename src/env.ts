@@ -47,7 +47,7 @@ const raw = createEnv({
     TEST_MIGRATION_DATABASE_URL: z.url().optional(),
 
     REDIS_URL: z.url(),
-    /** Test Redis DB (`REDIS_URL`'s DB index is redirected to a non-zero one when unset). */
+    /** Test Redis DB (10-14 pin, or the harness's claim; see the Redis DB policy below). */
     TEST_REDIS_URL: z.url().optional(),
 
     S3_BUCKET: z.string(),
@@ -222,56 +222,83 @@ function withDatabase(url: string, database: string): string {
   return u.toString();
 }
 
-/** Default Redis DB for tests (B-205): never 0, the dev/CI worker's DB. */
-const TEST_REDIS_DB = 15;
+/**
+ * Redis DB policy (T-49-3, architect ruling R2, wave 49). Valkey DB map: 0 app; 1-8 test-harness
+ * claims only; 9 gate scratch; 10-14 pinned stacks and pinned test runs; 15 claim registry only.
+ * Duplicated in `src/test/test-redis.ts` (env.ts must not import test code); a test pins both.
+ */
+const CLAIM_DBS = { min: 1, max: 8 } as const;
+const PIN_DBS = { min: 10, max: 14 } as const;
+const REGISTRY_REDIS_DB = 15;
+/** Set by the vitest harness (global-setup.ts, then setup-env.ts) to the DB it claimed. */
+const CLAIM_MARK = "INVAI_TEST_REDIS_CLAIMED";
 
 /**
  * True only when the URL's path is written exactly as a positive integer with no leading zero
- * (`/1`, `/14`, ...) — the one shape treated as "the caller explicitly pinned a non-zero DB".
- * Everything else — no path, a bare `/0`, a trailing slash (`/0/`), a decimal (`/0.5`), hex
- * (`/0x1`), blank or non-numeric text — is treated as DB 0 (unset) and redirected.
- *
- * This is deliberately *stricter* than ioredis's own parsing. ioredis picks the DB with
- * `parseInt(options.db, 10)` (`node_modules/ioredis/built/Redis.js:725-726`), so `/0/` and
- * `/0x1` both resolve to live DB 0 there too — but a naive `Number(path) !== 0` check (this
- * function's round-1 shape) reads `/0/` and `/0x1` as *non-zero* (`Number` returns `NaN`, and
- * `NaN !== 0` is true) and wrongly keeps them as "pinned", so the suite ends up on DB 0 anyway
- * (round-1 review finding). Matching ioredis's `parseInt` instead of anchoring on a canonical
- * literal would have the same hole for any other `Number`/`parseInt` divergence, so this checks
- * the literal text.
+ * (`/1`, `/14`, ...) - the one shape treated as "the caller explicitly pinned a non-zero DB".
+ * Everything else (no path, `/0`, `/0/`, `/0.5`, `/0x1`, blank or non-numeric text) is treated as
+ * DB 0 (unset). Stricter than ioredis's `parseInt` on purpose (round-1 review finding, B-205).
  */
 function isPinnedNonZeroDb(url: string): boolean {
   const path = new URL(url).pathname.replace(/^\//, "");
   return /^[1-9]\d*$/.test(path);
 }
 
-/**
- * Redirects a Redis URL to `TEST_REDIS_DB` (B-205), unless the caller already picked a non-zero
- * DB (`REDIS_URL=redis://localhost:6379/14`, the pattern `team/agent-brief.md` tells agents to
- * use): that explicit choice always wins, so two agents pinning different DBs never collide.
- */
-function withTestRedisDb(url: string): string {
-  if (isPinnedNonZeroDb(url)) return url;
-  const u = new URL(url);
-  u.pathname = `/${TEST_REDIS_DB}`;
-  return u.toString();
+/** The DB ioredis would select: `parseInt` of the path (so `/1/` and `/01` are DB 1). */
+function ioredisDb(url: string): number {
+  const n = Number.parseInt(new URL(url).pathname.replace(/^\//, ""), 10);
+  return Number.isNaN(n) ? 0 : n;
+}
+
+/** Outside tests the API, worker and scripts must not sit in the harness (1-8) or registry (15) DBs. */
+function assertRuntimeRedisDb(url: string): string {
+  const db = ioredisDb(url);
+  if ((db >= CLAIM_DBS.min && db <= CLAIM_DBS.max) || db === REGISTRY_REDIS_DB) {
+    throw new Error(
+      `REDIS_URL selects Valkey DB ${db}, which is reserved (1-8 test-harness claims, 15 claim ` +
+        "registry). Use DB 0 or a pinned stack on 10-14, e.g. redis://localhost:6379/12.",
+    );
+  }
+  return url;
 }
 
 /**
- * `TEST_REDIS_URL` is an explicit, higher-trust opt-in (a second agent pinning its own DB per
- * `team/agent-brief.md`) — but "explicit" must not mean "even DB 0 is honored verbatim". Round 1
- * used `raw.TEST_REDIS_URL` as-is with no check at all. A `TEST_REDIS_URL` that isn't a pinned
- * non-zero DB fails the boot with a clear message instead of silently sharing the dev/CI worker's
- * DB 0 (chosen over a silent redirect so a mistyped `TEST_REDIS_URL` can't go unnoticed).
+ * Test mode: a pinned `TEST_REDIS_URL` must be on 10-14, or on 1-8 only when the harness itself
+ * claimed that DB (`INVAI_TEST_REDIS_CLAIMED`); never DB 0, 9 or 15.
  */
 function assertTestRedisDbPinned(url: string): string {
   if (!isPinnedNonZeroDb(url)) {
     throw new Error(
-      `TEST_REDIS_URL must point at a non-zero Redis DB (got "${url}"), never DB 0 — the ` +
-        "dev/CI worker's DB (B-205). Use e.g. redis://localhost:6379/14.",
+      `TEST_REDIS_URL must point at a non-zero Redis DB (got "${url}"), never DB 0 - the ` +
+        "dev/CI worker's DB (B-205). Use e.g. redis://localhost:6379/12.",
+    );
+  }
+  const db = ioredisDb(url);
+  const pinOk = db >= PIN_DBS.min && db <= PIN_DBS.max;
+  const claimOk =
+    db >= CLAIM_DBS.min && db <= CLAIM_DBS.max && process.env[CLAIM_MARK] === String(db);
+  if (!pinOk && !claimOk) {
+    throw new Error(
+      `Test Redis DB ${db} is not allowed: pin a stack or test run on DB 10-14 ` +
+        "(e.g. redis://localhost:6379/12). DB 1-8 are claimed by the test harness itself, 9 is the " +
+        "gate's, 15 is the claim registry.",
     );
   }
   return url;
+}
+
+/**
+ * Test mode without `TEST_REDIS_URL`: only a pinned `REDIS_URL` on 10-14 is accepted. The old
+ * fallback (redirect to DB 15) is gone: it dumped ~1,900 app keys into the claim registry.
+ */
+function testRedisFromRedisUrl(url: string): string {
+  if (!isPinnedNonZeroDb(url)) {
+    throw new Error(
+      "No test Redis DB: run tests through vitest (its global setup claims DB 1-8), or pin " +
+        "REDIS_URL / TEST_REDIS_URL to DB 10-14, e.g. redis://localhost:6379/12.",
+    );
+  }
+  return assertTestRedisDbPinned(url);
 }
 
 const isTest = raw.NODE_ENV === "test";
@@ -365,15 +392,15 @@ export const env = {
   /**
    * Under test, redirected to a non-zero DB so the suite never shares BullMQ queues or realtime
    * streams with a dev worker on DB 0 (B-205), mirroring how DATABASE_URL redirects to invai_test.
-   * `TEST_REDIS_URL` wins when set, but it must itself be a pinned non-zero DB (throws otherwise,
-   * `assertTestRedisDbPinned`); otherwise an already non-zero `REDIS_URL` DB is kept as-is;
-   * otherwise it redirects to `TEST_REDIS_DB` (15).
+   * `TEST_REDIS_URL` wins when set; it, or a pinned `REDIS_URL`, must be on 10-14 (or the DB the
+   * harness claimed on 1-8), else this throws: there is no fallback DB. Outside tests the
+   * reserved DBs 1-8 and 15 are refused (Redis DB policy above).
    */
   REDIS_URL: isTest
     ? raw.TEST_REDIS_URL
       ? assertTestRedisDbPinned(raw.TEST_REDIS_URL)
-      : withTestRedisDb(raw.REDIS_URL)
-    : raw.REDIS_URL,
+      : testRedisFromRedisUrl(raw.REDIS_URL)
+    : assertRuntimeRedisDb(raw.REDIS_URL),
   /**
    * Under test the AI keys from .env are dropped (decision 0021): a test run must never reach a
    * paid model or send test data out. Tests that exercise a real provider stub its HTTP layer.

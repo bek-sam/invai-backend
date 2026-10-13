@@ -20,6 +20,7 @@
     "db:studio": "drizzle-kit studio",
     "test": "vitest run --passWithNoTests",
     "test:watch": "vitest",
+    "test:valkey-registry-clean": "tsx scripts/test-valkey-registry-clean.ts",
     "evals": "tsx evals/run.ts"
   },
   "dependencies": {

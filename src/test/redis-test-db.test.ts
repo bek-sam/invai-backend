@@ -70,44 +70,33 @@ async function bootRedisUrlExpectError(extra: Record<string, string>): Promise<s
   return `${failure?.stdout ?? ""}${failure?.stderr ?? ""}${failure?.message ?? ""}`;
 }
 
-describe("REDIS_URL test redirect (B-205)", () => {
-  it("redirects DB 0 to a non-zero test DB under NODE_ENV=test", async () => {
-    const url = await bootRedisUrl({ NODE_ENV: "test", REDIS_URL: "redis://localhost:6379" });
-    expect(dbIndex(url)).not.toBe(0);
-    expect(dbIndex("redis://localhost:6379")).toBe(0);
+describe("Redis DB policy in test mode (B-205, T-49-3)", () => {
+  it("has no fallback: an unpinned REDIS_URL (no path, /0, /0/, /0.5, /0x1) refuses to boot", async () => {
+    for (const path of ["", "/0", "/0/", "/0.5", "/0x1"]) {
+      const out = await bootRedisUrlExpectError({
+        NODE_ENV: "test",
+        REDIS_URL: `redis://localhost:6379${path}`,
+      });
+      expect(out, `path "${path}"`).toMatch(/No test Redis DB/);
+    }
   });
 
-  it("also redirects an explicit /0", async () => {
-    const url = await bootRedisUrl({ NODE_ENV: "test", REDIS_URL: "redis://localhost:6379/0" });
-    expect(dbIndex(url)).not.toBe(0);
-  });
-
-  // These three paths all parse to `Number(...) !== 0` (NaN, 0.5, or a hex-parsed 1), so a naive
-  // "already non-zero" check (this file's own `dbIndex`, and round 1's `redisDbIndex`) reads them
-  // as "caller pinned a DB" and leaves them untouched — but ioredis's own `parseInt(path, 10)`
-  // resolves every one of them to live DB 0. Assert the literal redirected path (not just
-  // `dbIndex(url) !== 0`, which round 1's bug would also satisfy for `/0x1`) to actually catch it.
-  it("redirects a trailing-slash DB 0 (/0/), never keeps it as pinned", async () => {
-    const url = await bootRedisUrl({ NODE_ENV: "test", REDIS_URL: "redis://localhost:6379/0/" });
-    expect(new URL(url).pathname).toBe("/15");
-  });
-
-  it("redirects a decimal DB path (/0.5), never keeps it as pinned", async () => {
-    const url = await bootRedisUrl({ NODE_ENV: "test", REDIS_URL: "redis://localhost:6379/0.5" });
-    expect(new URL(url).pathname).toBe("/15");
-  });
-
-  it("redirects a hex-looking DB path (/0x1), never keeps it as pinned", async () => {
-    const url = await bootRedisUrl({ NODE_ENV: "test", REDIS_URL: "redis://localhost:6379/0x1" });
-    expect(new URL(url).pathname).toBe("/15");
-  });
-
-  it("keeps an explicit non-zero DB the caller already pinned (agent-brief pattern)", async () => {
+  it("keeps a REDIS_URL pinned on 10-14", async () => {
     const url = await bootRedisUrl({ NODE_ENV: "test", REDIS_URL: "redis://localhost:6379/14" });
     expect(url).toBe("redis://localhost:6379/14");
   });
 
-  it("TEST_REDIS_URL wins over a plain REDIS_URL redirect when both are set", async () => {
+  it("refuses a REDIS_URL pinned on 1-9 or 15 (harness claims, gate, registry)", async () => {
+    for (const db of [1, 8, 9, 15]) {
+      const out = await bootRedisUrlExpectError({
+        NODE_ENV: "test",
+        REDIS_URL: `redis://localhost:6379/${db}`,
+      });
+      expect(out, `DB ${db}`).toMatch(/not allowed/);
+    }
+  });
+
+  it("TEST_REDIS_URL on 10-14 wins over a plain REDIS_URL", async () => {
     const url = await bootRedisUrl({
       NODE_ENV: "test",
       REDIS_URL: "redis://localhost:6379",
@@ -116,32 +105,89 @@ describe("REDIS_URL test redirect (B-205)", () => {
     expect(url).toBe("redis://localhost:6379/13");
   });
 
-  it("refuses to boot when TEST_REDIS_URL itself points at DB 0", async () => {
-    const out = await bootRedisUrlExpectError({
-      NODE_ENV: "test",
-      REDIS_URL: "redis://localhost:6379/14",
-      TEST_REDIS_URL: "redis://localhost:6379/0",
-    });
-    expect(out).toMatch(/TEST_REDIS_URL must point at a non-zero Redis DB/);
-    expect(out).toMatch(/never DB 0/);
+  it("refuses TEST_REDIS_URL on DB 0 or a non-canonical DB 0 spelling", async () => {
+    for (const path of ["/0", "/0/"]) {
+      const out = await bootRedisUrlExpectError({
+        NODE_ENV: "test",
+        REDIS_URL: "redis://localhost:6379/14",
+        TEST_REDIS_URL: `redis://localhost:6379${path}`,
+      });
+      expect(out).toMatch(/TEST_REDIS_URL must point at a non-zero Redis DB/);
+      expect(out).toMatch(/never DB 0/);
+    }
   });
 
-  it("refuses to boot when TEST_REDIS_URL is a non-canonical DB 0 spelling (/0/)", async () => {
-    const out = await bootRedisUrlExpectError({
+  it("refuses TEST_REDIS_URL on 1-9 or 15 unless the harness claimed exactly that DB", async () => {
+    for (const db of [1, 8, 9, 15]) {
+      const out = await bootRedisUrlExpectError({
+        NODE_ENV: "test",
+        REDIS_URL: "redis://localhost:6379",
+        TEST_REDIS_URL: `redis://localhost:6379/${db}`,
+      });
+      expect(out, `DB ${db}`).toMatch(/not allowed/);
+    }
+    // The harness's own claim (global-setup marks the DB it claimed): 1-8 only, and only that one.
+    const claimed = await bootRedisUrl({
       NODE_ENV: "test",
-      REDIS_URL: "redis://localhost:6379/14",
-      TEST_REDIS_URL: "redis://localhost:6379/0/",
-    });
-    expect(out).toMatch(/TEST_REDIS_URL must point at a non-zero Redis DB/);
-  });
-
-  it("leaves REDIS_URL unchanged outside test (development, production)", async () => {
-    const dev = await bootRedisUrl({
-      NODE_ENV: "development",
       REDIS_URL: "redis://localhost:6379",
+      TEST_REDIS_URL: "redis://localhost:6379/3",
+      INVAI_TEST_REDIS_CLAIMED: "3",
     });
-    expect(dev).toBe("redis://localhost:6379");
+    expect(claimed).toBe("redis://localhost:6379/3");
+    for (const [db, mark] of [
+      [4, "3"],
+      [9, "9"],
+      [15, "15"],
+    ] as const) {
+      const out = await bootRedisUrlExpectError({
+        NODE_ENV: "test",
+        REDIS_URL: "redis://localhost:6379",
+        TEST_REDIS_URL: `redis://localhost:6379/${db}`,
+        INVAI_TEST_REDIS_CLAIMED: mark,
+      });
+      expect(out, `DB ${db} mark ${mark}`).toMatch(/not allowed/);
+    }
+  });
 
+  it("this suite's own live env.REDIS_URL (claimed by global-setup, or pinned) is allowed and non-zero", async () => {
+    const { env } = await import("../env");
+    expect(env.isTest).toBe(true);
+    const db = dbIndex(env.REDIS_URL);
+    expect(db).toBeGreaterThanOrEqual(1);
+    expect(db).not.toBe(9);
+    expect(db).not.toBe(15);
+  });
+});
+
+describe("Redis DB policy outside test (API, worker, scripts) (T-49-3 AC6)", () => {
+  it("refuses a REDIS_URL on DB 1-8 or 15, in development and production, non-zero exit", async () => {
+    for (const db of [1, 5, 8, 15]) {
+      const out = await bootRedisUrlExpectError({
+        NODE_ENV: "development",
+        REDIS_URL: `redis://localhost:6379/${db}`,
+      });
+      expect(out, `DB ${db}`).toMatch(/reserved/);
+    }
+    for (const path of ["/1/", "/01"]) {
+      const out = await bootRedisUrlExpectError({
+        NODE_ENV: "development",
+        REDIS_URL: `redis://localhost:6379${path}`,
+      });
+      expect(out, path).toMatch(/reserved/);
+    }
+  });
+
+  it("allows DB 0 (with or without a path), 9 and the pinned 10-14 stacks", async () => {
+    for (const path of ["", "/0", "/9", "/10", "/14"]) {
+      const url = await bootRedisUrl({
+        NODE_ENV: "development",
+        REDIS_URL: `redis://localhost:6379${path}`,
+      });
+      expect(url).toBe(`redis://localhost:6379${path}`);
+    }
+  });
+
+  it("leaves a production URL without a path (DB 0) alone", async () => {
     const prodExtra = {
       EASYPOST_API_KEY: "k",
       STRIPE_SECRET_KEY: "k",
@@ -155,15 +201,9 @@ describe("REDIS_URL test redirect (B-205)", () => {
     };
     const prod = await bootRedisUrl({
       NODE_ENV: "production",
-      REDIS_URL: "redis://localhost:6379",
+      REDIS_URL: "rediss://cache.example.test:6380",
       ...prodExtra,
     });
-    expect(prod).toBe("redis://localhost:6379");
-  });
-
-  it("this suite's own live env.REDIS_URL (as vitest.config.ts / global-setup.ts set it) is a non-zero test DB", async () => {
-    const { env } = await import("../env");
-    expect(env.isTest).toBe(true);
-    expect(dbIndex(env.REDIS_URL)).not.toBe(0);
+    expect(prod).toBe("rediss://cache.example.test:6380");
   });
 });
