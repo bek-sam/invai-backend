@@ -16,6 +16,7 @@ import {
   outboxEvents,
 } from "../../db/schema";
 import { ImagingError } from "../../integrations/imaging/client";
+import { putObject } from "../../lib/s3";
 import {
   createCompany,
   createConnection,
@@ -530,6 +531,7 @@ describe("QA warnings (T-42-5)", () => {
       const id = items[0]?.id as string;
       img.qaCheck.mockResolvedValue(result(issues));
       const { setItemArtwork } = await import("../orders/service");
+      await putObject(`${companyId}/art/${id}.png`, "x", "image/png"); // T-48-2: the object must exist
       await withTenant(companyId, (tx) =>
         setItemArtwork(tx, ctx, { id, fileKey: `${companyId}/art/${id}.png` }),
       );
