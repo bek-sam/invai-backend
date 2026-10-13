@@ -148,6 +148,10 @@ async function crit1(
   const manualBound = scaledBounds ? 30_000 * scale + S81_SLACK_MS : 30_000; // the test's give-up
   // T-46-3: the victim's result must also leave 2 s of the 30 s line free (headroom), scaled.
   const resultBound = scaledBounds ? 28_000 * scale + S81_SLACK_MS : 30_000;
+  // Why the headroom is there: the victim is served at the next free slot, about one Retry-After
+  // plus its own call (~11 s at real timing), not after the attacker's 5-call turn (30 s). Without
+  // the yield this case measures 15 s at scale 0.5 (30 s real), which the 28 s line alone lets by.
+  const yieldBound = scaledBounds ? 15_000 * scale + S81_SLACK_MS : 30_000;
   const jobBound = scaledBounds ? 60_000 * scale + S81_SLACK_MS : 60_000;
   const enqueue = vi.spyOn(itemArtworkQaJob, "enqueue").mockResolvedValue(undefined as never);
   try {
@@ -236,6 +240,7 @@ async function crit1(
     expect(await qaStatusOf(b, bJobDesign.id)).toBe("passed");
     expect(manualRes.error).toBeUndefined();
     expect(manualRes.ms).toBeLessThan(resultBound);
+    expect(manualRes.ms).toBeLessThan(yieldBound);
     expect(await qaStatusOf(b, bManualDesign.id)).toBe("passed");
     expect(aRefused).toBeGreaterThan(0);
   } finally {
