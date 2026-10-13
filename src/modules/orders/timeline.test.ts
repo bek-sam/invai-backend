@@ -10,6 +10,7 @@ import {
   tenantContext,
 } from "../../test/fixtures";
 import { cancelOrder, holdOrder, reasonCodeFor, releaseOrder, timeline } from "./service";
+import { transitionItem } from "./state-machine";
 
 /**
  * T-P5-4 (B-238): `reasonCodeFor` is the pure read-time mapping from a stored
@@ -124,5 +125,40 @@ describe("orders.timeline carries reasonCode/reasonParams (read time, no produce
     const cancelled = stateChanges.find((e) => e.to === "cancelled");
     expect(cancelled?.reasonCode).toBe("cancelled");
     expect(cancelled?.reasonParams).toEqual({ cancelReason: "buyer_request" });
+  });
+});
+
+describe("orders.timeline keeps steps of one transaction in order (B-418)", () => {
+  it("returns three steps written in one transaction newest first, and pages through them once", async () => {
+    const companyId = (await createCompany()).id;
+    const office = await createUser(companyId, "office");
+    const ctx = tenantContext(companyId, office.id, "office");
+    await createLocation(companyId);
+    const conn = await createConnection(companyId);
+    const { order, items } = await createOrder(companyId, conn.id, { units: 1, state: "ready" });
+    const item = items[0];
+    if (!item) throw new Error("no item");
+    const actor = { kind: "user" as const, userId: office.id };
+    await withTenant(companyId, async (tx) => {
+      await transitionItem(tx, item.id, "on_sheet", { actor });
+      await transitionItem(tx, item.id, "transfer_in", { actor });
+      await transitionItem(tx, item.id, "pressed", { actor });
+    });
+    const want = ["pressed", "transfer_in", "on_sheet"];
+
+    const all = await withTenant(companyId, (tx) => timeline(tx, ctx, { id: order.id, limit: 50 }));
+    expect(all.items.filter((e) => e.kind === "state_changed").map((e) => e.to)).toEqual(want);
+
+    const seen: string[] = [];
+    let cursor: string | undefined;
+    for (let i = 0; i < 20; i++) {
+      const page = await withTenant(companyId, (tx) =>
+        timeline(tx, ctx, { id: order.id, limit: 1, cursor }),
+      );
+      for (const e of page.items) if (e.kind === "state_changed") seen.push(e.to as string);
+      if (!page.nextCursor) break;
+      cursor = page.nextCursor;
+    }
+    expect(seen).toEqual(want);
   });
 });

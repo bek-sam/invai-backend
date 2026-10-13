@@ -78,6 +78,10 @@ export async function transitionItem(
     stationId: opts.actor.stationId ?? null,
     reason: opts.reason ?? null,
     data: opts.data ?? {},
+    // Steps of one item written in one transaction must keep their order (B-418): the column
+    // default is the transaction start time, so every step would tie. Real clock, and never
+    // earlier than this item's previous step even if the clock steps back.
+    createdAt: sql`greatest(clock_timestamp(), (select max(${orderItemTransitions.createdAt}) from ${orderItemTransitions} where ${orderItemTransitions.orderItemId} = ${itemId}) + interval '1 microsecond')`,
   });
 
   await audit(tx, {

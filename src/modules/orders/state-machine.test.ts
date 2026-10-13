@@ -1,4 +1,4 @@
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { beforeAll, describe, expect, it } from "vitest";
 import { withTenant } from "../../db/client";
 import { auditLog, orderItemTransitions, orders, outboxEvents } from "../../db/schema";
@@ -37,7 +37,8 @@ describe("orders state machine", () => {
       const transitions = await tx
         .select()
         .from(orderItemTransitions)
-        .where(eq(orderItemTransitions.orderItemId, item.id));
+        .where(eq(orderItemTransitions.orderItemId, item.id))
+        .orderBy(sql`created_at`, orderItemTransitions.id);
       expect(transitions.map((t) => t.toState)).toEqual([
         "ready",
         "on_sheet",
@@ -45,6 +46,18 @@ describe("orders state machine", () => {
         "pressed",
         "packed",
       ]);
+      // each step starts where the previous one ended
+      transitions.forEach((t, i) => {
+        if (i > 0) expect(t.fromState).toBe(transitions[i - 1]?.toState);
+      });
+      // B-418: strictly increasing at microsecond precision (a JS Date would tie at ms)
+      const ordered = await tx.execute(
+        sql`select bool_and(created_at > prev) as ok, count(prev) as n from (
+          select created_at, lag(created_at) over (order by created_at, id) as prev
+          from order_item_transitions where order_item_id = ${item.id}) x`,
+      );
+      expect(ordered.rows[0]?.ok).toBe(true);
+      expect(Number(ordered.rows[0]?.n)).toBe(4);
       const audits = await tx.select().from(auditLog).where(eq(auditLog.entityId, item.id));
       expect(audits).toHaveLength(5);
       const events = await tx

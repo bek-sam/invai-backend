@@ -647,12 +647,18 @@ export async function timeline(
     await tx.select({ id: orderItems.id }).from(orderItems).where(eq(orderItems.orderId, input.id))
   ).map((r) => r.id);
   const c = input.cursor ? decodeSort(input.cursor) : null;
+  // Sort and page on the full microsecond value: steps of one transaction are microseconds apart.
   const before = (at: PgColumn, id: PgColumn) =>
-    c ? or(lt(at, new Date(c.v)), and(eq(at, new Date(c.v)), lt(id, c.id))) : undefined;
+    c
+      ? or(lt(at, sql`${c.v}::timestamptz`), and(eq(at, sql`${c.v}::timestamptz`), lt(id, c.id)))
+      : undefined;
+  const atUs = (at: PgColumn) =>
+    sql<string>`to_char(${at} at time zone 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`.as("at_us");
 
   const tRows = await tx
     .select({
       t: orderItemTransitions,
+      atUs: atUs(orderItemTransitions.createdAt),
       userName: users.name,
       stationKind: stations.kind,
     })
@@ -675,7 +681,12 @@ export async function timeline(
       )
     : and(eq(auditLog.entityType, "order"), eq(auditLog.entityId, input.id));
   const aRows = await tx
-    .select({ a: auditLog, userName: users.name, stationKind: stations.kind })
+    .select({
+      a: auditLog,
+      atUs: atUs(auditLog.createdAt),
+      userName: users.name,
+      stationKind: stations.kind,
+    })
     .from(auditLog)
     .leftJoin(users, eq(users.id, auditLog.actorUserId))
     .leftJoin(stations, eq(stations.id, auditLog.stationId))
@@ -703,9 +714,9 @@ export async function timeline(
         : null,
   });
 
-  const entries: (TimelineEntry & { _at: Date })[] = [
-    ...tRows.map(({ t, userName, stationKind }) => ({
-      _at: t.createdAt,
+  const entries: (TimelineEntry & { _at: string })[] = [
+    ...tRows.map(({ t, atUs, userName, stationKind }) => ({
+      _at: atUs,
       id: t.id,
       at: t.createdAt.toISOString(),
       kind: "state_changed" as const,
@@ -717,8 +728,8 @@ export async function timeline(
       meta: t.data,
       ...reasonCodeFor(t.toState, t.reason),
     })),
-    ...aRows.map(({ a, userName, stationKind }) => ({
-      _at: a.createdAt,
+    ...aRows.map(({ a, atUs, userName, stationKind }) => ({
+      _at: atUs,
       id: a.id,
       at: a.createdAt.toISOString(),
       kind: AUDIT_KIND[a.action] ?? ("note" as const),
@@ -729,14 +740,14 @@ export async function timeline(
       message: a.summary,
       meta: { action: a.action, ...a.data },
     })),
-  ].sort((x, y) => y._at.getTime() - x._at.getTime() || (y.id > x.id ? 1 : -1));
+  ].sort((x, y) => (x._at === y._at ? (y.id > x.id ? 1 : -1) : y._at > x._at ? 1 : -1));
 
   const page = entries.slice(0, input.limit);
   const last = page[page.length - 1];
   return {
     items: page.map(({ _at, ...e }) => e),
     nextCursor:
-      entries.length > input.limit && last ? encodeSort({ v: last.at, id: last.id }) : null,
+      entries.length > input.limit && last ? encodeSort({ v: last._at, id: last.id }) : null,
   };
 }
 
