@@ -310,13 +310,17 @@ export function planClaimedDbCleanup(d: ClaimDescriptor | undefined): {
 export async function cleanClaimedDbLeftovers(d: ClaimDescriptor | undefined): Promise<number> {
   const plan = planClaimedDbCleanup(d);
   const desc = d as ClaimDescriptor;
-  const registry = new Redis(withDb(desc.baseUrl, desc.registryDb), { maxRetriesPerRequest: 1 });
+  // The token is checked in the REAL registry (DB 15, default prefix), never in whatever
+  // registryDb/key the descriptor carries: a caller-supplied registry must not authorize a delete
+  // (round-2 review finding).
+  const realKey = lockKey(plan.db, DEFAULT_KEY_PREFIX);
+  const registry = new Redis(withDb(desc.baseUrl, REGISTRY_DB), { maxRetriesPerRequest: 1 });
   registry.on("error", () => {});
   let target: Redis | undefined;
   try {
-    const held = await registry.get(desc.key);
+    const held = await registry.get(realKey);
     if (held !== desc.token) {
-      throw new Error(`clean-up refused: ${desc.key} does not hold this run's token`);
+      throw new Error(`clean-up refused: ${realKey} does not hold this run's token`);
     }
     target = new Redis(withDb(desc.baseUrl, plan.db), { maxRetriesPerRequest: 1 });
     target.on("error", () => {});

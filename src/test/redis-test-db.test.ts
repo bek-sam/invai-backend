@@ -177,6 +177,50 @@ describe("Redis DB policy outside test (API, worker, scripts) (T-49-3 AC6)", () 
     }
   });
 
+  it("uses the DB ioredis selects, including the db query parameter, and refuses ambiguity", async () => {
+    for (const tail of ["?db=15", "/?db=3", "?db=1", "/?db=8"]) {
+      const out = await bootRedisUrlExpectError({
+        NODE_ENV: "development",
+        REDIS_URL: `redis://localhost:6379${tail}`,
+      });
+      expect(out, tail).toMatch(/reserved/);
+    }
+    for (const tail of ["/2?db=15", "/0?db=15", "?db=3&db=12", "?db=abc"]) {
+      const out = await bootRedisUrlExpectError({
+        NODE_ENV: "development",
+        REDIS_URL: `redis://localhost:6379${tail}`,
+      });
+      expect(out, tail).toMatch(/two different|more than one|not a whole number/);
+    }
+    const ok = await bootRedisUrl({
+      NODE_ENV: "development",
+      REDIS_URL: "redis://localhost:6379?db=12",
+    });
+    expect(ok).toContain("db=12");
+  });
+
+  it("in test mode a pinned URL may not carry a db query at all", async () => {
+    for (const tail of ["?db=15", "/?db=3", "/12?db=12", "/2?db=15"]) {
+      const out = await bootRedisUrlExpectError({
+        NODE_ENV: "test",
+        REDIS_URL: "redis://localhost:6379/12",
+        TEST_REDIS_URL: `redis://localhost:6379${tail}`,
+      });
+      expect(out, tail).toMatch(/non-zero Redis DB|not allowed/);
+    }
+  });
+
+  it("the harness claim marker does not unlock a reserved DB outside test mode", async () => {
+    for (const db of [3, 15]) {
+      const out = await bootRedisUrlExpectError({
+        NODE_ENV: "development",
+        REDIS_URL: `redis://localhost:6379/${db}`,
+        INVAI_TEST_REDIS_CLAIMED: String(db),
+      });
+      expect(out, `DB ${db}`).toMatch(/reserved/);
+    }
+  });
+
   it("allows DB 0 (with or without a path), 9 and the pinned 10-14 stacks", async () => {
     for (const path of ["", "/0", "/9", "/10", "/14"]) {
       const url = await bootRedisUrl({

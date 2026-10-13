@@ -240,14 +240,37 @@ const CLAIM_MARK = "INVAI_TEST_REDIS_CLAIMED";
  * DB 0 (unset). Stricter than ioredis's `parseInt` on purpose (round-1 review finding, B-205).
  */
 function isPinnedNonZeroDb(url: string): boolean {
+  if (new URL(url).searchParams.has("db")) return false; // path only in test mode
   const path = new URL(url).pathname.replace(/^\//, "");
   return /^[1-9]\d*$/.test(path);
 }
 
-/** The DB ioredis would select: `parseInt` of the path (so `/1/` and `/01` are DB 1). */
+/**
+ * The DB ioredis would select. It reads the path (`parseInt`, path wins) and also a `db` query
+ * parameter (`redis://h:6379?db=15`). Ambiguous forms are refused instead of guessed: a repeated
+ * `db`, a non-integer `db`, or a path DB that differs from the `db` query (`/2?db=15`).
+ */
 function ioredisDb(url: string): number {
-  const n = Number.parseInt(new URL(url).pathname.replace(/^\//, ""), 10);
-  return Number.isNaN(n) ? 0 : n;
+  const u = new URL(url);
+  const pathDb = Number.parseInt(u.pathname.replace(/^\//, ""), 10);
+  const queries = u.searchParams.getAll("db");
+  if (queries.length > 1) throw new Error("REDIS_URL has more than one db query parameter");
+  let queryDb: number | undefined;
+  if (queries.length === 1) {
+    if (!/^\d+$/.test(queries[0] as string)) {
+      throw new Error("REDIS_URL has a db query parameter that is not a whole number");
+    }
+    queryDb = Number(queries[0]);
+  }
+  if (!Number.isNaN(pathDb)) {
+    if (queryDb !== undefined && queryDb !== pathDb) {
+      throw new Error(
+        `REDIS_URL names two different Valkey DBs (path ${pathDb}, ?db=${queryDb}); use the path only.`,
+      );
+    }
+    return pathDb;
+  }
+  return queryDb ?? 0;
 }
 
 /** Outside tests the API, worker and scripts must not sit in the harness (1-8) or registry (15) DBs. */

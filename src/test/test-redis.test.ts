@@ -23,7 +23,13 @@ const BASE_URL = `redis://${HOST}`;
 // using it can never take over a dead PID's claim: only the TTL frees a DB.
 const NON_LOOPBACK_URL = `redis://${HOST.replace(/^[^:]+/, "0.0.0.0")}`;
 // Registry for these tests: the DB this run itself claimed (never DB 15, never a shared one).
-const OWN_DB = Number(new URL(process.env.REDIS_URL as string).pathname.slice(1));
+// process.env.REDIS_URL is the raw DB-0 URL; the run's claimed DB is TEST_REDIS_URL.
+const OWN_DB = Number(
+  new URL((process.env.TEST_REDIS_URL ?? process.env.REDIS_URL) as string).pathname.slice(1),
+);
+if (OWN_DB < 1 || OWN_DB === 9 || OWN_DB === 15) {
+  throw new Error(`these tests write only in the run's own claimed DB, not ${OWN_DB}`);
+}
 const KEY_PREFIX = `tr-ut-${process.pid}-${randomUUID()}:`;
 
 const url = (db: number) => `${BASE_URL}/${db}`;
@@ -364,6 +370,31 @@ describe("scoped clean-up (AC5)", () => {
       // nothing left to clean: the clean-up emptied the DB this run claimed
       claimed.disconnect();
       app0.disconnect();
+    }
+  });
+
+  it("verifies the token in the REAL registry: a caller-supplied registry DB/prefix cannot authorize a delete", async () => {
+    // Forge a descriptor whose own registry (the run's claimed DB, test prefix) "holds" the token.
+    // The real registry (DB 15, default prefix) does not, so nothing may be deleted.
+    const forgedToken = `forged-${randomUUID()}`;
+    const forgedKey = `${KEY_PREFIX}${OWN_DB}`;
+    const sentinel = `${KEY_PREFIX}sentinel`;
+    await admin.set(forgedKey, forgedToken);
+    await admin.set(sentinel, "keep");
+    try {
+      const forged: ClaimDescriptor = {
+        baseUrl: BASE_URL,
+        db: OWN_DB,
+        registryDb: OWN_DB,
+        key: forgedKey,
+        token: forgedToken,
+        pinned: false,
+      };
+      await expect(cleanClaimedDbLeftovers(forged)).rejects.toThrow(/does not hold/);
+      expect(await admin.get(sentinel)).toBe("keep");
+      expect(await admin.get(forgedKey)).toBe(forgedToken);
+    } finally {
+      await admin.del(forgedKey, sentinel);
     }
   });
 
