@@ -312,4 +312,11 @@ describe("floor non-GET procedures are classified by hand (T-56-1, B-479)", () =
     expect(bucketFor(p, meta(), "POST", { sessionKind: null, stationId: null })).toBe("writes");
     expect(bucketFor(["shipping", "batchBuy"], meta(), "POST", floorSession)).toBe("writes");
   });
+
+  it("a station-token session (sessionKind station) is never on scans (B-487)", () => {
+    const p = ["production", "scan"];
+    expect(bucketFor(p, meta(), "POST", { sessionKind: "station", stationId: "s1" })).toBe(
+      "writes",
+    );
+  });
 });

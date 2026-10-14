@@ -1,10 +1,10 @@
 import { isIP } from "node:net";
 import { type Permission, ROLE_PERMISSIONS } from "@invai/contracts";
-import { and, eq } from "drizzle-orm";
+import { and, eq, isNull } from "drizzle-orm";
 import { auth } from "../auth";
 import { db, withTenant } from "../db/client";
 import type { CompanyType, Role, StationKind } from "../db/schema";
-import { companies, members, stations, users } from "../db/schema";
+import { companies, members, stations, stationTokens, users } from "../db/schema";
 import type { Actor } from "../lib/audit";
 import { logger } from "../lib/log";
 import { logContext } from "../lib/log-context";
@@ -183,11 +183,28 @@ async function floorContext(ctx: Context, token: string): Promise<Context | null
     )
     .limit(1);
   if (!company || !user) return null;
+  // B-487: one uncached join, so the session's own station must be active and its own token live
+  // (`tid` must belong to station `sid`) in every API process at once, not only after the 30 s
+  // cache behind `isStationTokenLive` expires. A forged or stale `sid` finds no row.
   const station = await withTenant(session.companyId, async (tx) => {
     const [s] = await tx
       .select({ id: stations.id, name: stations.name, kind: stations.kind })
       .from(stations)
-      .where(eq(stations.id, session.stationId))
+      .innerJoin(
+        stationTokens,
+        and(
+          eq(stationTokens.stationId, stations.id),
+          eq(stationTokens.companyId, stations.companyId),
+        ),
+      )
+      .where(
+        and(
+          eq(stations.id, session.stationId),
+          eq(stationTokens.id, session.stationTokenId),
+          isNull(stationTokens.revokedAt),
+          eq(stations.active, true),
+        ),
+      )
       .limit(1);
     return s ?? null;
   });
