@@ -23,7 +23,6 @@ import {
   asc,
   desc,
   eq,
-  gt,
   gte,
   ilike,
   inArray,
@@ -312,9 +311,11 @@ function decodeSort(cursor: string): SortCursor {
 
 function sortKeyset(col: PgColumn, idCol: PgColumn, dir: "asc" | "desc", cursor?: string) {
   const c = cursor ? decodeSort(cursor) : null;
-  const cmp = dir === "asc" ? gt : lt;
+  // Row comparison so Postgres can use it as an index condition (the OR form is only a filter).
+  // Sort columns are NOT NULL, so this equals ship_by > v OR (ship_by = v AND id > c).
+  const op = dir === "asc" ? sql.raw(">") : sql.raw("<");
   const where = c
-    ? or(cmp(col, new Date(c.v)), and(eq(col, new Date(c.v)), cmp(idCol, c.id)))
+    ? sql`(${col}, ${idCol}) ${op} (${sql.param(new Date(c.v), col)}, ${sql.param(c.id, idCol)})`
     : undefined;
   const orderBy = dir === "asc" ? [asc(col), asc(idCol)] : [desc(col), desc(idCol)];
   return { where, orderBy };
@@ -376,24 +377,27 @@ function orderFilters(ctx: TenantContext, f: OrderFilters): (SQL | undefined)[] 
   return out;
 }
 
-export async function listOrders(
-  tx: Tx,
-  ctx: TenantContext,
-  input: OrderFilters & {
-    cursor?: string;
-    limit: number;
-    sort: "shipBy" | "placedAt" | "updatedAt";
-    dir: "asc" | "desc";
-  },
-) {
+type ListOrdersInput = OrderFilters & {
+  cursor?: string;
+  limit: number;
+  sort: "shipBy" | "placedAt" | "updatedAt";
+  dir: "asc" | "desc";
+};
+
+/** The orders.list query builder (not awaited); list-plan.test.ts runs EXPLAIN on this exact SQL. */
+export function listOrdersQuery(tx: Tx, ctx: TenantContext, input: ListOrdersInput) {
   const col = { shipBy: orders.shipBy, placedAt: orders.placedAt, updatedAt: orders.updatedAt }[
     input.sort
   ];
   const page = sortKeyset(col, orders.id, input.dir, input.cursor);
-  const rows = await orderQuery(tx)
+  return orderQuery(tx)
     .where(and(...orderFilters(ctx, input), page.where))
     .orderBy(...page.orderBy)
     .limit(input.limit + 1);
+}
+
+export async function listOrders(tx: Tx, ctx: TenantContext, input: ListOrdersInput) {
+  const rows = await listOrdersQuery(tx, ctx, input);
   const pageRows = rows.slice(0, input.limit);
   const last = pageRows[pageRows.length - 1];
   return {

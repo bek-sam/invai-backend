@@ -126,6 +126,7 @@ export const orders = pgTable(
     tenantKey("orders", t),
     uniqueIndex().on(t.companyId, t.channel, t.channelOrderId),
     index().on(t.companyId, t.status, t.shipBy),
+    index().on(t.companyId, t.shipBy, t.id),
     index().on(t.companyId, t.placedAt),
     index().on(t.companyId, t.orderNo),
     index().on(t.companyId, t.connectionId),

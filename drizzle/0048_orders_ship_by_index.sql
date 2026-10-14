@@ -1,0 +1,1 @@
+CREATE INDEX "orders_company_id_ship_by_id_index" ON "orders" USING btree ("company_id","ship_by","id");

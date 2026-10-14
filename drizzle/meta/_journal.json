@@ -337,6 +337,13 @@
       "when": 1791943439254,
       "tag": "0047_orders_notes",
       "breakpoints": true
+    },
+    {
+      "idx": 48,
+      "version": "7",
+      "when": 1791990669363,
+      "tag": "0048_orders_ship_by_index",
+      "breakpoints": true
     }
   ]
 }
