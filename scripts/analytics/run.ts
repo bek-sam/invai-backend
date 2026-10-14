@@ -6,13 +6,13 @@ import { companies } from "../../src/db/schema";
 import { QUERY_NAMES, type QueryName, type Row, runQuery } from "./queries";
 
 /*
- * pnpm analytics --company <slug> --from <YYYY-MM-DD> --to <YYYY-MM-DD> [--query late_rate|overdue_open|film_use|reprint|profit] [--now <ISO instant>]
+ * pnpm analytics --company <slug> --from <YYYY-MM-DD> --to <YYYY-MM-DD> [--query late_rate|overdue_open|film_use|reprint|profit] [--now <ISO instant, overdue_open only>]
  *
  * One shop per run, window [from, to) in the shop's time zone. Prints one JSON document with
  * aggregates only (counts, cents, percents) and the shop's own id on every row. It reads through
  * withTenantReadOnly (app role, read-only transaction); it never uses the owner role and never
- * touches a buyer table. --now (overdue_open only) replaces the database clock with an ISO instant, so a
- * test or a past-day report can pin "now". Exit 0 ok, 1 database or lookup failure, 2 bad arguments.
+ * touches a buyer table. --now affects only overdue_open: it replaces the database clock with an ISO instant, so
+ * a test or a past-day report can pin "now"; every other query ignores it. Exit 0 ok, 1 database or lookup failure, 2 bad arguments.
  */
 
 export type Report = {
@@ -127,7 +127,7 @@ export async function main(argv: string[]): Promise<number> {
     });
     if (!values.company || !values.from || !values.to)
       throw new UsageError(
-        "usage: --company <slug> --from <YYYY-MM-DD> --to <YYYY-MM-DD> [--query <name>] [--now <ISO instant>]",
+        "usage: --company <slug> --from <YYYY-MM-DD> --to <YYYY-MM-DD> [--query <name>] [--now <ISO instant, overdue_open only>]",
       );
     const query = values.query as QueryName | undefined;
     if (query && !QUERY_NAMES.includes(query))

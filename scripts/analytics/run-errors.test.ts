@@ -39,6 +39,8 @@ describe("runner after a database error (B-470)", () => {
     );
     const err = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const ownerConnect = vi.spyOn(client.systemPool, "connect");
+    const ownerQuery = vi.spyOn(client.systemPool, "query");
     try {
       const code = await main([
         "--company",
@@ -53,9 +55,14 @@ describe("runner after a database error (B-470)", () => {
       expect(log).not.toHaveBeenCalled();
       expect(JSON.stringify(err.mock.calls)).not.toContain(SECRET);
       expect(client.closeDb).toHaveBeenCalledTimes(1);
+      // B-477: the run never used the owner pool, also on the failure path
+      expect(ownerConnect).not.toHaveBeenCalled();
+      expect(ownerQuery).not.toHaveBeenCalled();
     } finally {
       err.mockRestore();
       log.mockRestore();
+      ownerConnect.mockRestore();
+      ownerQuery.mockRestore();
     }
   });
 

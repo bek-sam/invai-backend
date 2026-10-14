@@ -88,6 +88,9 @@ const forbidden = [
   /pg_ls_dir/i,
   /pg_stat_file/i,
   /\b(query|cursor|table|schema|database)_to_xml/i,
+  // wave 56, S-96 (A4.1): Unicode-escaped identifiers and strings hide any word above. Literal, so linear.
+  /u&/i,
+  /uescape/i,
 ];
 
 // One planted statement per denied word (wave 55, A2.4): each must be caught by some pattern.
@@ -123,6 +126,14 @@ const planted: Array<[string, string]> = [
   ["table_to_xml", "SELECT table_to_xml('orders', true, true, '')"],
   ["schema_to_xml", "SELECT schema_to_xml('public', true, true, '')"],
   ["database_to_xml", "SELECT database_to_xml(true, true, '')"],
+  // wave 56, S-96 (A4.2): escaped spellings of denied words, checked on the stripped text
+  ["escaped set_config", "SELECT U&\"\\0073et\\005fconfig\"('app.company_id','x',true)"],
+  ["escaped query_to_xml", "SELECT U&\"query\\005fto\\005fxml\"('select 1',true,true,'')"],
+  ["U& string", "SELECT u&'x'"],
+  ["U& with UESCAPE", "SELECT U&\"x!0073\" UESCAPE '!'"],
+  ["U& lower case, space before quote", 'SELECT u& "x"'],
+  ["UESCAPE alone", "SELECT 'x' uescape '!'"],
+  ["UESCAPE alone, upper case", "SELECT 'x' UESCAPE '!'"],
 ];
 
 describe("deny list refuses each planted statement (A2.4)", () => {
@@ -134,6 +145,24 @@ describe("deny list refuses each planted statement (A2.4)", () => {
   it("lets a CASE ... END, a comment and plain reads through", () => {
     const ok = "SELECT CASE WHEN a THEN 1 END FROM orders -- begin commit\nWHERE x = :company_id";
     expect(forbidden.some((re) => re.test(stripComments(ok)))).toBe(false);
+  });
+});
+
+describe("escape patterns are linear (S-96, A4.1)", () => {
+  for (const unit of ["u&", 'U&"', "uescap ", "u ", "uesc&"])
+    it(`200 KB of ${JSON.stringify(unit)} scans in under 50 ms`, () => {
+      const text = unit.repeat(Math.ceil(200_000 / unit.length));
+      const t0 = performance.now();
+      for (const re of forbidden.slice(-2)) re.test(text);
+      expect(performance.now() - t0).toBeLessThan(50);
+    });
+
+  it("the committed SQL files contain neither pattern (no false positive)", () => {
+    for (const f of sqlFiles) {
+      const body = stripComments(read(join(here, f)));
+      expect(/u&/i.test(body), f).toBe(false);
+      expect(/uescape/i.test(body), f).toBe(false);
+    }
   });
 });
 
