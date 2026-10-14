@@ -1,5 +1,5 @@
 import { type NormalizedOrder, NormalizedOrder as NormalizedOrderSchema } from "@invai/contracts";
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, eq, inArray, or, sql } from "drizzle-orm";
 import type { TenantContext } from "../../api/context";
 import { afterCommit, type Tx } from "../../db/client";
 import {
@@ -11,8 +11,10 @@ import {
   orderItemTransitions,
   orders,
 } from "../../db/schema";
+import { env } from "../../env";
 import type { ChannelHold, ChannelLineCancel } from "../../integrations/channels/types";
 import { audit } from "../../lib/audit";
+import { hmacHex } from "../../lib/crypto";
 import { emit } from "../../lib/outbox";
 import { publish } from "../../lib/realtime";
 import { sanitizeDeep } from "../../lib/text-safety";
@@ -785,6 +787,11 @@ async function locallyCancelled(tx: Tx, ids: string[]): Promise<Set<string>> {
   return new Set(rows.filter((r) => r.reason !== "channel_cancelled").map((r) => r.id));
 }
 
+/** The fingerprint holds the buyer's personalization answers; the append-only audit row keeps a keyed hash (decision 0027). */
+function fingerprintHash(fingerprint: string): string {
+  return hmacHex(env.BETTER_AUTH_SECRET, `edit-after-press:${fingerprint}`);
+}
+
 /**
  * Flag pressed units the channel tried to change. Once per edit: a flag the shop cleared isn't
  * raised again for the same channel values. Returns whether anything was flagged.
@@ -796,6 +803,7 @@ async function flagPressed(
 ): Promise<boolean> {
   let any = false;
   for (const f of flags) {
+    const hashed = fingerprintHash(f.fingerprint);
     const [seen] = await tx
       .select({ id: auditLog.id })
       .from(auditLog)
@@ -805,7 +813,10 @@ async function flagPressed(
           eq(auditLog.entityType, "order_item"),
           eq(auditLog.entityId, f.item.id),
           eq(auditLog.action, "item.flag"),
-          sql`${auditLog.data}->>'fingerprint' = ${f.fingerprint}`,
+          or(
+            sql`${auditLog.data}->>'fingerprint' = ${hashed}`,
+            sql`${auditLog.data}->>'fingerprint' = ${f.fingerprint}`,
+          ),
         ),
       )
       .limit(1);
@@ -829,7 +840,7 @@ async function flagPressed(
         orderId: f.item.orderId,
         code: "channel_edit_after_press",
         active: true,
-        fingerprint: f.fingerprint,
+        fingerprint: hashed,
       },
     });
     afterCommit(tx, async () => {

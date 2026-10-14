@@ -35,6 +35,12 @@ export type TransitionOptions = {
   actor: Actor;
   /** The station kind for floor scans, recorded on the transition and the event. */
   stationKind?: StationKind | null;
+  /**
+   * Closed vocabulary only: a code, an enum value (`reprint: <ReprintReason>`, hold and cancel
+   * reasons) or a fixed phrase. Never text a person typed about a buyer: this lands in the
+   * append-only `order_item_transitions` and `audit_log` rows (decision 0027). A shop-typed sheet
+   * name (`on sheet <name>`) is allowed; sheet text is not buyer text.
+   */
   reason?: string | null;
   data?: Record<string, unknown>;
 };

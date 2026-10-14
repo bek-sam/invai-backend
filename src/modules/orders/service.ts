@@ -848,7 +848,6 @@ export async function holdOrder(
       actor: ctx.actor,
       reason: input.reason,
       data: {
-        note: input.note,
         ...(input.channelSignal ? { channelSignal: input.channelSignal } : {}),
       },
     });
@@ -1066,7 +1065,6 @@ export async function cancelOrder(
     await transitionItem(tx, i.id, "cancelled", {
       actor: ctx.actor,
       reason: input.reason,
-      data: { note: input.note },
     });
   const ids = targets.map((i) => i.id);
   await releaseForItems(tx, ctx, ids);
