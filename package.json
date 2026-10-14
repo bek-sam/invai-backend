@@ -17,10 +17,12 @@
     "db:migrate": "tsx src/db/migrate-cli.ts",
     "db:reset": "tsx src/db/reset.ts",
     "db:seed": "tsx src/db/seed/index.ts",
+    "db:seed:scale": "tsx src/db/seed/scale/index.ts",
     "db:studio": "drizzle-kit studio",
     "test": "vitest run --passWithNoTests",
     "test:watch": "vitest",
     "test:valkey-registry-clean": "tsx scripts/test-valkey-registry-clean.ts",
+    "analytics": "tsx scripts/analytics/run.ts",
     "evals": "tsx evals/run.ts"
   },
   "dependencies": {

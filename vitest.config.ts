@@ -2,7 +2,7 @@ import { defineConfig } from "vitest/config";
 
 export default defineConfig({
   test: {
-    include: ["src/**/*.test.ts"],
+    include: ["src/**/*.test.ts", "scripts/analytics/**/*.test.ts"],
     globalSetup: ["src/test/global-setup.ts"],
     // setup-env.ts must run first: it reads the per-run DATABASE_URL/MIGRATION_DATABASE_URL/
     // REDIS_URL global-setup.ts claimed (T-P1-1) via Vitest's provide()/inject() channel and

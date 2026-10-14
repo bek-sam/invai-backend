@@ -12,6 +12,6 @@
     }
   },
   "files": {
-    "includes": ["src/**", "*.ts", "*.json"]
+    "includes": ["src/**", "scripts/analytics/**", "*.ts", "*.json"]
   }
 }

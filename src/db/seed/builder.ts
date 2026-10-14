@@ -173,8 +173,8 @@ export type ShopSeedResult = {
 /** The full Desert Bloom volumes. A demo uses a smaller slice of the same shape. */
 export const FULL_VOLUME = { historicalOrders: 300, dueSoonOrders: 60, adSpendDays: 30 };
 
-type NestItemLike = { id: string; widthIn: number; heightIn: number };
-type SheetPlan<T> = {
+export type NestItemLike = { id: string; widthIn: number; heightIn: number };
+export type SheetPlan<T> = {
   lengthIn: number;
   utilization: number;
   placements: { item: T; xIn: number; yIn: number; rotated: boolean }[];
@@ -187,7 +187,7 @@ type SheetPlan<T> = {
  * opening a new one, so a later narrower item can backfill a wide item's leftover width) only
  * runs if imaging is unreachable, so the seed can still finish. It never rotates.
  */
-function ffdPack<T extends NestItemLike>(items: T[], spec: SheetSpec): SheetPlan<T> {
+export function ffdPack<T extends NestItemLike>(items: T[], spec: SheetSpec): SheetPlan<T> {
   const { marginIn, spacingIn, widthIn: filmIn } = spec;
   const usableIn = filmIn - 2 * marginIn;
   const order = items
