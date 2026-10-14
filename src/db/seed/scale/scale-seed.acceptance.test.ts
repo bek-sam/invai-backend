@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { readFileSync, statSync } from "node:fs";
+import { readFileSync, rmSync, statSync } from "node:fs";
 import { promisify } from "node:util";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -318,6 +318,7 @@ describe("T-55-3 phase 1: floor logins, shipments and fake buyer data", () => {
     const openIds = new Set(open.map((r) => r.id));
     for (const t of got.floor.scanTargets) expect(openIds.has(t)).toBe(true);
     expect(readFileSync(file, "utf8")).not.toMatch(/@example\.com/);
+    rmSync(file, { force: true });
   });
 
   it("AC2: one shipment per order with a shipped or delivered unit, consistent with the units", async () => {
