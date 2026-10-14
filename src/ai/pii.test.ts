@@ -505,6 +505,8 @@ describe("stripPii email forms (T-54-4)", () => {
     ["\u{1D423}\u{1D428}@x.com", "[email]"],
     ["ab\u{1D423}\u{1D428}cd@x.com", "[email]"],
     ["foo\uFF20\uFF20x.com", "[email]"],
+    ["jo@a\uFF0Eb\uFF0Ecom", "[email]"],
+    ["a@b.cc\uDC00@x.com", "[email]\uDC00@x.com"],
     [`"${"a".repeat(254)}"@x.com`, "[email]"],
     [`"${"a".repeat(255)}"@x.com`, `"${"a".repeat(255)}"@x.com`],
   ])("%s -> %s", (text, out) => {
@@ -580,6 +582,8 @@ describe("stripPii stays linear on the T-54-4 shapes", () => {
     ["backslash run then quote then @", `"${"\\".repeat(KB200)}"@x.com`],
     ["escaped quotes then @ repeated", '"\\"@b.cc '.repeat(25_000)],
     ["1 MB backslash quotes then one @", `${'"\\'.repeat(500_000)}@x.com`],
+    ["escaped quote then @ repeated, no opener", '\\"@b.cc '.repeat(25_000)],
+    ["1 MB escaped quote then @ repeated, no opener", '\\"@b.cc '.repeat(125_000)],
     ["zero-width run before one @", `${"\u200B".repeat(KB200)}@x.com`],
     ["zero-width a pairs before one @", `${"a\u200B".repeat(100_000)}@x.com`],
     ["astral letters before one @", `${"\u{1D423}".repeat(100_000)}@x.com`],
