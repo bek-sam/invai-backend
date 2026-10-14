@@ -29,13 +29,13 @@ res AS (
   SELECT 'all' AS reason, count(*)::int AS reprints, (SELECT n FROM pressed) AS items_pressed,
          CASE WHEN (SELECT n FROM pressed) >= 30
               THEN round(100.0 * count(*) / (SELECT n FROM pressed), 1)::float8 END AS rate_pct,
-         coalesce(sum(cost_cents), 0)::int AS cost_cents
+         coalesce(sum(cost_cents), 0)::bigint AS cost_cents
   FROM rp
   UNION ALL
   SELECT reason, count(*)::int, (SELECT n FROM pressed),
          CASE WHEN (SELECT n FROM pressed) >= 30
               THEN round(100.0 * count(*) / (SELECT n FROM pressed), 1)::float8 END,
-         coalesce(sum(cost_cents), 0)::int
+         coalesce(sum(cost_cents), 0)::bigint
   FROM rp GROUP BY reason)
 SELECT reason, reprints, items_pressed, rate_pct, cost_cents
 FROM res ORDER BY (reason <> 'all'), reason

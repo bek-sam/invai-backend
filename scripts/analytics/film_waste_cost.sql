@@ -9,8 +9,8 @@ w AS (
   SELECT (:from::date::timestamp AT TIME ZONE c.timezone) AS f,
          (:to::date::timestamp AT TIME ZONE c.timezone) AS t FROM c)
 SELECT count(g.id)::int AS sheets,
-  coalesce(sum(g.cost_cents), 0)::int AS film_cost_cents,
-  round(coalesce(sum(g.cost_cents * (1 - g.utilization)), 0))::int AS film_waste_cents,
+  coalesce(sum(g.cost_cents), 0)::bigint AS film_cost_cents,
+  round(coalesce(sum(g.cost_cents * (1 - g.utilization)), 0))::bigint AS film_waste_cents,
   CASE WHEN count(g.id) >= 10
        THEN round((100 * sum(g.utilization * g.length_in) / nullif(sum(g.length_in), 0))::numeric, 1)::float8
   END AS film_use_pct,

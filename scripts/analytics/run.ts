@@ -6,12 +6,13 @@ import { companies } from "../../src/db/schema";
 import { QUERY_NAMES, type QueryName, type Row, runQuery } from "./queries";
 
 /*
- * pnpm analytics --company <slug> --from <YYYY-MM-DD> --to <YYYY-MM-DD> [--query late_rate|film_use|reprint|profit]
+ * pnpm analytics --company <slug> --from <YYYY-MM-DD> --to <YYYY-MM-DD> [--query late_rate|overdue_open|film_use|reprint|profit] [--now <ISO instant>]
  *
  * One shop per run, window [from, to) in the shop's time zone. Prints one JSON document with
  * aggregates only (counts, cents, percents) and the shop's own id on every row. It reads through
  * withTenantReadOnly (app role, read-only transaction); it never uses the owner role and never
- * touches a buyer table. Exit 0 ok, 1 database or lookup failure, 2 bad arguments.
+ * touches a buyer table. --now (overdue_open only) replaces the database clock with an ISO instant, so a
+ * test or a past-day report can pin "now". Exit 0 ok, 1 database or lookup failure, 2 bad arguments.
  */
 
 export type Report = {
@@ -23,6 +24,8 @@ export type Report = {
     to: string;
     data_label: "SEED" | "NOT_SEED";
     queries: QueryName[];
+    /** The instant overdue_open used as now: the --now value, or null for the database clock. */
+    now: string | null;
     note: string;
   };
   queries: Partial<Record<QueryName, Array<Row & { company_id: string }>>>;
@@ -46,6 +49,15 @@ export function parseWindow(from: string, to: string) {
   return { from, to };
 }
 
+const ISO_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?(Z|[+-]\d{2}:\d{2})$/;
+
+/** An ISO 8601 instant with a zone, as typed on the command line. */
+export function parseNow(value: string): string {
+  if (!ISO_INSTANT.test(value) || Number.isNaN(Date.parse(value)))
+    throw new UsageError("--now must be an ISO instant such as 2026-10-14T12:00:00Z");
+  return value;
+}
+
 /** The demo shop and the scale-profile shops hold generated data, never a business result. */
 export function isSeedSlug(slug: string): boolean {
   return slug === "desert-bloom-tees" || slug.startsWith("seed-scale-");
@@ -56,8 +68,10 @@ export async function runReport(input: {
   from: string;
   to: string;
   queries?: readonly QueryName[];
+  now?: string;
 }): Promise<Report> {
   const { from, to } = parseWindow(input.from, input.to);
+  const now = input.now === undefined ? null : parseNow(input.now);
   const queries = [...(input.queries ?? QUERY_NAMES)];
   // The one lookup outside a tenant scope: `companies` has no RLS, so it is read by slug here and
   // only by the bound id inside the queries.
@@ -70,7 +84,7 @@ export async function runReport(input: {
   const out: Report["queries"] = {};
   await withTenantReadOnly(company.id, async (tx) => {
     for (const name of queries) {
-      const rows = await runQuery(tx, name, { companyId: company.id, from, to });
+      const rows = await runQuery(tx, name, { companyId: company.id, from, to, now });
       out[name] = rows.map((r) => ({ company_id: company.id, ...r }));
     }
   });
@@ -83,6 +97,7 @@ export async function runReport(input: {
       to,
       data_label: isSeedSlug(company.slug) ? "SEED" : "NOT_SEED",
       queries,
+      now,
       note: "Aggregates only. Window [from, to) in the shop time zone. Percents are null below each metric's minimum sample.",
     },
     queries: out,
@@ -106,12 +121,13 @@ export async function main(argv: string[]): Promise<number> {
         from: { type: "string" },
         to: { type: "string" },
         query: { type: "string" },
+        now: { type: "string" },
       },
       strict: true,
     });
     if (!values.company || !values.from || !values.to)
       throw new UsageError(
-        "usage: --company <slug> --from <YYYY-MM-DD> --to <YYYY-MM-DD> [--query <name>]",
+        "usage: --company <slug> --from <YYYY-MM-DD> --to <YYYY-MM-DD> [--query <name>] [--now <ISO instant>]",
       );
     const query = values.query as QueryName | undefined;
     if (query && !QUERY_NAMES.includes(query))
@@ -122,6 +138,7 @@ export async function main(argv: string[]): Promise<number> {
       from: values.from,
       to: values.to,
       queries: query ? [query] : undefined,
+      now: values.now,
     });
     if (systemPool.totalCount !== 0) throw new Error("owner pool was used");
   } catch (err) {

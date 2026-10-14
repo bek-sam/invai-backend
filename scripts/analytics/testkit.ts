@@ -58,6 +58,8 @@ export type OrderSpec = {
   units?: number;
   rush?: boolean;
   personalized?: boolean;
+  /** State per unit, in unit order; units without an entry keep the default `imported`. */
+  itemStates?: Array<(typeof orderItems.$inferInsert)["state"]>;
 };
 
 export type MadeOrder = { orderId: string; itemIds: string[] };
@@ -102,6 +104,7 @@ export async function makeOrders(shop: Shop, specs: OrderSpec[]): Promise<MadeOr
             title: "Test tee",
             unitPriceCents: 2500,
             shipBy: spec.shipBy ?? now,
+            ...(spec.itemStates?.[u] ? { state: spec.itemStates[u] } : {}),
           }));
         }),
       )

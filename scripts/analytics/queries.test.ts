@@ -2,8 +2,8 @@ import { beforeAll, describe, expect, it, vi } from "vitest";
 import * as client from "../../src/db/client";
 import { db, systemPool } from "../../src/db/client";
 import { getProfit } from "../../src/modules/finance/service";
-import { COLUMNS, type QueryName, type Row, readQuerySql, runQuery } from "./queries";
-import { isSeedSlug, parseWindow, type Report, runReport } from "./run";
+import { COLUMNS, normalizeRow, type QueryName, type Row, readQuerySql, runQuery } from "./queries";
+import { isSeedSlug, parseNow, parseWindow, type Report, runReport } from "./run";
 import {
   addProfitLines,
   addRefunds,
@@ -609,18 +609,23 @@ describe("tenant scope and empty windows (AC9, AC12, AC13)", () => {
     });
   });
 
-  it("counts nothing when no company is set on the connection", async () => {
+  it("counts nothing, without an error, when no company is set on the connection (A2.6)", async () => {
     const params = { companyId: a.id, from: FROM, to: TO };
-    const outcome = await db
-      .transaction((tx) => runQuery(tx, "late_rate", params))
-      .then((rows) => ({ rows }))
-      .catch((error: unknown) => ({ error }));
-    // either RLS hides every row, or the policy refuses to run without a company
-    if ("rows" in outcome) {
-      expect(find(outcome.rows, { driver: "all" })).toMatchObject({ shipped: 0 });
-    } else {
-      expect(outcome.error).toBeDefined();
-    }
+    // precondition: the same window with the company set is not empty
+    const withCompany = await runReport({
+      slug: a.slug,
+      from: FROM,
+      to: TO,
+      queries: ["late_rate"],
+    });
+    expect(find(rowsOf(withCompany, "late_rate"), { driver: "all" })).toMatchObject({ shipped: 3 });
+    // currentCompanyId is NULL here, so RLS hides every row; the query itself must not fail
+    const rows = await db.transaction((tx) => runQuery(tx, "late_rate", params));
+    expect(find(rows, { driver: "all" })).toMatchObject({
+      shipped: 0,
+      late: 0,
+      late_rate_pct: null,
+    });
   });
 
   it("returns one totals row per query, zero counts and null percents, for an empty window", async () => {
@@ -632,6 +637,15 @@ describe("tenant scope and empty windows (AC9, AC12, AC13)", () => {
         shipped: 0,
         late: 0,
         late_rate_pct: null,
+      }),
+    ]);
+    expect(rowsOf(rep, "overdue_open")).toEqual([
+      expect.objectContaining({
+        channel: "all",
+        overdue_orders: 0,
+        on_hold_orders: 0,
+        partly_shipped_orders: 0,
+        open_units: 0,
       }),
     ]);
     expect(rowsOf(rep, "film_use")).toEqual([
@@ -700,5 +714,269 @@ describe("tenant scope and empty windows (AC9, AC12, AC13)", () => {
       to: "2026-06-04",
     });
     expect(readQuerySql("film_use")).toContain(":company_id");
+  });
+});
+
+/* ---------------------------- overdue open (AC4, T-55-2) ---------------------------- */
+
+describe("overdue_open (spec AC4; definition overdue_open.md)", () => {
+  const TZ = "America/Los_Angeles";
+  const NOW = "2026-05-20T10:00:00Z";
+  const nowAt = new Date(NOW);
+  const at = (ms: number) => new Date(nowAt.getTime() + ms);
+  const day = 86_400_000;
+  let shop: Shop;
+
+  beforeAll(async () => {
+    shop = await makeShop(TZ);
+    const { fromAt } = await window(TZ);
+    await makeOrders(shop, [
+      // counted: plain overdue, one second before now, an order with its first unit at the start edge
+      { channel: "etsy", shipBy: at(-day) },
+      { channel: "etsy", shipBy: at(-1000) },
+      { channel: "csv", shipBy: fromAt, units: 1 },
+      // held: counted, in on_hold_orders; a held order with a shipped unit is not also partly shipped
+      { channel: "etsy", shipBy: at(-day), status: "on_hold" },
+      {
+        channel: "amazon",
+        shipBy: at(-day),
+        status: "on_hold",
+        units: 2,
+        itemStates: ["shipped", "packed"],
+      },
+      // partly shipped: counted once at order grain; only the 2 unshipped units are open
+      {
+        channel: "amazon",
+        shipBy: at(-2 * day),
+        status: "partially_shipped",
+        units: 3,
+        itemStates: ["shipped", "packed", "packed"],
+      },
+      // two units, one cancelled: one open unit
+      {
+        channel: "csv",
+        shipBy: at(-day),
+        status: "in_production",
+        units: 2,
+        itemStates: ["pressed", "cancelled"],
+      },
+      // not counted: ship-by exactly now, in the future, shipped, delivered, cancelled, before the window
+      { channel: "etsy", shipBy: nowAt },
+      { channel: "etsy", shipBy: at(1000) },
+      { channel: "etsy", shipBy: at(-day), status: "shipped", shippedAt: at(-day / 2) },
+      { channel: "etsy", shipBy: at(-day), status: "delivered", shippedAt: at(-day / 2) },
+      { channel: "etsy", shipBy: at(-day), status: "cancelled" },
+      { channel: "etsy", shipBy: new Date(fromAt.getTime() - 1) },
+    ]);
+  });
+
+  const overdue = async (s: Shop, extra: { from?: string; to?: string; now?: string } = {}) =>
+    rowsOf(
+      await runReport({
+        slug: s.slug,
+        from: extra.from ?? FROM,
+        to: extra.to ?? TO,
+        queries: ["overdue_open"],
+        now: extra.now ?? NOW,
+      }),
+      "overdue_open",
+    );
+
+  it("counts each open order once under its channel, with the pinned columns and the shop id", async () => {
+    const rows = await overdue(shop);
+    expect(rows.map((r) => keys(r))).toEqual(rows.map(() => COLUMNS.overdue_open));
+    expect(rows).toEqual([
+      expect.objectContaining({
+        channel: "all",
+        overdue_orders: 7,
+        on_hold_orders: 2,
+        partly_shipped_orders: 1,
+        open_units: 8,
+      }),
+      expect.objectContaining({
+        channel: "amazon",
+        overdue_orders: 2,
+        on_hold_orders: 1,
+        partly_shipped_orders: 1,
+        open_units: 3,
+      }),
+      expect.objectContaining({
+        channel: "csv",
+        overdue_orders: 2,
+        on_hold_orders: 0,
+        partly_shipped_orders: 0,
+        open_units: 2,
+      }),
+      expect.objectContaining({
+        channel: "etsy",
+        overdue_orders: 3,
+        on_hold_orders: 1,
+        partly_shipped_orders: 0,
+        open_units: 3,
+      }),
+    ]);
+    for (const r of rows) expect(r.company_id).toBe(shop.id);
+  });
+
+  it("pins now: ship-by exactly now is not overdue, one second before is", async () => {
+    // a window that holds only the two orders around now
+    const one = await makeShop(TZ);
+    await makeOrders(one, [{ shipBy: at(-1000) }, { shipBy: nowAt }, { shipBy: at(1000) }]);
+    expect(await overdue(one)).toEqual([
+      expect.objectContaining({ channel: "all", overdue_orders: 1 }),
+      expect.objectContaining({ channel: "csv", overdue_orders: 1 }),
+    ]);
+    // moving now back to the same instant as the first order drops it
+    const earlier = await overdue(one, { now: at(-1000).toISOString() });
+    expect(earlier).toEqual([expect.objectContaining({ channel: "all", overdue_orders: 0 })]);
+  });
+
+  it("uses the database clock when no now is given: a past ship-by counts, a future one does not", async () => {
+    const real = await makeShop(TZ);
+    const t = Date.now();
+    await makeOrders(real, [{ shipBy: new Date(t - day) }, { shipBy: new Date(t + 3600_000) }]);
+    const rows = rowsOf(
+      await runReport({
+        slug: real.slug,
+        from: "2020-01-01",
+        to: "2100-01-01",
+        queries: ["overdue_open"],
+      }),
+      "overdue_open",
+    );
+    expect(find(rows, { channel: "all" })).toMatchObject({ overdue_orders: 1 });
+  });
+
+  it("cuts the window by the shop's local midnights: the end is exclusive, the start inclusive", async () => {
+    const kolkata = "Asia/Kolkata";
+    const edge = await makeShop(kolkata);
+    const from = await localMidnight(FROM, kolkata);
+    const to = await localMidnight("2026-05-10", kolkata);
+    await makeOrders(edge, [
+      { shipBy: from }, // in
+      { shipBy: new Date(to.getTime() - 1) }, // in
+      { shipBy: to }, // out: window end is exclusive
+      { shipBy: new Date(from.getTime() - 1) }, // out
+      // 2026-05-09 20:00 UTC is 2026-05-10 01:30 in Kolkata: a UTC-day window would count it
+      { shipBy: new Date("2026-05-09T20:00:00Z") },
+    ]);
+    const rows = await overdue(edge, { to: "2026-05-10" });
+    expect(find(rows, { channel: "all" })).toMatchObject({ overdue_orders: 2, open_units: 2 });
+  });
+
+  it("clips the window end to now: a to date in the future adds nothing after now", async () => {
+    const rows = await overdue(shop, { to: "2099-01-01" });
+    expect(find(rows, { channel: "all" })).toMatchObject({ overdue_orders: 7 });
+  });
+
+  it("reports only this shop's orders and counts nothing when no company is set (A2.6)", async () => {
+    const other = await makeShop(TZ);
+    await makeOrders(other, [{ shipBy: at(-day), channel: "tiktok" }]);
+    const rows = await overdue(shop);
+    expect(JSON.stringify(rows)).not.toContain(other.id);
+    expect(find(rows, { channel: "tiktok" })).toBeUndefined();
+    // precondition above: non-zero with the company set; now bare connection, no company
+    const bare = await db.transaction((tx) =>
+      runQuery(tx, "overdue_open", { companyId: shop.id, from: FROM, to: TO, now: NOW }),
+    );
+    expect(bare).toEqual([
+      expect.objectContaining({
+        channel: "all",
+        overdue_orders: 0,
+        on_hold_orders: 0,
+        partly_shipped_orders: 0,
+        open_units: 0,
+      }),
+    ]);
+  });
+
+  it("reads no buyer column: every string cell is a channel name or the shop id", async () => {
+    const rows = await overdue(shop);
+    for (const r of rows)
+      for (const [k, v] of Object.entries(r))
+        if (typeof v === "string") expect(["channel", "company_id"]).toContain(k);
+  });
+
+  it("parseNow takes an ISO instant with a zone and nothing else", () => {
+    expect(parseNow("2026-05-20T10:00:00Z")).toBe("2026-05-20T10:00:00Z");
+    expect(parseNow("2026-05-20T12:00:00.123456+02:00")).toBe("2026-05-20T12:00:00.123456+02:00");
+    for (const bad of [
+      "2026-05-20",
+      "2026-05-20T10:00:00",
+      "now",
+      "2026-13-20T10:00:00Z",
+      "",
+      "2026-05-20 10:00:00Z",
+    ])
+      expect(() => parseNow(bad), bad).toThrow();
+  });
+});
+
+/* ------------------------- cents are exact above the int range (A2.5) ------------------------- */
+
+describe("cents above 2,147,483,647 stay exact", () => {
+  const TZ = "America/Los_Angeles";
+  let shop: Shop;
+  let rep: Report;
+
+  beforeAll(async () => {
+    shop = await makeShop(TZ);
+    const { fromAt } = await window(TZ);
+    await addSheets(
+      shop,
+      Array.from({ length: 12 }, (_, i) => ({
+        status: "sent" as const,
+        utilization: 0.5,
+        lengthIn: 10,
+        costCents: 200_000_000,
+        createdAt: new Date(fromAt.getTime() + hours(24 + i)),
+      })),
+    );
+    const made = await makeOrders(
+      shop,
+      [0, 1].map((i) => ({
+        placedAt: new Date(fromAt.getTime() + hours(i)),
+        shipBy: new Date(fromAt.getTime() + hours(100)),
+      })),
+    );
+    await addProfitLines(
+      shop,
+      made.map((m, i) => ({
+        orderId: m.orderId,
+        itemId: m.itemIds[0] as string,
+        channel: "csv" as const,
+        placedAt: new Date(fromAt.getTime() + hours(i)),
+        revenueCents: 1_500_000_000,
+      })),
+    );
+    rep = await runReport({ slug: shop.slug, from: FROM, to: TO, queries: ["film_use", "profit"] });
+  });
+
+  it("film cost and waste sum past 2^31 as exact numbers", () => {
+    const row = rowsOf(rep, "film_use")[0];
+    expect(row?.film_cost_cents).toBe(2_400_000_000);
+    expect(row?.film_waste_cents).toBe(1_200_000_000);
+  });
+
+  it("profit revenue, CM and profit per order sum past 2^31 as exact numbers", () => {
+    const row = find(rowsOf(rep, "profit"), { channel: "all" });
+    expect(row).toMatchObject({
+      revenue_cents: 3_000_000_000,
+      cm1_cents: 3_000_000_000,
+      cm3_cents: 3_000_000_000,
+      profit_per_order_cents: 1_500_000_000,
+    });
+  });
+
+  it("normalizeRow turns int8 strings into numbers and refuses an unsafe integer", () => {
+    expect(normalizeRow({ a_cents: "2400000000", n: 3, channel: "etsy" })).toEqual({
+      a_cents: 2_400_000_000,
+      n: 3,
+      channel: "etsy",
+    });
+    expect(normalizeRow({ a_cents: "-5" })).toEqual({ a_cents: -5 });
+    expect(() => normalizeRow({ a_cents: "9007199254740993" })).toThrow();
+    expect(() => normalizeRow({ a_cents: "1e3" })).toThrow();
+    expect(() => normalizeRow({ a_cents: "12.5" })).toThrow();
   });
 });

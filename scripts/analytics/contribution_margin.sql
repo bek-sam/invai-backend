@@ -42,16 +42,16 @@ agg AS (
     coalesce(sum(unit), 0)::int AS units,
     coalesce(sum(est_unit), 0)::int AS estimated_units,
     (count(DISTINCT order_id) FILTER (WHERE kind = 'noline'))::int AS orders_without_profit_line,
-    coalesce(sum(revenue), 0)::int AS revenue_cents,
-    coalesce(sum(revenue) - sum(fees) + sum(ref_recovered) - sum(cogs), 0)::int AS cm1_cents,
+    coalesce(sum(revenue), 0)::bigint AS revenue_cents,
+    coalesce(sum(revenue) - sum(fees) + sum(ref_recovered) - sum(cogs), 0)::bigint AS cm1_cents,
     coalesce(sum(revenue) - sum(fees) + sum(ref_recovered) - sum(cogs)
-             - sum(fulfil) - sum(cancel_refunds) - sum(ref_amount), 0)::int AS cm2_cents,
+             - sum(fulfil) - sum(cancel_refunds) - sum(ref_amount), 0)::bigint AS cm2_cents,
     coalesce(sum(revenue) - sum(fees) + sum(ref_recovered) - sum(cogs)
-             - sum(fulfil) - sum(cancel_refunds) - sum(ref_amount) - sum(ads), 0)::int AS cm3_cents
+             - sum(fulfil) - sum(cancel_refunds) - sum(ref_amount) - sum(ads), 0)::bigint AS cm3_cents
   FROM facts GROUP BY GROUPING SETS ((channel), ()))
 SELECT channel, orders, units, estimated_units, orders_without_profit_line, revenue_cents,
   cm1_cents, cm2_cents, cm3_cents,
   CASE WHEN units >= 30 AND revenue_cents <> 0
        THEN round(100.0 * cm3_cents / revenue_cents, 1)::float8 END AS cm3_pct,
-  CASE WHEN orders > 0 THEN floor(cm3_cents::numeric / orders + 0.5)::int END AS profit_per_order_cents
+  CASE WHEN orders > 0 THEN floor(cm3_cents::numeric / orders + 0.5)::bigint END AS profit_per_order_cents
 FROM agg ORDER BY (channel <> 'all'), channel
