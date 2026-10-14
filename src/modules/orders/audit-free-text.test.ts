@@ -262,7 +262,7 @@ describe("staff free text lives in order_notes, not audit_log (A4)", () => {
     const entry = await withTenant(co, (tx) => addNote(tx, c, { id: a.order.id, text: TEXT }));
     expect(entry.message).toBe(TEXT);
     await withTenant(co, (tx) =>
-      setItemFlag(tx, c, { id: itemA, code: "address_check", active: true, note: TEXT }),
+      setItemFlag(tx, c, { id: itemA, code: "manual_review", active: true, note: TEXT }),
     );
     await withTenant(co, (tx) =>
       holdOrder(tx, c, { id: a.order.id, reason: "address_check", note: TEXT }),
@@ -286,7 +286,7 @@ describe("staff free text lives in order_notes, not audit_log (A4)", () => {
     const msgs = tl.items.map((e) => e.message);
     expect(msgs).toContain(TEXT);
     expect(msgs).toContain(`Held (address check): ${TEXT}`);
-    expect(msgs).toContain(`Flagged address check: ${TEXT}`);
+    expect(msgs).toContain(`Flagged manual review: ${TEXT}`);
     const tlB = await withTenant(co, (tx) => timeline(tx, c, { id: b.order.id, limit: 50 }));
     expect(
       tlB.items.some(
