@@ -18,10 +18,10 @@ import {
   unauthorized,
 } from "../lib/errors";
 import { MFA_EXEMPT_PROCEDURES, mfaBlocks } from "../lib/mfa";
-import { checkRateLimit, type RateBucket } from "../lib/ratelimit";
+import { checkRateLimit, checkScanRateLimit, type RateBucket } from "../lib/ratelimit";
 import { sanitizeDeep } from "../lib/text-safety";
 import { tracingOn } from "../lib/tracing";
-import { type Context, type TenantContext, tenantOf } from "./context";
+import { type Context, type SessionKind, type TenantContext, tenantOf } from "./context";
 
 /*
  * oRPC base builders. Every module router is built from these:
@@ -210,14 +210,40 @@ export const AI_BUCKET_PROCEDURES: ReadonlySet<string> = new Set([
   "photos.pushToShopify",
 ]);
 
+/**
+ * Per-unit and per-order floor writes the tablet outbox sends (ADR 0040, B-479). From a floor
+ * session at a station they take the `scans` buckets (per station, then per company), not
+ * `writes`. Money (`shipping.buy`) and other floor writes stay in `writes`; buckets.test.ts walks
+ * every `auth: "floor"` non-GET procedure and fails on one that is in no list.
+ */
+export const SCAN_BUCKET_PROCEDURES: ReadonlySet<string> = new Set([
+  "production.scan",
+  "production.qc",
+  "production.packOrder",
+  "production.bins.assign",
+  "production.bins.release",
+]);
+
+export type BucketSession = { sessionKind: SessionKind | null; stationId: string | null };
+
 export function bucketFor(
   path: readonly string[],
   meta: ProcedureMeta,
   method: string | undefined,
+  session: BucketSession,
 ): RateBucket {
   if (path[0] === "ai") return AI_CHEAP_READS.has(path.join(".")) ? "reads" : "ai";
   if (AI_BUCKET_PROCEDURES.has(path.join("."))) return "ai";
   if (meta.auth === "station") return "auth";
+  // Only a signed floor session with a resolved station (set server side, never from input); a
+  // web user calling `production.scan` stays on `writes`.
+  if (
+    SCAN_BUCKET_PROCEDURES.has(path.join(".")) &&
+    session.sessionKind === "floor" &&
+    session.stationId
+  ) {
+    return "scans";
+  }
   if (method === "GET") return "reads";
   return NON_GET_READS.has(path.join(".")) ? "reads" : "writes";
 }
@@ -226,8 +252,12 @@ const rateLimit = os.middleware(async ({ context, next, procedure, path }) => {
   if (!context.companyId) return next();
   const meta = procedure["~orpc"].meta as ProcedureMeta;
   const method = (procedure["~orpc"].route as { method?: string } | undefined)?.method;
-  const bucket = bucketFor(path, meta, method);
-  const { allowed, retryAfterSec } = await checkRateLimit(bucket, context.companyId);
+  const stationId = context.station?.id ?? null;
+  const bucket = bucketFor(path, meta, method, { sessionKind: context.sessionKind, stationId });
+  const { allowed, retryAfterSec } =
+    bucket === "scans" && stationId
+      ? await checkScanRateLimit(context.companyId, stationId)
+      : await checkRateLimit(bucket, context.companyId);
   if (!allowed) {
     context.resHeaders?.set("Retry-After", String(retryAfterSec));
     throw rateLimited(retryAfterSec);

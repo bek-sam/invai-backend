@@ -1,6 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { redis } from "./queues";
-import { betterAuthConsume, checkRateLimit, RATE_BUCKET_LIMITS, takeToken } from "./ratelimit";
+import {
+  betterAuthConsume,
+  checkRateLimit,
+  checkScanRateLimit,
+  RATE_BUCKET_LIMITS,
+  rateLimitKey,
+  scanStationKey,
+  takeToken,
+} from "./ratelimit";
 
 /*
  * T-12-3 (B-20): per-tenant API rate limits, a Valkey token bucket keyed by company_id (AC1), and
@@ -110,5 +118,22 @@ describe("Better Auth rate limiting moved to Valkey (AC2)", () => {
     expect((await betterAuthConsume(key, rule)).allowed).toBe(false);
     await new Promise((r) => setTimeout(r, 1100));
     expect((await betterAuthConsume(key, rule)).allowed).toBe(true);
+  });
+});
+
+describe("floor scan keys and fail-open (T-56-1, ADR 0040)", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("builds the company and station keys under tb:", () => {
+    expect(rateLimitKey("scans", "c1")).toBe("tb:scans:c1");
+    expect(scanStationKey("c1", "s1")).toBe("tb:scans:c1:s1");
+  });
+
+  it("a Redis failure admits the scan like every other bucket", async () => {
+    vi.spyOn(redis, "eval").mockRejectedValue(new Error("ECONNREFUSED"));
+    expect(await checkScanRateLimit(`c-${uniq()}`, "s1")).toEqual({
+      allowed: true,
+      retryAfterSec: 0,
+    });
   });
 });

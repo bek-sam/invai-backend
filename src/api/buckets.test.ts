@@ -6,7 +6,13 @@ import { redis } from "../lib/queues";
 import { checkRateLimit, RATE_BUCKET_LIMITS, rateLimitKey } from "../lib/ratelimit";
 import { createCompany, createUser } from "../test/fixtures";
 import { anonymousContext, type Context, permissionsFor } from "./context";
-import { AI_BUCKET_PROCEDURES, AI_CHEAP_READS, bucketFor, NON_GET_READS } from "./orpc";
+import {
+  AI_BUCKET_PROCEDURES,
+  AI_CHEAP_READS,
+  bucketFor,
+  NON_GET_READS,
+  SCAN_BUCKET_PROCEDURES,
+} from "./orpc";
 import { router } from "./router";
 
 /*
@@ -39,27 +45,29 @@ function userContext(companyId: string, userId: string): Context {
 /** `call()` has no router path unless told; the limiter classifies by it, so pass the real one. */
 const BALANCE = ["ai", "credits", "balance"] as const;
 
+const NO_SESSION = { sessionKind: "user" as const, stationId: null };
+
 const meta = (auth?: ProcedureMeta["auth"]): ProcedureMeta =>
   ({ permission: "org.read", auth }) as unknown as ProcedureMeta;
 
 describe("bucketFor (B-133)", () => {
   it("routes the cheap ai reads to reads and every model-calling ai procedure to ai", () => {
     for (const name of AI_CHEAP_READS)
-      expect(bucketFor(name.split("."), meta(), "GET")).toBe("reads");
-    expect(bucketFor(["ai", "assistant", "ask"], meta(), "POST")).toBe("ai");
-    expect(bucketFor(["ai", "listings", "create"], meta(), "POST")).toBe("ai");
-    expect(bucketFor(["ai", "listings", "regenerate"], meta(), "POST")).toBe("ai");
-    expect(bucketFor(["ai", "tools", "trademarkCheck"], meta(), "POST")).toBe("ai");
-    expect(bucketFor(["orders", "list"], meta(), "GET")).toBe("reads");
-    expect(bucketFor(["orders", "hold"], meta(), "POST")).toBe("writes");
-    expect(bucketFor(["floor", "login"], meta("station"), "POST")).toBe("auth");
+      expect(bucketFor(name.split("."), meta(), "GET", NO_SESSION)).toBe("reads");
+    expect(bucketFor(["ai", "assistant", "ask"], meta(), "POST", NO_SESSION)).toBe("ai");
+    expect(bucketFor(["ai", "listings", "create"], meta(), "POST", NO_SESSION)).toBe("ai");
+    expect(bucketFor(["ai", "listings", "regenerate"], meta(), "POST", NO_SESSION)).toBe("ai");
+    expect(bucketFor(["ai", "tools", "trademarkCheck"], meta(), "POST", NO_SESSION)).toBe("ai");
+    expect(bucketFor(["orders", "list"], meta(), "GET", NO_SESSION)).toBe("reads");
+    expect(bucketFor(["orders", "hold"], meta(), "POST", NO_SESSION)).toBe("writes");
+    expect(bucketFor(["floor", "login"], meta("station"), "POST", NO_SESSION)).toBe("auth");
   });
 
   it("routes the credit-spending photos procedures to ai and the photo estimate to reads (ADR 0023)", () => {
     for (const name of AI_BUCKET_PROCEDURES)
-      expect(bucketFor(name.split("."), meta(), "POST")).toBe("ai");
-    expect(bucketFor(["photos", "estimate"], meta(), "POST")).toBe("reads");
-    expect(bucketFor(["photos", "reviewImages"], meta(), "POST")).toBe("writes");
+      expect(bucketFor(name.split("."), meta(), "POST", NO_SESSION)).toBe("ai");
+    expect(bucketFor(["photos", "estimate"], meta(), "POST", NO_SESSION)).toBe("reads");
+    expect(bucketFor(["photos", "reviewImages"], meta(), "POST", NO_SESSION)).toBe("writes");
   });
 
   it("25 credit-balance reads in a minute do not block an ask; the 21st ask is still limited", async () => {
@@ -181,7 +189,9 @@ describe("non-GET read-permission procedures are classified by hand (T-P3-1, B-2
           "signs an upload or calls an outbound/paid service, then add it to one list with a reason",
       ).toBe(true);
       expect(inReads && inWrites, `${p.path} is in both lists`).toBe(false);
-      expect(bucketFor(p.path.split("."), p.meta, p.method)).toBe(inReads ? "reads" : "writes");
+      expect(bucketFor(p.path.split("."), p.meta, p.method, NO_SESSION)).toBe(
+        inReads ? "reads" : "writes",
+      );
     }
   });
 
@@ -202,7 +212,7 @@ describe("files.downloadUrls bucket and permission (T-37-5)", () => {
 
   it("is classified as reads even though it is a POST", () => {
     expect(NON_GET_READS.has("files.downloadUrls")).toBe(true);
-    expect(bucketFor(["files", "downloadUrls"], meta(), "POST")).toBe("reads");
+    expect(bucketFor(["files", "downloadUrls"], meta(), "POST", NO_SESSION)).toBe("reads");
   });
 
   it("one call costs exactly one reads token, also when every key is null", async () => {
@@ -237,5 +247,69 @@ describe("files.downloadUrls bucket and permission (T-37-5)", () => {
     await expect(
       call(procedureAt("files.downloadUrls"), { fileKeys: ["a"] }, { context: ctx, path: DL }),
     ).rejects.toMatchObject({ code: "FORBIDDEN" });
+  });
+});
+
+/*
+ * T-56-1 (B-479, ADR 0040): every `auth: "floor"` non-GET procedure is classified by hand. The
+ * scan set takes the `scans` buckets from a floor session at a station; the rest stays in
+ * `writes` (or `reads` for the pure reads), each with a reason.
+ */
+const FLOOR_STAYS_WRITES: Record<string, string> = {
+  "production.reprints.request": "creates a reprint request row and an outbox event",
+  "production.sheets.markReceived": "moves a sheet's state and writes inventory",
+  "inventory.purchaseOrders.receive": "writes stock movements",
+  "inventory.adjust": "writes stock movements",
+  "inventory.count": "writes stock movements",
+  "shipping.rates": "calls the live carrier (outbound, costs a rate call)",
+  "shipping.buy": "buys postage: money stays out of the scan buckets",
+  "shipping.batchLabelPdf": "writes a merged label PDF to storage",
+  "alerts.markRead": "writes alert read state",
+  "floor.logout": "revokes the floor session",
+};
+
+describe("floor non-GET procedures are classified by hand (T-56-1, B-479)", () => {
+  const floorWrites = listProcedures(contract).filter(
+    (p) => p.meta.auth === "floor" && p.method !== "GET",
+  );
+  const floorSession = { sessionKind: "floor" as const, stationId: "s1" };
+
+  it("every one is in the scan set, the stays-writes list or NON_GET_READS", () => {
+    for (const p of floorWrites) {
+      const n = [
+        SCAN_BUCKET_PROCEDURES.has(p.path),
+        p.path in FLOOR_STAYS_WRITES,
+        NON_GET_READS.has(p.path),
+      ];
+      expect(
+        n.filter(Boolean).length,
+        `${p.path} must be in exactly one of: SCAN_BUCKET_PROCEDURES, FLOOR_STAYS_WRITES, NON_GET_READS`,
+      ).toBe(1);
+      const want = n[0] ? "scans" : n[2] ? "reads" : "writes";
+      expect(bucketFor(p.path.split("."), p.meta, p.method, floorSession), p.path).toBe(want);
+    }
+  });
+
+  it("the scan set is exactly the five tablet writes and all exist in the contract", () => {
+    expect([...SCAN_BUCKET_PROCEDURES].sort()).toEqual([
+      "production.bins.assign",
+      "production.bins.release",
+      "production.packOrder",
+      "production.qc",
+      "production.scan",
+    ]);
+    const paths = new Set(floorWrites.map((p) => p.path));
+    for (const name of SCAN_BUCKET_PROCEDURES) expect(paths.has(name), name).toBe(true);
+    for (const name of Object.keys(FLOOR_STAYS_WRITES)) expect(paths.has(name), name).toBe(true);
+  });
+
+  it("scans applies only to a floor session with a station; everything else keeps today's rules", () => {
+    const p = ["production", "scan"];
+    expect(bucketFor(p, meta(), "POST", { sessionKind: "floor", stationId: "s1" })).toBe("scans");
+    expect(bucketFor(p, meta(), "POST", { sessionKind: "user", stationId: null })).toBe("writes");
+    expect(bucketFor(p, meta(), "POST", { sessionKind: "user", stationId: "s1" })).toBe("writes");
+    expect(bucketFor(p, meta(), "POST", { sessionKind: "floor", stationId: null })).toBe("writes");
+    expect(bucketFor(p, meta(), "POST", { sessionKind: null, stationId: null })).toBe("writes");
+    expect(bucketFor(["shipping", "batchBuy"], meta(), "POST", floorSession)).toBe("writes");
   });
 });

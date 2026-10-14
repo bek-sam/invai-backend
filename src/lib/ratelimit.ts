@@ -80,7 +80,7 @@ export async function isRevoked(key: string): Promise<boolean> {
  * the rest of this file: a Redis timeout allows the request and logs a warning.
  */
 
-export type RateBucket = "auth" | "reads" | "writes" | "ai" | "links";
+export type RateBucket = "auth" | "reads" | "writes" | "ai" | "links" | "scans";
 
 export type BucketLimits = { capacity: number; refillPerSec: number };
 
@@ -97,7 +97,17 @@ export const RATE_BUCKET_LIMITS: Record<RateBucket, BucketLimits> = {
   ai: perMinute(20), // the AI gateway has its own per-company spend breaker; this is request volume
   // Public `/l/:token` email links (ADR 0016): no session, so keyed by IP, not company.
   links: perMinute(60),
+  // Floor scans (ADR 0040, B-479): the per-company ceiling over every tablet of one shop. 900/min
+  // = 2.25x the 400/min measured for 20 stations; the 600 burst absorbs a whole floor replaying
+  // its offline outbox.
+  scans: { capacity: 600, refillPerSec: 15 },
 };
+
+/**
+ * Per-station scan limit (ADR 0040): 60/min per station, 3x the measured 20/min, so a fast
+ * packer fits. The 60 burst admits about 3 minutes of offline outbox at once; Retry-After is 1 s.
+ */
+export const SCAN_STATION_LIMITS: BucketLimits = { capacity: 60, refillPerSec: 1 };
 
 /**
  * Atomic Redis-side token bucket. `KEYS[1]` is the bucket key; a Redis hash holds `tokens` and
@@ -142,6 +152,11 @@ export function rateLimitKey(bucket: RateBucket, companyId: string): string {
   return `tb:${bucket}:${companyId}`;
 }
 
+/** The per-station scans key, `tb:scans:{companyId}:{stationId}`; under `tb:` so the gate clears it. */
+export function scanStationKey(companyId: string, stationId: string): string {
+  return `tb:scans:${companyId}:${stationId}`;
+}
+
 /**
  * Take one token from `key`'s bucket. Fails open (allowed, `retryAfterSec: 0`) on a Redis error
  * or timeout: a stuck Valkey must not 429 every tenant.
@@ -169,6 +184,23 @@ export async function checkRateLimit(
   limits: BucketLimits = RATE_BUCKET_LIMITS[bucket],
 ): Promise<{ allowed: boolean; retryAfterSec: number }> {
   return takeToken(rateLimitKey(bucket, companyId), limits);
+}
+
+/**
+ * Floor scan limit (ADR 0040): the station's own token first, then the company's. A station
+ * refusal spends no company token (a flooding tablet can't drain its shop's ceiling); a company
+ * refusal does NOT refund the station token (the call was real traffic from that station).
+ * `retryAfterSec` is the refusing bucket's. Fail-open comes from `takeToken`.
+ */
+export async function checkScanRateLimit(
+  companyId: string,
+  stationId: string,
+  stationLimits: BucketLimits = SCAN_STATION_LIMITS,
+  companyLimits: BucketLimits = RATE_BUCKET_LIMITS.scans,
+): Promise<{ allowed: boolean; retryAfterSec: number }> {
+  const station = await takeToken(scanStationKey(companyId, stationId), stationLimits);
+  if (!station.allowed) return station;
+  return takeToken(rateLimitKey("scans", companyId), companyLimits);
 }
 
 /*
