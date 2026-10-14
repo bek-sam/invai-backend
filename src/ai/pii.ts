@@ -9,9 +9,10 @@
  * single separators (space, `.`, `-`) and at most one `(..)` group, 8 to 15 digits in total. A
  * trailing date or count that joins the run (`+52 55 1234 5678 2026-10-14`) is trimmed back off. Runs
  * under 8 digits (`+12 orders`, `+1,234`, `+6.5%`) and numbers followed by a digit, `%` or `[.,]\d`
- * are not phones. This runs before `[number]`: a `+` never starts a card number.
+ * are not phones. The match is capped at 16 groups of 16 digits (a longer run is never a phone, and an
+ * unbounded run made the trim loop quadratic). This runs before `[number]`: a `+` never starts a card number.
  */
-const INTL_RE = /(?<![\w+])\+(?:[ .-]?(?:\(\d+\)|\d+))+/g;
+const INTL_RE = /(?<![\w+])\+(?:[ .-]?(?:\(\d{1,16}\)|\d{1,16})){1,16}/g;
 const INTL_GROUP = /[ .-]?(?:\(\d+\)|\d+)/g;
 const digitCount = (s: string) => s.replace(/\D/g, "").length;
 
@@ -43,7 +44,8 @@ const maskToken = (n: number) =>
   `\uE000${String.fromCharCode(97 + (n % 26))}${"x".repeat(Math.floor(n / 26))}\uE001`;
 
 const PATTERNS: [RegExp | ((text: string) => string), string][] = [
-  [/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[email]"],
+  // The lookbehind starts a match only at the head of a local-part run, so a long run with no `@` is scanned once.
+  [/(?<![A-Z0-9._%+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[email]"],
   [scrubInternational, ""],
   [/\b(?:\d[ -]?){13,19}\b/g, "[number]"],
   [/(?:\+?1[ .-]?)?\(?\b\d{3}\)?[ .-]?\d{3}[ .-]?\d{4}\b/g, "[phone]"],

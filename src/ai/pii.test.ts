@@ -126,6 +126,21 @@ describe("stripPii keeps ordinary shop text", () => {
   });
 });
 
+describe("stripPii stays linear on adversarial input (S-91 r1)", () => {
+  const BOUND_MS = 1000;
+  const shapes: [string, string][] = [
+    ["one long + run with separators", `+${"1 ".repeat(100_000)}`],
+    ["one long + digit run", `+${"1".repeat(200_000)}`],
+    ["long run with dash groups", `+${"12-".repeat(70_000)}`],
+    ["repeated +1 fragments", "+1 ".repeat(70_000)],
+  ];
+  it.each(shapes)("200 KB: %s", (_name, text) => {
+    const t0 = performance.now();
+    stripPii(text);
+    expect(performance.now() - t0).toBeLessThan(BOUND_MS);
+  });
+});
+
 describe("stripPiiDeep", () => {
   it("scrubs a phone inside a nested object", () => {
     const out = stripPiiDeep({ a: { b: { note: "ring +52 55 1234 5678 please" } }, n: 3 });
