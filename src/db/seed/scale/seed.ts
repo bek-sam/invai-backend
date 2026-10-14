@@ -21,6 +21,7 @@ import {
   type Role,
   reprints,
   shipments,
+  shippingSettings,
   stations,
   transfers,
   vendorConnections,
@@ -159,6 +160,11 @@ export async function seedScaleProfile(
       })
       .returning({ id: locations.id });
     if (!loc) throw new Error("location insert failed");
+    // A batch buy needs a ship-from address (B-481); same fake as the location, other columns default.
+    await tx.insert(shippingSettings).values({
+      companyId,
+      fromAddress: { ...DESERT_BLOOM_PROFILE.address, name: profile.companyName },
+    });
     const stationRows: (typeof stations.$inferInsert)[] = [];
     for (const kind of ["pick", "press", "qc", "pack"] as const) {
       for (let n = 1; n <= profile.stations[kind]; n++) {

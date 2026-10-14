@@ -1,5 +1,13 @@
-import { describe, expect, it } from "vitest";
-import { assertScaleSeedEnv, type ScaleSeedEnv, scaleSeedEnvFrom, valkeyDb } from "./guard";
+import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { join } from "node:path";
+import { afterAll, describe, expect, it } from "vitest";
+import {
+  assertScaleSeedEnv,
+  insideRepoFolder,
+  type ScaleSeedEnv,
+  scaleSeedEnvFrom,
+  valkeyDb,
+} from "./guard";
 
 /* Spec AC8. Pure function, explicit args, in the safe-seed.test.ts style. */
 const DB = (name: string) => `postgres://invai:invai@localhost:5432/${name}`;
@@ -89,5 +97,40 @@ describe("assertScaleSeedEnv", () => {
       } as NodeJS.ProcessEnv),
     ).toEqual({ databaseUrl: "a", migrationDatabaseUrl: "b", redisUrl: "c", seedOutputFile: "d" });
     expect(valkeyDb("redis://x/12")).toBe(12);
+  });
+});
+
+/* T-56-5 A5.2: SEED_OUTPUT_FILE must not land inside any invai-* repo folder. */
+describe("SEED_OUTPUT_FILE repo-folder guard", () => {
+  const WS = join(import.meta.dirname, "../../../../..");
+  const tmp = mkdtempSync("/tmp/scale-guard-");
+  afterAll(() => rmSync(tmp, { recursive: true, force: true }));
+  const out = (seedOutputFile: string) => () => assertScaleSeedEnv(with_({ seedOutputFile }));
+
+  it("refuses a path inside a repo folder, even a not-yet-existing one", () => {
+    expect(out(`${WS}/invai-backend/seed-output.json`)).toThrow(/inside a repo folder/);
+    expect(out(`${WS}/invai-docs/new/dir/creds.json`)).toThrow(/inside a repo folder/);
+  });
+
+  it("refuses a `..` escape that resolves back into a repo", () => {
+    expect(out("/tmp/../" + WS.slice(1) + "/invai-web/creds.json")).toThrow(/inside a repo folder/);
+    expect(out(`${WS}/invai-backend/../invai-floor/x.json`)).toThrow(/inside a repo folder/);
+  });
+
+  it("refuses a /tmp symlink that points into a repo folder", () => {
+    symlinkSync(`${WS}/invai-backend`, join(tmp, "link"));
+    expect(out(join(tmp, "link", "creds.json"))).toThrow(/inside a repo folder/);
+  });
+
+  it("refuses an upper-case spelling (case-insensitive file system)", () => {
+    // a folder that does not exist yet keeps its spelling through realpath, so only the compare folds case
+    expect(out(`${WS}/INVAI-Newrepo/creds.json`)).toThrow(/inside a repo folder/);
+    expect(out(`${WS.toUpperCase()}/invai-docs/creds.json`)).toThrow(/inside a repo folder/);
+  });
+
+  it("still allows /tmp paths and non-repo files directly in the workspace", () => {
+    expect(out("/tmp/scale-out-check/creds.json")).not.toThrow();
+    expect(out(join(tmp, "creds.json"))).not.toThrow();
+    expect(insideRepoFolder(`${WS}/notes.json`)).toBe(false);
   });
 });

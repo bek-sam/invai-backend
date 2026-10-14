@@ -2,7 +2,7 @@
 
 Seeds one profile as its own company in a **scratch** database. Entry point `index.ts`; the guard
 (`guard.ts`) refuses any database not named `invai_scale_*`, a Valkey DB outside 10-13 and a
-blank `SEED_OUTPUT_FILE`. `pnpm db:seed` and `seed/index.ts` never import this folder.
+blank `SEED_OUTPUT_FILE` or one that resolves (symlinks, `..`, case) inside any `invai-*` repo folder of the workspace. `pnpm db:seed` and `seed/index.ts` never import this folder.
 
 ## What a profile writes
 Company, staff (login per member), stations, vendors, channels, designs, SKUs and `historyDays` of
@@ -13,6 +13,8 @@ orders with items, transitions, gang sheets, transfers, reprints and profit line
   database holds hashes only. Plaintext goes to `SEED_OUTPUT_FILE` (mode 0600) under `floor`:
   `stations[{id,kind,token}]`, `members[{email,role,pin}]`, `scanTargets` (up to 400 transfer ids
   of open units, press-ready first). Nothing is printed or logged.
+- **Ship-from address** (T-56-5). One `shipping_settings` row per company whose `fromAddress` is the
+  fake Desert Bloom address under the profile's company name, so a batch buy needs no API setup.
 - **Shipments.** One per order with a shipped or delivered unit: carrier `usps`, mock id
   `shp_mock_<n>`, unique `9400 1000 0000 ...` tracking, `delivered` only when every shipped unit
   is delivered. `label_key` and `label_format` are NULL on purpose (no `files` rows exist; a key

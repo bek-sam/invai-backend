@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { readFileSync, rmSync, statSync } from "node:fs";
 import { promisify } from "node:util";
+import { Address } from "@invai/contracts";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { env } from "../../../env";
@@ -421,6 +422,19 @@ describe("T-55-3 phase 1: floor logins, shipments and fake buyer data", () => {
 
   it("AC2: no files rows are written (no label or buyer object keys point at missing files)", async () => {
     expect(await num(sql`select count(*) as n from files where company_id = ${companyId}`)).toBe(0);
+  });
+});
+
+describe("T-56-5 phase 1: ship-from address", () => {
+  it("AC1: the company has one shipping_settings row whose fromAddress is a valid fake US address", async () => {
+    const r = await rows<{ from_address: unknown; n: string }>(
+      sql`select from_address, count(*) over () as n from shipping_settings where company_id = ${companyId}`,
+    );
+    expect(r).toHaveLength(1);
+    const addr = Address.parse(r[0]?.from_address);
+    expect(addr.country).toBe("US");
+    expect(addr.name).toBe(profile.companyName);
+    expect(addr.street1.length).toBeGreaterThan(0);
   });
 });
 
