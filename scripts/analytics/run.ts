@@ -3,7 +3,8 @@ import { parseArgs } from "node:util";
 import { eq } from "drizzle-orm";
 import { closeDb, db, systemPool, withTenantReadOnly } from "../../src/db/client";
 import { companies } from "../../src/db/schema";
-import { QUERY_NAMES, type QueryName, type Row, runQuery } from "./queries";
+import { prepareQuery, QUERY_NAMES, type QueryName, type Row, runPrepared } from "./queries";
+import { SqlGuardError } from "./sql-guard";
 
 /*
  * pnpm analytics --company <slug> --from <YYYY-MM-DD> --to <YYYY-MM-DD> [--query late_rate|overdue_open|film_use|reprint|profit] [--now <ISO instant, overdue_open only>]
@@ -81,10 +82,14 @@ export async function runReport(input: {
     .where(eq(companies.slug, input.slug));
   if (!company) throw new UsageError("company not found");
 
+  // Every statement is built (and allow-list checked, S-97) before the transaction opens.
+  const statements = queries.map(
+    (name) => [name, prepareQuery(name, { companyId: company.id, from, to, now })] as const,
+  );
   const out: Report["queries"] = {};
   await withTenantReadOnly(company.id, async (tx) => {
-    for (const name of queries) {
-      const rows = await runQuery(tx, name, { companyId: company.id, from, to, now });
+    for (const [name, statement] of statements) {
+      const rows = await runPrepared(tx, statement);
       out[name] = rows.map((r) => ({ company_id: company.id, ...r }));
     }
   });
@@ -143,6 +148,10 @@ export async function main(argv: string[]): Promise<number> {
     if (systemPool.totalCount !== 0) throw new Error("owner pool was used");
   } catch (err) {
     await closeDb().catch(() => undefined);
+    if (err instanceof SqlGuardError) {
+      console.error(`analytics: query refused by the SQL guard: ${err.message}`);
+      return 1;
+    }
     if (
       err instanceof UsageError ||
       (err as { code?: string }).code?.startsWith("ERR_PARSE_ARGS")

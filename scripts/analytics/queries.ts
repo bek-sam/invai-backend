@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import type { SQL } from "drizzle-orm";
 import { sql } from "drizzle-orm";
 import type { Tx } from "../../src/db/client";
+import { assertAllowedSql } from "./sql-guard";
 
 /*
  * The four first pilot queries (spec analytics-first-queries.md; wave 54 T-54-2). Each is one
@@ -91,6 +92,7 @@ export function readQuerySql(name: QueryName): string {
 /** Placeholders become bound parameters (drizzle chunks); the file text is never string-built. */
 export function bindQuery(text: string, p: QueryParams): SQL {
   const body = stripComments(text);
+  assertAllowedSql(body); // first: nothing builds an analytics SQL object without the allow-list (S-97)
   const values = {
     company_id: p.companyId,
     from: p.from,
@@ -124,7 +126,16 @@ export function normalizeRow(row: Row): Row {
   return out;
 }
 
-export async function runQuery(tx: Tx, name: QueryName, p: QueryParams): Promise<Row[]> {
-  const result = await tx.execute<Row>(bindQuery(readQuerySql(name), p));
+/** Build the statement for one named query; the guard runs here, before any transaction exists. */
+export function prepareQuery(name: QueryName, p: QueryParams): SQL {
+  return bindQuery(readQuerySql(name), p);
+}
+
+export async function runPrepared(tx: Tx, statement: SQL): Promise<Row[]> {
+  const result = await tx.execute<Row>(statement);
   return result.rows.map(normalizeRow);
+}
+
+export async function runQuery(tx: Tx, name: QueryName, p: QueryParams): Promise<Row[]> {
+  return runPrepared(tx, prepareQuery(name, p));
 }

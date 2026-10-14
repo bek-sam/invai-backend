@@ -264,10 +264,11 @@ describe("runner source (AC8, A2.6)", () => {
     expect(run).not.toMatch(/\.transaction\(|set transaction/i);
   });
 
-  it("imports only db/client, db/schema and its own SQL runner", () => {
+  it("imports only db/client, db/schema, its own SQL runner and its SQL guard", () => {
     expect(importsOf(run)).toEqual(
       [
         "./queries",
+        "./sql-guard",
         "../../src/db/client",
         "../../src/db/schema",
         "drizzle-orm",
@@ -277,7 +278,7 @@ describe("runner source (AC8, A2.6)", () => {
     );
     const queries = read(join(here, "queries.ts"));
     expect(importsOf(queries)).toEqual(
-      ["../../src/db/client", "drizzle-orm", "drizzle-orm", "node:fs"].sort(),
+      ["./sql-guard", "../../src/db/client", "drizzle-orm", "drizzle-orm", "node:fs"].sort(),
     );
   });
 });
