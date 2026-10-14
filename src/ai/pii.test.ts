@@ -49,9 +49,11 @@ describe("stripPii phones", () => {
     expect(stripPii("+12345678,5")).toBe("+12345678,5");
   });
 
-  it("a plus after a word character or another plus is not a phone start", () => {
-    expect(stripPii("a+16025550143")).toBe("a+16025550143");
+  it("a plus after a digit or another plus is not a phone start", () => {
+    // T-53-1 A2 (authorized tightening): a plus glued to a word is now a phone, `a+16025550143` was kept before.
+    expect(stripPii("a+16025550143")).toBe("a[phone]");
     expect(stripPii("++16025550143")).toBe("++16025550143");
+    expect(stripPii("1+16025550143")).toBe("1+16025550143");
   });
 
   it("two parenthesised groups are not one phone", () => {
@@ -100,6 +102,16 @@ const KEEP = [
   "3 units",
   "85003",
   "10 2024-2025",
+  "TEE_BLK_XL",
+  "G500_BLK_2XL",
+  "SKU_602_555_0143",
+  "1990\u20132024",
+  "10 1990\u20132024",
+  "10 2024\u20132025",
+  "2026/10/14",
+  "10/14/2026",
+  "1 / 2",
+  "12\u00A0x\u00A016\u00A0in",
   "55123456-1234-5678-9012-345678901234",
   "{{market.55123456-1234-5678-9012-345678901234.asOf}}",
   "insight 12345678-1234-1234-1234-123456789012 done",
@@ -176,10 +188,152 @@ describe("stripPii scrubs every email, even glued together (S-91 r3)", () => {
   });
 });
 
+/* T-53-1 (B-458, S-92): more phone separators and email forms. */
+
+const NBSP = " ";
+const NNBSP = " ";
+const PHONE_FORMS = [
+  "call+525512345678",
+  "tel:+16025550143",
+  "602  555  0143",
+  "+52  55  1234  5678",
+  "602/555/0143",
+  "+52/55/1234/5678",
+  "602_555_0143",
+  `602${NBSP}555${NBSP}0143`,
+  `602${NNBSP}555${NNBSP}0143`,
+  `+52${NBSP}55${NBSP}1234${NBSP}5678`,
+  `+52${NNBSP}55${NNBSP}1234${NNBSP}5678`,
+  "602–555–0143",
+  "602‒555‒0143",
+  "602—555—0143",
+  "+52 - 55 - 1234 - 5678",
+  "+1 – 602 – 555 – 0143",
+];
+
+describe("stripPii phone separators (T-53-1)", () => {
+  it.each(PHONE_FORMS)("scrubs %s", (p) => {
+    const out = stripPii(`Call me on ${p} after five`);
+    const word = /^[a-z]+:?(?=\+)/.exec(p)?.[0] ?? "";
+    expect(out).toBe(`Call me on ${word}[phone] after five`);
+    expect(out).not.toMatch(/\d{2,}/);
+  });
+
+  it("keeps a date after a phone whole (trim goes back to a whitespace boundary)", () => {
+    expect(stripPii("+52 55 1234 5678 14/10/2026")).toBe("[phone] 14/10/2026");
+    expect(stripPii("+52 55 1234 5678 14-10-2026")).toBe("[phone] 14-10-2026");
+    expect(stripPii("+52 55 1234 5678 2026-10-14")).toBe("[phone] 2026-10-14");
+  });
+
+  it("rules: a Mexican number shape stays scrubbed with an en dash range", () => {
+    expect(stripPii("55 1990–2024")).toBe("[phone]");
+    expect(stripPii("55 1990-2024")).toBe("[phone]");
+  });
+
+  it("a SKU with underscores is kept, a phone alone in an underscore token is scrubbed", () => {
+    expect(stripPii("SKU_602_555_0143")).toBe("SKU_602_555_0143");
+    expect(stripPii("x 602_555_0143 y")).toBe("x [phone] y");
+  });
+
+  it("two phones glued by a separator are both scrubbed", () => {
+    expect(stripPii("602-555-0143 /602 555 0144")).not.toMatch(/\d{4}/);
+    expect(stripPii("+16025550143/+16025550144")).not.toMatch(/\d{5}/);
+  });
+});
+
+const EMAIL_FORMS: [string, string][] = [
+  ['"jo smith"@x.com', "[email]"],
+  ['mail "jo smith"@x.com now', "mail [email] now"],
+  ["o'brien@x.com", "[email]"],
+  ["x o'brien@x.com y", "x [email] y"],
+  ["'jo@x.com'", "'[email]'"],
+  ["’jo@x.com’", "’[email]’"],
+  ["jo@münchen.de", "[email]"],
+  ["jo@xn--mnchen-3ya.de", "[email]"],
+  ["jo@[192.0.2.4]", "[email]"],
+  ["jo@[IPv6:2001:db8::1]", "[email]"],
+  ["12345678-1234-1234-1234-123456789012@x.com", "[email]"],
+  ["a@@x.com", "[email]"],
+  ["@@x.com", "@@x.com"],
+  ["see @x.com", "see @x.com"],
+  ["foo@bar@x.com", "foo@[email]"],
+  ["'@x.com", "'@x.com"],
+];
+
+describe("stripPii email forms (T-53-1)", () => {
+  it.each(EMAIL_FORMS)("%s -> %s", (text, out) => {
+    expect(stripPii(text)).toBe(out);
+  });
+
+  it.each([
+    ['"a b"@x.com."c d"@y.com', "[email][email]"],
+    ["o'brien@x.com-o'neil@y.com", "[email][email]"],
+    ["jo@[1.2.3.4]5ana@y.com", "[email][email]"],
+    [
+      "12345678-1234-1234-1234-123456789012@x.com.12345678-1234-1234-1234-123456789012@y.com",
+      "[email][email]",
+    ],
+    ["a@@x.com7b@@y.com", "[email][email]"],
+    ['"a b"@x.com "c d"@y.com', "[email] [email]"],
+    ["o'brien@x.com o'neil@y.com", "[email] [email]"],
+    ["jo@[1.2.3.4] 5ana@y.com", "[email] [email]"],
+    ["a@@x.com b@@y.com", "[email] [email]"],
+  ])("glued or spaced pair %s", (text, out) => {
+    expect(stripPii(text)).toBe(out);
+    expect(stripPii(text)).not.toMatch(/@/);
+  });
+
+  it("an email next to a UUID: the UUID survives, the email goes", () => {
+    const id = "55123456-1234-5678-9012-345678901234";
+    expect(stripPii(`${id} jo@x.com ${id}`)).toBe(`${id} [email] ${id}`);
+  });
+});
+
+describe("stripPii stays linear on the T-53-1 shapes", () => {
+  const BOUND_MS = 1000;
+  const uuid = "12345678-1234-1234-1234-123456789012";
+  const shapes: [string, string][] = [
+    ["+ then 12/ runs", `+${"12/".repeat(70_000)}`],
+    ["+ then 1 and two NBSPs", `+${`1${NBSP}${NBSP}`.repeat(70_000)}`],
+    ["+ then 12 and en dash", `+${"12–".repeat(70_000)}`],
+    ["+ then two spaces and dash", `+${"1  -".repeat(50_000)}`],
+    ["a+1 repeated", "a+1 ".repeat(50_000)],
+    ["1_ runs", "1_".repeat(100_000)],
+    ["1// runs", "1//".repeat(70_000)],
+    ["quotes then one @", `${'"'.repeat(200_000)}@x.com`],
+    ["a quote @ repeated", 'a"@b.cc '.repeat(25_000)],
+    ["a, many @, domain", `a${"@".repeat(200_000)}x.com`],
+    ["a@@x.com repeated", "a@@x.com".repeat(25_000)],
+    ["IP literal open run", `a@[${"1.".repeat(100_000)}`],
+    ["a@ then umlauts", `a@${"ü".repeat(200_000)}`],
+    ["apostrophes then one @", `${"'".repeat(200_000)}@x.com`],
+    ["uuid emails repeated", `${uuid}@x.com `.repeat(5_000)],
+    ["1 MB quotes then one @", `${'"'.repeat(1_000_000)}@x.com`],
+    ["1 MB + run with separators", `+${"1 ".repeat(500_000)}`],
+    ["1 MB glued emails", "a@b.cc.".repeat(150_000)],
+  ];
+  it.each(shapes)("%s", (_name, text) => {
+    const t0 = performance.now();
+    stripPii(text);
+    expect(performance.now() - t0).toBeLessThan(BOUND_MS);
+  });
+});
+
 describe("stripPiiDeep", () => {
   it("scrubs a phone inside a nested object", () => {
     const out = stripPiiDeep({ a: { b: { note: "ring +52 55 1234 5678 please" } }, n: 3 });
     expect(out).toEqual({ a: { b: { note: "ring [phone] please" } }, n: 3 });
+  });
+
+  it("scrubs a new phone form and a new email form in nested values (T-53-1)", () => {
+    const out = stripPiiDeep({
+      a: { b: ["ring 602/555/0143 ok", { c: 'mail "jo smith"@x.com' }] },
+      d: [["tel:+16025550143"], "o'brien@x.com"],
+    });
+    expect(out).toEqual({
+      a: { b: ["ring [phone] ok", { c: "mail [email]" }] },
+      d: [["tel:[phone]"], "[email]"],
+    });
   });
 
   it("scrubs a phone inside an array", () => {
