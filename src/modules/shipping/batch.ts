@@ -4,7 +4,7 @@ import { z } from "zod";
 import { systemContext, type TenantContext } from "../../api/context";
 import { withTenant } from "../../db/client";
 import { jobs, orders, type ShipmentState, shipments } from "../../db/schema";
-import { upstream } from "../../lib/errors";
+import { badRequest, upstream } from "../../lib/errors";
 import { errorData, logger } from "../../lib/log";
 import { emit } from "../../lib/outbox";
 import { defineJob, isFinalAttempt, onEvent, RETRY_BACKOFF } from "../../lib/queues";
@@ -58,6 +58,9 @@ export async function startBatchBuy(
   const job = await withTenant(ctx.companyId, async (tx) => {
     await assertPaidActionAllowed(tx, ctx);
     const settings = await getSettings(tx, ctx);
+    // Same sentence as a single buy (service.ts rateOrder): refuse now, before any job exists.
+    if (!settings.fromAddress)
+      throw badRequest("Set a ship-from address in shipping settings first");
     const batch: BatchInput = {
       orderIds,
       strategy: input.strategy ?? settings.defaultStrategy,
@@ -277,13 +280,44 @@ export async function runBatchBuy(companyId: string, jobId: string) {
   const failed = results.filter((r) => r.status === "failed").length;
   const skipped = results.filter((r) => r.status === "skipped").length;
   const postage = labeled.reduce((s, r) => s + r.postage, 0);
+  const message = `${labeled.length} labeled, ${failed} failed${skipped ? `, ${skipped} skipped` : ""}; postage $${(postage / 100).toFixed(2)}`;
+  // A batch that bought nothing and had failures is a failed job, with the reason the office
+  // can read (B-482). Nothing labeled and nothing failed (all skipped) is still done.
+  if (labeled.length === 0 && failed >= 1) {
+    await updateJobRow(companyId, jobId, {
+      status: "failed",
+      progress: 1,
+      error: commonError(results),
+      message,
+      resultIds: [],
+    });
+    return { labeled: 0, failed, skipped };
+  }
   await updateJobRow(companyId, jobId, {
     status: "done",
     progress: 1,
-    message: `${labeled.length} labeled, ${failed} failed${skipped ? `, ${skipped} skipped` : ""}; postage $${(postage / 100).toFixed(2)}`,
+    message,
     resultIds: labeled.flatMap((r) => (r.shipmentId ? [r.shipmentId] : [])),
   });
   return { labeled: labeled.length, failed, skipped };
+}
+
+/** The most frequent failure text; a tie goes to the first failed order in `orderIds` order. */
+function commonError(results: OrderResult[]): string {
+  const counts = new Map<string, number>();
+  for (const r of results)
+    if (r.status === "failed") {
+      const text = r.error ?? "failed";
+      counts.set(text, (counts.get(text) ?? 0) + 1);
+    }
+  let best = "failed";
+  let bestN = 0;
+  for (const [text, n] of counts)
+    if (n > bestN) {
+      best = text;
+      bestN = n;
+    }
+  return best;
 }
 
 export const batchBuyJob = defineJob({

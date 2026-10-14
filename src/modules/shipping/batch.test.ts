@@ -120,13 +120,13 @@ describe("batch label buy job", () => {
     vi.mocked(carriersModule.carrierAdapter).mockImplementation(async () => fake);
   });
 
-  async function packedOrders(n: number) {
+  async function packedOrders(n: number, cid = companyId, conn = connectionId) {
     const ids: string[] = [];
     for (let i = 0; i < n; i++) {
-      const { order } = await createOrder(companyId, connectionId, { units: 1, state: "packed" });
+      const { order } = await createOrder(cid, conn, { units: 1, state: "packed" });
       await withSystem((tx) =>
         tx.insert(buyerPii).values({
-          companyId,
+          companyId: cid,
           orderId: order.id,
           name: "Test Buyer",
           street1: "1 Buyer Way",
@@ -206,6 +206,122 @@ describe("batch label buy job", () => {
     expect(results[unpacked]?.status).toBe("failed");
     expect(job.resultIds).toHaveLength(1);
     expect(job.message).toMatch(/^1 labeled, 1 failed, 1 skipped/);
+    // Partial success is still a finished job, not a failed one (B-482).
+    expect(job).toMatchObject({ status: "done", error: null });
+  });
+
+  // B-482: a batch that bought nothing must not look like a success.
+  async function shopWithoutShipFrom() {
+    const cid = (await createCompany()).id;
+    const owner = await createUser(cid, "owner");
+    const c = tenantContext(cid, owner.id, "owner");
+    const conn = (await createConnection(cid, "csv")).id;
+    return { cid, c, conn };
+  }
+  const jobCount = async (cid: string) =>
+    (await withTenant(cid, (tx) => tx.select().from(jobs))).length;
+  const SHIP_FROM = "Set a ship-from address in shipping settings first";
+
+  it("refuses at once without a ship-from address, with the single buy's exact message (B-482)", async () => {
+    const { cid, c, conn } = await shopWithoutShipFrom();
+    const orderIds = await packedOrders(3, cid, conn);
+    const single = await svc.rateOrder(c, { orderId: orderIds[0] as string }).then(
+      () => null,
+      (e: unknown) => e as { code: string; message: string },
+    );
+    const batch = await startBatchBuy(c, { orderIds }).then(
+      () => null,
+      (e: unknown) => e as { code: string; message: string },
+    );
+    expect(single).toMatchObject({ code: "BAD_REQUEST", message: SHIP_FROM });
+    expect(batch?.code).toBe(single?.code);
+    expect(Buffer.from(batch?.message ?? "")).toEqual(Buffer.from(single?.message ?? "x"));
+    expect(await jobCount(cid)).toBe(0);
+    const events = await withSystem((tx) =>
+      tx.select().from(outboxEvents).where(eq(outboxEvents.companyId, cid)),
+    );
+    expect(events.filter((e) => e.name === "shipping.batch_requested")).toHaveLength(0);
+    const ships = await withTenant(cid, (tx) => tx.select().from(shipments));
+    expect(ships).toHaveLength(0);
+    expect(fake.calls.buy).toBe(0);
+  });
+
+  it("a batch where every order fails ends failed with the reason, once (B-482)", async () => {
+    const { cid, c, conn } = await shopWithoutShipFrom();
+    await withTenant(cid, (tx) => svc.updateSettings(tx, c, { fromAddress: address }));
+    const orderIds = await packedOrders(3, cid, conn);
+    const res = await startBatchBuy(c, { orderIds });
+    // The preflight passed; the address disappears before the worker runs.
+    await withTenant(cid, (tx) => svc.updateSettings(tx, c, { fromAddress: null }));
+    await runJobInline(batchBuyJob, { companyId: cid, jobId: res.jobId });
+    const read = async () => {
+      const [row] = await withTenant(cid, (tx) => tx.select().from(jobs));
+      if (!row) throw new Error("job row missing");
+      return row;
+    };
+    const job = await read();
+    expect(job).toMatchObject({
+      status: "failed",
+      progress: 1,
+      error: SHIP_FROM,
+      message: "0 labeled, 3 failed; postage $0.00",
+      resultIds: [],
+    });
+    expect(fake.calls.buy).toBe(0);
+    // A duplicate delivery skips a finished job and changes nothing.
+    await expect(runJobInline(batchBuyJob, { companyId: cid, jobId: res.jobId })).resolves.toEqual({
+      skipped: true,
+    });
+    expect(await read()).toMatchObject({ status: "failed", error: SHIP_FROM });
+  });
+
+  it("the job's reason is the most frequent failure, a tie goes to the first order (B-482)", async () => {
+    // A packed order with no buyer_pii row fails the address check; ready orders are not packed.
+    const packedNoAddr = (await createOrder(companyId, connectionId, { units: 1, state: "packed" }))
+      .order.id;
+    const ready1 = (await createOrder(companyId, connectionId, { units: 1, state: "ready" })).order
+      .id;
+    const ready2 = (await createOrder(companyId, connectionId, { units: 1, state: "ready" })).order
+      .id;
+    const run = async (orderIds: string[]) => {
+      const res = await startBatchBuy(ctx, { orderIds });
+      await runJobInline(batchBuyJob, { companyId, jobId: res.jobId });
+      const job = await jobRow(res.jobId);
+      const results = (job.input as { results: Record<string, { error: string }> }).results;
+      return { job, results };
+    };
+    const a = await run([ready1, packedNoAddr, ready2]);
+    expect(a.job.status).toBe("failed");
+    expect(a.job.error).toBe(a.results[ready1]?.error);
+    expect(a.results[ready1]?.error).toBe(a.results[ready2]?.error);
+    expect(a.results[packedNoAddr]?.error).not.toBe(a.results[ready1]?.error);
+    const b = await run([packedNoAddr, ready1]);
+    expect(b.job.error).toBe(b.results[packedNoAddr]?.error);
+    expect(b.results[ready1]?.error).not.toBe(b.job.error);
+  });
+
+  it("skipped plus failed with nothing labeled ends failed; all skipped ends done (B-482)", async () => {
+    const [o1, o2] = await packedOrders(2);
+    for (const o of [o1, o2]) {
+      const q = await svc.rateOrder(ctx, { orderId: o as string });
+      await svc.buyLabel(ctx, { shipmentId: q.shipmentId, rateId: q.rates[0]?.rateId as string });
+    }
+    const allSkipped = await startBatchBuy(ctx, { orderIds: [o1 as string, o2 as string] });
+    await runJobInline(batchBuyJob, { companyId, jobId: allSkipped.jobId });
+    expect(await jobRow(allSkipped.jobId)).toMatchObject({
+      status: "done",
+      error: null,
+      message: "0 labeled, 0 failed, 2 skipped; postage $0.00",
+    });
+
+    const unpacked = (await createOrder(companyId, connectionId, { units: 1, state: "ready" }))
+      .order.id;
+    const mixed = await startBatchBuy(ctx, { orderIds: [o1 as string, unpacked] });
+    await runJobInline(batchBuyJob, { companyId, jobId: mixed.jobId });
+    const job = await jobRow(mixed.jobId);
+    expect(job).toMatchObject({ status: "failed", resultIds: [] });
+    expect(job.error).toBeTruthy();
+    expect(job.message).toMatch(/^0 labeled, 1 failed, 1 skipped/);
   });
 
   it("after a crash mid-buy, the restarted run reads the carrier back and never buys twice", async () => {
