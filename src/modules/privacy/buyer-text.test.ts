@@ -1,7 +1,7 @@
 import { eq } from "drizzle-orm";
 import { beforeAll, describe, expect, it, vi } from "vitest";
-import { withSystem } from "../../db/client";
-import { channelConnections, orderItems, orders } from "../../db/schema";
+import { withSystem, withTenant } from "../../db/client";
+import { channelConnections, orderItems, orderNotes, orders } from "../../db/schema";
 import { createCompany, createConnection, createOrder } from "../../test/fixtures";
 import {
   createNameTemplate,
@@ -128,6 +128,34 @@ describe("redact requests clear every unit", () => {
     expect(kept.order?.buyerNote).toBe("Probe note");
     await redact([o.order.channelOrderId]);
     await expectAllCleared(o);
+  });
+});
+
+describe("18-month sweep and staff notes (T-52-4, A7)", () => {
+  const notesOf = (orderId: string) =>
+    withTenant(companyId, (tx) =>
+      tx.select().from(orderNotes).where(eq(orderNotes.orderId, orderId)),
+    );
+
+  it("sweeps an order whose only buyer text is an order_notes row, and keeps a recent one", async () => {
+    const placedAt = new Date(buyerPiiCutoff().getTime() - 86400_000);
+    const mk = async (set: Partial<typeof orders.$inferInsert>) => {
+      const { order } = await createOrder(companyId, shopifyConn, { units: 1, channel: "shopify" });
+      await withSystem(async (tx) => {
+        await tx.update(orders).set(set).where(eq(orders.id, order.id));
+        await tx
+          .insert(orderNotes)
+          .values({ companyId, orderId: order.id, kind: "hold", text: "Probe staff text" });
+      });
+      return order.id;
+    };
+    const old = await mk({ placedAt, shippedAt: placedAt, status: "shipped" });
+    const recent = await mk({ status: "shipped" });
+    await redactStaleBuyerPii();
+    expect(await notesOf(old)).toEqual([]);
+    expect(await notesOf(recent)).toHaveLength(1);
+    await redactStaleBuyerPii();
+    expect(await notesOf(old)).toEqual([]);
   });
 });
 

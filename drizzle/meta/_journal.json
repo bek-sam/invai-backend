@@ -330,6 +330,13 @@
       "when": 1791910011122,
       "tag": "0046_catalog_design_ai_use",
       "breakpoints": true
+    },
+    {
+      "idx": 47,
+      "version": "7",
+      "when": 1791943439254,
+      "tag": "0047_orders_notes",
+      "breakpoints": true
     }
   ]
 }

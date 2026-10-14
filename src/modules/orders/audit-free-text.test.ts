@@ -1,4 +1,5 @@
 import type { NormalizedOrder } from "@invai/contracts";
+import { ROLE_PERMISSIONS } from "@invai/contracts";
 import { and, eq } from "drizzle-orm";
 import { beforeAll, describe, expect, it } from "vitest";
 import type { TenantContext } from "../../api/context";
@@ -9,6 +10,7 @@ import {
   type channelConnections,
   orderItems,
   orderItemTransitions,
+  orderNotes,
 } from "../../db/schema";
 import { env } from "../../env";
 import { audit } from "../../lib/audit";
@@ -25,7 +27,7 @@ import { bulkImportBlanks, createDesign } from "../catalog/service";
 import { getConnectionRow } from "../channels/service";
 import { createRule } from "../channels/sku";
 import { importNormalizedOrders } from "./import";
-import { cancelOrder, holdOrder } from "./service";
+import { addNote, cancelOrder, holdOrder, setItemFlag, timeline } from "./service";
 
 /*
  * T-52-4 (B-453, decision 0027): staff and channel free text never lands in an append-only row.
@@ -239,5 +241,84 @@ describe("transition rows carry no staff note (A5)", () => {
     const aud = await auditFor(items[0]?.id as string, "item.state_changed");
     expect(aud.length).toBeGreaterThanOrEqual(2);
     expect(JSON.stringify(aud)).not.toContain("Quimby");
+  });
+});
+
+describe("staff free text lives in order_notes, not audit_log (A4)", () => {
+  const TEXT = "Marta Quimby 555-0199";
+  const auditOf = (cid: string) =>
+    withTenant(cid, (tx) => tx.select().from(auditLog).where(eq(auditLog.companyId, cid)));
+
+  it("note, hold, flag and cancel notes appear in the timeline and in no append-only row", async () => {
+    const co = (await createCompany()).id;
+    const conn2 = await createConnection(co, "shopify");
+    await createLocation(co);
+    const office = await createUser(co, "office");
+    const c = tenantContext(co, office.id, "office");
+    const a = await createOrder(co, conn2.id, { units: 1, state: "ready" });
+    const b = await createOrder(co, conn2.id, { units: 1, state: "ready" });
+    const itemA = a.items[0]?.id as string;
+
+    const entry = await withTenant(co, (tx) => addNote(tx, c, { id: a.order.id, text: TEXT }));
+    expect(entry.message).toBe(TEXT);
+    await withTenant(co, (tx) =>
+      setItemFlag(tx, c, { id: itemA, code: "address_check", active: true, note: TEXT }),
+    );
+    await withTenant(co, (tx) =>
+      holdOrder(tx, c, { id: a.order.id, reason: "address_check", note: TEXT }),
+    );
+    await withTenant(co, (tx) =>
+      cancelOrder(tx, c, { id: b.order.id, reason: "buyer_request", note: TEXT }),
+    );
+
+    for (const [name, rows] of [
+      ["audit_log", await auditOf(co)],
+      [
+        "order_item_transitions",
+        await withTenant(co, (tx) => tx.select().from(orderItemTransitions)),
+      ],
+    ] as const) {
+      expect(JSON.stringify(rows), name).not.toContain("Quimby");
+      expect(JSON.stringify(rows), name).not.toContain("555-0199");
+    }
+
+    const tl = await withTenant(co, (tx) => timeline(tx, c, { id: a.order.id, limit: 50 }));
+    const msgs = tl.items.map((e) => e.message);
+    expect(msgs).toContain(TEXT);
+    expect(msgs).toContain(`Held (address check): ${TEXT}`);
+    expect(msgs).toContain(`Flagged address check: ${TEXT}`);
+    const tlB = await withTenant(co, (tx) => timeline(tx, c, { id: b.order.id, limit: 50 }));
+    expect(
+      tlB.items.some(
+        (e) => e.message.startsWith("Order cancelled (buyer request)") && e.message.endsWith(TEXT),
+      ),
+    ).toBe(true);
+    // the staff note rows are the only copy
+    const noteRows = await withTenant(co, (tx) => tx.select().from(orderNotes));
+    expect(noteRows.map((n) => n.kind).sort()).toEqual(["cancel", "flag", "hold", "note"]);
+    // a purged note leaves the fixed phrase in the timeline
+    await withTenant(co, (tx) => tx.delete(orderNotes));
+    const gone = await withTenant(co, (tx) => timeline(tx, c, { id: a.order.id, limit: 50 }));
+    expect(gone.items.map((e) => e.message)).toContain("Note added");
+    expect(gone.items.map((e) => e.message).join("|")).not.toContain("Quimby");
+
+    // a role without orders.manage cannot hold or cancel (the guard reads this table)
+    expect(ROLE_PERMISSIONS.presser).not.toContain("orders.manage");
+  });
+
+  it("another company never sees the note: timeline NOT_FOUND, rows invisible under RLS", async () => {
+    const coA = (await createCompany()).id;
+    const coB = (await createCompany()).id;
+    const connA = await createConnection(coA, "shopify");
+    const uA = await createUser(coA, "office");
+    const uB = await createUser(coB, "office");
+    const cA = tenantContext(coA, uA.id, "office");
+    const cB = tenantContext(coB, uB.id, "office");
+    const o = await createOrder(coA, connA.id, { units: 1, state: "ready" });
+    await withTenant(coA, (tx) => addNote(tx, cA, { id: o.order.id, text: TEXT }));
+    await expect(
+      withTenant(coB, (tx) => timeline(tx, cB, { id: o.order.id, limit: 50 })),
+    ).rejects.toMatchObject({ code: "NOT_FOUND" });
+    expect(await withTenant(coB, (tx) => tx.select().from(orderNotes))).toEqual([]);
   });
 });

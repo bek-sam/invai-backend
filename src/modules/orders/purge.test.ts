@@ -1,7 +1,7 @@
 import { eq, inArray } from "drizzle-orm";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import { withSystem, withTenant } from "../../db/client";
-import { buyerPii, files, orderItems, orders, reprints } from "../../db/schema";
+import { buyerPii, files, orderItems, orderNotes, orders, reprints } from "../../db/schema";
 import { headObject, objectKey, putObject } from "../../lib/s3";
 import { createCompany, createConnection, createOrder } from "../../test/fixtures";
 import {
@@ -29,6 +29,11 @@ vi.mock("../../lib/s3", async (orig) => {
 });
 
 type ItemState = (typeof orderItems.$inferInsert)["state"] & string;
+
+const notesOf = (companyId: string, orderId: string) =>
+  withTenant(companyId, (tx) =>
+    tx.select().from(orderNotes).where(eq(orderNotes.orderId, orderId)),
+  );
 
 const days = (n: number) => new Date(Date.now() - n * 86400_000);
 
@@ -127,6 +132,12 @@ describe("buyer text on the 30-day clock", () => {
     const artB = await seedItemArt(companyId, b.id, templateId);
     await seedNotes(companyId, order.id, a.id, "Probe note A");
     await withSystem((tx) =>
+      tx.insert(orderNotes).values([
+        { companyId, orderId: order.id, kind: "note", text: "Probe staff note" },
+        { companyId, orderId: order.id, orderItemId: a.id, kind: "flag", text: "Probe flag note" },
+      ]),
+    );
+    await withSystem((tx) =>
       tx.insert(reprints).values({ companyId, orderItemId: b.id, reason: "peel", note: "Probe B" }),
     );
     return { orderId: order.id, a: a.id, b: b.id, artA, artB };
@@ -173,6 +184,7 @@ describe("buyer text on the 30-day clock", () => {
       expect(await exists(k)).toBe(false);
     // Notes a person typed are cleared on the order clock; enum reasons and money stay.
     expect(a.order).toMatchObject({ buyerNote: null, holdNote: null, cancelNote: null });
+    expect(await notesOf(companyId, o.orderId)).toEqual([]);
     expect(a.refunds.map((r) => [r.note, r.amountCents])).toEqual([[null, 500]]);
     expect(a.reprints.map((r) => r.reason)).toEqual(["misprint"]);
     // Order facts stay.
@@ -212,6 +224,10 @@ describe("buyer text on the 30-day clock", () => {
     const a = await readBack(companyId, o.orderId, o.a);
     expectKept(a, o.artA);
     expect(a.order?.buyerNote).toBe("Probe note A");
+    expect((await notesOf(companyId, o.orderId)).map((n) => n.text).sort()).toEqual([
+      "Probe flag note",
+      "Probe staff note",
+    ]);
     expect(a.refunds[0]?.note).toBe("Probe note A");
     expect(await exists(o.artA.fileKey)).toBe(true);
   });
@@ -229,9 +245,11 @@ describe("buyer text on the 30-day clock", () => {
     const o = await readBack(companyId, old.orderId, old.a);
     expectCleared(o);
     expect(o.order?.cancelNote).toBeNull();
+    expect(await notesOf(companyId, old.orderId)).toEqual([]);
     const r = await readBack(companyId, recent.orderId, recent.a);
     expectKept(r, recent.artA);
     expect(r.order?.cancelNote).toBe("Probe note A");
+    expect(await notesOf(companyId, recent.orderId)).toHaveLength(2);
   });
 
   it("leaves a unit whose object delete failed for the next night", async () => {

@@ -298,3 +298,38 @@ export const buyerPii = pgTable(
     tenantPolicy("buyer_pii"),
   ],
 ).enableRLS();
+
+export const ORDER_NOTE_KINDS = ["note", "hold", "cancel", "flag"] as const;
+export type OrderNoteKind = (typeof ORDER_NOTE_KINDS)[number];
+
+/**
+ * Text a person typed about an order (a note, a hold, cancel or flag note). It can name the buyer,
+ * so it lives here, where the privacy purge can delete it, and never in the append-only audit_log
+ * (decision 0027). The audit row keeps a fixed phrase and `data.noteId`; the timeline joins them.
+ */
+export const orderNotes = pgTable(
+  "order_notes",
+  {
+    id: id(),
+    companyId: companyId(),
+    orderId: uuid().notNull(),
+    orderItemId: uuid(),
+    kind: text(enumText(ORDER_NOTE_KINDS)).notNull(),
+    text: text().notNull(),
+    ...timestamps,
+  },
+  (t) => [
+    index().on(t.companyId, t.orderId),
+    foreignKey({
+      name: "order_notes_order_id_fk",
+      columns: [t.companyId, t.orderId],
+      foreignColumns: [orders.companyId, orders.id],
+    }).onDelete("cascade"),
+    foreignKey({
+      name: "order_notes_order_item_id_fk",
+      columns: [t.companyId, t.orderItemId],
+      foreignColumns: [orderItems.companyId, orderItems.id],
+    }).onDelete("cascade"),
+    tenantPolicy("order_notes"),
+  ],
+).enableRLS();

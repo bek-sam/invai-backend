@@ -46,8 +46,10 @@ import {
   companies,
   designs,
   type ItemFlag,
+  type OrderNoteKind,
   orderItems,
   orderItemTransitions,
+  orderNotes,
   orders,
   products,
   stations,
@@ -716,6 +718,20 @@ export async function timeline(
         : null,
   });
 
+  const noteIds = [
+    ...new Set(aRows.map(({ a }) => (a.data as { noteId?: unknown }).noteId).filter(isString)),
+  ];
+  const notes = new Map<string, string>(
+    noteIds.length
+      ? (
+          await tx
+            .select({ id: orderNotes.id, text: orderNotes.text })
+            .from(orderNotes)
+            .where(and(eq(orderNotes.orderId, input.id), inArray(orderNotes.id, noteIds)))
+        ).map((n) => [n.id, n.text])
+      : [],
+  );
+
   const entries: (TimelineEntry & { _at: string })[] = [
     ...tRows.map(({ t, atUs, userName, stationKind }) => ({
       _at: atUs,
@@ -739,7 +755,7 @@ export async function timeline(
       actor: actorOf(a.actorKind, a.actorUserId, userName, stationKind),
       from: null,
       to: null,
-      message: a.summary,
+      message: noteMessage(a, notes),
       meta: { action: a.action, ...a.data },
     })),
   ].sort((x, y) => (x._at === y._at ? (y.id > x.id ? 1 : -1) : y._at > x._at ? 1 : -1));
@@ -753,25 +769,68 @@ export async function timeline(
   };
 }
 
+const isString = (v: unknown): v is string => typeof v === "string";
+
+/** The audit row's fixed phrase plus the staff note it points at, if that note still exists. */
+function noteMessage(
+  a: { action: string; summary: string; data: unknown },
+  notes: Map<string, string>,
+) {
+  const noteId = (a.data as { noteId?: unknown }).noteId;
+  const text = isString(noteId) ? notes.get(noteId) : undefined;
+  if (text === undefined) return a.summary;
+  return a.action === "order.note" ? text : `${a.summary}: ${text}`;
+}
+
+/**
+ * Text a person typed about an order goes to `order_notes`, never into the append-only audit_log
+ * (decision 0027); the audit row keeps a fixed phrase and the note's id.
+ */
+async function insertNote(
+  tx: Tx,
+  ctx: TenantContext,
+  n: { orderId: string; orderItemId?: string; kind: OrderNoteKind; text: string | null },
+): Promise<string | null> {
+  if (!n.text) return null;
+  const [row] = await tx
+    .insert(orderNotes)
+    .values({
+      companyId: ctx.companyId,
+      orderId: n.orderId,
+      orderItemId: n.orderItemId ?? null,
+      kind: n.kind,
+      text: n.text,
+    })
+    .returning({ id: orderNotes.id });
+  return row?.id ?? null;
+}
+
 export async function addNote(
   tx: Tx,
   ctx: TenantContext,
   input: { id: string; text: string },
 ): Promise<TimelineEntry> {
   await getOrderRow(tx, input.id);
+  const noteId = await insertNote(tx, ctx, { orderId: input.id, kind: "note", text: input.text });
   await audit(tx, {
     companyId: ctx.companyId,
     actor: ctx.actor,
     action: "order.note",
     entityType: "order",
     entityId: input.id,
-    summary: input.text,
+    summary: "Note added",
+    data: { noteId },
   });
   const [row] = await tx
     .select()
     .from(auditLog)
-    .where(and(eq(auditLog.entityId, input.id), eq(auditLog.action, "order.note")))
-    .orderBy(desc(auditLog.createdAt))
+    .where(
+      and(
+        eq(auditLog.entityId, input.id),
+        eq(auditLog.action, "order.note"),
+        sql`${auditLog.data}->>'noteId' = ${noteId}`,
+      ),
+    )
     .limit(1);
   if (!row) throw new Error("note insert failed");
   return {
@@ -843,11 +902,13 @@ export async function holdOrder(
     items.map((i) => i.id),
     "hold",
   );
+  const noteId = await insertNote(tx, ctx, { orderId: order.id, kind: "hold", text: input.note });
   for (const i of items)
     await transitionItem(tx, i.id, "on_hold", {
       actor: ctx.actor,
       reason: input.reason,
       data: {
+        ...(noteId ? { noteId } : {}),
         ...(input.channelSignal ? { channelSignal: input.channelSignal } : {}),
       },
     });
@@ -861,7 +922,8 @@ export async function holdOrder(
     action: "order.held",
     entityType: "order",
     entityId: order.id,
-    summary: `Held (${input.reason.replace(/_/g, " ")})${input.note ? `: ${input.note}` : ""}`,
+    summary: `Held (${input.reason.replace(/_/g, " ")})`,
+    data: { noteId },
   });
   await emit(tx, ctx.companyId, "order.held", { orderId: order.id, reason: input.reason });
   publishOrder(tx, ctx.companyId, order.id);
@@ -1061,10 +1123,12 @@ export async function cancelOrder(
         (nested.has(i.state) || (i.state === "on_hold" && nested.has(i.heldFromState ?? ""))),
     )
     .map((i) => i.transferId as string);
+  const noteId = await insertNote(tx, ctx, { orderId: order.id, kind: "cancel", text: input.note });
   for (const i of targets)
     await transitionItem(tx, i.id, "cancelled", {
       actor: ctx.actor,
       reason: input.reason,
+      ...(noteId ? { data: { noteId } } : {}),
     });
   const ids = targets.map((i) => i.id);
   await releaseForItems(tx, ctx, ids);
@@ -1090,8 +1154,8 @@ export async function cancelOrder(
     entityId: order.id,
     summary: `${remaining.length === 0 ? "Order" : `${ids.length} item(s)`} cancelled (${input.reason.replace(/_/g, " ")})${
       scrappedTransferIds.length ? `; ${scrappedTransferIds.length} transfer(s) scrapped` : ""
-    }${input.note ? `: ${input.note}` : ""}`,
-    data: { orderItemIds: ids, scrappedTransferIds },
+    }`,
+    data: { orderItemIds: ids, scrappedTransferIds, noteId },
   });
   await emit(tx, ctx.companyId, "order.cancelled", {
     orderId: order.id,
@@ -1132,14 +1196,20 @@ export async function setItemFlag(
       ])
     : withFlags(item.flags, [], [input.code]);
   await tx.update(orderItems).set({ flags }).where(eq(orderItems.id, input.id));
+  const noteId = await insertNote(tx, ctx, {
+    orderId: item.orderId,
+    orderItemId: item.id,
+    kind: "flag",
+    text: input.note,
+  });
   await audit(tx, {
     companyId: ctx.companyId,
     actor: ctx.actor,
     action: "item.flag",
     entityType: "order_item",
     entityId: input.id,
-    summary: `${input.active ? "Flagged" : "Cleared"} ${input.code.replace(/_/g, " ")}${input.note ? `: ${input.note}` : ""}`,
-    data: { orderId: item.orderId, code: input.code, active: input.active },
+    summary: `${input.active ? "Flagged" : "Cleared"} ${input.code.replace(/_/g, " ")}`,
+    data: { orderId: item.orderId, code: input.code, active: input.active, noteId },
   });
   if (input.active)
     afterCommit(tx, async () => {

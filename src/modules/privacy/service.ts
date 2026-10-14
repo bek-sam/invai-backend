@@ -41,6 +41,7 @@ import {
   marketPriceSnapshots,
   members,
   orderItems,
+  orderNotes,
   orders,
   PRIVACY_REQUEST_DUE_MS,
   type PrivacyCounts,
@@ -162,6 +163,8 @@ export function holdsBuyerText(scope: BuyerTextScope): SQL {
     scope === "all" ? sql`` : sql` and i.state in ('shipped', 'delivered', 'cancelled')`;
   return sql`(${orders.buyerNote} is not null or ${orders.holdNote} is not null
     or ${orders.cancelNote} is not null
+    or exists (select 1 from order_notes n where n.company_id = ${orders.companyId}
+      and n.order_id = ${orders.id})
     or exists (select 1 from refund_events r where r.company_id = ${orders.companyId}
       and r.order_id = ${orders.id} and r.note is not null)
     or exists (select 1 from order_items i where i.company_id = ${orders.companyId}
@@ -177,7 +180,7 @@ export function holdsBuyerText(scope: BuyerTextScope): SQL {
 /**
  * Clear the buyer's free text from these orders, inside the caller's tenant transaction:
  * - notes a person typed that may name the buyer (`orders.buyer_note`, `hold_note`,
- *   `cancel_note`, `refund_events.note`) on every order, and `reprints.note` per cleared item;
+ *   `cancel_note`, `order_notes` rows, `refund_events.note`) on every order, and `reprints.note` per cleared item;
  * - per item in scope: personalization answers and file URLs; `item_artwork` values, flags and
  *   error, its render and preview objects and any buyer-photo objects, status `purged`; on the
  *   item the artwork keys, `artwork_status = purged` and the artwork flags. A purged item can't
@@ -375,6 +378,12 @@ export async function redactBuyerText(
         ),
       )
       .returning({ id: orders.id })
+  ).length;
+  res.notes += (
+    await tx
+      .delete(orderNotes)
+      .where(inArray(orderNotes.orderId, orderIds))
+      .returning({ id: orderNotes.id })
   ).length;
   res.notes += (
     await tx
