@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { eq, like } from "drizzle-orm";
 import { Pool } from "pg";
 import { afterAll, describe, expect, it } from "vitest";
@@ -7,6 +8,7 @@ import {
   assertEvalDatabase,
   assertEvalEnv,
   runInScratch,
+  safeErrorText,
   scratchName,
 } from "../../evals/lib/scratch-db";
 import { withSystem } from "../db/client";
@@ -31,8 +33,16 @@ const admin = new Pool({
   })(),
   max: 2,
 });
-const stamp = (n: number) => `2099123123595${n}`.slice(0, 14);
-const nameFor = (n: number, pid = process.pid) => `invai_evals_${stamp(n)}_${pid}`;
+// Every database this file creates carries this process's pid in its 14-digit stamp, so two runs
+// against one Postgres server never share a name (14 digits: 2099 + pid padded to 8 + 2-digit n).
+const stamp = (n: number) =>
+  `2099${String(process.pid).padStart(8, "0")}${String(n).padStart(2, "0")}`;
+const created = new Set<string>();
+const track = (name: string) => {
+  created.add(name);
+  return name;
+};
+const nameFor = (n: number, pid = process.pid) => track(`invai_evals_${stamp(n)}_${pid}`);
 
 async function exists(name: string): Promise<boolean> {
   const { rowCount } = await admin.query("select 1 from pg_database where datname = $1", [name]);
@@ -41,10 +51,7 @@ async function exists(name: string): Promise<boolean> {
 
 afterAll(async () => {
   await admin.query("select 1"); // keep the pool alive until the last test finishes
-  const { rows } = await admin.query<{ datname: string }>(
-    "select datname from pg_database where datname like 'invai_evals_2099%'",
-  );
-  for (const r of rows) await admin.query(`DROP DATABASE IF EXISTS "${r.datname}"`);
+  for (const name of created) await admin.query(`DROP DATABASE IF EXISTS "${name}"`);
   await admin.end();
 });
 
@@ -190,10 +197,10 @@ describe("runInScratch", () => {
       await admin.query(`CREATE DATABASE "${name}"`);
       if (marker) await admin.query(`COMMENT ON DATABASE "${name}" IS '${marker}'`);
     };
-    const staleDead = `invai_evals_20990101000001_${dead}`;
-    const freshDead = `invai_evals_20990101000002_${dead}`;
-    const oldLive = `invai_evals_20990101000003_${process.pid}`;
-    const unmarked = `invai_evals_20990101000004_${dead}`;
+    const staleDead = track(`invai_evals_${stamp(1)}_${dead}`);
+    const freshDead = track(`invai_evals_${stamp(2)}_${dead}`);
+    const oldLive = track(`invai_evals_${stamp(3)}_${process.pid}`);
+    const unmarked = track(`invai_evals_${stamp(4)}_${dead}`);
     await mk(staleDead, `created_at:${old}`);
     await mk(freshDead, `created_at:${Date.now()}`);
     await mk(oldLive, `created_at:${old}`);
@@ -236,4 +243,51 @@ describe("eval tenant setup leaves no company behind (AC4)", () => {
     );
     expect(rows).toHaveLength(1);
   });
+});
+
+describe("the launcher never prints a connection URL or password (T-53-2 r2)", () => {
+  const MARK = "PwMarker9z";
+  const bad = `postgres://owner:${MARK}@db.example.test:notaport/invai`;
+
+  it("safeErrorText drops the URL parser's input, URL spans and the env passwords", () => {
+    let thrown: unknown;
+    try {
+      new URL(bad);
+    } catch (e) {
+      thrown = e;
+    }
+    expect(JSON.stringify(Object.getOwnPropertyNames(thrown))).toContain("input"); // why err is never printed
+    const prev = process.env.DATABASE_URL;
+    process.env.DATABASE_URL = bad;
+    try {
+      const out = safeErrorText(new Error(`connect failed for ${bad} and again ${MARK}`));
+      expect(out).not.toContain(MARK);
+      expect(out).not.toContain("db.example.test");
+      expect(safeErrorText(thrown)).not.toContain(MARK);
+    } finally {
+      if (prev === undefined) delete process.env.DATABASE_URL;
+      else process.env.DATABASE_URL = prev;
+    }
+  });
+
+  for (const entry of ["evals/run.ts", "evals/market/main.ts"]) {
+    it(`${entry} with a malformed password URL prints no marker (stdout + stderr)`, () => {
+      const r = spawnSync("./node_modules/.bin/tsx", [entry], {
+        encoding: "utf8",
+        timeout: 60_000,
+        env: {
+          PATH: process.env.PATH,
+          INVAI_SKIP_DOTENV: "1",
+          DATABASE_URL: bad,
+          MIGRATION_DATABASE_URL: bad,
+          REDIS_URL: `redis://:${MARK}@localhost:notaport/0`,
+        },
+      });
+      const all = `${r.stdout}${r.stderr}`;
+      expect(r.status).toBe(1);
+      expect(all).toContain("evals failed:");
+      expect(all).not.toContain(MARK);
+      expect(all).not.toContain("db.example.test");
+    });
+  }
 });

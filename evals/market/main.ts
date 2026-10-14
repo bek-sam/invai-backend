@@ -1,4 +1,4 @@
-import { runInScratch } from "../lib/scratch-db";
+import { runInScratch, safeErrorText } from "../lib/scratch-db";
 
 /*
  * Entry point for the market eval set: `tsx evals/market/main.ts [--json <path>]`. The seed writes
@@ -16,6 +16,6 @@ runInScratch(
   },
   { applyEnv: true, onSignalCleanup: async () => close?.() },
 ).catch((err) => {
-  console.error(err);
+  console.error(`evals failed: ${safeErrorText(err)}`);
   process.exitCode = 1;
 });

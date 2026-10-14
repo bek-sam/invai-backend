@@ -54,6 +54,36 @@ export function assertEvalEnv(databaseUrl: string, migrationDatabaseUrl: string)
   assertEvalDatabase(migrationDatabaseUrl);
 }
 
+const SECRET_ENV = ["DATABASE_URL", "MIGRATION_DATABASE_URL", "REDIS_URL"] as const;
+
+/**
+ * Text that is safe to print for a launcher failure: the error name and message with every
+ * `scheme://...` span removed, plus the exact connection URLs and passwords from the environment
+ * (the URL parser keeps the input on `err.input`, so the error object itself is never printed).
+ */
+export function safeErrorText(err: unknown): string {
+  const name = err instanceof Error ? err.name : "Error";
+  let text = err instanceof Error ? err.message : "unknown failure";
+  text = text.replace(/[a-z][a-z0-9+.-]*:\/\/\S*/gi, "[url]");
+  for (const key of SECRET_ENV) {
+    const raw = process.env[key];
+    if (!raw) continue;
+    const pw = /^[^:]*:\/\/[^:@/]*:([^@]*)@/.exec(raw)?.[1];
+    for (const secret of [raw, pw, pw && safeDecode(pw)]) {
+      if (secret) text = text.split(secret).join("[redacted]");
+    }
+  }
+  return `${name}: ${text}`;
+}
+
+function safeDecode(v: string): string {
+  try {
+    return decodeURIComponent(v);
+  } catch {
+    return v;
+  }
+}
+
 /** Same loading rule as `src/env.ts` (never overwrites, never logs a value). */
 function loadDotenv(): void {
   if (process.env.NODE_ENV === "production" || process.env.INVAI_SKIP_DOTENV) return;
@@ -162,7 +192,7 @@ export async function runInScratch<T>(
   const onSignal = (code: number) => () => {
     void (async () => {
       await opts.onSignalCleanup?.().catch(() => {});
-      await dropOnce().catch((err) => console.error(`[evals] could not drop ${name}:`, err));
+      await dropOnce().catch((err) => console.error(`[evals] could not drop ${name}: ${safeErrorText(err)}`));
       process.exit(code);
     })();
   };
@@ -191,6 +221,6 @@ export async function runInScratch<T>(
   } finally {
     process.off("SIGINT", onInt);
     process.off("SIGTERM", onTerm);
-    await dropOnce().catch((err) => console.error(`[evals] could not drop ${name}:`, err));
+    await dropOnce().catch((err) => console.error(`[evals] could not drop ${name}: ${safeErrorText(err)}`));
   }
 }

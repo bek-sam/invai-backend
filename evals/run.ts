@@ -1,4 +1,4 @@
-import { runInScratch } from "./lib/scratch-db";
+import { runInScratch, safeErrorText } from "./lib/scratch-db";
 
 /*
  * Launcher for `pnpm evals` (T-53-2, B-460, architect rulings A9-A16). Nothing here may statically
@@ -18,6 +18,6 @@ runInScratch(
   },
   { applyEnv: true, onSignalCleanup: async () => closeResources?.() },
 ).catch((err) => {
-  console.error(err);
+  console.error(`evals failed: ${safeErrorText(err)}`);
   process.exitCode = 1;
 });
