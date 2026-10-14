@@ -1,5 +1,5 @@
 import { ORPCError } from "@orpc/server";
-import { sanitizeText } from "../lib/text-safety";
+import { cutWhole, sanitizeText } from "../lib/text-safety";
 import { stripPii } from "./pii";
 
 /**
@@ -17,7 +17,7 @@ export function storedErrorText(err: unknown): string {
       const name = typeof service === "string" && service.length <= 40 ? service : "The AI service";
       return `${name} could not finish this request. Try again in a minute. (UPSTREAM_FAILED)`;
     }
-    const text = stripPii(sanitizeText(err.message)).trim().slice(0, 300);
+    const text = cutWhole(stripPii(sanitizeText(err.message)).trim(), 300);
     return text || "failed";
   }
   return "The AI service could not finish this request. Try again in a minute. (INTERNAL)";

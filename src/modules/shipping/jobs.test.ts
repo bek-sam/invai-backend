@@ -664,6 +664,31 @@ describe("stuck intent sweep", () => {
     await redis.del(`stuck-intent:void:${shipment.id}`);
   });
 
+  it("a stuck-intent alert detail never ends in half an emoji (T-51-4)", async () => {
+    const { shipment } = await labeled("etsy");
+    await withSystem((tx) =>
+      tx
+        .update(shipments)
+        .set({ status: "voiding", voidAttemptedAt: null })
+        .where(eq(shipments.id, shipment.id)),
+    );
+    const real = await vi.importActual<typeof import("../../lib/outbox")>("../../lib/outbox");
+    vi.mocked(outbox.emit).mockImplementation(async (tx, co, name, payload) => {
+      if (name === "shipment.voided") throw new Error(`${"a".repeat(299)}\u{1F600}`);
+      return real.emit(tx, co, name, payload);
+    });
+    await redis.set(`stuck-intent:void:${shipment.id}`, String(STUCK_ALERT_AFTER - 1));
+    await age(shipment.id);
+    try {
+      expect(await retryStuckIntent(companyId, shipment.id, "void")).toBe("alerted");
+    } finally {
+      vi.mocked(outbox.emit).mockImplementation(real.emit);
+      await redis.del(`stuck-intent:void:${shipment.id}`);
+    }
+    const alert = await stuckAlert("void", shipment.id);
+    expect((alert?.data as { detail?: string } | undefined)?.detail).toBe("a".repeat(299));
+  });
+
   it(`a stuck push alerts after ${STUCK_ALERT_AFTER} failed retries`, async () => {
     const { shipment } = await labeled("shopify");
     await withSystem((tx) =>

@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { isORPCError } from "../../../lib/errors";
 import { logger } from "../../../lib/log";
+import { cutWhole } from "../../../lib/text-safety";
 import {
   type ChannelConn,
   type ProductImage,
@@ -182,10 +183,7 @@ export function altMarker(filename: string): string {
 /** The alt sent to Shopify: the shop's alt (cut to fit) followed by the image's marker. */
 export function shopifyAlt(img: ProductImage): string {
   const marker = altMarker(img.filename);
-  const base = img.alt
-    .trim()
-    .slice(0, MAX_ALT - marker.length - 1)
-    .trimEnd();
+  const base = cutWhole(img.alt.trim(), MAX_ALT - marker.length - 1).trimEnd();
   return base ? `${base} ${marker}` : marker;
 }
 

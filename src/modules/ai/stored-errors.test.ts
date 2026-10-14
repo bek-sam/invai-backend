@@ -1,3 +1,4 @@
+import { ORPCError } from "@orpc/server";
 import { desc, eq } from "drizzle-orm";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { mockProvider } from "../../ai/providers/mock";
@@ -90,5 +91,16 @@ describe("AI stored error text (T-35-4, B-353)", () => {
     );
     expect(storedErrorText(new Error(LEAKY))).not.toContain("Main Street");
     expect(storedErrorText(new Error(LEAKY))).toMatch(/\(INTERNAL\)$/);
+  });
+});
+
+describe("storedErrorText cut (T-51-4)", () => {
+  it("never ends in half an emoji", () => {
+    const err = new ORPCError("BAD_REQUEST", { message: `${"a".repeat(299)}\u{1F600}` });
+    expect(storedErrorText(err)).toBe("a".repeat(299));
+  });
+  it("cuts after the PII strip, so a cut never leaves half an address", () => {
+    const err = new ORPCError("BAD_REQUEST", { message: `${"a".repeat(285)} buyer@example.com` });
+    expect(storedErrorText(err)).not.toContain("buyer@");
   });
 });

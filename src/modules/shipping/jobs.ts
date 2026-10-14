@@ -20,6 +20,7 @@ import { errorData, logger } from "../../lib/log";
 import { emit } from "../../lib/outbox";
 import { defineJob, isFinalAttempt, onEvent, queues, redis } from "../../lib/queues";
 import { publish } from "../../lib/realtime";
+import { cutWhole } from "../../lib/text-safety";
 import { raiseAlert } from "../today/service";
 import {
   buyLabel,
@@ -643,7 +644,7 @@ async function alertStuck(companyId: string, shipmentId: string, kind: StuckKind
       entityType: "shipment",
       entityId: shipmentId,
       dedupeKey: `stuck-intent-${kind}-${shipmentId}`,
-      data: { intent: kind, detail: why.slice(0, 300) },
+      data: { intent: kind, detail: cutWhole(why, 300) },
       messageCode: STUCK_MESSAGE_CODE[kind],
       params: {},
     }),

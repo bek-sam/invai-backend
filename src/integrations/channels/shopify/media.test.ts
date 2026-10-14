@@ -577,3 +577,15 @@ describe("Shopify mock pushProductImages", () => {
       expect(a.pushProductImages).toBeUndefined();
   });
 });
+
+describe("shopifyAlt cut (T-51-4)", () => {
+  it("keeps the marker intact and never splits an emoji at the limit", () => {
+    const img = { ...input().images[0], filename: IMG_A } as ProductImage;
+    const marker = altMarker(img.filename);
+    const L = 512 - marker.length - 1;
+    const alt = shopifyAlt({ ...img, alt: `  ${"a".repeat(L - 1)}\u{1F600}` });
+    expect(alt).toBe(`${"a".repeat(L - 1)} ${marker}`);
+    expect(alt.endsWith(marker)).toBe(true);
+    expect(alt.length).toBeLessThanOrEqual(512);
+  });
+});
