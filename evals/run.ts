@@ -1,118 +1,23 @@
-import { writeFileSync } from "node:fs";
-import { closeDb } from "../src/db/client";
-import { describeMode, evalMode } from "./lib/mode";
-import { closeQueues } from "../src/lib/queues";
-import { runAssistantEvals } from "./assistant/run";
-import { runDigestNarrative } from "./digest_narrative/run";
-import type { EvalTenant } from "./lib/fixtures";
-import { createEvalTenant, deleteEvalTenant } from "./lib/fixtures";
-import { printOverall, printRoute, type RouteSummary } from "./lib/report";
-import type { RouteReport } from "./lib/types";
-import { runListingCopy } from "./listing_copy/run";
-import { runPersonalizationCheck } from "./personalization_check/run";
-import { runPhotoAnalysis } from "./photo_analysis/run";
-import { runScenePrompts } from "./scene_prompts/run";
-import { runTrademarkJudge } from "./trademark_judge/run";
+import { runInScratch } from "./lib/scratch-db";
 
 /*
- * Eval harness entry point (T-8-5, B-48; invai-docs/decisions/0007-ai-model-policy.md). One eval
- * set per AI route, run through the real gateway (src/ai/gateway.ts) against a throwaway tenant.
- *
- * Mode: paid AI is opt-in (decision 0038): a key in .env is ignored unless INVAI_PAID_AI=1 is set in the
- * shell, so a bare `pnpm evals` is always the free mock. With neither ANTHROPIC_API_KEY nor OPENAI_API_KEY (CI, and any local run without one), env.mocks.ai is true and
- * every call goes to the mock provider automatically (gateway.ts's aiProvider()) — this run then
- * checks the plumbing (schema-valid output, correct cardinality, the gateway/validator wiring)
- * rather than model quality, which a fixed mock can't demonstrate either way. With a key it calls
- * the real model (Anthropic first, else OpenAI: decision 0021, `evals/lib/mode.ts`) and scores against each case's `expect`.
- *
- * Usage: `pnpm evals` (all routes) or `pnpm evals listing_copy trademark_judge` (a subset).
- * `--json <path>` also writes the route summaries as JSON (used to regenerate `evals/baseline.json`).
+ * Launcher for `pnpm evals` (T-53-2, B-460, architect rulings A9-A16). Nothing here may statically
+ * import a module that reaches `src/env.ts` or the db client: the scratch database must be created
+ * and `DATABASE_URL`, `MIGRATION_DATABASE_URL` and `REDIS_URL` pointed at it BEFORE they load.
+ * The run itself lives in `evals/main.ts`, loaded by the dynamic import below. Arguments, output
+ * and exit codes are unchanged; only where the run writes changes.
  */
 
-const ROUTES: Record<string, (tenant: EvalTenant) => Promise<RouteReport>> = {
-  listing_copy: runListingCopy,
-  trademark_judge: runTrademarkJudge,
-  assistant: runAssistantEvals,
-  personalization_check: runPersonalizationCheck,
-  digest_narrative: runDigestNarrative,
-  photo_analysis: runPhotoAnalysis,
-  scene_prompts: runScenePrompts,
-};
+let closeResources: (() => Promise<void>) | undefined;
 
-/** The card's spelling (`pnpm evals photo-analysis`) for the underscore route ids. */
-const ALIASES: Record<string, string> = {
-  "photo-analysis": "photo_analysis",
-  "scene-prompts": "scene_prompts",
-};
-
-/** Always closes the db pool and the redis client — ioredis/pg keep an open handle that stops
- *  the process from exiting on its own, so every return path (including an early bad-arg exit)
- *  has to go through this, not just the happy path at the bottom of `main`. */
-async function closeResources() {
-  await closeQueues().catch(() => undefined);
-  await closeDb().catch(() => undefined);
-}
-
-function jsonArg(argv: string[]): string | null {
-  const i = argv.indexOf("--json");
-  return i >= 0 ? (argv[i + 1] ?? null) : null;
-}
-
-async function main() {
-  const argv = process.argv.slice(2);
-  const jsonOut = jsonArg(argv);
-  const requested = argv.filter((a, i) => !a.startsWith("-") && argv[i - 1] !== "--json");
-  const names = (requested.length ? requested : Object.keys(ROUTES)).map((n) => ALIASES[n] ?? n);
-  for (const n of names) {
-    if (!(n in ROUTES)) {
-      console.error(`Unknown route "${n}". Known routes: ${Object.keys(ROUTES).join(", ")}`);
-      process.exitCode = 1;
-      return;
-    }
-  }
-
-  console.log(`AI eval harness — mode: ${describeMode()}`);
-  const tenant = await createEvalTenant();
-  console.log(`Eval tenant (companyId): ${tenant.companyId}`);
-
-  try {
-    const summaries: RouteSummary[] = [];
-    let plumbingFailed = false;
-    for (const name of names) {
-      const report = await ROUTES[name]?.(tenant);
-      if (!report) continue;
-      const summary = printRoute(report);
-      summaries.push(summary);
-      if (report.mode !== "skipped" && summary.plumbingPass < summary.cases) plumbingFailed = true;
-    }
-    printOverall(summaries);
-
-    if (jsonOut) {
-      writeFileSync(
-        jsonOut,
-        `${JSON.stringify({ generatedAt: new Date().toISOString(), mode: evalMode(), routes: summaries }, null, 2)}\n`,
-      );
-      console.log(`\nWrote ${jsonOut}`);
-    }
-
-    if (plumbingFailed) {
-      console.error(
-        "\nOne or more routes have plumbing failures (schema/structure, not model quality) — see above.",
-      );
-      process.exitCode = 1;
-    }
-  } finally {
-    // B-165: delete the throwaway tenant on every exit, including a route throwing, so a failed
-    // run doesn't leave eval companies behind in whatever database `env` points at.
-    await deleteEvalTenant(tenant).catch((err) =>
-      console.error(`Could not delete eval tenant ${tenant.companyId}:`, err),
-    );
-  }
-}
-
-main()
-  .catch((err) => {
-    console.error(err);
-    process.exitCode = 1;
-  })
-  .finally(closeResources);
+runInScratch(
+  async () => {
+    const main = await import("./main");
+    closeResources = main.closeResources;
+    await main.runEvalsAndClose(process.argv.slice(2));
+  },
+  { applyEnv: true, onSignalCleanup: async () => closeResources?.() },
+).catch((err) => {
+  console.error(err);
+  process.exitCode = 1;
+});

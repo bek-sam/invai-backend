@@ -16,9 +16,38 @@ import { createCompany, createLocation, createUser } from "../../src/test/fixtur
 
 export type EvalTenant = { companyId: string; userId: string };
 
-export async function createEvalTenant(): Promise<EvalTenant> {
-  const company = await createCompany({ name: `Eval harness ${new Date().toISOString()}` });
+/**
+ * T-53-2 (A15): the `src/test` fixtures take no transaction, so a failure after `createCompany`
+ * would orphan the company. Run the rest of the setup through this: on any throw it deletes the
+ * company (everything cascades) and rethrows the original error.
+ */
+export async function withCompanyCleanup<T>(companyId: string, fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (err) {
+    await deleteEvalTenant({ companyId, userId: "" }).catch((e) =>
+      console.error(`Could not delete half-built eval tenant ${companyId}:`, e),
+    );
+    throw err;
+  }
+}
+
+export async function createEvalTenant(
+  opts: { failForTest?: boolean; name?: string } = {},
+): Promise<EvalTenant> {
+  const company = await createCompany({
+    name: opts.name ?? `Eval harness ${new Date().toISOString()}`,
+  });
+  return withCompanyCleanup(company.id, () => seedEvalTenant(company.id, opts));
+}
+
+async function seedEvalTenant(
+  companyId: string,
+  opts: { failForTest?: boolean },
+): Promise<EvalTenant> {
+  const company = { id: companyId };
   const user = await createUser(company.id, "owner");
+  if (opts.failForTest) throw new Error("failForTest: eval tenant setup failed");
   await createLocation(company.id);
   // A new company is on the trial plan (100 credits a month), fewer than one full run uses, so
   // the later routes failed with CREDITS_EXHAUSTED. A pack keeps every case about the route.
