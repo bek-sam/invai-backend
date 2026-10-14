@@ -1,5 +1,7 @@
+import { eq } from "drizzle-orm";
 import { beforeAll, describe, expect, it } from "vitest";
 import { withTenant } from "../db/client";
+import { stationTokens } from "../db/schema";
 import {
   createFloorSessionToken,
   issueStationToken,
@@ -111,6 +113,15 @@ describe("floor session station check (B-487)", () => {
       role: "presser",
     }).token;
     expect((await ctxFor(token)).station?.id).toBe(station);
+    // Revoke the way another API process would: the row changes, this process's cache entry stays.
+    await withTenant(companyId, (tx) =>
+      tx
+        .update(stationTokens)
+        .set({ revokedAt: new Date() })
+        .where(eq(stationTokens.id, issued.tokenId)),
+    );
+    expect((await ctxFor(token)).sessionKind).toBeNull();
+    // And through the admin helper, which also drops the cache in the handling process.
     await withTenant(companyId, (tx) => revokeStationTokens(tx, { companyId, stationId: station }));
     expect((await ctxFor(token)).sessionKind).toBeNull();
   });
