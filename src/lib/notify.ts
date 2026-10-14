@@ -374,7 +374,11 @@ async function claimAndCheck(input: SendUserEmailInput, now: Date): Promise<Clai
         .limit(1);
       if (!existing) return { kind: "duplicate" };
       const stale = now.getTime() - existing.updatedAt.getTime() > PENDING_STALE_MS;
-      const retryable = existing.status === "failed" || (existing.status === "pending" && stale);
+      // A pending row marked `sending` reached the transport and its mail may have gone: it is
+      // never retaken (B-450, at most one email). Only a pending row that never got there is.
+      const retryable =
+        existing.status === "failed" ||
+        (existing.status === "pending" && stale && existing.reason === null);
       if (!retryable) return { kind: "duplicate" };
       await tx
         .update(emailSends)
@@ -462,7 +466,13 @@ export async function sendUserEmail(input: SendUserEmailInput): Promise<SendUser
       .from(users)
       .where(eq(users.id, input.userId))
       .limit(1);
-    return u?.email ?? null;
+    if (!u) return null;
+    // Intent marker: from here the mail may go out, so no later claim may send it again.
+    await tx
+      .update(emailSends)
+      .set({ reason: "sending", updatedAt: new Date() })
+      .where(eq(emailSends.id, claim.id));
+    return u.email;
   });
   if (!to) {
     await settle(input, claim.id, { status: "skipped", reason: "not_member" });
@@ -474,8 +484,9 @@ export async function sendUserEmail(input: SendUserEmailInput): Promise<SendUser
     ? unsubscribeHeaders(input.companyId, input.userId, prefKind)
     : undefined;
 
+  let sent: Awaited<ReturnType<typeof sendMail>>;
   try {
-    const sent = await sendMail(
+    sent = await sendMail(
       {
         to,
         subject: input.subject,
@@ -486,24 +497,53 @@ export async function sendUserEmail(input: SendUserEmailInput): Promise<SendUser
       },
       { companyId: input.companyId },
     );
-    const mailerSkip = mailSkipReason(sent);
-    if (mailerSkip) {
-      const reason: SkipReason = mailerSkip === "pin_only" ? "placeholder" : "sample_workspace";
-      await settle(input, claim.id, { status: "skipped", reason });
-      log.info("user email skipped", { ...ctx, reason });
-      return { status: "skipped", reason };
-    }
-    await settle(input, claim.id, { status: "sent" });
-    log.info("user email sent", { ...ctx, messageId: input.messageId });
-    return { status: "sent", messageId: input.messageId };
   } catch (err) {
     // The transport error quotes the recipient: only a closed reason and safe codes leave here,
     // and the rethrown error carries no cause (B-441, S-88).
     const reason = mailFailureReason(err);
-    await settle(input, claim.id, { status: "failed", reason });
+    try {
+      await settle(input, claim.id, { status: "failed", reason });
+    } catch {
+      log.error("user email failed settle failed", ctx);
+    }
     log.error("user email failed", { ...ctx, reason, ...mailErrorFields(err) });
     throw new MailSendError(`mail transport failed (${reason})`);
   }
+
+  // The mail has gone (or the mailer skipped it). A database error from here on must not turn
+  // into `failed` or a throw: a retry would send it twice (B-450).
+  const mailerSkip = mailSkipReason(sent);
+  if (mailerSkip) {
+    const reason: SkipReason = mailerSkip === "pin_only" ? "placeholder" : "sample_workspace";
+    await settleAfterSend(input, claim.id, { status: "skipped", reason }, ctx);
+    log.info("user email skipped", { ...ctx, reason });
+    return { status: "skipped", reason };
+  }
+  await settleAfterSend(input, claim.id, { status: "sent" }, ctx);
+  log.info("user email sent", { ...ctx, messageId: input.messageId });
+  return { status: "sent", messageId: input.messageId };
+}
+
+const SETTLE_WAITS_MS = [100, 500];
+
+/** Settle after the transport answered: up to 3 tries, then log (no address) and carry on. */
+async function settleAfterSend(
+  input: SendUserEmailInput,
+  rowId: string,
+  outcome: { status: "sent" } | { status: "skipped"; reason: string },
+  ctx: { companyId: string; userId: string; kind: string },
+) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await settle(input, rowId, outcome);
+      return;
+    } catch {
+      const wait = SETTLE_WAITS_MS[attempt];
+      if (wait === undefined) break;
+      await new Promise((r) => setTimeout(r, wait));
+    }
+  }
+  log.error("user email settle failed after send", { ...ctx, messageId: input.messageId });
 }
 
 /** Tests and operators: the durable send row for a key, or null. */
