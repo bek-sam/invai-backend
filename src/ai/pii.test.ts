@@ -260,7 +260,8 @@ const EMAIL_FORMS: [string, string][] = [
   ["'@x.com", "'@x.com"],
   ["o\u2019brien@x.com", "[email]"],
   [`"${"a".repeat(64)}"@x.com`, "[email]"],
-  [`"${"a".repeat(65)}"@x.com`, `"${"a".repeat(65)}"@x.com`],
+  // T-54-4 A4.4 (authorized tightening): the quoted bound went from 64 to 254, so 65 chars is now scrubbed.
+  [`"${"a".repeat(65)}"@x.com`, "[email]"],
   ['"ef@x.com"@y.com', '"[email]"@y.com'],
 ];
 
@@ -403,5 +404,195 @@ describe("digest narrative false positives (AC4)", () => {
         expect(stripPii(text), `${unit} ${lang} ${text}`).toBe(text);
       }
     }
+  });
+});
+
+/* T-54-4 (S-93): the last phone and email forms, with the keep list around them. */
+
+const SEPS: [string, string][] = [
+  ["tab", "\t"],
+  ["thin space U+2009", "\u2009"],
+  ["U+2000", "\u2000"],
+  ["U+200A", "\u200A"],
+  ["U+205F", "\u205F"],
+  ["ideographic space U+3000", "\u3000"],
+  ["zero-width U+200B", "\u200B"],
+  ["U+2060", "\u2060"],
+  ["U+FEFF", "\uFEFF"],
+  ["tilde", "~"],
+  ["middle dot", "\u00B7"],
+  ["fullwidth hyphen U+FF0D", "\uFF0D"],
+  ["fullwidth full stop U+FF0E", "\uFF0E"],
+  ["fullwidth solidus U+FF0F", "\uFF0F"],
+  ["fullwidth low line U+FF3F", "\uFF3F"],
+  ["four spaces", "    "],
+  ["eight tabs", "\t".repeat(8)],
+];
+
+describe("stripPii phone separators and fullwidth digits (T-54-4)", () => {
+  it.each(SEPS)("US number joined by %s", (_n, sep) => {
+    const out = stripPii(`call 602${sep}555${sep}0143 now`);
+    expect(out).toBe("call [phone] now");
+  });
+
+  it.each(SEPS)("international number joined by %s", (_n, sep) => {
+    expect(stripPii(`x +52${sep}55${sep}1234${sep}5678 y`)).toBe("x [phone] y");
+  });
+
+  it.each([
+    "\uFF16\uFF10\uFF12-\uFF15\uFF15\uFF15-\uFF10\uFF11\uFF14\uFF13",
+    "\uFF0B\uFF15\uFF12 \uFF15\uFF15 \uFF11\uFF12\uFF13\uFF14 \uFF15\uFF16\uFF17\uFF18",
+    "\uFF08\uFF15\uFF15\uFF09\uFF11\uFF12\uFF13\uFF14\uFF0D\uFF15\uFF16\uFF17\uFF18",
+    "\uFF0B\uFF11 602 555 0143",
+    "\uFF11-602-555-0143",
+    "+1 \uFF16\uFF10\uFF12 555 0143",
+    "\uFF08602\uFF09 555-0143",
+  ])("fullwidth form %s leaves no digits", (p) => {
+    const out = stripPii(`tel ${p} ok`);
+    expect(out).toBe("tel [phone] ok");
+  });
+
+  it("a fullwidth date or count after a phone stays whole", () => {
+    expect(stripPii("+52 55 1234 5678\t14/10/2026")).toBe("[phone]\t14/10/2026");
+    expect(stripPii("+52 55 1234 5678 \uFF12\uFF10\uFF12\uFF16-10-14")).toBe(
+      "[phone] \uFF12\uFF10\uFF12\uFF16-10-14",
+    );
+  });
+
+  it("a fullwidth digit joins the digit run; a fullwidth decimal after eight digits is not a phone", () => {
+    expect(stripPii("+12345678\uFF15")).toBe("[phone]");
+    expect(stripPii("+12345678\uFF0E5")).toBe("+12345678\uFF0E5");
+  });
+
+  it("a word before a fullwidth digit run is not a phone start (lookbehind)", () => {
+    expect(stripPii("A\uFF16\uFF10\uFF12 555 0143")).toBe("A\uFF16\uFF10\uFF12 555 0143");
+    expect(stripPii("\uFF11602 555 0143x")).toBe("\uFF11602 555 0143x");
+  });
+
+  it.each([
+    "10~12 in",
+    "2024~2025",
+    "10 \u00B7 2024 \u00B7 2025",
+    "Qty\t3\t$19.99",
+    "1990\u30002024",
+    "\uFF11\uFF12 x \uFF11\uFF16 in",
+    "\uFF11\uFF10\uFF14\uFF12",
+    "2026\uFF0D10\uFF0D14",
+    "Sizes S\u00B7M\u00B7L\u00B7XL",
+    "TEE~BLK~XL",
+    "price 12\u200B34",
+  ])("keeps ordinary text: %s", (t) => {
+    expect(stripPii(t)).toBe(t);
+  });
+
+  it("ruled scrubbed, same as a dash today: tilde SKU digits and tab-joined 2-4-4", () => {
+    expect(stripPii("SKU~602~555~0143")).toBe("SKU~[phone]");
+    expect(stripPii("55\t2024\t2025")).toBe("[phone]");
+  });
+});
+
+describe("stripPii email forms (T-54-4)", () => {
+  it.each([
+    ['"jo\\"smith"@x.com', "[email]"],
+    ['"jo@smith"@x.com', "[email]"],
+    ["jo\uFF20x.com", "[email]"],
+    ["jo\uFE6Bx.com", "[email]"],
+    ["jo@x\uFF0Ecom", "[email]"],
+    ["jo@x\u3002com", "[email]"],
+    ["jo\u200Bsmith@x.com", "[email]"],
+    ["jo\u00ADsmith@x.com", "[email]"],
+    ["jo@x\u200B.com", "[email]"],
+    ["\u{1D423}\u{1D428}@x.com", "[email]"],
+    ["ab\u{1D423}\u{1D428}cd@x.com", "[email]"],
+    ["foo\uFF20\uFF20x.com", "[email]"],
+    [`"${"a".repeat(254)}"@x.com`, "[email]"],
+    [`"${"a".repeat(255)}"@x.com`, `"${"a".repeat(255)}"@x.com`],
+  ])("%s -> %s", (text, out) => {
+    expect(stripPii(text)).toBe(out);
+  });
+
+  it("an @ inside a quoted local part no longer stops the scan (pin for the removed stop)", () => {
+    expect(stripPii('mail "jo@smith"@x.com now')).toBe("mail [email] now");
+  });
+
+  it("a newline still stops the quoted scan", () => {
+    expect(stripPii('"jo\nsmith"@x.com')).toBe('"jo\nsmith"@x.com');
+  });
+
+  it("an even run of backslashes does not escape the quote", () => {
+    expect(stripPii('"a\\\\"b"@x.com')).toBe('"a\\\\[email]');
+  });
+
+  it.each([
+    ['"a b"@x.com.\u200B"c d"@y.com', "[email][email]"],
+    ["jo\uFF20x.com-ab\uFF20y.com", "[email][email]"],
+    ["jo@x\uFF0Ecom1ana@y.com", "[email][email]"],
+    ["\u{1D423}@x.com \u{1D428}@y.com", "[email] [email]"],
+    ["\u{1D423}@x.com.\u{1D428}@y.com", "[email][email]"],
+    ['"jo\\"s"@x.com 7 "a@b"@y.com', "[email] 7 [email]"],
+    ["jo\u200B@x.com-ab\u200B@y.com", "[email][email]"],
+  ])("glued: %s -> %s", (text, out) => {
+    expect(stripPii(text)).toBe(out);
+  });
+});
+
+describe("stripPiiDeep with the T-54-4 forms", () => {
+  it("scrubs a new phone form and a new email form in nested values and arrays", () => {
+    const out = stripPiiDeep({
+      a: { b: ["ring 602\t555\t0143 ok", { c: "mail jo\uFF20x.com" }] },
+      d: [
+        ["tel \uFF0B\uFF15\uFF12 \uFF15\uFF15 \uFF11\uFF12\uFF13\uFF14 \uFF15\uFF16\uFF17\uFF18"],
+        '"a\\"b"@x.com',
+      ],
+    });
+    expect(out).toEqual({
+      a: { b: ["ring [phone] ok", { c: "mail [email]" }] },
+      d: [["tel [phone]"], "[email]"],
+    });
+  });
+});
+
+describe("stripPii stays linear on the T-54-4 shapes", () => {
+  const BOUND_MS = 1000;
+  const KB200 = 200_000;
+  const shapes: [string, string][] = [
+    ["+ then 12 and tab", `+${"12\t".repeat(70_000)}`],
+    ["+ then 1 and thin space", `+${"1\u2009".repeat(100_000)}`],
+    ["+ then 12 and U+3000 pairs", `+${"12\u3000\u3000".repeat(50_000)}`],
+    ["+ then 1 and tilde", `+${"1~".repeat(100_000)}`],
+    ["+ then 1 and middle dot", `+${"1\u00B7".repeat(100_000)}`],
+    ["+ then 1 and fullwidth hyphen", `+${"1\uFF0D".repeat(100_000)}`],
+    ["+ then 1 and zero-width", `+${"1\u200B".repeat(100_000)}`],
+    ["+ then 1 and 8-wide tabs", `+${`1${"\t".repeat(8)}`.repeat(20_000)}`],
+    ["+ then 1 and 9-wide tabs", `+${`1${"\t".repeat(9)}`.repeat(20_000)}`],
+    ["fullwidth + then fullwidth digits", `\uFF0B${"\uFF11 ".repeat(100_000)}`],
+    ["fullwidth digit run", "\uFF11".repeat(KB200)],
+    ["fullwidth digits with parens", `\uFF0B${"\uFF08\uFF11\uFF09".repeat(60_000)}`],
+    ["602 then a 200k tab run", `602${"\t".repeat(KB200)}555`],
+    ["602 then a 200k U+3000 run", `602${"\u3000".repeat(KB200)}555`],
+    ["55 then a 200k tilde run", `55${"~".repeat(KB200)}1234`],
+    ["many 123 groups with tabs", `123\t\t`.repeat(30_000)],
+    ["many fullwidth 123 groups", "\uFF11\uFF12\uFF13\u3000".repeat(40_000)],
+    ["fullwidth at repeated", "a\uFF20".repeat(100_000)],
+    ["a, many fullwidth at, domain", `a${"\uFF20".repeat(KB200)}x.com`],
+    ["a@@x.com with fullwidth at repeated", "a\uFF20\uFF20x.com".repeat(25_000)],
+    ["quotes with backslashes then one @", `${'"\\'.repeat(100_000)}@x.com`],
+    ["backslash run then quote then @", `"${"\\".repeat(KB200)}"@x.com`],
+    ["escaped quotes then @ repeated", '"\\"@b.cc '.repeat(25_000)],
+    ["1 MB backslash quotes then one @", `${'"\\'.repeat(500_000)}@x.com`],
+    ["zero-width run before one @", `${"\u200B".repeat(KB200)}@x.com`],
+    ["zero-width a pairs before one @", `${"a\u200B".repeat(100_000)}@x.com`],
+    ["astral letters before one @", `${"\u{1D423}".repeat(100_000)}@x.com`],
+    ["astral letters and @ repeated", "\u{1D423}@b.cc.".repeat(25_000)],
+    ["lone low surrogates before @", `${"\uDC00".repeat(KB200)}@x.com`],
+    ["fullwidth dot domain run", `a@${"1\uFF0E".repeat(100_000)}`],
+    ["zero-width domain run", `a@${"1\u200B".repeat(100_000)}`],
+    ["a long quoted run (254) repeated", `"${"a".repeat(250)}"@b.cc`.repeat(700)],
+    ["quote then 300 chars then @ repeated", `"${"a".repeat(300)}"@b.cc `.repeat(600)],
+  ];
+  it.each(shapes)("%s", (_name, text) => {
+    const t0 = performance.now();
+    stripPii(text);
+    expect(performance.now() - t0).toBeLessThan(BOUND_MS);
   });
 });

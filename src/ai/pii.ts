@@ -7,11 +7,20 @@
 /**
  * Separator between phone digit groups (T-53-1, S-92): space, `.`, `-`, `/`, `_`, NBSP, narrow NBSP,
  * any dash from U+2010 to U+2015 (en, figure, em) and the minus sign. A run of 0 to 3 of them joins two
- * groups (`602  555  0143`, `+52 - 55`); the bound keeps every pattern linear.
+ * groups (`602  555  0143`, `+52 - 55`); the bound keeps every pattern linear. T-54-4 (S-93): also tab, the
+ * U+2000-U+200D spaces, U+205F, U+3000, U+2060, U+FEFF, `~`, `·` and the fullwidth `－ ． ／ ＿`, runs of 0 to 8;
+ * digits may be fullwidth. Two phones glued by a digit (any separator but space and `-`) are not split (backlog).
  */
-const SEP = "[ .\\-/_\u00A0\u202F\u2010-\u2015\u2212]";
-const SEP_RUN = `${SEP}{0,3}`;
-const SPACE_IN_RUN = /[ \u00A0\u202F]/;
+const SEP =
+  "[ \\t.\\-/_~\u00B7\u00A0\u202F\u2000-\u200D\u2010-\u2015\u205F\u2060\u2212\u3000\uFEFF\uFF0D\uFF0E\uFF0F\uFF3F]";
+const SEP_RUN = `${SEP}{0,8}`;
+const SPACE_IN_RUN = /[ \t\u00A0\u202F\u2000-\u200A\u205F\u3000]/;
+/** Digits, ASCII or fullwidth (T-54-4): a class, never a rewrite of the text. */
+const D = "[0-9\uFF10-\uFF19]";
+const NOT_AFTER_WORD = "(?<![\\w\uFF10-\uFF19])";
+const NOT_BEFORE_WORD = "(?![\\w\uFF10-\uFF19])";
+const OPEN = "[(\uFF08]";
+const CLOSE = "[)\uFF09]";
 
 /**
  * International phone numbers (R-B454): a `+` not preceded by a digit or `+` (so `call+525512345678` is a phone),
@@ -21,15 +30,20 @@ const SPACE_IN_RUN = /[ \u00A0\u202F]/;
  * are not phones. The match is capped at 16 groups of 16 digits (a longer run is never a phone, and an
  * unbounded run made the trim loop quadratic). This runs before `[number]`: a `+` never starts a card number.
  */
-const INTL_RE = new RegExp(`(?<![\\d+])\\+(?:${SEP_RUN}(?:\\(\\d{1,16}\\)|\\d{1,16})){1,16}`, "g");
-const INTL_GROUP = new RegExp(`${SEP_RUN}(?:\\(\\d+\\)|\\d+)`, "g");
-const groupSeparator = (g: string) => /^[^\d(]*/.exec(g)?.[0] ?? "";
-const digitCount = (s: string) => s.replace(/\D/g, "").length;
+const INTL_RE = new RegExp(
+  `(?<![0-9\uFF10-\uFF19+\uFF0B])[+\uFF0B](?:${SEP_RUN}(?:${OPEN}${D}{1,16}${CLOSE}|${D}{1,16})){1,16}`,
+  "g",
+);
+const INTL_GROUP = new RegExp(`${SEP_RUN}(?:${OPEN}${D}+${CLOSE}|${D}+)`, "g");
+const groupSeparator = (g: string) => /^[^0-9\uFF10-\uFF19(\uFF08]*/.exec(g)?.[0] ?? "";
+const digitCount = (s: string) => s.replace(/[^0-9\uFF10-\uFF19]/g, "").length;
+const DOT_DD = new RegExp(`^[.\uFF0E]${D}{1,2}$`);
+const NEXT_GLUED = new RegExp(`^(?:[0-9\uFF10-\uFF19%]|[.,\uFF0E]${D})`);
 
 function scrubInternational(text: string): string {
   return text.replace(INTL_RE, (match, offset: number) => {
     const groups = match.slice(1).match(INTL_GROUP) ?? [];
-    if (groups.filter((g) => g.includes("(")).length > 1) return match;
+    if (groups.filter((g) => /[(\uFF08]/.test(g)).length > 1) return match;
     let used = groups.length;
     while (used > 1 && digitCount(groups.slice(0, used).join("")) > 15) used--;
     // A trim that would cut a date or count in two (`... 5678 14/10/2026`) goes back to a whitespace boundary.
@@ -41,10 +55,10 @@ function scrubInternational(text: string): string {
       used--;
     const total = digitCount(groups.slice(0, used).join(""));
     if (total < 8 || total > 15) return match;
-    if (/^\.\d{1,2}$/.test(groups[used - 1] ?? "")) return match;
-    const phone = `+${groups.slice(0, used).join("")}`;
+    if (DOT_DD.test(groups[used - 1] ?? "")) return match;
+    const phone = `${match.charAt(0)}${groups.slice(0, used).join("")}`;
     const next = text.slice(offset + phone.length);
-    if (/^(?:[\d%]|[.,]\d)/.test(next)) return match;
+    if (NEXT_GLUED.test(next)) return match;
     return `[phone]${match.slice(phone.length)}`;
   });
 }
@@ -54,9 +68,12 @@ function scrubInternational(text: string): string {
  * 3-digit ladas are 3-3-4 and the US pattern already catches them. A generic 2-4-4 would eat
  * `10 2024-2025`.
  */
-const MX_RE = new RegExp(`\\(?\\b(?:55|56|33|81)\\)?${SEP_RUN}\\d{4}${SEP_RUN}\\d{4}\\b`, "g");
+const MX_RE = new RegExp(
+  `${OPEN}?${NOT_AFTER_WORD}(?:[5\uFF15][56\uFF15\uFF16]|[3\uFF13][3\uFF13]|[8\uFF18][1\uFF11])${CLOSE}?${SEP_RUN}${D}{4}${SEP_RUN}${D}{4}${NOT_BEFORE_WORD}`,
+  "g",
+);
 const US_RE = new RegExp(
-  `(?:\\+?1${SEP_RUN})?\\(?\\b\\d{3}\\)?${SEP_RUN}\\d{3}${SEP_RUN}\\d{4}\\b`,
+  `(?:[+\uFF0B]?[1\uFF11]${SEP_RUN})?${OPEN}?${NOT_AFTER_WORD}${D}{3}${CLOSE}?${SEP_RUN}${D}{3}${SEP_RUN}${D}{4}${NOT_BEFORE_WORD}`,
   "g",
 );
 
@@ -72,28 +89,59 @@ const maskToken = (n: number) =>
  * (`a@b.com.d@x.com`) are each scrubbed. A domain whose `@` has no local part right after a scrubbed
  * email (`jo@x.com.bob@yahoo.com`) joins that email. A run of `@` before the anchor is skipped
  * (`a@@x.com`); leading apostrophes are not part of the local part (`'jo@x.com'`); a quoted local part
- * (`"jo smith"@x.com`) is found by one backward scan of at most 64 chars (the RFC local-part maximum)
- * that stops at the previous email, an `@` or a newline. Emails run before the UUID mask, so a UUID
+ * (`"jo smith"@x.com`) is found by one backward scan of at most 254 chars (the longest deliverable address, T-54-4)
+ * that stops at the previous email or a newline (an `@` inside the quotes is allowed; a `\"` is skipped).
+ * T-54-4: the anchor may be fullwidth `＠` or small `﹫`, domain dots may be fullwidth, zero-width chars and astral letters belong to the local part. Emails run before the UUID mask, so a UUID
  * local part is scrubbed.
  */
-const EMAIL_DOMAIN_RE = /@(?:[\p{L}\p{N}\p{M}.-]+\.\p{L}{2,}|\[(?:IPv6:)?[0-9A-F.:]{2,45}\])/giu;
-const LOCAL_CHAR = /[\p{L}\p{N}\p{M}._%+'\u2019-]/u;
-const QUOTED_LOCAL_MAX = 64;
+const ZW = "\u00AD\u200B-\u200D\u2060\uFEFF";
+const AT = "[@\uFF20\uFE6B]";
+const DOT = "[.\uFF0E\u3002\uFF61]";
+const EMAIL_DOMAIN_RE = new RegExp(
+  `${AT}(?:[\\p{L}\\p{N}\\p{M}${ZW}.\\uFF0E\\u3002\\uFF61-]+${DOT}\\p{L}{2,}|\\[(?:IPv6:)?[0-9A-F.:]{2,45}\\])`,
+  "giu",
+);
+const HAS_AT = /[@\uFF20\uFE6B]/;
+const IS_AT = /^[@\uFF20\uFE6B]$/;
+const LOCAL_CHAR = new RegExp(`[\\p{L}\\p{N}\\p{M}._%+'\u2019${ZW}-]`, "u");
+const QUOTED_LOCAL_MAX = 254;
 const isApostrophe = (c: string | undefined) => c === "'" || c === "\u2019";
+
+/** Start of the local-part char (1 or 2 UTF-16 units) that ends right before `end`, or `end` when none. */
+function localCharStart(text: string, end: number, last: number): number {
+  if (end <= last) return end;
+  const c = text.charCodeAt(end - 1);
+  if (c >= 0xdc00 && c <= 0xdfff && end - 2 >= last && LOCAL_CHAR.test(text.slice(end - 2, end)))
+    return end - 2;
+  return LOCAL_CHAR.test(text[end - 1] ?? "") ? end - 1 : end;
+}
+
+function walkLocal(text: string, from: number, last: number): number {
+  let start = from;
+  for (let p = localCharStart(text, start, last); p < start; p = localCharStart(text, start, last))
+    start = p;
+  return start;
+}
+
+function escapedQuote(text: string, i: number, stop: number): boolean {
+  let run = 0;
+  for (let j = i - 1; j >= stop && text[j] === "\\"; j--) run++;
+  return run % 2 === 1;
+}
 
 function quotedStart(text: string, at: number, last: number): number {
   if (text[at - 1] !== '"') return -1;
   const stop = Math.max(last, at - 2 - QUOTED_LOCAL_MAX);
   for (let i = at - 2; i >= stop; i--) {
     const c = text[i];
-    if (c === '"') return i;
-    if (c === "@" || c === "\n") return -1;
+    if (c === '"' && !escapedQuote(text, i, stop)) return i;
+    if (c === "\n") return -1;
   }
   return -1;
 }
 
 function scrubEmails(text: string): string {
-  if (!text.includes("@")) return text;
+  if (!HAS_AT.test(text)) return text;
   let out = "";
   let last = 0;
   let lastWasEmail = false;
@@ -103,13 +151,12 @@ function scrubEmails(text: string): string {
     let start = quotedStart(text, at, last);
     if (start < 0) {
       let s0 = at;
-      while (s0 > last && text[s0 - 1] === "@") s0--;
-      start = s0;
-      while (start > last && LOCAL_CHAR.test(text[start - 1] ?? "")) start--;
+      while (s0 > last && IS_AT.test(text[s0 - 1] ?? "")) s0--;
+      start = walkLocal(text, s0, last);
       while (start < s0 && isApostrophe(text[start])) start++;
       if (start === s0) start = at;
     } else {
-      while (start > last && LOCAL_CHAR.test(text[start - 1] ?? "")) start--;
+      start = walkLocal(text, start, last);
     }
     if (start < at) {
       out += `${text.slice(last, start)}[email]`;
