@@ -302,6 +302,11 @@ export function localFlags(slots: TemplateSlot[], values: Record<string, string>
   return flags;
 }
 
+/** audit_log is append-only: flag messages and suggestions quote the buyer's answer, so only codes and slot names go in. */
+function auditFlags(flags: ArtworkFlag[]): { code: string; slot: string | null }[] {
+  return flags.map((f) => ({ code: f.code, slot: f.slot }));
+}
+
 export type RenderOutcome = {
   status: "rendered" | "flagged" | "failed";
   /** Photo slots whose value was not a key of the render's company: not sent, flagged (S-60). */
@@ -645,11 +650,16 @@ async function saveItemRender(
     entityId: itemId,
     summary:
       out.status === "failed"
-        ? `Personalization render failed: ${out.error ?? "unknown error"}`
+        ? "Personalization render failed"
         : out.status === "flagged"
           ? `Personalization rendered with ${out.flags.length} flag(s): ${out.flags.map((f) => f.code).join(", ")}`
           : "Personalization rendered",
-    data: { orderId: item.orderId, status: out.status, fileKey: out.fileKey, flags: out.flags },
+    data: {
+      orderId: item.orderId,
+      status: out.status,
+      fileKey: out.fileKey,
+      flags: auditFlags(out.flags),
+    },
   });
   if (out.fileKey)
     await emit(tx, ctx.companyId, "artwork.rendered", {
