@@ -508,7 +508,7 @@ describe("stripPii email forms (T-54-4)", () => {
     ["jo@a\uFF0Eb\uFF0Ecom", "[email]"],
     ["a@b.cc\uDC00@x.com", "[email]\uDC00@x.com"],
     [`"${"a".repeat(254)}"@x.com`, "[email]"],
-    [`"${"a".repeat(255)}"@x.com`, `"${"a".repeat(255)}"@x.com`],
+    [`"${"a".repeat(255)}"@x.com`, "[email]"],
   ])("%s -> %s", (text, out) => {
     expect(stripPii(text)).toBe(out);
   });
@@ -517,8 +517,8 @@ describe("stripPii email forms (T-54-4)", () => {
     expect(stripPii('mail "jo@smith"@x.com now')).toBe("mail [email] now");
   });
 
-  it("a newline still stops the quoted scan", () => {
-    expect(stripPii('"jo\nsmith"@x.com')).toBe('"jo\nsmith"@x.com');
+  it("a newline no longer stops the quoted scan (T-55-1, A1.7: authorized flip)", () => {
+    expect(stripPii('"jo\nsmith"@x.com')).toBe("[email]");
   });
 
   it("an even run of backslashes does not escape the quote", () => {
@@ -598,5 +598,407 @@ describe("stripPii stays linear on the T-54-4 shapes", () => {
     const t0 = performance.now();
     stripPii(text);
     expect(performance.now() - t0).toBeLessThan(BOUND_MS);
+  });
+});
+
+describe("stripPii last phone and email forms (T-55-1, S-94)", () => {
+  const nd = (s: string) => (s.match(/\p{Nd}/gu) ?? []).length;
+  const range = (from: number, to: number) =>
+    Array.from({ length: to - from + 1 }, (_, i) => String.fromCharCode(from + i));
+  const OLD_SEPS = [
+    " ",
+    "\t",
+    ".",
+    "-",
+    "/",
+    "_",
+    "~",
+    "\u00B7",
+    "\u00A0",
+    "\u202F",
+    ...range(0x2000, 0x200d),
+    ...range(0x2010, 0x2015),
+    "\u205F",
+    "\u2060",
+    "\u2212",
+    "\u3000",
+    "\uFEFF",
+    "\uFF0D",
+    "\uFF0E",
+    "\uFF0F",
+    "\uFF3F",
+  ];
+  const NEW_SEPS: [string, string][] = [
+    ["CR", "\r"],
+    ["LF", "\n"],
+    ["VT", "\v"],
+    ["FF", "\f"],
+    ["NEL", "\u0085"],
+    ["U+1680", "\u1680"],
+    ["U+2028", "\u2028"],
+    ["U+2029", "\u2029"],
+    ["bullet", "\u2022"],
+    ["fullwidth tilde", "\uFF5E"],
+    ["wave dash", "\u301C"],
+    ["katakana middle dot", "\u30FB"],
+    ["halfwidth katakana dot", "\uFF65"],
+  ];
+  const ALL_SEPS = [...OLD_SEPS, ...NEW_SEPS.map(([, s]) => s)];
+  const us = (s: string) => `602${s}555${s}0143`;
+
+  it.each(NEW_SEPS)("%s joins the groups of a US, Mexican and international number", (_n, s) => {
+    expect(stripPii(`tel ${us(s)} ok`)).toBe("tel [phone] ok");
+    expect(stripPii(`tel 55${s}1234${s}5678 ok`)).toBe("tel [phone] ok");
+    expect(stripPii(`tel +52${s}55${s}1234${s}5678 ok`)).toBe("tel [phone] ok");
+  });
+
+  it("two phones glued by a digit are scrubbed for every separator", () => {
+    for (const s of ALL_SEPS) {
+      expect(nd(stripPii(`${us(s)}1${us(s)}`)), JSON.stringify(s)).toBe(0);
+      expect(nd(stripPii(`${us(s)}\uFF16${us(s)}`)), JSON.stringify(s)).toBe(0);
+      expect(nd(stripPii(`${us(s)}\u0666${us(s)}`)), JSON.stringify(s)).toBe(0);
+    }
+  });
+
+  it("a separator run of any length joins the groups (the bound of 8 is gone)", () => {
+    for (const n of [9, 20, 200, 5000]) {
+      expect(stripPii(us(" ".repeat(n)))).toBe("[phone]");
+      expect(stripPii(us("\t".repeat(n)))).toBe("[phone]");
+      expect(stripPii(`55${"\u3000".repeat(n)}1234${"\u3000".repeat(n)}5678`)).toBe("[phone]");
+      expect(stripPii(`+52${"\u200B".repeat(n)}55 1234 5678`)).toBe("[phone]");
+    }
+  });
+
+  it.each([
+    ["6 0 2 5 5 5 0 1 4 3", "[phone]"],
+    ["tel 6 0 2 5 5 5 0 1 4 3 ok", "tel [phone] ok"],
+    [[..."6025550143"].join("\u200B"), "[phone]"],
+    [[..."6025550143"].join("-"), "[phone]"],
+    [[..."6025550143"].join("\u3000"), "[phone]"],
+    [[..."6025550143"].join(" \u200B "), "[phone]"],
+    ["+5 2 5 5 1 2 3 4 5 6 7 8", "[phone]"],
+    ["\uFF16 \uFF10 \uFF12 \uFF15 \uFF15 \uFF15 \uFF10 \uFF11 \uFF14 \uFF13", "[phone]"],
+  ])("a separator between every digit: %s", (text, out) => {
+    expect(stripPii(text)).toBe(out);
+  });
+
+  it("a run of 20 or more digits joined by separators is a phone pair, not a card", () => {
+    expect(stripPii("602 555 0143 602 555 0143")).toBe("[phone]");
+    expect(stripPii("602-555-0143-602-555-0143")).toBe("[phone]");
+    expect(nd(stripPii("60255501431602555014312"))).toBe(0);
+    expect(stripPii("tracking 9400100000000000000000 ok")).toBe("tracking [phone] ok");
+  });
+
+  it("a run under 20 digits keeps the old card rule", () => {
+    expect(stripPii("card 4111 1111 1111 1111 ok")).toBe("card [number] ok");
+    expect(stripPii("card 4111-1111-1111-1111 ok")).toBe("card [number] ok");
+    expect(stripPii("card 4111111111111111 ok")).toBe("card [number] ok");
+    expect(stripPii("card 411111111111 ok")).toBe("card 411111111111 ok");
+  });
+
+  it.each([
+    ["comma", "602,555,0143", "[phone]"],
+    ["colon", "602:555:0143", "[phone]"],
+    ["US prefix with colons", "tel 1:602:555:0143", "tel [phone]"],
+    ["Mexican comma", "55,1234,5678", "[phone]"],
+    ["Mexican colon", "55:1234:5678", "[phone]"],
+    ["Mexican colon inside a sentence", "llama 33:1234:5678 hoy", "llama [phone] hoy"],
+  ])("%s joins only the national patterns: %s", (_n, text, out) => {
+    expect(stripPii(text)).toBe(out);
+  });
+
+  it.each([
+    "Sold 120, 340, 1200 units",
+    "10:30, 11:45, 12:15",
+    "UTC+05:30 2026-10-14",
+    "+12,345,678 units",
+    "1.234.567,89",
+    "sizes 8.5 9.5 10.5 11.5 12.5 in",
+    "192.168.0.1",
+    "In stock: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10",
+    "price 1,234,567 total",
+    "at 10:30:45 ok",
+    "Order 2026-10-14\n10:30 shipped",
+    "1Z999AA10123456784123456",
+  ])("keeps %j", (text) => {
+    expect(stripPii(text)).toBe(text);
+  });
+
+  it("keeps the two remainders of the comma and colon rule (AC8): no 7-digit run is left", () => {
+    expect(stripPii("602, 555, 0143")).toBe("602, 555, 0143");
+    expect(stripPii("+44:20:7946:0958")).toBe("+44:20:7946:0958");
+    expect(stripPii("+52,55,1234,5678")).not.toMatch(/\d{7}/);
+  });
+
+  it.each([
+    ["Qty\n120\n340\n1200", "Qty\n[phone]"],
+    ["5 4 5 5 3 4 5 5 4 5", "[phone]"],
+    ["2026/10/14 2026/10/15 2026/10/16", "[phone]"],
+    ["zip 85003 85004 85005 85006", "zip [phone]"],
+  ])("scrubs the same class as the old number net: %j", (text, out) => {
+    expect(stripPii(text)).toBe(out);
+  });
+
+  it("a date on the next line stays whole", () => {
+    expect(stripPii("tel 602 555 0143\n2026-10-14")).toBe("tel [phone]\n2026-10-14");
+  });
+
+  it.each(["\r", "\n", "\v", "\f", "\u0085", "\u1680", "\u2028", "\u2029"])(
+    "an international number followed by a date after %j keeps the date whole",
+    (s) => {
+      expect(stripPii(`+52 55 1234 5678${s}14/10/2026`)).toBe(`[phone]${s}14/10/2026`);
+    },
+  );
+
+  it.each([
+    "\t",
+    "-",
+    "\u00A0",
+    "\u202F",
+    ...Array.from({ length: 14 }, (_, i) => String.fromCharCode(0x2000 + i)),
+    ...Array.from({ length: 6 }, (_, i) => String.fromCharCode(0x2010 + i)),
+    "\u205F",
+    "\u2060",
+    "\u2212",
+    "\u3000",
+    "\uFEFF",
+    "\uFF0D",
+  ])("a card number written with the separator %j is a card", (s) => {
+    expect(stripPii(`card ${["4111", "1111", "1111", "1111"].join(s)} ok`)).toBe(
+      "card [number] ok",
+    );
+  });
+
+  const mapDigits = (s: string, zero: number) =>
+    s.replace(/[0-9]/g, (d) => String.fromCodePoint(zero + Number(d)));
+  it.each([
+    ["Arabic-Indic", 0x660],
+    ["extended Arabic-Indic", 0x6f0],
+    ["Devanagari", 0x966],
+    ["mathematical bold", 0x1d7ce],
+    ["fullwidth", 0xff10],
+  ])("%s digits are digits", (_n, zero) => {
+    expect(stripPii(mapDigits("602-555-0143", zero))).toBe("[phone]");
+    expect(stripPii(`+${mapDigits("52 55 1234 5678", zero)}`)).toBe("[phone]");
+    expect(stripPii(mapDigits("4111 1111 1111 1111", zero))).toBe("[number]");
+  });
+
+  it.each([
+    ["Arabic-Indic", 0x660],
+    ["extended Arabic-Indic", 0x6f0],
+    ["Devanagari", 0x966],
+    ["fullwidth", 0xff10],
+  ])("a Mexican lada written in %s digits is a phone", (_n, zero) => {
+    expect(stripPii(mapDigits("55 1234 5678", zero))).toBe("[phone]");
+    expect(stripPii(mapDigits("(33) 1234 5678", zero))).toBe("[phone]");
+    expect(stripPii(mapDigits("81-1234-5678", zero))).toBe("[phone]");
+    expect(stripPii(mapDigits("56 1234 5678", zero))).toBe("[phone]");
+  });
+
+  it("a digit of another script glued before or after a number blocks nothing", () => {
+    expect(stripPii("\u0661602-555-0143")).toBe("\u0661602-555-0143");
+    expect(stripPii("602-555-0143\u0661")).toBe("602-555-0143\u0661");
+  });
+
+  it("fullwidth cards, ZIPs and street addresses use the ASCII placeholders", () => {
+    const fw = (s: string) =>
+      s.replace(/[!-~]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 0xfee0));
+    expect(stripPii(fw("4111 1111 1111 1111"))).toBe("[number]");
+    expect(stripPii(fw("4111-1111-1111-1111"))).toBe("[number]");
+    expect(
+      stripPii(
+        "\uFF14\uFF11\uFF11\uFF11\u3000\uFF11\uFF11\uFF11\uFF11\u3000\uFF11\uFF11\uFF11\uFF11\u3000\uFF11\uFF11\uFF11\uFF11",
+      ),
+    ).toBe("[number]");
+    expect(stripPii("zip 85003-1234 ok")).toBe("zip [zip] ok");
+    expect(stripPii("zip \uFF18\uFF15\uFF10\uFF10\uFF13-\uFF11\uFF12\uFF13\uFF14 ok")).toBe(
+      "zip [zip] ok",
+    );
+    expect(stripPii(`zip ${fw("85003-1234")} ok`)).toBe("zip [zip] ok");
+    expect(stripPii("zip \u0668\u0665\u0660\u0660\u0663-\u0661\u0662\u0663\u0664 ok")).toBe(
+      "zip [zip] ok",
+    );
+    expect(stripPii("zip 85003 ok")).toBe("zip 85003 ok");
+    expect(stripPii("ship to 2140 E Camelback Rd.")).toBe("ship to [address]");
+    expect(stripPii(`ship to ${fw("2140 E Camelback Rd")}`)).toBe("ship to [address]");
+    expect(stripPii("ship to \uFF12\uFF11\uFF14\uFF10 E Camelback Rd")).toBe("ship to [address]");
+    expect(stripPii(`ship to ${fw("2140")} E Camelback Rd Apt 4`)).toBe("ship to [address]");
+    expect(stripPii(`ship to ${fw("12 Main St Suite 5")}`)).toBe("ship to [address]");
+    expect(stripPii("ship to 2140\u3000East\u3000Camelback\u3000Road")).toBe("ship to [address]");
+    expect(stripPii("2140 E Camelback Roadmap")).toBe("2140 E Camelback Roadmap");
+    expect(stripPii(`${fw("2140 E Camelback Roadmap")}`)).toBe(fw("2140 E Camelback Roadmap"));
+  });
+
+  it.each([
+    [`"${"a".repeat(300)}"@x.com`, "[email]"],
+    [`"${"a".repeat(2000)}"@x.com`, "[email]"],
+    [`mail "${"a b".repeat(700)}"@x.com now`, "mail [email] now"],
+    ['"jo\nsmith"@x.com', "[email]"],
+    ['"jo\r\nsmith"@x.com', "[email]"],
+    ['mail "jo\nsmith"@x.com now', "mail [email] now"],
+    ["jo@example.c\u200Bom", "[email]"],
+    ["jo@x.co\u200Dm", "[email]"],
+    ["jo@x.c\u200B\u200Bom", "[email]"],
+    ["jo@x.com\u200B", "[email]"],
+    [
+      "\uFF4A\uFF4F\uFF0E\uFF53\uFF4D\uFF49\uFF54\uFF48\uFF20\uFF58\uFF0E\uFF43\uFF4F\uFF4D",
+      "[email]",
+    ],
+    ["\uFF4A\uFF4F\uFF0E\uFF53\uFF4D\uFF49\uFF54\uFF48@x.com", "[email]"],
+    ["\uFF4A\uFF4F\uFF0D\uFF53\uFF4D\uFF49\uFF54\uFF48\uFF20x.com", "[email]"],
+    ["\uFF4A\uFF4F\uFF3F\uFF53\uFF4D\uFF49\uFF54\uFF48\uFF20x.com", "[email]"],
+    ["\uFF4A\uFF4F\uFF0B\uFF53\uFF4D\uFF49\uFF54\uFF48\uFF20x.com", "[email]"],
+    ["\uFF4A\uFF4F\uFF05\uFF53\uFF4D\uFF49\uFF54\uFF48\uFF20x.com", "[email]"],
+    ["jo\u3002smith@x.com", "[email]"],
+    ["jo\uFF61smith@x.com", "[email]"],
+  ])("email form %j -> %j", (text, out) => {
+    expect(stripPii(text)).toBe(out);
+  });
+
+  it("an escaped quote still does not open a quoted local part, at any distance", () => {
+    expect(stripPii(`${'\\"'.repeat(1000)}a b"@x.com`)).not.toContain("[email]a");
+    expect(stripPii('"a\\\\"b"@x.com')).toBe('"a\\\\[email]');
+    expect(stripPii('"jo\\"s"@x.com')).toBe("[email]");
+    expect(stripPii('"jo\\\\\\"s"@x.com')).toBe("[email]");
+  });
+
+  it("an opener before the previous email is not reused", () => {
+    expect(stripPii('x "q"@b.cc and r"@d.ee')).toBe('x [email] and r"@d.ee');
+  });
+
+  it.each([
+    [`"${"a".repeat(300)}"@x.com."${"b".repeat(300)}"@y.com`, "[email][email]"],
+    [`"${"a".repeat(300)}"@x.com "${"b".repeat(300)}"@y.com`, "[email] [email]"],
+    ['"jo\nsmith"@x.com "ab\ncd"@y.com', "[email] [email]"],
+    ['"jo\nsmith"@x.com."ab\ncd"@y.com', "[email][email]"],
+    ['"jo\nsmith"@x.com-"ab\ncd"@y.com', "[email][email]"],
+    ["jo@x.c\u200Bom-ana@y.c\u200Bom", "[email][email]"],
+    ["jo@x.c\u200Bom7ana@y.c\u200Bom", "[email][email]"],
+    ["jo@x.c\u200Bom ana@y.c\u200Bom", "[email] [email]"],
+    ["jo@x.c\u200Bom.ana@y.c\u200Bom", "[email]"],
+    ["\uFF4A\uFF0E\uFF53\uFF20x.com.\uFF41\uFF0E\uFF42\uFF20y.com", "[email][email]"],
+    ["\uFF4A\uFF0E\uFF53\uFF20x.com \uFF41\uFF0E\uFF42\uFF20y.com", "[email] [email]"],
+    ["\uFF4A\uFF0E\uFF53\uFF20x.com-\uFF41\uFF0E\uFF42\uFF20y.com", "[email][email]"],
+    ["\uFF4A\uFF0E\uFF53\uFF20x.com7\uFF41\uFF0E\uFF42\uFF20y.com", "[email][email]"],
+  ])("glued: %j -> %j", (text, out) => {
+    expect(stripPii(text)).toBe(out);
+  });
+});
+
+describe("stripPiiDeep with the T-55-1 forms", () => {
+  it("scrubs a new phone form and a new email form in nested values and arrays", () => {
+    const out = stripPiiDeep({
+      a: { b: ["ring 602\n555\n0143 ok", { c: "mail \uFF4A\uFF0E\uFF53\uFF20x.com" }] },
+      d: [["tel 6 0 2 5 5 5 0 1 4 3", "call 602,555,0143 now"], `"${"a b".repeat(200)}"@x.com`],
+      e: [
+        { f: "\u0666\u0660\u0662-\u0665\u0665\u0665-\u0660\u0661\u0664\u0663" },
+        "jo@x.c\u200Bom",
+      ],
+    });
+    expect(out).toEqual({
+      a: { b: ["ring [phone] ok", { c: "mail [email]" }] },
+      d: [["tel [phone]", "call [phone] now"], "[email]"],
+      e: [{ f: "[phone]" }, "[email]"],
+    });
+  });
+});
+
+describe("stripPii stays linear on the T-55-1 shapes", () => {
+  const BOUND_MS = 1000;
+  const KB200 = 200_000;
+  const NEW_SEP_CHARS = [
+    "\r",
+    "\n",
+    "\v",
+    "\f",
+    "\u0085",
+    "\u1680",
+    "\u2028",
+    "\u2029",
+    "\u2022",
+    "\uFF5E",
+    "\u301C",
+    "\u30FB",
+    "\uFF65",
+  ];
+  const sepShapes: [string, string][] = NEW_SEP_CHARS.flatMap((s) => {
+    const label = `U+${s.charCodeAt(0).toString(16).toUpperCase().padStart(4, "0")}`;
+    return [
+      [`602 ${label} run then 555`, `602${s.repeat(KB200)}555`],
+      [`+ then 1 and ${label}`, `+${`1${s}`.repeat(100_000)}`],
+      [`1 and ${label} without a plus`, `1${s}`.repeat(100_000)],
+      [`12 and ${label} pairs`, `12${s}${s}`.repeat(60_000)],
+    ];
+  });
+  const mapZero = (s: string, zero: number) =>
+    s.replace(/[0-9]/g, (d) => String.fromCodePoint(zero + Number(d)));
+  const shapes: [string, string][] = [
+    ...sepShapes,
+    ["spaced digits", "1 ".repeat(100_000)],
+    ["spaced digits in pairs", "12 ".repeat(66_000)],
+    ["spaced digits with a plus", `+${"1 ".repeat(100_000)}`],
+    ["spaced digits, zero-width", "1\u200B".repeat(100_000)],
+    ["spaced digits, hyphen", "1-".repeat(100_000)],
+    ["spaced digits, fullwidth", "\uFF11\u3000".repeat(66_000)],
+    ["a 200k digit run", "1".repeat(KB200)],
+    ["a 32 digit run then a letter", `${"1".repeat(32)}a`],
+    ["a 200k digit run then a letter", `${"1".repeat(KB200)}a`],
+    ["spaced digits then a letter", `${"1 ".repeat(100_000)}a`],
+    ["hyphenated digits then a letter", `${"1-".repeat(100_000)}a`],
+    ["a 200k Arabic-Indic digit run", "\u0661".repeat(KB200)],
+    ["Arabic-Indic digits and spaces", "\u0661\u0662\u0663 ".repeat(50_000)],
+    ["Arabic-Indic plus run", `+${"\u0661 ".repeat(100_000)}`],
+    ["Arabic-Indic lada groups", mapZero("55 1234 ", 0x660).repeat(25_000)],
+    ["mathematical digits", "\u{1D7CF}".repeat(100_000)],
+    ["mathematical digits spaced", "\u{1D7CF} ".repeat(60_000)],
+    ["comma runs", "1,".repeat(100_000)],
+    ["colon runs", "55:".repeat(66_000)],
+    ["comma 3-3-4 groups", "123,456,7890,".repeat(15_000)],
+    ["colon 2-4-4 groups", "55:1234:5678:".repeat(15_000)],
+    ["US groups with LF", "123\n456\n7890\n".repeat(15_000)],
+    ["a comma run between groups", `602${",".repeat(KB200)}555`],
+    ["a colon run between groups", `55${":".repeat(KB200)}1234`],
+    ["many zero-width between digits", `${"1\u200B\u200B".repeat(66_000)}`],
+    ["a 20 digit near miss repeated", "1234567890123456789 ".repeat(10_000)],
+    ["a 12 digit near miss repeated", "1 2 3 4 5 6 7 8 9 ".repeat(11_000)],
+    ["a 10 digit single run repeated", "1 2 3 4 5 6 7 8 9 0 x".repeat(9_000)],
+    ["a 13 digit card net repeated", "4111 1111 1111 1 x".repeat(11_000)],
+    ["dates joined by slashes", "2026/10/14 ".repeat(18_000)],
+    ["fullwidth card groups", "\uFF11\uFF11\uFF11\uFF11\u3000".repeat(40_000)],
+    ["fullwidth zip dash", "\uFF18\uFF15\uFF10\uFF10\uFF13\uFF0D\uFF11\uFF12\uFF13".repeat(20_000)],
+    ["fullwidth address words", `12\u3000${"\uFF21\uFF42 ".repeat(66_000)}`],
+    ["address words long", `12 ${"Ab ".repeat(66_000)}`],
+    ["address numbers", "12 Ab Cd ".repeat(22_000)],
+    ["address unit", `12 Ab St ${"Apt ".repeat(40_000)}`],
+    ["quoted local across LF, one @", `"${"a\n".repeat(100_000)}"@x.com`],
+    ["quoted opener LF pairs repeated", '"a\nb"@c.dd '.repeat(18_000)],
+    ["opener far before many @", `"${"a b ".repeat(20_000)}${"c@d.ee ".repeat(18_000)}`],
+    ["escaped quotes across LF then @", '\\"\n@b.cc '.repeat(25_000)],
+    ["quote escapes then @ repeated", '"\\"@b.cc '.repeat(25_000)],
+    ["1 MB escaped quote, no opener", '\\"@b.cc '.repeat(125_000)],
+    ["1 MB quoted, quote then @ repeated", '"@b.cc '.repeat(140_000)],
+    ["zero-width TLD letters", `jo@x.${"c\u200B".repeat(100_000)}`],
+    ["zero-width TLD and @ repeated", "a@b.c\u200Bd ".repeat(25_000)],
+    ["zero-width TLD then more domain", `a@b.${"c\u200B".repeat(50_000)}-`],
+    ["fullwidth local run before one @", `${"\uFF4A\uFF0E".repeat(100_000)}@x.com`],
+    ["fullwidth local run, fullwidth @", `${"\uFF4A\uFF0D".repeat(100_000)}\uFF20x.com`],
+    ["fullwidth local with punctuation", `${"\uFF3F\uFF0B\uFF05".repeat(66_000)}@x.com`],
+    ["ideographic stops before one @", `${"\u3002".repeat(KB200)}@x.com`],
+    ["fullwidth local and @ repeated", "\uFF4A\uFF0E\uFF53\uFF20b.cc ".repeat(20_000)],
+  ];
+  it.each(shapes)("%s", (_name, text) => {
+    const t0 = performance.now();
+    stripPii(text);
+    expect(performance.now() - t0).toBeLessThan(BOUND_MS);
+  });
+
+  it("a realistic 200 KB listing text is unchanged and fast", () => {
+    const para =
+      "Vintage desert bloom tee, soft ring-spun cotton, 12 x 16 in DTF transfer, sizes S-3XL. Order #1042 ships in 2-3 days; $19.99, 2026-10-14 10:30. Care: wash cold 30\u00B0C, tumble dry low. Bulk 10+ pcs save 6.5%. SKU TEE-BLK-XL / G500-BLK-2XL.\n";
+    const text = para.repeat(Math.ceil(KB200 / para.length)).slice(0, KB200);
+    const t0 = performance.now();
+    const out = stripPii(text);
+    expect(performance.now() - t0).toBeLessThan(BOUND_MS);
+    expect(out).toBe(text);
   });
 });
