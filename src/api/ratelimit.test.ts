@@ -1,5 +1,5 @@
 import { call } from "@orpc/server";
-import { beforeAll, describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import { env } from "../env";
 import { checkRateLimit, RATE_BUCKET_LIMITS } from "../lib/ratelimit";
 import { createCompany, createUser } from "../test/fixtures";
@@ -14,6 +14,21 @@ import { router } from "./router";
  * (`checkRateLimit`) directly, rather than firing hundreds of real requests -- same bucket, same
  * key, so it proves the same thing much faster.
  */
+
+/**
+ * B-283: the buckets refill by wall-clock (`reads` 5 tokens a second), so a drain loop that a loaded
+ * machine slows down hands back a whole token and the "drained" call is admitted. Freeze Date (only
+ * Date: timers and Valkey I/O stay real) around drain + call, so no refill can happen between them.
+ */
+async function withFrozenDate<T>(fn: () => Promise<T>): Promise<T> {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(new Date());
+  try {
+    return await fn();
+  } finally {
+    vi.useRealTimers();
+  }
+}
 
 type AnyProcedure = Parameters<typeof call>[0];
 function procedureAt(path: string): AnyProcedure {
@@ -47,13 +62,15 @@ describe("per-company rate limit middleware", () => {
 
   it("admits requests under the bucket, then RATE_LIMITED with a Retry-After header once drained", async () => {
     const limits = RATE_BUCKET_LIMITS.reads;
-    for (let i = 0; i < limits.capacity; i++) {
-      expect((await checkRateLimit("reads", companyId, limits)).allowed).toBe(true);
-    }
     const ctx = userContext(companyId, userId);
-    await expect(call(procedureAt("me.get"), {}, { context: ctx })).rejects.toMatchObject({
-      code: "RATE_LIMITED",
-      data: { retryAfterSec: expect.any(Number) },
+    await withFrozenDate(async () => {
+      for (let i = 0; i < limits.capacity; i++) {
+        expect((await checkRateLimit("reads", companyId, limits)).allowed).toBe(true);
+      }
+      await expect(call(procedureAt("me.get"), {}, { context: ctx })).rejects.toMatchObject({
+        code: "RATE_LIMITED",
+        data: { retryAfterSec: expect.any(Number) },
+      });
     });
     // Set even though the middleware threw (ResponseHeadersPlugin merges it into the response).
     expect(Number(ctx.resHeaders?.get("Retry-After"))).toBeGreaterThanOrEqual(1);
@@ -71,12 +88,15 @@ describe("per-company rate limit middleware", () => {
     const co = await createCompany();
     const u = await createUser(co.id, "owner");
     const limits = RATE_BUCKET_LIMITS.ai;
-    for (let i = 0; i < limits.capacity; i++) {
-      expect((await checkRateLimit("ai", co.id, limits)).allowed).toBe(true);
-    }
-    // The ai bucket is drained; reads/writes for the same company are untouched.
     const readsLimits = RATE_BUCKET_LIMITS.reads;
-    expect((await checkRateLimit("reads", co.id, readsLimits)).allowed).toBe(true);
+    await withFrozenDate(async () => {
+      for (let i = 0; i < limits.capacity; i++) {
+        expect((await checkRateLimit("ai", co.id, limits)).allowed).toBe(true);
+      }
+      // The ai bucket is drained; reads/writes for the same company are untouched.
+      expect((await checkRateLimit("ai", co.id, limits)).allowed).toBe(false);
+      expect((await checkRateLimit("reads", co.id, readsLimits)).allowed).toBe(true);
+    });
     void u;
   });
 });
@@ -110,11 +130,13 @@ describe("rate limit header over real HTTP", () => {
   it("a 429 from the real HTTP surface carries a Retry-After header", async () => {
     const { cookie, companyId } = await signUpAndCreateOrg();
     const limits = RATE_BUCKET_LIMITS.reads;
-    for (let i = 0; i < limits.capacity; i++) {
-      await checkRateLimit("reads", companyId, limits);
-    }
-    const res = await app.request("/api/v1/me", {
-      headers: { origin: env.WEB_ORIGIN, cookie },
+    const res = await withFrozenDate(async () => {
+      for (let i = 0; i < limits.capacity; i++) {
+        await checkRateLimit("reads", companyId, limits);
+      }
+      return app.request("/api/v1/me", {
+        headers: { origin: env.WEB_ORIGIN, cookie },
+      });
     });
     expect(res.status).toBe(429);
     expect(Number(res.headers.get("retry-after"))).toBeGreaterThanOrEqual(1);

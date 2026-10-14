@@ -164,6 +164,7 @@ async function crit1(
     const bJobDesign = await design(b);
     const bManualDesign = await design(b);
 
+    const tA0 = Date.now();
     let stop = false;
     let aOk = 0;
     let aRefused = 0;
@@ -229,6 +230,13 @@ async function crit1(
       }
     })();
     const [jobRes, manualRes] = await Promise.all([jobRun, manualRun]);
+    // B-457: "A is the one refused" must not depend on how far A's loop got while B was served
+    // (a loaded machine serves B before A has drained its allowance). Keep A calling until its
+    // first RATE_LIMITED, and bound that by a count the allowance guarantees: the burst plus the
+    // refills since A started, plus 2 for the call in flight and rounding. More successes than
+    // that means A was never limited.
+    const maxAOk = () => QA_BURST + Math.floor((Date.now() - tA0) / qaTimingNow().refillMs) + 2;
+    while (aRefused === 0 && aOk <= maxAOk()) await sleep(10);
     stop = true;
     await Promise.all([loopA, loopArtwork]);
     process.stderr.write(
@@ -242,7 +250,10 @@ async function crit1(
     expect(manualRes.ms).toBeLessThan(resultBound);
     expect(manualRes.ms).toBeLessThan(yieldBound);
     expect(await qaStatusOf(b, bManualDesign.id)).toBe("passed");
-    expect(aRefused).toBeGreaterThan(0);
+    expect(
+      aRefused,
+      `shop A made ${aOk} successful QA calls (allowance ${QA_BURST} + refills) without one RATE_LIMITED`,
+    ).toBeGreaterThan(0);
   } finally {
     scaleQaTiming(1); // also resets the re-delay floor and the manual busy budget
     setQaCooldown(0);

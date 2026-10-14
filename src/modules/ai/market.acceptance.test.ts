@@ -21,6 +21,7 @@ import {
   channelConnections,
   designs,
   listings,
+  marketSeriesCache,
   orderItems,
   orders,
   products,
@@ -422,6 +423,10 @@ describe("T-18-4 market answers on a fixture shop (spec AC2, AC16, AC30, AC31, A
 
   beforeAll(async () => {
     s = await shop("Answer Bloom");
+    // B-283: `market.refreshDemand` is cross-tenant and skips a source whose global cache is still
+    // fresh, so what these answers saw depended on which file wrote the cache last and with which
+    // clock. Start from an empty cache, as the sibling market suites do (B-221).
+    await withSystem((tx) => tx.delete(marketSeriesCache));
     const now = freeze(NOW);
     amazon = await connection(s.id, "amazon", "connected");
     // Two Halloween designs on Etsy, both below the 15% margin floor (R1 + R3 each).
@@ -467,7 +472,14 @@ describe("T-18-4 market answers on a fixture shop (spec AC2, AC16, AC30, AC31, A
       expect.arrayContaining(["get_price_position", "simulate_price"]),
     );
     const mockRecs = turn.results.flatMap((r) => (r.recommendations ?? []).filter((x) => x.mock));
-    expect(mockRecs.length, "an R2 on the mock Amazon comparables").toBeGreaterThan(0);
+    // The failure message carries what the tools returned, so a recurrence explains itself.
+    const seen = JSON.stringify(
+      turn.results.map((r) => ({ name: r.name, recs: r.recommendations, summary: r.summary })),
+    );
+    expect(
+      mockRecs.length,
+      `an R2 on the mock Amazon comparables; tools returned ${seen}`,
+    ).toBeGreaterThan(0);
     expect(mockRecs.some((r) => r.rule === "R2")).toBe(true);
     expect(turn.text).toMatch(REC_SAMPLE);
     expect(turn.text.toLowerCase()).toContain("sample data");
