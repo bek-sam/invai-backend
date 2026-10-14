@@ -258,6 +258,10 @@ const EMAIL_FORMS: [string, string][] = [
   ["see @x.com", "see @x.com"],
   ["foo@bar@x.com", "foo@[email]"],
   ["'@x.com", "'@x.com"],
+  ["o\u2019brien@x.com", "[email]"],
+  [`"${"a".repeat(64)}"@x.com`, "[email]"],
+  [`"${"a".repeat(65)}"@x.com`, `"${"a".repeat(65)}"@x.com`],
+  ['"ef@x.com"@y.com', '"[email]"@y.com'],
 ];
 
 describe("stripPii email forms (T-53-1)", () => {
