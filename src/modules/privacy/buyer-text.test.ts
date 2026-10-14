@@ -1,8 +1,17 @@
+import { ITEM_FLAG_CODES } from "@invai/contracts";
 import { eq } from "drizzle-orm";
 import { beforeAll, describe, expect, it, vi } from "vitest";
 import { withSystem, withTenant } from "../../db/client";
 import { channelConnections, orderItems, orderNotes, orders } from "../../db/schema";
-import { createCompany, createConnection, createOrder } from "../../test/fixtures";
+import { getObject } from "../../lib/s3";
+import {
+  createCompany,
+  createConnection,
+  createOrder,
+  createUser,
+  tenantContext,
+} from "../../test/fixtures";
+import { setItemFlag } from "../orders/service";
 import {
   createNameTemplate,
   exists,
@@ -11,7 +20,16 @@ import {
   seedItemArt,
   seedNotes,
 } from "./buyer-text.fixtures";
-import { buyerPiiCutoff, handlePrivacyRequest, redactStaleBuyerPii } from "./service";
+import {
+  buyerPiiCutoff,
+  exportKey,
+  handlePrivacyRequest,
+  redactBuyerText,
+  redactStaleBuyerPii,
+  requestExport,
+  runTenantExport,
+} from "./service";
+import { readZip } from "./zip";
 
 /*
  * T-29-1 (S-56, B-293, B-296, decision 0027): redact requests and the 18-month sweep clear every
@@ -186,5 +204,131 @@ describe("18-month sweep clears every unit", () => {
     expect((await readBack(companyId, o.order.id, o.b)).art?.status).toBe("purged");
     await redactStaleBuyerPii();
     await expectAllCleared(o);
+  });
+});
+
+/*
+ * T-53-3 (B-459, decision 0027 amendment): a flag's staff `message` (setItemFlag note) is buyer
+ * text. Purged with the order; code, severity, active and createdAt stay; the export still has it.
+ */
+describe("staff flag text is purged with the order", () => {
+  let cid: string;
+  let ctx: ReturnType<typeof tenantContext>;
+  let conn: string;
+  const marker = (code: string) => `Probe flag text ${code} ${uniq()}`;
+
+  beforeAll(async () => {
+    cid = (await createCompany()).id;
+    const office = await createUser(cid, "office");
+    ctx = tenantContext(cid, office.id, "office");
+    conn = (await createConnection(cid)).id;
+  });
+
+  /** One unit carrying one flag per code, each with its own marker; the unit stays in `state`. */
+  async function flagged(state: "ready" | "delivered", set: Partial<typeof orders.$inferInsert>) {
+    const { order, items } = await createOrder(cid, conn, { units: 1 });
+    const item = items[0];
+    if (!item) throw new Error("item");
+    await withSystem(async (tx) => {
+      await tx.update(orders).set(set).where(eq(orders.id, order.id));
+      await tx.update(orderItems).set({ state }).where(eq(orderItems.id, item.id));
+    });
+    const markers = new Map<string, string>();
+    for (const code of ITEM_FLAG_CODES) {
+      const m = marker(code);
+      markers.set(code, m);
+      await withTenant(cid, (tx) =>
+        setItemFlag(tx, ctx, { id: item.id, code, active: true, note: m }),
+      );
+    }
+    return { orderId: order.id, itemId: item.id, markers };
+  }
+
+  const itemRow = (itemId: string) =>
+    withTenant(cid, async (tx) => {
+      const [r] = await tx.select().from(orderItems).where(eq(orderItems.id, itemId));
+      return r;
+    });
+
+  const shape = (flags: { code: string; severity: string; active: boolean; createdAt: string }[]) =>
+    flags.map(({ code, severity, active, createdAt }) => ({ code, severity, active, createdAt }));
+
+  it("resets every code's message on both clocks, keeping code, severity, active, createdAt", async () => {
+    const old = new Date(buyerPiiCutoff().getTime() - 86400_000);
+    const all = await flagged("ready", { placedAt: old, shippedAt: old, status: "shipped" });
+    const shipped = await flagged("delivered", { status: "delivered" });
+    const before = shape((await itemRow(shipped.itemId))?.flags ?? []);
+    expect(before.map((f) => f.code).sort()).toEqual([...ITEM_FLAG_CODES].sort());
+
+    // 30-day clock (scope shipped-items), order-level: even the unit still in production resets.
+    await withTenant(cid, (tx) =>
+      redactBuyerText(tx, [shipped.orderId], { scope: "shipped-items" }),
+    );
+    const r = await itemRow(shipped.itemId);
+    for (const m of shipped.markers.values()) expect(JSON.stringify(r)).not.toContain(m);
+    expect(shape(r?.flags ?? [])).toEqual(before);
+    for (const f of r?.flags ?? []) expect(f.message).toBe(f.code.replace(/_/g, " "));
+
+    // 18-month sweep (scope all).
+    await redactStaleBuyerPii();
+    const r2 = await itemRow(all.itemId);
+    for (const m of all.markers.values()) expect(JSON.stringify(r2)).not.toContain(m);
+    expect((r2?.flags ?? []).map((f) => f.message)).toEqual(
+      (r2?.flags ?? []).map((f) => f.code.replace(/_/g, " ")),
+    );
+
+    // Run twice: nothing changes.
+    const snap = facts(await itemRow(shipped.itemId));
+    await withTenant(cid, (tx) =>
+      redactBuyerText(tx, [shipped.orderId], { scope: "shipped-items" }),
+    );
+    expect(facts(await itemRow(shipped.itemId))).toBe(snap);
+  });
+
+  it("keeps artwork-code flags consistent: purge removes them, other flag text still resets", async () => {
+    const o = await flagged("delivered", { status: "delivered" });
+    await withSystem((tx) =>
+      tx.update(orderItems).set({ artworkStatus: "approved" }).where(eq(orderItems.id, o.itemId)),
+    );
+    await withTenant(cid, (tx) => redactBuyerText(tx, [o.orderId], { scope: "all" }));
+    const r = await itemRow(o.itemId);
+    for (const m of o.markers.values()) expect(JSON.stringify(r)).not.toContain(m);
+    expect(r?.flags.some((f) => f.code === "address_invalid")).toBe(true);
+  });
+
+  it("picks up a legacy already-purged order whose only buyer text is a flag message", async () => {
+    const old = new Date(buyerPiiCutoff().getTime() - 86400_000);
+    const o = await flagged("delivered", { placedAt: old, shippedAt: old, status: "shipped" });
+    // Legacy: everything else was purged by the earlier version; only the flag text stayed.
+    await withSystem((tx) => tx.delete(orderNotes).where(eq(orderNotes.orderId, o.orderId)));
+    await redactStaleBuyerPii();
+    const r = await itemRow(o.itemId);
+    for (const m of o.markers.values()) expect(JSON.stringify(r)).not.toContain(m);
+  });
+
+  it("leaves an order alone that has no flag text (no rewrite)", async () => {
+    const { order, items } = await createOrder(cid, conn, { units: 1 });
+    const id = items[0]?.id as string;
+    await withTenant(cid, (tx) =>
+      setItemFlag(tx, ctx, { id, code: "reprint", active: true, note: null }),
+    );
+    const snap = facts(await itemRow(id));
+    await withTenant(cid, (tx) => redactBuyerText(tx, [order.id], { scope: "all" }));
+    expect(facts(await itemRow(id))).toBe(snap);
+  });
+
+  it("export carries the flag message before the purge, and not after", async () => {
+    const o = await flagged("delivered", { status: "delivered" });
+    const exportItems = async () => {
+      const job = await withTenant(cid, (tx) => requestExport(tx, ctx));
+      await runTenantExport(cid, job.id);
+      const zip = readZip(await getObject(exportKey(cid, job.id)));
+      return zip.get("tables/order_items.json")?.toString("utf8") ?? "";
+    };
+    const first = await exportItems();
+    for (const m of o.markers.values()) expect(first).toContain(m);
+    await withTenant(cid, (tx) => redactBuyerText(tx, [o.orderId], { scope: "all" }));
+    const second = await exportItems();
+    for (const m of o.markers.values()) expect(second).not.toContain(m);
   });
 });

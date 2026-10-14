@@ -167,6 +167,9 @@ export function holdsBuyerText(scope: BuyerTextScope): SQL {
       and n.order_id = ${orders.id})
     or exists (select 1 from refund_events r where r.company_id = ${orders.companyId}
       and r.order_id = ${orders.id} and r.note is not null)
+    or exists (select 1 from order_items f, jsonb_array_elements(f.flags) e
+      where f.company_id = ${orders.companyId} and f.order_id = ${orders.id}
+      and e->>'message' is distinct from replace(e->>'code', '_', ' '))
     or exists (select 1 from order_items i where i.company_id = ${orders.companyId}
       and i.order_id = ${orders.id}${itemState} and (
         jsonb_path_exists(i.personalization, '$[*] ? (@.answer != null || @.fileUrl != null)')
@@ -385,6 +388,17 @@ export async function redactBuyerText(
       .where(inArray(orderNotes.orderId, orderIds))
       .returning({ id: orderNotes.id })
   ).length;
+  // A flag's message is staff free text (setItemFlag note): reset to the fixed code text, on
+  // every item of the order (re-read: the art update above rewrote flags).
+  const flagRows = await tx
+    .select({ id: orderItems.id, flags: orderItems.flags })
+    .from(orderItems)
+    .where(inArray(orderItems.orderId, orderIds));
+  for (const r of flagRows) {
+    const fixed = r.flags.map((f) => ({ ...f, message: f.code.replace(/_/g, " ") }));
+    if (fixed.some((f, n) => f.message !== r.flags[n]?.message))
+      await tx.update(orderItems).set({ flags: fixed }).where(eq(orderItems.id, r.id));
+  }
   res.notes += (
     await tx
       .update(refundEvents)

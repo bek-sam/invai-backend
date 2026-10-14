@@ -856,7 +856,7 @@ export async function setTags(tx: Tx, ctx: TenantContext, input: { id: string; t
     action: "order.tags",
     entityType: "order",
     entityId: input.id,
-    summary: tags.length ? `Tags: ${tags.join(", ")}` : "Tags cleared",
+    summary: tags.length ? `Tags updated (${tags.length})` : "Tags cleared",
   });
   await emit(tx, ctx.companyId, "order.updated", { orderId: input.id });
   return getOrderSummary(tx, ctx, input.id);
