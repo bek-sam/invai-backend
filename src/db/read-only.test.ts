@@ -82,7 +82,10 @@ describe("withTenantReadOnly", () => {
     expect(own.length).toBeGreaterThan(0);
     expect(own.every((r) => r.companyId === a)).toBe(true);
     const bRows = await withTenantReadOnly(b, (tx) => tx.select().from(locations));
+    // `every()` on an empty array is true, so prove B has rows and A does not see them.
+    expect(bRows.length).toBeGreaterThan(0);
     expect(bRows.every((r) => r.companyId === b)).toBe(true);
+    expect(own.some((r) => bRows.some((x) => x.id === r.id))).toBe(false);
     // Same pool, no company set: RLS hides every row. Owner pool proves the rows exist.
     const none = await db.select().from(locations);
     expect(none).toHaveLength(0);

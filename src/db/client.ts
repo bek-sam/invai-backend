@@ -82,6 +82,9 @@ export function withTenant<T>(companyId: string, fn: (tx: Tx) => Promise<T>): Pr
  * query fails with 25001.
  * Limit: read-only does NOT stop `select set_config('app.company_id', <other>, true)` inside `fn`,
  * which switches the tenant. Callers must keep their SQL fixed and free of `set_config`.
+ * A COMMIT or ROLLBACK run inside `fn` ends this read-only transaction and its `app.company_id`; later
+ * statements run outside both. Pass only fixed, single-statement SQL with bound parameters: text with no
+ * parameters goes as a simple query, which may hold several statements.
  */
 export function withTenantReadOnly<T>(companyId: string, fn: (tx: Tx) => Promise<T>): Promise<T> {
   return scoped(db, { "app.company_id": companyId }, async (tx) => {
