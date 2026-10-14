@@ -182,10 +182,42 @@ const NUMBER_IN_RUN = new RegExp(
   `${NOT_AFTER_WORD}${D}(?:${NET_SEP}?${D}){12,18}${NOT_BEFORE_WORD}`,
   "gu",
 );
-const scrubRuns = (text: string) =>
-  text.replace(RUN_RE, (m) =>
-    digitCount(m) >= 20 || SINGLE_DIGITS.test(m) ? "[phone]" : m.replace(NUMBER_IN_RUN, "[number]"),
-  );
+const replaceRun = (m: string) =>
+  digitCount(m) >= 20 || SINGLE_DIGITS.test(m) ? "[phone]" : m.replace(NUMBER_IN_RUN, "[number]");
+/**
+ * RUN_RE ends in a lookahead, so on a run with no valid end (`1_ 1_ 1_ ...`: `_` is a separator and a word char)
+ * every start scans to the end of the run and backtracks: quadratic (T-55-1 r2). Each region of 13+ digit and
+ * separator chars (starting at a digit) is cut at its last valid end first (a digit not followed by a word char or digit), which keeps
+ * the same matches: no match can end later, and a region with no valid end has none.
+ */
+const RUN_REGION = new RegExp(`${D}[${D}${SEP.slice(1, -1)}]{12,}`, "gu");
+const VALID_END = new RegExp(`${D}(?![\\w\\p{Nd}])`, "gu");
+function scrubRuns(text: string): string {
+  let out = "";
+  let last = 0;
+  for (const m of text.matchAll(RUN_REGION)) {
+    const rs = m.index;
+    const len = m[0].length;
+    const seg = text.slice(rs, rs + len + 2);
+    VALID_END.lastIndex = 0;
+    let end = -1;
+    for (let v = VALID_END.exec(seg); v && v.index < len; v = VALID_END.exec(seg)) {
+      end = v.index + v[0].length;
+    }
+    if (end < 0) continue;
+    // One char before (the lookbehind) and the char after the cut (the lookahead) give RUN_RE its real context.
+    const ctx = Math.max(rs - 1, 0);
+    const stop = Math.min(
+      rs + end + ((text.codePointAt(rs + end) ?? 0) > 0xffff ? 2 : 1),
+      text.length,
+    );
+    const rep = text.slice(ctx, stop).replace(RUN_RE, replaceRun);
+    if (ctx > last) out += text.slice(last, ctx);
+    out += rep.slice(Math.max(0, last - ctx));
+    last = stop;
+  }
+  return out + text.slice(last);
+}
 const fw = (s: string) => s.replace(/[!-~]/g, (c) => String.fromCharCode(c.charCodeAt(0) + 0xfee0));
 const SUFFIX = [
   "St",

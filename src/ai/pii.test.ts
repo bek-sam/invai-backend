@@ -1002,3 +1002,36 @@ describe("stripPii stays linear on the T-55-1 shapes", () => {
     expect(out).toBe(text);
   });
 });
+
+describe("stripPii stays linear on separator runs with a word-char separator (T-55-1 r2)", () => {
+  const BOUND_MS = 1000;
+  const sizes = [
+    ["200 KB", 200_000],
+    ["1 MB", 1_000_000],
+  ] as const;
+  const units = [
+    ["ASCII digit, underscore, space", "1_ "],
+    ["ASCII digit, underscore, dash", "1_-"],
+    ["Arabic-Indic digit, underscore, space", "١_ "],
+    ["Arabic-Indic digit, underscore, dash", "١_-"],
+    ["double underscore", "1__ "],
+    ["underscore then dot", "1_._"],
+    ["two-digit groups", "12_ "],
+    ["underscore, line separator", "1_ "],
+    ["underscore run ending valid", "1_ 1_ 1_ 1_ 1_ 1_ 1_ 1_ 1_ 1_ 1 "],
+  ] as const;
+  const cases = units.flatMap(([u, unit]) =>
+    sizes.map(([s, n]) => [`${u}, ${s}`, unit.repeat(Math.ceil(n / unit.length))] as const),
+  );
+  it.each(cases)("%s", (_name, text) => {
+    const t0 = performance.now();
+    stripPii(text);
+    expect(performance.now() - t0).toBeLessThan(BOUND_MS);
+  });
+
+  it("keeps the same matches as before the cut", () => {
+    expect(stripPii("1 2 3 4 5 6 7 8 9 0 x")).toBe("[phone] x");
+    expect(stripPii("1_ 2_ 3_ 4_ 5_ 6_ 7_ 8_ 9_ 0 x")).toBe("[phone] x");
+    expect(stripPii("1_ 2_ 3_ 4_ 5_ 6_ 7_ 8_ 9_ 0_ x")).toBe("1_ 2_ 3_ 4_ 5_ 6_ 7_ 8_ 9_ 0_ x");
+  });
+});
