@@ -76,6 +76,21 @@ export function withTenant<T>(companyId: string, fn: (tx: Tx) => Promise<T>): Pr
 }
 
 /**
+ * Read-only variant of `withTenant` for scripts that must never write (the analytics runner).
+ * Same pool (`invai_app`, RLS on) and same `app.company_id`; then `SET TRANSACTION READ ONLY`
+ * on the same `tx` before `fn`. Writes fail with 25006; `SET TRANSACTION READ WRITE` after a
+ * query fails with 25001.
+ * Limit: read-only does NOT stop `select set_config('app.company_id', <other>, true)` inside `fn`,
+ * which switches the tenant. Callers must keep their SQL fixed and free of `set_config`.
+ */
+export function withTenantReadOnly<T>(companyId: string, fn: (tx: Tx) => Promise<T>): Promise<T> {
+  return scoped(db, { "app.company_id": companyId }, async (tx) => {
+    await tx.execute(sql`set transaction read only`);
+    return fn(tx);
+  });
+}
+
+/**
  * Vendor portal scope: the vendor's own company plus `app.vendor_org_id`, which the
  * `*_vendor_read` policies use to expose the sheets shops shared with this vendor.
  */
