@@ -918,17 +918,44 @@ describe("cents above 2,147,483,647 stay exact", () => {
   const TZ = "America/Los_Angeles";
   let shop: Shop;
   let rep: Report;
+  let reprintRows: Row[];
 
   beforeAll(async () => {
     shop = await makeShop(TZ);
     const { fromAt } = await window(TZ);
+    const costly = await makeShop(TZ);
+    const two = await makeOrders(costly, [{}, {}]);
+    await addProfitLines(
+      costly,
+      two.map((m) => ({
+        orderId: m.orderId,
+        itemId: m.itemIds[0] as string,
+        channel: "csv" as const,
+        placedAt: fromAt,
+        transferCostCents: 1_000_000_000,
+        blankCostCents: 1_000_000_000,
+      })),
+    );
+    await addReprints(
+      costly,
+      two.map((m) => ({
+        itemId: m.itemIds[0] as string,
+        reason: "peel" as const,
+        blankConsumed: true,
+        at: new Date(fromAt.getTime() + hours(30)),
+      })),
+    );
+    reprintRows = rowsOf(
+      await runReport({ slug: costly.slug, from: FROM, to: TO, queries: ["reprint"] }),
+      "reprint",
+    );
     await addSheets(
       shop,
       Array.from({ length: 12 }, (_, i) => ({
         status: "sent" as const,
-        utilization: 0.5,
+        utilization: 0.25,
         lengthIn: 10,
-        costCents: 200_000_000,
+        costCents: 300_000_000,
         createdAt: new Date(fromAt.getTime() + hours(24 + i)),
       })),
     );
@@ -954,8 +981,8 @@ describe("cents above 2,147,483,647 stay exact", () => {
 
   it("film cost and waste sum past 2^31 as exact numbers", () => {
     const row = rowsOf(rep, "film_use")[0];
-    expect(row?.film_cost_cents).toBe(2_400_000_000);
-    expect(row?.film_waste_cents).toBe(1_200_000_000);
+    expect(row?.film_cost_cents).toBe(3_600_000_000);
+    expect(row?.film_waste_cents).toBe(2_700_000_000);
   });
 
   it("profit revenue, CM and profit per order sum past 2^31 as exact numbers", () => {
@@ -965,6 +992,14 @@ describe("cents above 2,147,483,647 stay exact", () => {
       cm1_cents: 3_000_000_000,
       cm3_cents: 3_000_000_000,
       profit_per_order_cents: 1_500_000_000,
+    });
+  });
+
+  it("reprint cost sums past 2^31 as an exact number", () => {
+    // each reprint: blank 1e9 + transfer 1e9 / (1 + 1 reprint) = 1.5e9
+    expect(find(reprintRows, { reason: "all" })).toMatchObject({
+      reprints: 2,
+      cost_cents: 3_000_000_000,
     });
   });
 
