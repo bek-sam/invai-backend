@@ -133,11 +133,46 @@ describe("stripPii stays linear on adversarial input (S-91 r1)", () => {
     ["one long + digit run", `+${"1".repeat(200_000)}`],
     ["long run with dash groups", `+${"12-".repeat(70_000)}`],
     ["repeated +1 fragments", "+1 ".repeat(70_000)],
+    ["a chain of glued emails", "a@b.cc.".repeat(29_000)],
+    ["a long digit run with no @", "1".repeat(200_000)],
+    ["a long local-part run before one @", `${"a".repeat(200_000)}@x`],
+    ["a long domain run with no tld", `a@${"1.".repeat(100_000)}`],
+    ["repeated @ with no domain", "a@".repeat(100_000)],
   ];
   it.each(shapes)("200 KB: %s", (_name, text) => {
     const t0 = performance.now();
     stripPii(text);
     expect(performance.now() - t0).toBeLessThan(BOUND_MS);
+  });
+});
+
+describe("stripPii scrubs every email, even glued together (S-91 r3)", () => {
+  it.each([
+    ["a@b.com.d@x.com", "[email][email]"],
+    ["a@b.com-c@d.com", "[email][email]"],
+    ["x@y.co1z@w.com", "[email][email]"],
+    ["x.com.bob@yahoo.com", "[email]"],
+    ["jo@x.com.bob@yahoo.com", "[email]"],
+    ["a1.b@x.com", "[email]"],
+    ["x123@y.co", "[email]"],
+    ["foo_a@x.com", "[email]"],
+    ["name:jo@x.com", "name:[email]"],
+    ["12.5 a1.b@x.com", "12.5 [email]"],
+    ["a.b+tag@ex.co.uk", "[email]"],
+    ["foo@bar@x.com", "foo@[email]"],
+    ["mail jo@x.com, ana@y.mx", "mail [email], [email]"],
+    ["@x.com", "@x.com"],
+  ])("%s -> %s", (text, out) => {
+    expect(stripPii(text)).toBe(out);
+  });
+
+  it("a chain of 1000 joined emails is fully scrubbed, fast", () => {
+    const text = Array.from({ length: 1000 }, (_, i) => `u${i}@d${i}.com`).join(".");
+    const t0 = performance.now();
+    const out = stripPii(text);
+    expect(performance.now() - t0).toBeLessThan(1000);
+    expect(out).not.toMatch(/@/);
+    expect(out.match(/\[email\]/g)).toHaveLength(1000);
   });
 });
 

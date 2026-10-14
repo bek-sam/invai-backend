@@ -43,9 +43,38 @@ const UUID_RE = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\
 const maskToken = (n: number) =>
   `\uE000${String.fromCharCode(97 + (n % 26))}${"x".repeat(Math.floor(n / 26))}\uE001`;
 
+/**
+ * Emails, anchored at the `@` (S-91 r3): the regex finds `@domain.tld`, then the local part is
+ * extended left over local-part chars, stopping at the end of the previous scrubbed email. Neither
+ * the domain nor the local part can cross an `@`, so every char is scanned a bounded number of times
+ * (linear), and emails glued together (`a@b.com.d@x.com`) are each scrubbed. A domain whose `@` has
+ * no local part right after a scrubbed email (`jo@x.com.bob@yahoo.com`) joins that email.
+ */
+const EMAIL_DOMAIN_RE = /@[A-Z0-9.-]+\.[A-Z]{2,}/gi;
+const LOCAL_CHAR = /[A-Za-z0-9._%+-]/;
+
+function scrubEmails(text: string): string {
+  let out = "";
+  let last = 0;
+  let lastWasEmail = false;
+  for (const m of text.matchAll(EMAIL_DOMAIN_RE)) {
+    const at = m.index;
+    const end = at + m[0].length;
+    let start = at;
+    while (start > last && LOCAL_CHAR.test(text[start - 1] ?? "")) start--;
+    if (start < at) {
+      out += `${text.slice(last, start)}[email]`;
+    } else if (!(lastWasEmail && at === last)) {
+      continue;
+    }
+    last = end;
+    lastWasEmail = true;
+  }
+  return out + text.slice(last);
+}
+
 const PATTERNS: [RegExp | ((text: string) => string), string][] = [
-  // The lookbehind starts a match only at the head of a local-part run, so a long run with no `@` is scanned once.
-  [/(?<![A-Z0-9._%+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[email]"],
+  [scrubEmails, ""],
   [scrubInternational, ""],
   [/\b(?:\d[ -]?){13,19}\b/g, "[number]"],
   [/(?:\+?1[ .-]?)?\(?\b\d{3}\)?[ .-]?\d{3}[ .-]?\d{4}\b/g, "[phone]"],
