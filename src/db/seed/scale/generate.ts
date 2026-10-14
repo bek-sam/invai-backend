@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { CHANNEL_RULES, deriveOrderStatus, type OrderItemState } from "@invai/contracts";
 import type {
+  buyerPii,
   gangSheetBatches,
   gangSheets,
   orderItems,
@@ -8,11 +9,12 @@ import type {
   orders,
   profitLines,
   reprints,
+  shipments,
   transfers,
 } from "../../schema";
 import { DEFAULT_SHEET_SPEC } from "../../schema";
 import { ffdPack } from "../builder";
-import type { rng } from "../data";
+import { CITIES, FIRST_NAMES, LAST_NAMES, type rng, STREETS } from "../data";
 import type { SkuRef } from "./catalog";
 import type { ScaleProfile } from "./profiles";
 
@@ -58,6 +60,11 @@ type SheetInsert = typeof gangSheets.$inferInsert;
 type TransferInsert = typeof transfers.$inferInsert;
 type ReprintInsert = typeof reprints.$inferInsert;
 type ProfitInsert = typeof profitLines.$inferInsert;
+type ShipmentInsert = typeof shipments.$inferInsert;
+type BuyerPiiInsert = typeof buyerPii.$inferInsert;
+
+/** Days a delivered order's buyer data is kept (`PII_RETENTION_DAYS`, privacy purge). */
+const PII_RETENTION_MS = 30 * DAY;
 
 export type GenContext = {
   profile: ScaleProfile;
@@ -81,6 +88,10 @@ export type DayRows = {
   transfers: TransferInsert[];
   reprints: ReprintInsert[];
   profit: ProfitInsert[];
+  /** One per order with a shipped or delivered unit (A3.3). No label rows, no label keys. */
+  shipments: ShipmentInsert[];
+  /** Fake buyer data for open and recently delivered orders (A3.4); encrypted at insert. */
+  buyerPii: BuyerPiiInsert[];
 };
 
 type Fate =
@@ -313,6 +324,8 @@ export function generateDay(ctx: GenContext, d: number): DayRows {
     transfers: [],
     reprints: [],
     profit: [],
+    shipments: [],
+    buyerPii: [],
   };
   const drafts: Draft[] = [];
 
@@ -421,6 +434,8 @@ export function generateDay(ctx: GenContext, d: number): DayRows {
       createdAt: new Date(plan.placedAt),
       updatedAt: new Date(lastAt),
     });
+    shipDraft(ctx, seq, orderId, orderDrafts, out);
+    piiDraft(ctx, seq, orderId, out.orders[out.orders.length - 1] as OrderInsert, out);
     for (const x of orderDrafts) {
       let from: OrderItemState = "imported";
       for (const hop of x.hops) {
@@ -444,6 +459,89 @@ export function generateDay(ctx: GenContext, d: number): DayRows {
   sheetDay(ctx, d, drafts, out);
   profitDay(ctx, drafts, out);
   return out;
+}
+
+/*
+ * Shipments (A3.3): one per order with at least one shipped or delivered unit, mock-carrier
+ * shaped like the demo seed's. `label_key` and `label_format` stay NULL on purpose (a documented
+ * null): the scale seed writes no `files` rows, so a key would name a missing object (B-403), and
+ * no `labels` rows either (`labels.label_key` is NOT NULL). Tracking is unique per order number.
+ */
+function shipDraft(ctx: GenContext, seq: number, orderId: string, drafts: Draft[], out: DayRows) {
+  const shipped = drafts.filter((x) => x.item.state === "shipped" || x.item.state === "delivered");
+  if (!shipped.length) return;
+  const firstShipped = Math.min(
+    ...shipped.map(
+      (x) => x.hops.find((h) => h.state === "shipped")?.at ?? Number.POSITIVE_INFINITY,
+    ),
+  );
+  const delivered = shipped.every((x) => x.item.state === "delivered");
+  const deliveredAt = delivered
+    ? Math.max(...shipped.map((x) => x.hops.find((h) => h.state === "delivered")?.at ?? 0))
+    : null;
+  const digits = String(seq).padStart(8, "0");
+  const tracking = `9400 1000 0000 ${digits.slice(0, 4)} ${digits.slice(4)} ${String(10 + (seq % 90)).padStart(2, "0")}`;
+  const weightOz = Math.round((5.5 * shipped.length + 0.4) * 10) / 10;
+  const created = new Date(firstShipped - 60_000);
+  out.shipments.push({
+    companyId: ctx.companyId,
+    orderId,
+    orderItemIds: shipped.map((x) => x.item.id as string),
+    status: delivered ? "delivered" : "in_transit",
+    carrier: "usps",
+    service: "GroundAdvantage",
+    trackingCode: tracking,
+    trackingUrl: `https://tools.usps.com/go/TrackConfirmAction?tLabels=${tracking.replace(/\s/g, "")}`,
+    trackingStatus: delivered ? "delivered" : "in_transit",
+    labelKey: null,
+    labelFormat: null,
+    postageCents: 450 + Math.round(weightOz * 22),
+    labelFeeCents: 4,
+    lengthIn: 10,
+    widthIn: 13,
+    heightIn: 1,
+    weightOz,
+    ratedAt: created,
+    carrierShipmentId: `shp_mock_${seq}`,
+    trackingPushStatus: "pushed",
+    trackingPushedAt: new Date(firstShipped),
+    trackingPushAttempts: 1,
+    labeledAt: new Date(firstShipped - 30_000),
+    deliveredAt: deliveredAt === null ? null : new Date(deliveredAt),
+    createdAt: created,
+    updatedAt: new Date(deliveredAt ?? firstShipped),
+  });
+}
+
+/*
+ * Fake buyer data (A3.4) for every order not delivered, plus delivered orders still inside the
+ * 30-day retention window. Names come from the demo seed's lists, addresses are fictional,
+ * emails use example.com and phones the 555-01NN range. No rng draw: the pick is arithmetic on
+ * the order number, so adding this changes none of the other generated rows.
+ */
+function piiDraft(ctx: GenContext, seq: number, orderId: string, order: OrderInsert, out: DayRows) {
+  const delivered = order.deliveredAt ? order.deliveredAt.getTime() : null;
+  if (delivered !== null && delivered + PII_RETENTION_MS <= ctx.now) return;
+  const first = FIRST_NAMES[seq % FIRST_NAMES.length] as string;
+  const last = LAST_NAMES[(seq * 7 + 3) % LAST_NAMES.length] as string;
+  const city = CITIES[seq % CITIES.length] as (typeof CITIES)[number];
+  out.buyerPii.push({
+    companyId: ctx.companyId,
+    orderId,
+    name: `${first} ${last}`,
+    email: `${first}.${last}${seq}@example.com`.toLowerCase().replace(/[^a-z0-9.@]/g, ""),
+    phone: `602-555-01${String(seq % 100).padStart(2, "0")}`,
+    company: null,
+    street1: `${100 + ((seq * 13) % 8900)} ${STREETS[seq % STREETS.length]}`,
+    street2: seq % 5 === 0 ? `Apt ${1 + (seq % 40)}` : null,
+    city: city.city,
+    state: city.state,
+    zip: city.zip,
+    country: "US",
+    purgeAfter: delivered === null ? null : new Date(delivered + PII_RETENTION_MS),
+    createdAt: order.createdAt as Date,
+    updatedAt: order.updatedAt as Date,
+  });
 }
 
 /** Sheet the day's items in on-sheet order; one batch per day, equal-sized sheets. */

@@ -1,16 +1,18 @@
 import { execFile } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { promisify } from "node:util";
-import { sql } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { env } from "../../../env";
+import { decryptField, sha256Hex } from "../../../lib/crypto";
+import { hashPin, pinLogin } from "../../../modules/tenancy/floor-auth";
 import { createCompany, createConnection, createOrder, truncateAll } from "../../../test/fixtures";
 import { withSystem, withTenant } from "../../client";
 import { members, users } from "../../schema";
 import { PRINT_SIZES } from "../data";
 import { SCALE_PROFILES } from "./profiles";
 import { countAllTables } from "./row-counts";
-import { ReplayError, type ScaleSeedReport, seedScaleProfile } from "./seed";
+import { ReplayError, type ScaleSeedReport, seedScaleProfile, writeReport } from "./seed";
 
 /*
  * T-54-3 acceptance on a real database (the harness's private test DB): the small profile is
@@ -114,7 +116,16 @@ describe("small profile, seeded for real", () => {
       "owner1@seed-scale-small.test",
       "presser1@seed-scale-small.test",
     ]);
-    expect(members).toBeDefined();
+    // the member rows themselves: three active members of this company, one per login
+    const rowsOf = await withSystem((tx) =>
+      tx
+        .select({ role: members.role, status: members.status, userId: members.userId })
+        .from(members)
+        .where(eq(members.organizationId, companyId)),
+    );
+    expect(rowsOf).toHaveLength(3);
+    expect(rowsOf.every((m) => m.status === "active")).toBe(true);
+    expect(new Set(rowsOf.map((m) => m.userId)).size).toBe(3);
   });
 
   it("AC3: the other shop's rows are identical before and after, and the new company is its own", async () => {
@@ -180,9 +191,6 @@ describe("small profile, seeded for real", () => {
     expect(
       await num(sql`select count(*) as n from outbox_events where company_id = ${companyId}`),
     ).toBe(0);
-    expect(
-      await num(sql`select count(*) as n from buyer_pii where company_id = ${companyId}`),
-    ).toBe(0);
   });
 
   it("AC7: distinct file keys across design, sheet and artwork columns stay at or under 50", async () => {
@@ -243,6 +251,175 @@ describe("small profile, seeded for real", () => {
     expect(await num(sql`select count(*) as n from companies where slug = ${profile.slug}`)).toBe(
       1,
     );
+  });
+});
+
+describe("T-55-3 phase 1: floor logins, shipments and fake buyer data", () => {
+  const DIR = "/tmp/invai-w55-T-55-3";
+  const isOpen = "i.state in ('transfer_in','on_sheet','pressed')";
+
+  it("AC1: one hashed PIN per presser/packer/receiver member (small: presser only), never plaintext", async () => {
+    expect(report.floor.members.map((m) => m.role)).toEqual(["presser"]);
+    const pins = await rows<{ pin_hash: string; user_id: string; active: boolean }>(
+      sql`select pin_hash, user_id, active from staff_pins where company_id = ${companyId}`,
+    );
+    expect(pins).toHaveLength(1);
+    const m = report.floor.members[0] as { pin: string; email: string };
+    expect(m.pin).toMatch(/^\d{6}$/);
+    expect(pins[0]?.pin_hash).toBe(hashPin(companyId, m.pin));
+    expect(pins[0]?.pin_hash).not.toContain(m.pin);
+    expect(pins[0]?.pin_hash).toMatch(/^[0-9a-f]{64}$/);
+    const owner = await rows<{ email: string }>(
+      sql`select u.email from users u where u.id = ${pins[0]?.user_id}`,
+    );
+    expect(owner[0]?.email).toBe(m.email);
+  });
+
+  it("AC1: one live token per station, stored as a hash with an 8-character prefix", async () => {
+    expect(report.floor.stations).toHaveLength(3);
+    const toks = await rows<{ station_id: string; token_hash: string; token_prefix: string }>(
+      sql`select station_id, token_hash, token_prefix from station_tokens
+          where company_id = ${companyId} and revoked_at is null`,
+    );
+    expect(toks).toHaveLength(3);
+    for (const st of report.floor.stations) {
+      const row = toks.find((t) => t.station_id === st.id);
+      expect(row?.token_hash).toBe(sha256Hex(st.token));
+      expect(st.token).toContain(companyId);
+      expect(row?.token_prefix).toHaveLength(8);
+    }
+    expect(new Set(report.floor.stations.map((s) => s.token)).size).toBe(3);
+  });
+
+  it("AC5: the seeded station token and PIN sign in through pinLogin; a wrong PIN is refused", async () => {
+    const press = report.floor.stations.find((s) => s.kind === "press") as { token: string };
+    const m = report.floor.members[0] as { pin: string };
+    const ok = await pinLogin({ stationToken: press.token, pin: m.pin, ip: null });
+    expect(ok.user.role).toBe("presser");
+    expect(ok.station.kind).toBe("press");
+    const wrong = m.pin === "654321" ? "123456" : "654321";
+    await expect(
+      pinLogin({ stationToken: press.token, pin: wrong, ip: null }),
+    ).rejects.toMatchObject({ code: "INVALID_PIN" });
+  });
+
+  it("AC1: the credentials file is mode 0600 and holds tokens, PINs and open-unit scan targets only", async () => {
+    const file = `${DIR}/accept-${process.pid}.json`;
+    writeReport(file, report);
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+    const got = JSON.parse(readFileSync(file, "utf8")) as ScaleSeedReport;
+    expect(got.floor.stations).toHaveLength(3);
+    expect(got.floor.scanTargets.length).toBeGreaterThan(0);
+    expect(new Set(got.floor.scanTargets).size).toBe(got.floor.scanTargets.length);
+    const open = await rows<{ id: string }>(
+      sql`select t.id from transfers t join order_items i on i.company_id = t.company_id and i.id = t.order_item_id
+          where t.company_id = ${companyId} and not t.scrapped and ${sql.raw(isOpen)}`,
+    );
+    const openIds = new Set(open.map((r) => r.id));
+    for (const t of got.floor.scanTargets) expect(openIds.has(t)).toBe(true);
+    expect(readFileSync(file, "utf8")).not.toMatch(/@example\.com/);
+  });
+
+  it("AC2: one shipment per order with a shipped or delivered unit, consistent with the units", async () => {
+    const orphan = await num(
+      sql`select count(*) as n from (
+            select o.id from orders o where o.company_id = ${companyId}
+            and exists (select 1 from order_items i where i.order_id = o.id and i.state in ('shipped','delivered'))
+            and not exists (select 1 from shipments s where s.order_id = o.id)) x`,
+    );
+    expect(orphan).toBe(0);
+    const extra = await num(
+      sql`select count(*) as n from shipments s where s.company_id = ${companyId}
+          and not exists (select 1 from order_items i where i.order_id = s.order_id and i.state in ('shipped','delivered'))`,
+    );
+    expect(extra).toBe(0);
+    const total = await num(
+      sql`select count(*) as n from shipments where company_id = ${companyId}`,
+    );
+    expect(total).toBeGreaterThan(500);
+    // status delivered iff every shipped/delivered unit is delivered; units match exactly
+    const wrong = await num(
+      sql`select count(*) as n from shipments s where s.company_id = ${companyId} and (
+            s.status <> case when (select bool_and(i.state = 'delivered') from order_items i
+                                   where i.order_id = s.order_id and i.state in ('shipped','delivered'))
+                             then 'delivered' else 'in_transit' end
+            or (select array_agg(x order by x) from unnest(s.order_item_ids) x) is distinct from
+               (select array_agg(i.id order by i.id) from order_items i
+                where i.order_id = s.order_id and i.state in ('shipped','delivered')))`,
+    );
+    expect(wrong).toBe(0);
+    const shape = await rows<{ n: string; d: string; u: string }>(
+      sql`select count(*) filter (where carrier = 'usps' and service = 'GroundAdvantage'
+                 and tracking_code like '9400 1000 0000 %' and carrier_shipment_id like 'shp_mock_%'
+                 and label_key is null and label_format is null) as n,
+                 count(*) filter (where (status = 'delivered') = (delivered_at is not null)) as d,
+                 count(distinct tracking_code) as u
+          from shipments where company_id = ${companyId}`,
+    );
+    expect(Number(shape[0]?.n)).toBe(total);
+    expect(Number(shape[0]?.d)).toBe(total);
+    expect(Number(shape[0]?.u)).toBe(total);
+    expect(await num(sql`select count(*) as n from labels where company_id = ${companyId}`)).toBe(
+      0,
+    );
+  });
+
+  it("AC2: a shipment is created no later than its first shipped transition", async () => {
+    const late = await num(
+      sql`select count(*) as n from shipments s where s.company_id = ${companyId}
+          and s.created_at > (select min(t.created_at) from order_item_transitions t
+                              where t.order_id = s.order_id and t.to_state = 'shipped')`,
+    );
+    expect(late).toBe(0);
+  });
+
+  it("AC3: buyer data is encrypted at rest, fake, and kept only for open or recent orders", async () => {
+    const pii = await rows<{
+      name: string;
+      email: string;
+      phone: string;
+      street1: string;
+      purge_after: Date | null;
+      delivered_at: Date | null;
+    }>(
+      sql`select p.name, p.email, p.phone, p.street1, p.purge_after, o.delivered_at
+          from buyer_pii p join orders o on o.id = p.order_id and o.company_id = p.company_id
+          where p.company_id = ${companyId}`,
+    );
+    expect(pii.length).toBeGreaterThan(100);
+    for (const r of pii.slice(0, 300)) {
+      for (const v of [r.name, r.email, r.phone, r.street1]) {
+        expect(v).toMatch(/^[^:\s]+:[A-Za-z0-9+/=]{20,}$/);
+      }
+      expect(decryptField(r.email)).toMatch(/@example\.com$/);
+      expect(decryptField(r.phone)).toMatch(/^602-555-01\d\d$/);
+      expect(r.email).not.toContain("example.com");
+    }
+    // share: every undelivered order, delivered ones only inside 30 days; purge_after = +30 d
+    const missing = await num(
+      sql`select count(*) as n from orders o where o.company_id = ${companyId}
+          and (o.delivered_at is null or o.delivered_at + interval '30 days' > ${new Date(NOW)})
+          and not exists (select 1 from buyer_pii p where p.order_id = o.id)`,
+    );
+    expect(missing).toBe(0);
+    const stale = await num(
+      sql`select count(*) as n from buyer_pii p join orders o on o.id = p.order_id and o.company_id = p.company_id
+          where p.company_id = ${companyId} and o.delivered_at is not null
+          and o.delivered_at + interval '30 days' <= ${new Date(NOW)}`,
+    );
+    expect(stale).toBe(0);
+    const purge = await num(
+      sql`select count(*) as n from buyer_pii p join orders o on o.id = p.order_id and o.company_id = p.company_id
+          where p.company_id = ${companyId}
+          and (p.purge_after is distinct from (o.delivered_at + interval '30 days'))`,
+    );
+    expect(purge).toBe(0);
+    expect(pii.some((r) => r.delivered_at === null)).toBe(true);
+    expect(pii.some((r) => r.purge_after !== null)).toBe(true);
+  });
+
+  it("AC2: no files rows are written (no label or buyer object keys point at missing files)", async () => {
+    expect(await num(sql`select count(*) as n from files where company_id = ${companyId}`)).toBe(0);
   });
 });
 
